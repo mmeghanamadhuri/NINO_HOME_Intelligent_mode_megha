@@ -1,0 +1,247 @@
+:root {
+  color-scheme: dark;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+  background: #08111f;
+  color: #f4f7fb;
+  --space-1: clamp(8px, 0.8vw, 12px);
+  --space-2: clamp(12px, 1vw, 16px);
+  --space-3: clamp(16px, 1.6vw, 24px);
+  --radius: 14px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at top left, rgba(31, 111, 235, 0.25), transparent 34rem),
+    #08111f;
+}
+
+.page {
+  width: min(1380px, 100%);
+  margin: 0 auto;
+  padding: var(--space-3) var(--space-2);
+}
+
+.hero {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+
+.eyebrow {
+  margin: 0 0 8px;
+  color: #69d2ff;
+  font-size: clamp(0.72rem, 0.7vw, 0.84rem);
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+h1,
+h2,
+p {
+  margin-top: 0;
+}
+
+h1 {
+  margin-bottom: 6px;
+  font-size: clamp(1.7rem, 2.4vw, 2.6rem);
+  line-height: 1.1;
+}
+
+h2 {
+  margin-bottom: 10px;
+  font-size: clamp(0.95rem, 1vw, 1.05rem);
+}
+
+p {
+  color: #aebbd0;
+  line-height: 1.55;
+  font-size: clamp(0.85rem, 0.86vw, 0.95rem);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.12fr) clamp(290px, 26vw, 360px);
+  gap: var(--space-2);
+  align-items: start;
+}
+
+.card {
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: var(--radius);
+  background: rgba(11, 24, 42, 0.82);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.28);
+  padding: var(--space-2);
+}
+
+.stream-card {
+  min-width: 0;
+}
+
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+a {
+  color: #69d2ff;
+}
+
+img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  min-height: 0;
+  max-height: min(68vh, 760px);
+  border-radius: 12px;
+  background: #02060c;
+  object-fit: contain;
+}
+
+.panel {
+  display: grid;
+  gap: var(--space-1);
+  align-content: start;
+  position: sticky;
+  top: var(--space-1);
+}
+
+label {
+  display: block;
+  margin: 9px 0 5px;
+  color: #dce7f7;
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+input,
+select {
+  width: 100%;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 9px;
+  background: #07101d;
+  color: #f4f7fb;
+  padding: 9px 10px;
+  font: inherit;
+  font-size: clamp(0.84rem, 0.82vw, 0.92rem);
+}
+
+button {
+  width: 100%;
+  margin-top: 9px;
+  border: 0;
+  border-radius: 9px;
+  background: #2f81f7;
+  color: white;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 700;
+  font-size: clamp(0.84rem, 0.82vw, 0.92rem);
+  padding: 9px 11px;
+}
+
+button.secondary {
+  background: #1d2a3c;
+  color: #dce7f7;
+}
+
+button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+code,
+pre {
+  border-radius: 10px;
+  background: #050b13;
+}
+
+code {
+  padding: 2px 5px;
+}
+
+pre {
+  overflow: auto;
+  max-height: min(33vh, 300px);
+  margin: 0;
+  padding: 9px;
+  color: #c8d5e8;
+  font-size: clamp(0.72rem, 0.72vw, 0.8rem);
+}
+
+.hint {
+  margin: 10px 0 0;
+  font-size: clamp(0.75rem, 0.74vw, 0.82rem);
+  line-height: 1.45;
+}
+
+.status-pill {
+  flex: 0 0 auto;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+  background: #2f1d12;
+  color: #ffc28a;
+  padding: 7px 11px;
+  font-size: clamp(0.7rem, 0.7vw, 0.8rem);
+  font-weight: 700;
+}
+
+.status-pill.connected {
+  background: #10351f;
+  color: #82f5a5;
+}
+
+@media (max-height: 860px) {
+  .page {
+    padding-top: 14px;
+  }
+
+  h1 {
+    font-size: clamp(1.5rem, 2.1vw, 2.2rem);
+  }
+
+  img {
+    max-height: min(60vh, 620px);
+  }
+
+  pre {
+    max-height: min(28vh, 230px);
+  }
+}
+
+@media (max-width: 980px) {
+  .page {
+    padding: 18px 14px 22px;
+  }
+
+  .hero,
+  .grid {
+    display: block;
+  }
+
+  .status-pill,
+  .panel {
+    margin-top: 16px;
+  }
+
+  .panel {
+    position: static;
+  }
+
+  img {
+    min-height: 240px;
+    max-height: none;
+  }
+}

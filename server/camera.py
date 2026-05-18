@@ -1,0 +1,330 @@
+from __future__ import annotations
+
+import os
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from contextlib import contextmanager
+from typing import Any
+from urllib.parse import urlparse, urlunparse
+
+os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
+
+import cv2
+import numpy as np
+
+try:
+    cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+except Exception:
+    pass
+
+AUTO_CAMERA_SOURCE = "auto"
+AUTO_CAMERA_INDEXES = range(0, 8)
+# UI / status: treat camera as connected if a frame arrived within this window (covers bad JPEG skips).
+STATUS_STALE_FRAME_SECONDS = 4.0
+SNAPSHOT_HTTP_TIMEOUT_SECONDS = 3.0
+SNAPSHOT_POLL_INTERVAL_SECONDS = 0.04
+_JPEG_DECODE_LOCK = threading.Lock()
+
+
+def _extract_first_jpeg(data: bytes) -> bytes | None:
+    """Keep one JPEG (SOI … EOI). Drops leading/trailing HTTP noise; avoids duplicate images."""
+    if not data:
+        return None
+    start = data.find(b"\xff\xd8")
+    if start < 0:
+        return None
+    end = data.find(b"\xff\xd9", start + 2)
+    if end < 0:
+        return data[start:]
+    return data[start : end + 2]
+
+
+@contextmanager
+def _suppress_native_stderr() -> Any:
+    """Silence libjpeg/OpenCV C-level warnings for one decode call.
+
+    These warnings are noisy (e.g. \"Corrupt JPEG data: ...\") and often benign for
+    streaming cameras. Suppression is scoped and serialized by a lock.
+    """
+    with _JPEG_DECODE_LOCK:
+        stderr_fd = None
+        saved_fd = None
+        devnull_fd = None
+        try:
+            stderr_fd = sys.stderr.fileno()
+            saved_fd = os.dup(stderr_fd)
+            devnull_fd = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull_fd, stderr_fd)
+            yield
+        finally:
+            if saved_fd is not None and stderr_fd is not None:
+                os.dup2(saved_fd, stderr_fd)
+            if devnull_fd is not None:
+                os.close(devnull_fd)
+            if saved_fd is not None:
+                os.close(saved_fd)
+
+
+class CameraStream:
+    """Continuously pulls frames from a local camera index or stream URL."""
+
+    def __init__(self, default_source: str) -> None:
+        self.source = default_source
+        self.active_source: int | str | None = None
+        self._capture: cv2.VideoCapture | None = None
+        self._frame: np.ndarray | None = None
+        self._lock = threading.Lock()
+        self._capture_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._connected = False
+        self._last_error = ""
+        self._last_frame_at = 0.0
+        self._frames_received = 0
+
+    def start(self, source: str | None = None) -> None:
+        if source:
+            self.source = source
+
+        if self._thread and self._thread.is_alive():
+            return
+
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, name="camera-stream", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._release_capture()
+        if (
+            self._thread
+            and self._thread.is_alive()
+            and threading.current_thread() is not self._thread
+        ):
+            try:
+                # Keep shutdown responsive; this worker is daemonized.
+                self._thread.join(timeout=0.2)
+            except BaseException:
+                pass
+        self._connected = False
+
+    def restart(self, source: str) -> None:
+        self.stop()
+        self.start(source)
+
+    def read(self) -> np.ndarray | None:
+        with self._lock:
+            if self._frame is None:
+                return None
+            return self._frame.copy()
+
+    def status(self) -> dict[str, Any]:
+        age = None
+        if self._last_frame_at > 0:
+            age = round(time.time() - self._last_frame_at, 2)
+
+        transport = "opencv"
+        if self.active_source and isinstance(self.active_source, str):
+            if self.active_source.lower().find("snapshot") >= 0:
+                transport = "http_snapshot"
+
+        now = time.time()
+        if self._frames_received > 0 and self._last_frame_at > 0.0:
+            connected_ui = (
+                now - self._last_frame_at
+            ) < STATUS_STALE_FRAME_SECONDS
+        else:
+            connected_ui = self._connected
+
+        return {
+            "source": self.source,
+            "active_source": self.active_source,
+            "transport": transport,
+            "connected": connected_ui,
+            "frames_received": self._frames_received,
+            "last_frame_age_seconds": age,
+            "last_error": self._last_error,
+        }
+
+    def _http_snapshot_poll_url(self, raw: str) -> str | None:
+        """ESP32 (and similar) HTTP servers: one MJPEG /stream client can starve OpenCV.
+        Polling /snapshot.jpg avoids competing with the browser and is much more reliable.
+        """
+        s = raw.strip()
+        parsed = urlparse(s)
+        if parsed.scheme not in ("http", "https"):
+            return None
+        path = (parsed.path or "").rstrip("/").lower()
+        if path.endswith("/snapshot.jpg") or path.endswith("/snapshot"):
+            return s
+        if path.endswith("/stream"):
+            new_path = (parsed.path or "").rsplit("/", 1)[0] + "/snapshot.jpg"
+            return urlunparse(
+                (
+                    parsed.scheme,
+                    parsed.netloc,
+                    new_path,
+                    parsed.params,
+                    parsed.query,
+                    parsed.fragment,
+                )
+            )
+        return None
+
+    def _run_http_snapshot_loop(self, snapshot_url: str) -> None:
+        self._release_capture()
+        while not self._stop_event.is_set():
+            try:
+                req = urllib.request.Request(
+                    snapshot_url,
+                    headers={"Cache-Control": "no-cache", "Connection": "close"},
+                )
+                with urllib.request.urlopen(req, timeout=SNAPSHOT_HTTP_TIMEOUT_SECONDS) as resp:
+                    data = resp.read()
+                if not data:
+                    raise ValueError("empty snapshot response")
+                jpeg = _extract_first_jpeg(data)
+                if not jpeg:
+                    raise ValueError("response is not a JPEG")
+                arr = np.frombuffer(jpeg, dtype=np.uint8)
+                with _suppress_native_stderr():
+                    frame = cv2.imdecode(
+                        arr, cv2.IMREAD_COLOR | cv2.IMREAD_IGNORE_ORIENTATION
+                    )
+                if frame is None:
+                    raise ValueError("snapshot is not a valid JPEG")
+                with self._lock:
+                    self._frame = frame
+                self._frames_received += 1
+                self._last_frame_at = time.time()
+                self._connected = True
+                self._last_error = ""
+                self.active_source = snapshot_url
+            except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
+                self._connected = False
+                self._last_error = str(exc)[:240]
+            except ValueError as exc:
+                # Bad or partial JPEG: keep last good frame; do not flip "connected" off
+                # if we were already streaming (avoids UI flicker with MJPEG-style JPEGs).
+                self._last_error = str(exc)[:120]
+                if self._frames_received == 0:
+                    self._connected = False
+            time.sleep(SNAPSHOT_POLL_INTERVAL_SECONDS)
+
+        self._connected = False
+
+    def _run(self) -> None:
+        snapshot_url = self._http_snapshot_poll_url(self.source)
+        if snapshot_url:
+            self._run_http_snapshot_loop(snapshot_url)
+            return
+
+        while not self._stop_event.is_set():
+            with self._capture_lock:
+                capture = self._capture
+
+            if capture is None or not capture.isOpened():
+                self._open_capture()
+                with self._capture_lock:
+                    capture = self._capture
+                if capture is None or not capture.isOpened():
+                    time.sleep(1.0)
+                    continue
+
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                self._connected = False
+                self._last_error = "Could not read frame; reconnecting"
+                self._release_capture()
+                time.sleep(0.5)
+                continue
+
+            with self._lock:
+                self._frame = frame
+                self._frames_received += 1
+                self._last_frame_at = time.time()
+                self._connected = True
+                self._last_error = ""
+
+        self._connected = False
+
+    def _open_capture(self) -> None:
+        self._release_capture()
+        candidates = self._opencv_sources()
+
+        for source in candidates:
+            capture = self._make_capture(source)
+            if not capture.isOpened():
+                capture.release()
+                continue
+
+            ok, frame = False, None
+            if isinstance(source, str) and source.lower().startswith(
+                ("http://", "https://")
+            ):
+                deadline = time.time() + 30.0
+                while time.time() < deadline:
+                    ok, frame = capture.read()
+                    if ok and frame is not None:
+                        break
+                    time.sleep(0.1)
+            else:
+                ok, frame = capture.read()
+
+            if ok and frame is not None:
+                with self._lock:
+                    self._frame = frame
+                self.active_source = source
+                with self._capture_lock:
+                    self._capture = capture
+                return
+
+            capture.release()
+
+        if self.source.strip().lower() == AUTO_CAMERA_SOURCE:
+            self._last_error = "Could not open any local camera source from 0 to 7"
+        else:
+            self._last_error = f"Could not open camera source: {self.source}"
+        self.active_source = None
+        self._connected = False
+
+    def _make_capture(self, source: int | str) -> cv2.VideoCapture:
+        if isinstance(source, int):
+            capture = cv2.VideoCapture(source, cv2.CAP_DSHOW)
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            return capture
+
+        url = str(source)
+        if url.lower().startswith(("http://", "https://")):
+            # MSMF default often fails or times out on MJPEG over HTTP; FFmpeg works.
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+                "stimeout;20000000|rw_timeout;20000000"
+            )
+            capture = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+            capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            return capture
+
+        return cv2.VideoCapture(url)
+
+    def _opencv_sources(self) -> list[int | str]:
+        source = self.source.strip()
+        if source.lower() == AUTO_CAMERA_SOURCE:
+            return list(AUTO_CAMERA_INDEXES)
+        if source.isdigit():
+            return [int(source)]
+        return [source]
+
+    def _release_capture(self) -> None:
+        with self._capture_lock:
+            capture = self._capture
+            self._capture = None
+
+        if capture is not None:
+            try:
+                capture.release()
+            except Exception as exc:
+                self._last_error = f"Could not release camera cleanly: {exc}"

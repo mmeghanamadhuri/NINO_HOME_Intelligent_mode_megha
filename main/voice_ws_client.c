@@ -1,0 +1,192 @@
+#include "voice_ws_client.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "esp_log.h"
+#include "esp_websocket_client.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+
+static const char *TAG = "nino_vws";
+
+/* Long TTS replies at 16 kHz mono: ~4 min max; must exceed largest WS binary frame reassembly. */
+#define MAX_VOICE_WAV (4 * 1024 * 1024)
+
+typedef struct {
+  SemaphoreHandle_t done;
+  esp_websocket_client_handle_t client;
+  uint8_t *buf;
+  size_t len;
+  size_t cap;
+  bool complete;
+  bool error;
+} vws_ctx_t;
+
+static void append_chunk(vws_ctx_t *ctx, const void *data, size_t len) {
+  if (len == 0) {
+    return;
+  }
+  size_t need = ctx->len + len;
+  if (need > MAX_VOICE_WAV) {
+    ctx->error = true;
+    return;
+  }
+  if (need > ctx->cap) {
+    size_t ncap = ctx->cap ? ctx->cap * 2 : 8192;
+    while (ncap < need) {
+      ncap *= 2;
+    }
+    uint8_t *nb = realloc(ctx->buf, ncap);
+    if (nb == NULL) {
+      ctx->error = true;
+      return;
+    }
+    ctx->buf = nb;
+    ctx->cap = ncap;
+  }
+  memcpy(ctx->buf + ctx->len, data, len);
+  ctx->len += len;
+}
+
+static void signal_done(vws_ctx_t *ctx) {
+  if (ctx->complete) {
+    return;
+  }
+  ctx->complete = true;
+  xSemaphoreGive(ctx->done);
+}
+
+static void on_event(void *handler_args, esp_event_base_t base, int32_t event_id,
+                     void *event_data) {
+  (void)base;
+  vws_ctx_t *ctx = (vws_ctx_t *)handler_args;
+  esp_websocket_event_data_t *ws = (esp_websocket_event_data_t *)event_data;
+
+  switch (event_id) {
+  case WEBSOCKET_EVENT_CONNECTED:
+    ESP_LOGI(TAG, "WS connected");
+    break;
+  case WEBSOCKET_EVENT_DATA:
+    /* esp_websocket passes one transport slice per event; data_ptr is that slice only.
+     * payload_offset is the offset in the full WS message — do NOT subtract it from data_len
+     * or continuation frames append 0 bytes and the WAV is truncated (~buffer_size). */
+    if (ws->data_ptr == NULL || ws->data_len <= 0) {
+      break;
+    }
+    if (ws->op_code != 0x02 && ws->op_code != 0x00) {
+      break; /* skip text (0x01), close (0x08), ping/pong, etc. */
+    }
+    append_chunk(ctx, (const uint8_t *)ws->data_ptr, (size_t)ws->data_len);
+    if (ws->fin) {
+      signal_done(ctx);
+    }
+    break;
+  case WEBSOCKET_EVENT_DISCONNECTED:
+    ESP_LOGI(TAG, "WS disconnected, collected %u bytes", (unsigned)ctx->len);
+    signal_done(ctx);
+    break;
+  case WEBSOCKET_EVENT_ERROR:
+    ESP_LOGW(TAG, "WS error type=%d sock_errno=%d msg=%.*s", (int)ws->error_handle.error_type,
+             ws->error_handle.esp_transport_sock_errno, ws->data_len > 0 ? ws->data_len : 0,
+             ws->data_ptr ? ws->data_ptr : "");
+    ctx->error = true;
+    signal_done(ctx);
+    break;
+  default:
+    break;
+  }
+}
+
+esp_err_t nino_voice_ws_exchange(const char *ws_uri, const uint8_t *wav_in,
+                                   size_t wav_in_len, uint8_t **wav_out,
+                                   size_t *wav_out_len, int timeout_ms) {
+  if (ws_uri == NULL || wav_in == NULL || wav_out == NULL || wav_out_len == NULL ||
+      wav_in_len == 0) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  *wav_out = NULL;
+  *wav_out_len = 0;
+
+  vws_ctx_t ctx = {.done = xSemaphoreCreateBinary(),
+                   .client = NULL,
+                   .buf = NULL,
+                   .len = 0,
+                   .cap = 0,
+                   .complete = false,
+                   .error = false};
+  if (ctx.done == NULL) {
+    return ESP_ERR_NO_MEM;
+  }
+
+  esp_websocket_client_config_t ws_cfg = {
+      .uri = ws_uri,
+      .buffer_size = 65536,
+      .network_timeout_ms = 300000,
+      .task_stack = 12288,
+      .task_prio = 5,
+      .disable_pingpong_discon = true,
+      .ping_interval_sec = 30,
+  };
+
+  ctx.client = esp_websocket_client_init(&ws_cfg);
+  if (ctx.client == NULL) {
+    vSemaphoreDelete(ctx.done);
+    return ESP_ERR_NO_MEM;
+  }
+
+  esp_websocket_register_events(ctx.client, WEBSOCKET_EVENT_ANY, on_event, &ctx);
+
+  esp_err_t err = esp_websocket_client_start(ctx.client);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "ws start failed: %s", esp_err_to_name(err));
+    esp_websocket_client_destroy(ctx.client);
+    vSemaphoreDelete(ctx.done);
+    return err;
+  }
+
+  /* Wait until connected then send (poll start is async). */
+  for (int i = 0; i < 200; i++) {
+    if (esp_websocket_client_is_connected(ctx.client)) {
+      break;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+  if (!esp_websocket_client_is_connected(ctx.client)) {
+    ESP_LOGE(TAG, "WS connect timeout");
+    ctx.error = true;
+    goto cleanup;
+  }
+
+  int sent = esp_websocket_client_send_bin(ctx.client, (const char *)wav_in,
+                                           (int)wav_in_len, pdMS_TO_TICKS(30000));
+  if (sent < 0 || (size_t)sent != wav_in_len) {
+    ESP_LOGE(TAG, "send_bin failed: %d", sent);
+    ctx.error = true;
+    goto cleanup;
+  }
+  ESP_LOGI(TAG, "Sent %u bytes to voice WS", (unsigned)wav_in_len);
+
+  if (xSemaphoreTake(ctx.done, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+    ESP_LOGE(TAG, "Response timeout");
+    ctx.error = true;
+  }
+
+cleanup:
+  esp_websocket_client_stop(ctx.client);
+  esp_websocket_client_destroy(ctx.client);
+  vSemaphoreDelete(ctx.done);
+
+  if (ctx.error || ctx.len == 0 || ctx.buf == NULL) {
+    if (ctx.len > 0 && ctx.buf != NULL) {
+      ESP_LOGW(TAG, "WS done but error=%d len=%u (reply dropped)", (int)ctx.error, (unsigned)ctx.len);
+    }
+    free(ctx.buf);
+    return ctx.error ? ESP_FAIL : ESP_ERR_NOT_FOUND;
+  }
+
+  *wav_out = ctx.buf;
+  *wav_out_len = ctx.len;
+  return ESP_OK;
+}

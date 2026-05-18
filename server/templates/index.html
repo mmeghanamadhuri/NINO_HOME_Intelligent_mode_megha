@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NiNO Camera Face Server</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">Server-side face detection and recognition</p>
+          <h1>NiNO Camera Face Server</h1>
+          <p>
+            Pulls a local USB camera or ESP32-P4 stream, detects faces on the
+            server, recognizes registered people, and sends robot responses back.
+          </p>
+        </div>
+        <div class="status-pill" id="connectionStatus">Starting...</div>
+      </section>
+
+      <section class="grid">
+        <div class="card stream-card">
+          <div class="card-header">
+            <h2>Live Feed</h2>
+            <a href="/snapshot.jpg" target="_blank" rel="noreferrer">Open snapshot</a>
+          </div>
+          <img id="stream" src="/video_feed" alt="Annotated camera stream" />
+        </div>
+
+        <aside class="panel">
+          <div class="card">
+            <h2>Camera Input</h2>
+            <label for="cameraSource">Camera source</label>
+            <input id="cameraSource" value="{{ camera_source }}" />
+            <button id="startCamera">Start / Restart Stream</button>
+            <p class="hint">
+              Use <code>auto</code> for a local webcam, or
+              <code>http://&lt;P4-IP&gt;/stream</code> for the ESP32-P4. You only need
+              this page (<code>localhost:8000</code>) for video and face recognition; you
+              do not need the board&rsquo;s web page open at the same time.
+            </p>
+          </div>
+
+          <div class="card">
+            <h2>Register Person</h2>
+            <label for="personName">Name</label>
+            <input id="personName" placeholder="Example: Sirena" />
+            <label for="sampleCount">Samples</label>
+            <input id="sampleCount" type="number" min="1" max="80" value="15" />
+            <button id="registerPerson">Capture Samples and Train</button>
+            <button class="secondary" id="retrain">Retrain Existing Samples</button>
+            <p class="hint">Keep one face centered while registering.</p>
+          </div>
+
+          <div class="card">
+            <h2>Recognition Status</h2>
+            <pre id="statusBox">Loading...</pre>
+          </div>
+        </aside>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

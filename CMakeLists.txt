@@ -6,3 +6,6 @@ cmake_minimum_required(VERSION 3.16)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(USB_Camera)
+
+# Use ESP32-P4 Function EV Board BSP without LVGL (audio + pins only for this app).
+add_compile_definitions(BSP_CONFIG_NO_GRAPHIC_LIB=1)

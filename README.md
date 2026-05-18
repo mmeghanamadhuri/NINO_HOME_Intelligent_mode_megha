@@ -1,230 +1,468 @@
-# USB Camera Complete Flow
+# NiNO Home — ESP32-P4 Camera, Face Recognition & Voice Assistant
 
-## Overview
-
-This project runs on the ESP32-P4 Function EV Board and does the following:
-
-1. Starts the ESP32-P4 application
-2. Brings up Wi-Fi in AP mode
-3. Starts an HTTP server
-4. Waits for a USB UVC camera on the host port
-5. Opens an MJPEG stream from the camera
-6. Copies the latest JPEG frame into RAM
-7. Serves the frame stream to a browser over HTTP
-8. Exposes a terminal command to dump CPU/task runtime stats
+NiNO is a smart-home demo built around the **ESP32-P4 Function EV Board** with a **USB UVC camera**, **on-board speaker (ES8311)**, and a **Python server** on your PC. The server performs face detection and recognition, speaks personalized greetings, and answers voice questions when you say **“Hi ESP”**.
 
 ---
 
-## Runtime Data Path
+## Table of contents
 
-USB Camera -> USB Host -> UVC Host Driver -> Frame Queue -> Latest Frame Buffer -> HTTP Server -> Browser
-
----
-
-## Boot Flow
-
-When `app_main()` runs in [`main/main.c`](/d:/Sirena%20Stuff/USB_Camera/main/main.c):
-
-1. NVS is initialized
-2. Shared mutex and UVC frame queue are created
-3. Wi-Fi AP is started
-4. HTTP server is started
-5. Console REPL is started
-6. USB host stack is installed
-7. USB host event task is started
-8. UVC host driver is installed
-9. The app waits for a UVC camera on port `J18`
+1. [System overview](#1-system-overview)
+2. [Hardware](#2-hardware)
+3. [Firmware (ESP32-P4)](#3-firmware-esp32-p4)
+4. [Python server (PC)](#4-python-server-pc)
+5. [End-to-end workflows](#5-end-to-end-workflows)
+6. [Configuration reference](#6-configuration-reference)
+7. [Troubleshooting](#7-troubleshooting)
+8. [Security notes](#8-security-notes)
+9. [Repository layout](#9-repository-layout)
 
 ---
 
-## Wi-Fi Flow
-
-The project starts a SoftAP with:
-
-- SSID: `ESP32_P4_CAM`
-- Password: `12345678`
-
-After boot:
-
-1. Connect your phone or laptop to `ESP32_P4_CAM`
-2. Open `http://192.168.4.1/`
-
----
-
-## HTTP Flow
-
-The HTTP server exposes these endpoints:
-
-- `/`
-  - Simple web page with an `<img>` pointing to `/stream`
-- `/stream`
-  - Live MJPEG multipart stream
-- `/snapshot.jpg`
-  - One JPEG frame
-
-The browser page continuously reads MJPEG frames from `/stream`.
-
----
-
-## Camera Flow
-
-When a USB camera is connected:
-
-1. The UVC driver reports the device connection
-2. The app reads the supported frame formats
-3. It selects an MJPEG mode
-4. It prefers `640x480`
-5. It caps the stream target to `5 FPS`
-6. It opens the camera stream
-7. It starts receiving frames
-
-The callback does not process the frame directly for HTTP.
-It pushes the frame pointer into a queue.
-
-Then the UVC stream task:
-
-1. Receives the frame from the queue
-2. Copies frame bytes into the shared latest-frame buffer
-3. Logs periodic frame info
-4. Returns the frame to the UVC driver using `uvc_host_frame_return()`
-
-That last step is important. Without returning frames, the driver starves and starts printing underflow warnings.
-
----
-
-## Latest Frame Buffer Flow
-
-The project keeps only one shared latest JPEG frame in memory.
-
-Why:
-
-- simpler than buffering many frames
-- good enough for browser MJPEG viewing
-- reduces memory pressure
-
-How it works:
-
-1. A new camera frame arrives
-2. The app copies it into the latest-frame buffer
-3. The old frame is overwritten
-4. HTTP handlers always serve the newest available frame
-
-This means the web page is not guaranteed to see every frame.
-It always gets the most recent one.
-
----
-
-## CPU Dump Terminal Flow
-
-The project also starts a console REPL on the terminal.
-
-Prompt:
+## 1. System overview
 
 ```text
-usb_cam>
+┌──────────────────────────────────────────────────────────────────────────┐
+│  ESP32-P4 Function EV Board                                               │
+│  • USB UVC camera (host port J18) → MJPEG frames in RAM                   │
+│  • Wi‑Fi SoftAP and/or STA (ESP-Hosted / ESP32-C6 coprocessor)            │
+│  • HTTP: /stream, /snapshot.jpg, POST /play_wav                           │
+│  • ES8311 mic + speaker (BSP)                                             │
+│  • Wake word “Hi ESP” → record question → WebSocket to PC                 │
+│  • Plays WAV replies + wake/done two-tone beeps on speaker                │
+└───────────────────────────────┬──────────────────────────────────────────┘
+                                │  Same LAN as your PC
+                                ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│  PC — Python server (FastAPI + OpenCV + Ollama + Whisper)                 │
+│  • Pulls video: local webcam OR ESP http://<IP>/stream (snapshot poll)    │
+│  • Face detect (Haar) + recognize (LBPH) → browser UI :8000               │
+│  • Vision greetings (LLM) → TTS → POST WAV to ESP speaker                 │
+│  • Voice: STT → LLM (uses recognized name) → TTS → WAV back to ESP         │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
-Available command:
+**Typical daily use**
 
-```text
-cpu_dump
-```
+| What you open | Purpose |
+|---------------|---------|
+| `http://localhost:8000` | Face UI, registration, live annotated video |
+| ESP `http://<board-ip>/` | Optional — camera appliance / snapshot check |
+| Serial monitor `usb_cam>` | Wi‑Fi, voice URL, `cpu_dump` |
 
-What `cpu_dump` shows:
+**Data paths**
 
-- task name
-- core ID
-- priority
-- task state
-- stack high-water mark
-- runtime counter
-- approximate CPU percentage
-
-Use it while the app is running to inspect task behavior at runtime.
+- **Video:** `USB camera → UVC → frame buffer → HTTP → PC OpenCV`
+- **Vision speech:** `Recognized face → Ollama greeting → SAPI WAV → POST /play_wav → ESP speaker`
+- **Voice Q&A:** `“Hi ESP” → mic + VAD → WAV → WebSocket → Whisper → Ollama → WAV → ESP playback`
 
 ---
 
-## Typical Usage
+## 2. Hardware
 
-### 1. Build and flash
+| Item | Notes |
+|------|--------|
+| **Board** | ESP32-P4 Function EV Board |
+| **Camera** | Standard UVC USB webcam on **J18 USB host** |
+| **Audio** | On-board **ES8311** codec (mic + speaker via BSP) |
+| **PC** | Windows recommended (SAPI TTS); Linux/macOS need TTS changes |
+| **Network** | PC and ESP on the same Wi‑Fi / LAN |
+| **LLM** | [Ollama](https://ollama.com/) on the PC (e.g. `qwen2.5:1.5b`) |
+
+**Flash:** 16 MB recommended; WakeNet model partition for “Hi ESP”.
+
+---
+
+## 3. Firmware (ESP32-P4)
+
+Built with **ESP-IDF 5.5+** (ESP32-P4 target). Root `CMakeLists.txt` sets `BSP_CONFIG_NO_GRAPHIC_LIB=1` so the BSP is used for audio and pins without pulling the full LVGL display stack.
+
+### 3.1 Features
+
+| Area | Description |
+|------|-------------|
+| **USB camera** | UVC host; prefers **MJPEG**, typically **640×480**, ~20 FPS |
+| **HTTP server** | Port **80** — stream, snapshot, WAV playback |
+| **Wi‑Fi** | Default SoftAP `ESP32_P4_CAM` / `12345678`; STA via console |
+| **Speaker** | `POST /play_wav` — PCM 16-bit WAV (mono or stereo; stereo averaged) |
+| **Wake word** | ESP-SR WakeNet **`wn9_hiesp`** (“Hi ESP”) |
+| **Voice pipeline** | Wake beep → VAD capture → WebSocket to PC → play reply + done beep |
+| **Discovery** | UDP **1900** (`discover`), TCP **8888** (text log; not used for TTS) |
+| **Console** | Prompt `usb_cam>` |
+
+### 3.2 Build and flash
+
+From an **ESP-IDF** shell at the project root:
 
 ```powershell
+idf.py set-target esp32p4
 idf.py build
 idf.py flash monitor
 ```
 
-### 2. Connect camera
+On Windows you can use `build-idf.bat` if your environment sets `IDF_PATH` and runs `export.bat` first.
 
-- Plug the USB webcam into the USB host port `J18`
+**Managed components** (`main/idf_component.yml`): `esp_hosted`, `esp_wifi_remote`, `usb`, `usb_host_uvc`, `esp32_p4_function_ev_board`.
 
-### 3. Connect to Wi-Fi
+### 3.3 Wi‑Fi
+
+**SoftAP (default after flash)**
 
 - SSID: `ESP32_P4_CAM`
 - Password: `12345678`
+- Browser: `http://192.168.4.1/`
 
-### 4. View stream
-
-Open:
+**STA (home router)** — serial console:
 
 ```text
-http://192.168.4.1/
+wifi mode sta
+wifi connect YOUR_SSID YOUR_PASSWORD
+wifi status
 ```
 
-### 5. Check CPU stats
+Use the **STA IP** in the Python server (`--camera-source`, `--esp-play-wav-url`).
 
-In terminal:
+Wi‑Fi uses the **ESP-Hosted** path (`esp_wifi_remote` + `esp_hosted`) for the on-board **ESP32-C6** coprocessor — not the legacy `esp-extconn` stack.
+
+### 3.4 HTTP API (firmware)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/` | Short HTML; single snapshot preview |
+| GET | `/stream` | MJPEG multipart live stream |
+| GET | `/snapshot.jpg` | One JPEG still |
+| POST | `/play_wav` | Raw WAV body (max **384 KiB**). Response `{"ok":true}` |
+
+WAV format: PCM **16-bit**, **mono** preferred; **8–48 kHz** (server usually sends **16 kHz** for voice, **22.05 kHz** possible for some TTS paths).
+
+### 3.5 Voice assistant (firmware)
+
+**Console setup** (once per board / saved to NVS):
 
 ```text
-cpu_dump
+voice connect <PC_LAN_IP> [port]
+```
+
+Default port **8000**. Saves `ws://<ip>:8000/voice-query` and enables wake.
+
+| Command | Action |
+|---------|--------|
+| `voice connect <ip> [port]` | Set WebSocket URL to PC voice endpoint |
+| `voice url [<ws-uri>]` | Show or set full WebSocket URI |
+| `voice wake on` / `off` | Enable/disable “Hi ESP” |
+
+**Runtime flow**
+
+1. Say **“Hi ESP”** → ascending **wake beep** (700 Hz → 980 Hz).
+2. Speak your question → firmware **VAD** records (16 kHz mono WAV).
+3. WAV sent to PC **`/voice-query`** (or `/ws/voice`).
+4. PC returns TTS WAV → ESP plays answer → descending **done beep** (1040 Hz → 760 Hz).
+
+Wake starts after USB/camera settle (on connect or ~5 s delay) to avoid boot watchdog issues.
+
+### 3.6 Firmware source map
+
+| File | Role |
+|------|------|
+| `main/main.c` | UVC, Wi‑Fi, HTTP, `play_wav` queue, voice console, discovery |
+| `main/audio_playback.c` | ES8311 speaker, WAV play, pipeline drain (full beeps) |
+| `main/audio_capture.c` | Microphone for VAD |
+| `main/voice_wake.cpp` | WakeNet feed/fetch, “Hi ESP” |
+| `main/voice_assist.c` | Chimes, VAD capture, WebSocket exchange |
+| `main/voice_ws_client.c` | WebSocket client to PC |
+| `partitions.csv` | Includes `srmodels` for wake word |
+
+### 3.7 Useful console commands
+
+```text
+cpu_dump          # FreeRTOS task CPU usage
+wifi status       # IP addresses
+voice connect …   # Point to PC server
+```
+
+### 3.8 Firmware notes
+
+- **UVC:** Always return frames with `uvc_host_frame_return()` or the stream underflows.
+- **Partition:** 16 MB flash, large app partition; speech recognition model in `srmodels`.
+- **Logs:** Occasional `Timed out waiting for a UVC frame` or `uvc-isoc` under load is common; stream usually recovers.
+
+---
+
+## 4. Python server (PC)
+
+### 4.1 Stack
+
+| Component | Use |
+|-----------|-----|
+| **FastAPI + Uvicorn** | HTTP API, Web UI, WebSockets |
+| **OpenCV** (`opencv-contrib-python`) | Haar face detection + **LBPH** recognition |
+| **faster-whisper** | Speech-to-text from ESP mic WAV |
+| **Ollama** | Greetings, voice answers, error recovery lines |
+| **Windows SAPI** | Text-to-speech (PowerShell `System.Speech`) |
+| **requests** | POST synthesized WAV to ESP `play_wav` |
+
+### 4.2 Prerequisites
+
+1. **Python 3.10+**
+2. **Ollama** running locally, e.g. `ollama pull qwen2.5:1.5b`
+3. **opencv-contrib-python** (LBPH face recognizer)
+4. **Windows** for default TTS (or adapt `tts_service.py` / `voice_service.py`)
+
+### 4.3 Install and run
+
+```powershell
+cd server
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+**With ESP as camera + speaker** (replace IP with your board STA IP):
+
+```powershell
+python app.py --host 0.0.0.0 --port 8000 `
+  --camera-source http://192.168.0.243/stream `
+  --esp-play-wav-url http://192.168.0.243/play_wav
+```
+
+Open **`http://localhost:8000`**.
+
+**Optional config file** `server/server_config.json`:
+
+```json
+{
+  "camera_source": "http://192.168.0.243/stream",
+  "esp_play_wav_url": "http://192.168.0.243/play_wav"
+}
+```
+
+Then `python app.py` is enough if CLI args are omitted.
+
+**Local webcam only** (no ESP):
+
+```powershell
+python app.py --camera-source auto
+```
+
+### 4.4 Camera transport (important)
+
+If `--camera-source` ends with **`/stream`**, `camera.py` **does not** open a second MJPEG client. It polls **`http://<host>/snapshot.jpg`** instead so the ESP HTTP stack is not overloaded. Status shows `transport: http_snapshot`.
+
+### 4.5 Web UI workflow
+
+1. Confirm **Camera connected** and live preview.
+2. **Register:** enter name → **Capture Samples and Train** (face centered, good light).
+3. Green box + name when recognized; yellow **Unknown** if not trained or score too weak.
+4. **Retrain** if you added samples under `server/data/faces/` manually.
+
+### 4.6 Face recognition
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `FACE_RECOGNITION_THRESHOLD` | `72` | LBPH distance; **lower = stricter match** |
+| Samples | 15 (UI) | Cropped 200×200 grayscale faces per person |
+| Storage | `server/data/faces/<id>/` | JPEG samples |
+| Model | `server/data/face_model.yml` | Trained LBPH |
+| Labels | `server/data/labels.json` | ID → display name |
+
+Detection uses **CLAHE** + dual-pass Haar for soft ESP JPEGs. Only the **largest recognized face** in frame drives vision greetings and voice personalization (avoids background false greets).
+
+### 4.7 Vision greetings (camera → speech)
+
+When a **registered** person is the **primary** face in view:
+
+- **First time this session:** LLM generates a short welcome (`greeting_for_face`).
+- **Return after interval:** welcome-back (default **600 s**, `--face-greeting-interval`).
+
+Speech is synthesized on the PC and sent to the ESP via **`ESP_PLAY_WAV_URL`**. After a **voice Q&A reply**, auto-greetings are **paused ~90 s** and stale greeting jobs are cleared so you do not hear the wrong name (e.g. Chakri in view but “Hello Khyati” from a queued job).
+
+### 4.8 Voice assistant (PC side)
+
+**WebSocket endpoints** (same pipeline):
+
+- `ws://<PC>:8000/voice-query` ← ESP default after `voice connect`
+- `ws://<PC>:8000/ws/voice`
+
+**Pipeline per message**
+
+1. Receive **WAV** from ESP (16 kHz mono).
+2. **Whisper** → user text.
+3. Resolve **viewer name** from current camera frame + session memory (largest recognized face).
+4. **Ollama** → spoken answer; prompt requires using their **name on every reply**, including follow-ups.
+5. **SAPI** → resample to **16 kHz** → send WAV bytes back to ESP.
+
+**Personalization:** Not hardcoded strings — the LLM is told who the camera recognizes (e.g. Chakri) and writes natural lines like *“Hi Chakri, here is what you asked for …”*.
+
+### 4.9 HTTP API (server)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/` | Web UI |
+| GET | `/video_feed` | Annotated MJPEG |
+| GET | `/snapshot.jpg` | Annotated JPEG |
+| GET | `/api/status` | Camera, faces, TTS, `latest_results` |
+| POST | `/api/camera` | `{"source":"..."}` — change camera |
+| POST | `/api/register` | `name`, `samples`, `interval_ms` |
+| POST | `/api/retrain` | Retrain from `data/faces/` |
+| WS | `/voice-query`, `/ws/voice` | Voice assistant binary WAV |
+
+### 4.10 Server source map
+
+| File | Role |
+|------|------|
+| `app.py` | Routes, MJPEG generator, voice WebSocket, CLI |
+| `camera.py` | Local / HTTP snapshot transport |
+| `face_service.py` | Detect, register, train, recognize, annotate |
+| `tts_service.py` | Vision greetings queue, ESP WAV POST |
+| `voice_service.py` | Whisper + voice WAV pipeline |
+| `llm_service.py` | Ollama prompts (greeting, Q&A, errors) |
+| `wav_resample.py` | Mono 16-bit WAV for ESP |
+| `templates/`, `static/` | Web UI |
+
+---
+
+## 5. End-to-end workflows
+
+### 5.1 First-time setup
+
+1. Flash firmware; connect camera and power.
+2. `wifi mode sta` + `wifi connect …` → note IP.
+3. Start Ollama on PC.
+4. Run `python app.py` with `--camera-source` and `--esp-play-wav-url`.
+5. Register faces at `http://localhost:8000`.
+6. On serial: `voice connect <PC_IP> 8000` and `voice wake on`.
+
+### 5.2 Vision-only greeting
+
+Sit in front of the camera → server recognizes you → LLM greeting plays on **ESP speaker** (if `esp_play_wav_url` set).
+
+### 5.3 Voice question
+
+1. Face recognized in UI (green box).
+2. Say **“Hi ESP”** → wake beep.
+3. Ask a question → wait for answer + done beep.
+4. Follow-up: say **“Hi ESP”** again; name should stay in replies while you remain in view / session memory.
+
+### 5.4 Two URLs (normal)
+
+| URL | Role |
+|-----|------|
+| `http://localhost:8000` | Face server + UI (use daily) |
+| `http://<ESP-ip>/` | Camera device (optional) |
+
+---
+
+## 6. Configuration reference
+
+### 6.1 Environment variables (server)
+
+| Variable | Meaning |
+|----------|---------|
+| `CAMERA_SOURCE` / `CAMERA_STREAM_URL` | Default camera URL |
+| `ESP_PLAY_WAV_URL` | POST TTS WAV to ESP |
+| `OLLAMA_URL` | Default `http://127.0.0.1:11434/api/generate` |
+| `OLLAMA_MODEL` | e.g. `qwen2.5:1.5b` |
+| `WHISPER_MODEL` | e.g. `tiny`, `base` |
+| `WHISPER_LANGUAGE` | `en` or `auto` |
+| `FACE_RECOGNITION_THRESHOLD` | LBPH threshold (default `72`) |
+| `FACE_GREETING_INTERVAL_SECONDS` | Welcome-back interval (default `600`) |
+| `VISION_GREETING_AFTER_VOICE_SECONDS` | Pause vision greet after voice (default `90`) |
+| `VOICE_VIEWER_TTL_SECONDS` | Remember speaker for follow-ups (default `900`) |
+
+### 6.2 CLI (`python app.py`)
+
+| Flag | Purpose |
+|------|---------|
+| `--host` | Bind address (default `0.0.0.0`) |
+| `--port` | Port (default `8000`) |
+| `--camera-source` | `auto`, `0`, or `http://…/stream` |
+| `--esp-play-wav-url` | ESP `http://<ip>/play_wav` |
+| `--face-greeting-interval` | Seconds between welcome-back greets |
+
+---
+
+## 7. Troubleshooting
+
+| Symptom | What to check |
+|---------|----------------|
+| No video on UI | ESP IP; open `http://<ip>/snapshot.jpg`; `/api/status` → `camera.last_error` |
+| **Unknown (score)** | Retrain; more samples; lighting; lower threshold slightly via `FACE_RECOGNITION_THRESHOLD` |
+| Register **500** / OpenCV error | Update `face_service.py` (safe Haar); face centered; restart server |
+| No sound from ESP | Serial: speaker init; test `curl -X POST --data-binary @test.wav http://<ip>/play_wav` |
+| TTS on PC not ESP | Set `--esp-play-wav-url` before speaking |
+| Wake word no action | `voice connect`; `voice wake on`; model partition flashed; WS reachable from ESP |
+| Truncated beeps | Reflash firmware with pipeline drain fix in `audio_playback.c` |
+| Wrong name after voice | Reflash server: primary-face-only greetings + `notify_voice_interaction` |
+| Voice without name on follow-up | Stay in frame; check logs for `Voice query viewer: <name>` |
+| Ollama errors | `ollama serve`; model pulled; firewall |
+| `movemodel` / build lock on Windows | Close OneDrive locks on `build/srmodels`; delete folder and rebuild |
+
+---
+
+## 8. Security notes
+
+- **`POST /play_wav`** and the camera HTTP server have **no authentication** — use only on a **trusted LAN**.
+- Do not port-forward to the internet without TLS and auth.
+- Face images and models live in `server/data/` — treat as personal data.
+
+---
+
+## 9. Repository layout
+
+```text
+CMakeLists.txt              # ESP-IDF project (BSP without full LVGL)
+build-idf.bat               # Windows build helper
+partitions.csv              # App + srmodels partitions
+sdkconfig.defaults          # IDF defaults
+
+main/
+  main.c                    # UVC, Wi‑Fi, HTTP, voice CLI
+  audio_playback.c / .h     # Speaker, WAV, beeps
+  audio_capture.c / .h      # Microphone
+  voice_wake.cpp / .h       # “Hi ESP” WakeNet
+  voice_assist.c / .h       # VAD, chimes, voice session
+  voice_ws_client.c / .h    # WebSocket to PC
+  idf_component.yml
+  CMakeLists.txt
+
+server/
+  app.py                    # FastAPI application
+  camera.py
+  face_service.py
+  tts_service.py
+  voice_service.py
+  llm_service.py
+  wav_resample.py
+  requirements.txt
+  server_config.json        # Optional defaults
+  templates/  static/
+  data/                     # faces/, face_model.yml, labels.json
 ```
 
 ---
 
-## Important Notes
+## Quick command cheat sheet
 
-### Wi-Fi backend
+**Firmware**
 
-This project is configured for:
-
-- ESP32-P4 as host
-- on-board ESP32-C6 as Wi-Fi coprocessor
-- `esp_wifi_remote` + `esp_hosted`
-
-It should not use the old `esp-extconn` path for this board setup.
-
-### Camera format
-
-The browser stream depends on MJPEG.
-If the connected camera does not support MJPEG, HTTP video streaming will not work correctly.
-
-### Throughput and warnings
-
-If you still see repeated:
-
-```text
-Frame buffer underflow, processing is too slow
+```powershell
+idf.py build flash monitor
 ```
 
-then possible causes are:
+```text
+wifi connect MySSID MyPassword
+voice connect 192.168.1.50 8000
+voice wake on
+```
 
-- stream FPS too high
-- camera bandwidth too high
-- HTTP serving too slow
-- frame copy/processing taking too long
+**Server**
 
-In that case reduce resolution or FPS further.
+```powershell
+cd server
+python app.py --camera-source http://<ESP_IP>/stream --esp-play-wav-url http://<ESP_IP>/play_wav
+```
+
+**Browser:** `http://localhost:8000`
 
 ---
 
-## Summary
-
-The complete flow is:
-
-1. ESP32-P4 boots
-2. Wi-Fi AP starts
-3. HTTP server starts
-4. USB camera is detected
-5. UVC MJPEG stream starts
-6. Latest frame is copied into RAM
-7. Browser reads frames from `/stream`
-8. You can inspect CPU/task usage anytime with `cpu_dump`
+*NiNO Home — USB camera on the P4, face intelligence and voice on the PC, speech on the board speaker.*

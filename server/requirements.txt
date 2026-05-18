@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+opencv-contrib-python
+numpy
+jinja2
+pyttsx3
+requests>=2.32.0
+faster-whisper>=1.1.0

@@ -18,6 +18,7 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "lwip/inet.h"
 #include "lwip/ip4_addr.h"
@@ -27,11 +28,17 @@
 #include "usb/usb_host.h"
 #include "usb/uvc_host.h"
 
+#include "audio_playback.h"
+#include "audio_capture.h"
+#include "voice_assist.h"
+#include "voice_wake.h"
+
 #define WIFI_SSID "ESP32_P4_CAM"
 #define WIFI_PASS "12345678"
 #define MAX_STA_CONN 4
 
 #define NVS_NAMESPACE "wifi_cfg"
+#define NVS_KEY_VOICE_WS "voice_ws"
 #define NVS_KEY_MODE "mode"
 #define NVS_KEY_STA_SSID "sta_ssid"
 #define NVS_KEY_STA_PASS "sta_pass"
@@ -63,17 +70,30 @@ static bool s_sta_connected = false;
 
 #define UVC_TARGET_WIDTH 640
 #define UVC_TARGET_HEIGHT 480
-#define UVC_TARGET_FPS 30.0f
+#define UVC_TARGET_FPS 20.0f
 #define UVC_FRAME_QUEUE_LEN 3
 #define UVC_FRAME_BUFFERS 3
-#define UVC_URB_COUNT 8
-#define UVC_URB_SIZE (16 * 1024)
-#define UVC_FRAME_SIZE_BYTES (64 * 1024)
+#define UVC_URB_COUNT 6
+#define UVC_URB_SIZE (32 * 1024)
+#define UVC_FRAME_SIZE_BYTES (92 * 1024)
+#define UVC_FRAME_TIMEOUT_LOG_INTERVAL_MS 15000
 #define UVC_OPEN_TIMEOUT_MS 5000
 
 #define HTTP_STREAM_BOUNDARY "frame"
 #define HTTP_SERVER_PORT 80
 #define HTTP_STREAM_POLL_MS 25
+#define MAX_PLAY_WAV_BYTES (384 * 1024)
+#define AUDIO_PLAY_QUEUE_LEN 2
+#define AUDIO_PLAY_TASK_STACK_SIZE 6144
+#define AUDIO_PLAY_TASK_PRIORITY 6
+
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+#define APP_CORE_NET 0
+#define APP_CORE_USB 1
+#else
+#define APP_CORE_NET tskNO_AFFINITY
+#define APP_CORE_USB tskNO_AFFINITY
+#endif
 
 typedef struct {
   uint8_t dev_addr;
@@ -92,6 +112,12 @@ typedef struct {
   bool ready;
 } latest_frame_t;
 
+typedef struct {
+  uint8_t *data;
+  size_t len;
+  bool play_done_chime;
+} audio_play_job_t;
+
 static const char *TAG = "usb_camera";
 
 static TaskHandle_t s_stream_task_handle;
@@ -103,8 +129,29 @@ static uvc_host_frame_info_t *s_frame_info_list;
 static size_t s_frame_info_count;
 static SemaphoreHandle_t s_frame_mutex;
 static latest_frame_t s_latest_frame;
+
 static httpd_handle_t s_http_server;
 static esp_console_repl_t *s_repl;
+static QueueHandle_t s_audio_play_queue;
+static char s_voice_ws_url[160];
+static bool s_voice_wake_started;
+static int64_t s_last_uvc_timeout_log_us;
+
+static void voice_wake_start_once(void) {
+  if (s_voice_wake_started) {
+    return;
+  }
+  s_voice_wake_started = true;
+  nino_voice_wake_init();
+  nino_voice_wake_set_enabled(s_voice_ws_url[0] != '\0');
+}
+
+static void delayed_voice_wake_task(void *arg) {
+  (void)arg;
+  vTaskDelay(pdMS_TO_TICKS(5000));
+  voice_wake_start_once();
+  vTaskDelete(NULL);
+}
 
 static void copy_cstr_field(uint8_t *dst, size_t dst_size, const char *src) {
   if (dst == NULL || dst_size == 0 || src == NULL) {
@@ -176,23 +223,29 @@ static const char *INDEX_HTML =
     "<!DOCTYPE html>"
     "<html><head><meta charset=\"utf-8\">"
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-    "<title>ESP32-P4 Camera</title>"
+    "<title>NiNO camera (ESP32-P4)</title>"
     "<style>"
     "body{font-family:system-ui,sans-serif;margin:0;background:#101820;color:#"
     "f5f7fa;}"
     "main{max-width:900px;margin:0 auto;padding:24px;}"
     "h1{margin:0 0 8px;font-size:2rem;}"
-    "p{color:#b8c2cc;}"
+    "p{color:#b8c2cc;line-height:1.5;}"
     ".card{background:#17232e;border-radius:16px;padding:16px;box-shadow:0 "
     "16px 40px rgba(0,0,0,.25);}"
-    "img{display:block;width:100%;height:auto;border-radius:12px;background:#"
-    "000;}"
+    "img{display:block;width:100%;max-width:640px;height:auto;border-radius:12px;"
+    "background:#000;}"
     "code{background:#0d141b;padding:2px 6px;border-radius:6px;}"
     "</style></head>"
-    "<body><main><h1>ESP32-P4 USB Camera</h1>"
-    "<p>Live MJPEG stream from the UVC webcam.</p>"
-    "<div class=\"card\"><img src=\"/stream\" alt=\"camera stream\"></div>"
-    "<p>Snapshot endpoint: <code>/snapshot.jpg</code></p>"
+    "<body><main><h1>NiNO camera host</h1>"
+    "<p>This board captures the USB camera and exposes it to your <strong>NiNO "
+    "Camera Face Server</strong> on the PC. Use <code>http://localhost:8000</code> "
+    "for live video, face recognition, and speech.</p>"
+    "<p>Opening this page does <strong>not</strong> start a second MJPEG viewer, so "
+    "it will not fight the PC app.</p>"
+    "<p>One-frame check (loads once when you open or refresh this page):</p>"
+    "<div class=\"card\"><img src=\"/snapshot.jpg\" alt=\"last camera frame\"></div>"
+    "<p>Machine endpoints: <code>/snapshot.jpg</code>, <code>/stream</code> (MJPEG), "
+    "<code>/play_wav</code> (POST WAV).</p>"
     "</main></body></html>";
 
 static int cmd_cpu_dump(int argc, char **argv) {
@@ -374,12 +427,15 @@ static void wifi_cli_register(void) {
   ESP_ERROR_CHECK(esp_console_cmd_register(&wifi_cmd));
 }
 
+static void voice_cli_register(void);
+
 static void console_init(void) {
   esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
   repl_config.prompt = "usb_cam> ";
 
   esp_console_register_help_command();
   wifi_cli_register();
+  voice_cli_register();
 
   const esp_console_cmd_t cpu_dump_cmd = {
       .command = "cpu_dump",
@@ -529,7 +585,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     ESP_LOGW(TAG, "STA: Disconnected (reason %d)", ev->reason);
     if (strlen(s_sta_ssid) > 0 &&
         (s_wifi_mode == WIFI_MODE_STA || s_wifi_mode == WIFI_MODE_APSTA)) {
-      xTaskCreate(sta_reconnect_task, "sta_reconn", 2048, NULL, 5, NULL);
+      xTaskCreatePinnedToCore(sta_reconnect_task, "sta_reconn", 2048, NULL, 5,
+                              NULL, APP_CORE_NET);
     }
   }
 
@@ -893,13 +950,216 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   return err;
 }
 
+static esp_err_t play_wav_handler(httpd_req_t *req) {
+  if (req->method != HTTP_POST) {
+    httpd_resp_set_status(req, "405 Method Not Allowed");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"POST only\"}",
+                            HTTPD_RESP_USE_STRLEN);
+  }
+
+  size_t total = req->content_len;
+  if (total == 0 || total > MAX_PLAY_WAV_BYTES) {
+    httpd_resp_set_status(req, "413 Payload Too Large");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(
+        req, "{\"ok\":false,\"error\":\"invalid Content-Length\"}",
+        HTTPD_RESP_USE_STRLEN);
+  }
+
+  uint8_t *buf =
+      heap_caps_malloc(total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (buf == NULL) {
+    buf = malloc(total);
+  }
+  if (buf == NULL) {
+    return httpd_resp_send_500(req);
+  }
+
+  int received = 0;
+  while (received < (int)total) {
+    int r = httpd_req_recv(req, (char *)buf + received,
+                           (int)total - received);
+    if (r <= 0) {
+      free(buf);
+      httpd_resp_set_status(req, "400 Bad Request");
+      httpd_resp_set_type(req, "application/json");
+      return httpd_resp_send(req, "{\"ok\":false,\"error\":\"recv\"}",
+                             HTTPD_RESP_USE_STRLEN);
+    }
+    received += r;
+  }
+
+  if (s_audio_play_queue == NULL) {
+    free(buf);
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"audio queue down\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+
+  audio_play_job_t job = {
+      .data = buf,
+      .len = total,
+  };
+  if (xQueueSendToBack(s_audio_play_queue, &job, 0) != pdPASS) {
+    free(buf);
+    httpd_resp_set_status(req, "429 Too Many Requests");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"audio busy\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, "{\"ok\":true,\"queued\":true}",
+                         HTTPD_RESP_USE_STRLEN);
+}
+
+void nino_main_queue_audio_wav(uint8_t *pcm_wav, size_t len, bool play_done_chime) {
+  if (pcm_wav == NULL || len == 0) {
+    free(pcm_wav);
+    return;
+  }
+  if (s_audio_play_queue == NULL) {
+    free(pcm_wav);
+    return;
+  }
+  audio_play_job_t job = {.data = pcm_wav, .len = len, .play_done_chime = play_done_chime};
+  if (xQueueSendToBack(s_audio_play_queue, &job, pdMS_TO_TICKS(5000)) != pdPASS) {
+    ESP_LOGW(TAG, "voice: audio queue busy");
+    free(pcm_wav);
+  }
+}
+
+static void audio_playback_task(void *arg) {
+  (void)arg;
+  audio_play_job_t job = {};
+
+  while (true) {
+    if (xQueueReceive(s_audio_play_queue, &job, portMAX_DELAY) != pdPASS) {
+      continue;
+    }
+
+    if (job.data == NULL || job.len == 0) {
+      continue;
+    }
+
+    esp_err_t play_err = nino_audio_play_wav(job.data, job.len);
+    if (play_err != ESP_OK) {
+      ESP_LOGW(TAG, "Queued WAV playback failed: %s", esp_err_to_name(play_err));
+    } else if (job.play_done_chime) {
+      (void)nino_voice_play_done_chime();
+    }
+    free(job.data);
+  }
+}
+
+static void load_voice_ws_from_nvs(void) {
+  s_voice_ws_url[0] = '\0';
+  nvs_handle_t h;
+  if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+    return;
+  }
+  size_t sz = sizeof(s_voice_ws_url);
+  (void)nvs_get_str(h, NVS_KEY_VOICE_WS, s_voice_ws_url, &sz);
+  nvs_close(h);
+}
+
+static int cmd_voice(int argc, char **argv) {
+  if (argc >= 2 && strcmp(argv[1], "connect") == 0) {
+    if (argc < 3) {
+      printf("Usage: voice connect <IPv4> [port]   (default port 8000)\n"
+             "  Saves ws://<ip>:<port>/voice-query for \"Hi ESP\" wake flow\n");
+      return 0;
+    }
+    int port = 8000;
+    if (argc >= 4) {
+      port = atoi(argv[3]);
+      if (port < 1 || port > 65535) {
+        printf("Invalid port\n");
+        return 1;
+      }
+    }
+    int n = snprintf(s_voice_ws_url, sizeof(s_voice_ws_url), "ws://%s:%d/voice-query",
+                     argv[2], port);
+    if (n <= 0 || (size_t)n >= sizeof(s_voice_ws_url)) {
+      printf("Voice URL too long or invalid\n");
+      return 1;
+    }
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+      (void)nvs_set_str(h, NVS_KEY_VOICE_WS, s_voice_ws_url);
+      (void)nvs_commit(h);
+      nvs_close(h);
+      printf("Saved voice url to NVS\n");
+    } else {
+      printf("NVS open failed\n");
+    }
+    nino_voice_assist_set_ws_uri(s_voice_ws_url);
+    nino_voice_wake_set_enabled(s_voice_ws_url[0] != '\0');
+    printf("Voice assistant: %s\n", s_voice_ws_url);
+    return 0;
+  }
+  if (argc >= 2 && strcmp(argv[1], "url") == 0) {
+    if (argc < 3) {
+      printf("voice url: \"%s\"\n", s_voice_ws_url);
+      return 0;
+    }
+    strncpy(s_voice_ws_url, argv[2], sizeof(s_voice_ws_url) - 1);
+    s_voice_ws_url[sizeof(s_voice_ws_url) - 1] = '\0';
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+      nvs_set_str(h, NVS_KEY_VOICE_WS, s_voice_ws_url);
+      nvs_commit(h);
+      nvs_close(h);
+      printf("Saved voice url to NVS\n");
+    } else {
+      printf("NVS open failed\n");
+    }
+    nino_voice_assist_set_ws_uri(s_voice_ws_url);
+    nino_voice_wake_set_enabled(s_voice_ws_url[0] != '\0');
+    return 0;
+  }
+  if (argc >= 2 && strcmp(argv[1], "wake") == 0) {
+    if (argc < 3) {
+      printf("voice wake: %s\n", nino_voice_wake_is_enabled() ? "on" : "off");
+      return 0;
+    }
+    if (strcmp(argv[2], "on") == 0) {
+      nino_voice_wake_set_enabled(true);
+      return 0;
+    }
+    if (strcmp(argv[2], "off") == 0) {
+      nino_voice_wake_set_enabled(false);
+      return 0;
+    }
+    printf("Usage: voice wake [on|off]\n");
+    return 1;
+  }
+  printf("Usage: voice connect <ip> [port]  |  voice url [<ws-uri>]  |  voice wake [on|off]\n");
+  return 0;
+}
+
+static void voice_cli_register(void) {
+  const esp_console_cmd_t cmd = {
+      .command = "voice",
+      .help = "voice connect <ip> [port] | voice url [<ws-uri>] | voice wake [on|off] (Hi ESP→beep→mic)",
+      .hint = NULL,
+      .func = &cmd_voice,
+      .argtable = NULL,
+  };
+  ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+}
+
 static void start_http_server(void) {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = HTTP_SERVER_PORT;
   config.stack_size = 8192;
-  config.max_uri_handlers = 8;
-  config.recv_wait_timeout = 10;
-  config.send_wait_timeout = 10;
+  config.max_uri_handlers = 12;
+  config.recv_wait_timeout = 45;
+  config.send_wait_timeout = 45;
+  config.core_id = APP_CORE_NET;
 
   ESP_ERROR_CHECK(httpd_start(&s_http_server, &config));
 
@@ -921,10 +1181,17 @@ static void start_http_server(void) {
       .handler = snapshot_handler,
       .user_ctx = NULL,
   };
+  const httpd_uri_t play_wav_uri = {
+      .uri = "/play_wav",
+      .method = HTTP_POST,
+      .handler = play_wav_handler,
+      .user_ctx = NULL,
+  };
 
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &index_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &stream_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &snapshot_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &play_wav_uri));
 }
 
 static void usb_lib_task(void *arg) {
@@ -1099,7 +1366,13 @@ static void uvc_stream_task(void *arg) {
     while (s_device_connected) {
       uvc_host_frame_t *frame = NULL;
       if (xQueueReceive(s_frame_queue, &frame, pdMS_TO_TICKS(2000)) != pdPASS) {
-        ESP_LOGW(TAG, "Timed out waiting for a UVC frame");
+        const int64_t now_us = esp_timer_get_time();
+        if (s_last_uvc_timeout_log_us == 0 ||
+            (now_us - s_last_uvc_timeout_log_us) >=
+                (int64_t)UVC_FRAME_TIMEOUT_LOG_INTERVAL_MS * 1000LL) {
+          s_last_uvc_timeout_log_us = now_us;
+          ESP_LOGW(TAG, "Timed out waiting for a UVC frame");
+        }
         continue;
       }
 
@@ -1171,15 +1444,19 @@ static void uvc_driver_event_callback(const uvc_host_driver_event_data_t *event,
   if (!s_stream_task_created) {
     BaseType_t ok = xTaskCreatePinnedToCore(
         uvc_stream_task, "uvc_stream", UVC_STREAM_TASK_STACK_SIZE, NULL,
-        UVC_STREAM_TASK_PRIORITY, &s_stream_task_handle, tskNO_AFFINITY);
+        UVC_STREAM_TASK_PRIORITY, &s_stream_task_handle, APP_CORE_USB);
     assert(ok == pdPASS);
     s_stream_task_created = true;
   }
+
+  voice_wake_start_once();
 }
 
 void app_main(void) {
   esp_log_level_set("esp_driver_usb", ESP_LOG_WARN);
   esp_log_level_set("uvc", ESP_LOG_WARN);
+  /* uvc-isoc "frame error" / "missed EoF" are recoverable ISO drops; hide at WARN. */
+  esp_log_level_set("uvc-isoc", ESP_LOG_ERROR);
 
   esp_err_t err = nvs_flash_init();
   if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
@@ -1189,6 +1466,10 @@ void app_main(void) {
   }
   ESP_ERROR_CHECK(err);
 
+  ESP_ERROR_CHECK(nino_voice_assist_init_mutex());
+  load_voice_ws_from_nvs();
+  nino_voice_assist_set_ws_uri(s_voice_ws_url);
+
   s_frame_mutex = xSemaphoreCreateMutex();
   assert(s_frame_mutex != NULL);
   s_frame_queue = xQueueCreate(UVC_FRAME_QUEUE_LEN, sizeof(uvc_host_frame_t *));
@@ -1196,8 +1477,20 @@ void app_main(void) {
 
   wifi_init_all();
 
-  xTaskCreate(multicast_discovery_task, "discovery", 4096, NULL, 5, NULL);
-  xTaskCreate(tcp_message_server_task, "tcp_server", 4096, NULL, 5, NULL);
+  if (nino_audio_init() != ESP_OK) {
+    ESP_LOGW(TAG,
+             "Speaker (BSP audio) init failed; POST /play_wav may not work");
+  }
+  s_audio_play_queue = xQueueCreate(AUDIO_PLAY_QUEUE_LEN, sizeof(audio_play_job_t));
+  assert(s_audio_play_queue != NULL);
+  xTaskCreatePinnedToCore(audio_playback_task, "audio_play",
+                          AUDIO_PLAY_TASK_STACK_SIZE, NULL,
+                          AUDIO_PLAY_TASK_PRIORITY, NULL, APP_CORE_NET);
+
+  xTaskCreatePinnedToCore(multicast_discovery_task, "discovery", 4096, NULL, 5,
+                          NULL, APP_CORE_NET);
+  xTaskCreatePinnedToCore(tcp_message_server_task, "tcp_server", 4096, NULL, 5,
+                          NULL, APP_CORE_NET);
 
   console_init();
   start_http_server();
@@ -1211,19 +1504,23 @@ void app_main(void) {
 
   BaseType_t ok = xTaskCreatePinnedToCore(
       usb_lib_task, "usb_lib", USB_LIB_TASK_STACK_SIZE, NULL,
-      USB_LIB_TASK_PRIORITY, NULL, tskNO_AFFINITY);
+      USB_LIB_TASK_PRIORITY, NULL, APP_CORE_USB);
   assert(ok == pdPASS);
 
   ESP_LOGI(TAG, "Installing UVC host driver");
   const uvc_host_driver_config_t uvc_driver_config = {
       .driver_task_stack_size = UVC_DRIVER_TASK_STACK_SIZE,
       .driver_task_priority = UVC_DRIVER_TASK_PRIORITY,
-      .xCoreID = tskNO_AFFINITY,
+      .xCoreID = APP_CORE_USB,
       .create_background_task = true,
       .event_cb = uvc_driver_event_callback,
       .user_ctx = NULL,
   };
   ESP_ERROR_CHECK(uvc_host_install(&uvc_driver_config));
+
+  /* If no camera plugs in, still start wake after USB/SDIO settle (HP WDT on boot). */
+  (void)xTaskCreatePinnedToCore(delayed_voice_wake_task, "wake_delay", 4096, NULL, 3, NULL,
+                                APP_CORE_NET);
 
   ESP_LOGI(TAG, "Waiting for a UVC camera on J18");
   ESP_LOGI(

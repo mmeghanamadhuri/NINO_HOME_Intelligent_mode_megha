@@ -1,0 +1,4 @@
+{
+  "camera_source": "http://192.168.0.85/stream",
+  "esp_play_wav_url": "http://192.168.0.85/play_wav"
+}
