@@ -466,3 +466,27 @@ python app.py --camera-source http://<ESP_IP>/stream --esp-play-wav-url http://<
 ---
 
 *NiNO Home — USB camera on the P4, face intelligence and voice on the PC, speech on the board speaker.*
+
+
+
+
+## GitHub clone and update
+
+Use these commands on a new system to download the project from GitHub:
+
+```powershell
+git clone https://github.com/ESP32-P4/voice-vision-server-setup-esp32p4.git
+cd voice-vision-server-setup-esp32p4
+```
+
+If the project is already cloned and you just want the latest changes:
+
+```powershell
+git pull origin main
+```
+
+If GitHub SSH access is configured, you can clone with SSH instead:
+
+```powershell
+git clone git@github.com:ESP32-P4/voice-vision-server-setup-esp32p4.git
+```
