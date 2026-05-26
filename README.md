@@ -556,30 +556,46 @@ python app.py --camera-source http://<ESP_IP>/stream --esp-play-wav-url http://<
 
 ## GitHub clone and update
 
-Use these commands on a new system to download the project from GitHub:
+**Canonical repository (voice + vision + touch):**
+
+https://github.com/ESP32-P4/voice-vision-touch
+
+Use this repo only. The older `voice-vision-server-setup-esp32p4` project is a separate repository — do not clone it for this build.
+
+### First-time clone (HTTPS)
 
 ```powershell
-git clone https://github.com/ESP32-P4/voice-vision-server-setup-esp32p4.git
-cd voice-vision-server-setup-esp32p4
+git clone https://github.com/ESP32-P4/voice-vision-touch.git
+cd voice-vision-touch
 ```
 
-If the project is already cloned and you just want the latest changes, open a terminal in the project folder and run:
+### Update an existing clone
+
+Open a terminal in your project folder, then:
 
 ```powershell
-cd voice-vision-server-setup-esp32p4
+cd voice-vision-touch
 git pull origin main
 ```
 
-Or use the full path to your clone (example):
+Or use the full path to your working copy (example):
 
 ```powershell
 cd "D:\Sirena Stuff\Final Integrations\Voice Vision Touch"
 git pull origin main
 ```
 
-If GitHub SSH access is configured, you can clone with SSH instead:
+### Clone with SSH (optional)
 
 ```powershell
-git clone git@github.com:ESP32-P4/voice-vision-server-setup-esp32p4.git
-cd voice-vision-server-setup-esp32p4
+git clone git@github.com:ESP32-P4/voice-vision-touch.git
+cd voice-vision-touch
+```
+
+### Point `origin` at this repo (if you cloned the wrong URL earlier)
+
+```powershell
+git remote set-url origin https://github.com/ESP32-P4/voice-vision-touch.git
+git remote -v
+git push -u origin main
 ```
