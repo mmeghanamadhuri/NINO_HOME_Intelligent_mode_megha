@@ -1,6 +1,14 @@
-# NiNO Home — ESP32-P4 Camera, Face Recognition & Voice Assistant
+# NiNO Home — Voice, Vision & Touch (ESP32-P4)
 
-NiNO is a smart-home demo built around the **ESP32-P4 Function EV Board** with a **USB UVC camera**, **QT2120 touch sensor (12 keys on I2C)**, **on-board speaker (ES8311)**, and a **Python server** on your PC. The server performs face detection and recognition, speaks personalized greetings, and answers voice questions when you say **“Hi ESP”**. A touch on the sensor plays an embedded **“please don’t touch me”** warning on the board speaker.
+NiNO is a smart-home demo on the **ESP32-P4 Function EV Board** with three interaction paths:
+
+| Modality | Where it runs | What happens |
+|----------|----------------|--------------|
+| **Vision** | PC (OpenCV + Ollama) | Face detect/recognize → personalized greeting → WAV to board speaker |
+| **Voice** | PC + board mic | Say **“Hi ESP”** → record question → Whisper + Ollama → answer on speaker |
+| **Touch** | Board (QT2120) | Stable touch → embedded **“please don’t touch me”** on speaker |
+
+Hardware: **USB UVC camera** (J18), **QT2120** touch (12 keys, I2C **0x1C**), **ES8311** mic/speaker, **Wi‑Fi**. Intelligence (faces, LLM, STT, TTS) runs on a **Windows PC** on the same LAN; the P4 is the camera, audio, touch, and network appliance.
 
 ---
 
@@ -8,13 +16,14 @@ NiNO is a smart-home demo built around the **ESP32-P4 Function EV Board** with a
 
 1. [System overview](#1-system-overview)
 2. [Hardware](#2-hardware)
-3. [Firmware (ESP32-P4)](#3-firmware-esp32-p4)
-4. [Python server (PC)](#4-python-server-pc)
+3. [Firmware (ESP32-P4)](#3-firmware-esp32-p4) — camera, touch, speaker FIFO, voice
+4. [Python server (PC)](#4-python-server-pc) — faces, TTS, Whisper, Ollama
 5. [End-to-end workflows](#5-end-to-end-workflows)
 6. [Configuration reference](#6-configuration-reference)
 7. [Troubleshooting](#7-troubleshooting)
 8. [Security notes](#8-security-notes)
 9. [Repository layout](#9-repository-layout)
+10. [GitHub clone and update](#github-clone-and-update)
 
 ---
 
@@ -52,9 +61,12 @@ NiNO is a smart-home demo built around the **ESP32-P4 Function EV Board** with a
 
 **Data paths**
 
-- **Video:** `USB camera → UVC → frame buffer → HTTP → PC OpenCV`
-- **Vision speech:** `Recognized face → Ollama greeting → SAPI WAV → POST /play_wav → ESP speaker`
-- **Voice Q&A:** `“Hi ESP” → mic + VAD → WAV → WebSocket → Whisper → Ollama → WAV → ESP playback`
+- **Video:** `USB camera → UVC → HTTP (/snapshot.jpg) → PC OpenCV`
+- **Vision speech:** `Confirmed face → Ollama greeting → SAPI WAV → POST /play_wav → ESP FIFO → speaker`
+- **Voice Q&A:** `“Hi ESP” → mic + VAD → WebSocket → Whisper → Ollama → WAV → ESP FIFO → speaker`
+- **Touch:** `QT2120 I2C → debounced touch → PDTM.wav → ESP FIFO → speaker`
+
+**Speaker policy:** Server WAV, touch warning, and voice replies share one **FIFO queue** (depth 32) on the P4. Clips play **one at a time** in enqueue order; callers **block until queued** (no drop when busy). ES8311 output volume is **100%** in firmware; PC TTS synthesis uses **75%** SAPI volume before POST.
 
 ---
 
@@ -64,6 +76,7 @@ NiNO is a smart-home demo built around the **ESP32-P4 Function EV Board** with a
 |------|--------|
 | **Board** | ESP32-P4 Function EV Board |
 | **Camera** | Standard UVC USB webcam on **J18 USB host** |
+| **Touch** | **QT2120** capacitive sensor (12 keys), **I2C 0x1C**, shared BSP I2C with ES8311 |
 | **Audio** | On-board **ES8311** codec (mic + speaker via BSP) |
 | **PC** | Windows recommended (SAPI TTS); Linux/macOS need TTS changes |
 | **Network** | PC and ESP on the same Wi‑Fi / LAN |
@@ -86,8 +99,9 @@ Built with **ESP-IDF 5.5+** (ESP32-P4 target). Root `CMakeLists.txt` sets `BSP_C
 | **Wi‑Fi** | Default SoftAP `ESP32_P4_CAM` / `12345678`; STA via console |
 | **Speaker** | `POST /play_wav` — PCM 16-bit WAV (mono or stereo; stereo averaged) |
 | **Wake word** | ESP-SR WakeNet **`wn9_hiesp`** (“Hi ESP”) |
-| **Touch sensor** | **QT2120** on BSP I2C (addr **0x1C**, 12 keys); stable touch → **`PDTM.wav`** on speaker |
-| **Voice pipeline** | Wake beep → VAD capture → WebSocket to PC → play reply + done beep |
+| **Touch sensor** | **QT2120** on BSP I2C (**0x1C**); 300 ms stable touch → queue **`PDTM.wav`** |
+| **Speaker queue** | **`audio_queue.c`** — FIFO for server / touch / voice WAV (blocking enqueue) |
+| **Voice pipeline** | Wake beep → VAD capture → WebSocket to PC → queue reply + done beep |
 | **Discovery** | UDP **1900** (`discover`), TCP **8888** (text log; not used for TTS) |
 | **Console** | Prompt `usb_cam>` |
 
@@ -136,7 +150,33 @@ Wi‑Fi uses the **ESP-Hosted** path (`esp_wifi_remote` + `esp_hosted`) for the 
 
 WAV format: PCM **16-bit**, **mono** preferred; **8–48 kHz** (server usually sends **16 kHz** for voice, **22.05 kHz** possible for some TTS paths).
 
-### 3.5 Voice assistant (firmware)
+### 3.5 Touch sensor (firmware)
+
+Runs automatically after boot (no serial command). On first start, keep hands off the sensor during **calibration** (~1.2 s settle).
+
+| Parameter | Value |
+|-----------|--------|
+| Poll interval | 30 ms |
+| Stable touch before trigger | 300 ms |
+| Cooldown between warnings | 500 ms |
+| Re-arm after release | 300 ms no-touch |
+| Audio clip | Embedded `main/PDTM.wav` |
+
+Touch warnings use the same speaker FIFO as `POST /play_wav` (see §3.6).
+
+### 3.6 Speaker playback queue (firmware)
+
+All speaker WAVs go through **`nino_audio_queue_*`** (`main/audio_queue.c`):
+
+| Source | How it enqueues |
+|--------|------------------|
+| `POST /play_wav` | HTTP handler → FIFO |
+| Touch | `touch_sensor.c` → copy `PDTM.wav` → FIFO |
+| Voice reply | `voice_assist.c` → FIFO (+ optional done chime after play) |
+
+**Order:** Strict **first-in, first-out**. If the speaker is busy, new clips wait (HTTP may block until the job is queued). Wake/done **chimes** still use the shared codec mutex directly.
+
+### 3.7 Voice assistant (firmware)
 
 **Console setup** (once per board / saved to NVS):
 
@@ -161,12 +201,13 @@ Default port **8000**. Saves `ws://<ip>:8000/voice-query` and enables wake.
 
 Wake starts after USB/camera settle (on connect or ~5 s delay) to avoid boot watchdog issues.
 
-### 3.6 Firmware source map
+### 3.8 Firmware source map
 
 | File | Role |
 |------|------|
-| `main/main.c` | UVC, Wi‑Fi, HTTP, `play_wav` queue, voice console, discovery |
-| `main/audio_playback.c` | ES8311 speaker, WAV play, pipeline drain (full beeps) |
+| `main/main.c` | UVC, Wi‑Fi, HTTP, `play_wav`, voice console, discovery |
+| `main/audio_queue.c` | Shared speaker FIFO (server, touch, voice) |
+| `main/audio_playback.c` | ES8311 codec, WAV/PCM play, volume **100%** |
 | `main/audio_capture.c` | Microphone for VAD |
 | `main/voice_wake.cpp` | WakeNet feed/fetch, “Hi ESP” |
 | `main/voice_assist.c` | Chimes, VAD capture, WebSocket exchange |
@@ -176,7 +217,7 @@ Wake starts after USB/camera settle (on connect or ~5 s delay) to avoid boot wat
 | `main/PDTM.wav` | Embedded “please don’t touch me” clip |
 | `partitions.csv` | Includes `srmodels` for wake word |
 
-### 3.7 Useful console commands
+### 3.9 Useful console commands
 
 ```text
 cpu_dump          # FreeRTOS task CPU usage
@@ -184,7 +225,7 @@ wifi status       # IP addresses
 voice connect …   # Point to PC server
 ```
 
-### 3.8 Firmware notes
+### 3.10 Firmware notes
 
 - **UVC:** Always return frames with `uvc_host_frame_return()` or the stream underflows.
 - **Partition:** 16 MB flash, large app partition; speech recognition model in `srmodels`.
@@ -225,9 +266,13 @@ pip install -r requirements.txt
 
 ```powershell
 python app.py --host 0.0.0.0 --port 8000 `
-  --camera-source http://192.168.0.243/stream `
-  --esp-play-wav-url http://192.168.0.243/play_wav
+  --camera-source http://192.168.0.85/stream `
+  --esp-play-wav-url http://192.168.0.85/play_wav `
+  --face-threshold 55 `
+  --face-confirm-frames 4
 ```
+
+`--face-threshold` and `--face-confirm-frames` reduce false recognition (see §4.6).
 
 Open **`http://localhost:8000`**.
 
@@ -235,8 +280,8 @@ Open **`http://localhost:8000`**.
 
 ```json
 {
-  "camera_source": "http://192.168.0.243/stream",
-  "esp_play_wav_url": "http://192.168.0.243/play_wav"
+  "camera_source": "http://192.168.0.85/stream",
+  "esp_play_wav_url": "http://192.168.0.85/play_wav"
 }
 ```
 
@@ -255,21 +300,33 @@ If `--camera-source` ends with **`/stream`**, `camera.py` **does not** open a se
 ### 4.5 Web UI workflow
 
 1. Confirm **Camera connected** and live preview.
-2. **Register:** enter name → **Capture Samples and Train** (face centered, good light).
-3. Green box + name when recognized; yellow **Unknown** if not trained or score too weak.
-4. **Retrain** if you added samples under `server/data/faces/` manually.
+2. **Register:** enter name → **Capture Samples and Train** (face centered, good light; **15+ samples** recommended).
+3. Box colors:
+   - **Green** — identity **confirmed** (used for greetings and voice name)
+   - **Cyan** — candidate match, waiting for consecutive frames
+   - **Yellow** — face detected but **Unknown** / not confirmed
+4. **Retrain** after adding images under `server/data/faces/` manually.
 
 ### 4.6 Face recognition
 
+LBPH distance: **lower score = better match**. Defaults are tuned to reduce false triggers on soft ESP JPEGs.
+
 | Setting | Default | Meaning |
 |---------|---------|---------|
-| `FACE_RECOGNITION_THRESHOLD` | `72` | LBPH distance; **lower = stricter match** |
-| Samples | 15 (UI) | Cropped 200×200 grayscale faces per person |
-| Storage | `server/data/faces/<id>/` | JPEG samples |
+| `FACE_RECOGNITION_THRESHOLD` | `58` | Max LBPH distance for a **strict** match |
+| `FACE_CONFIRM_FRAMES` | `3` | Consecutive strict matches before **recognized** |
+| `FACE_UNKNOWN_GRACE_DELTA` | `8` | Extra margin for **track hold** after confirmed only |
+| `FACE_DETECT_MIN_NEIGHBORS` | `5` | Haar strictness (higher = fewer false face boxes) |
+| `FACE_DETECT_MIN_SIZE` | `56` | Minimum face size (pixels) in detector pass |
+| `FACE_MIN_AREA_RATIO` | `0.004` | Ignore tiny boxes vs frame area |
+| Samples | 15 (UI) | Cropped **200×200** grayscale per person |
+| Storage | `server/data/faces/<id>/` | JPEG training samples |
 | Model | `server/data/face_model.yml` | Trained LBPH |
-| Labels | `server/data/labels.json` | ID → display name |
+| Labels | `server/data/labels.json` | Numeric ID → display name |
 
-Detection uses **CLAHE** + dual-pass Haar for soft ESP JPEGs. Only the **largest recognized face** in frame drives vision greetings and voice personalization (avoids background false greets).
+Detection: **CLAHE** + dual-pass Haar, aspect/area filters. Only the **largest confirmed face** drives vision greetings and voice personalization.
+
+**Tuning false positives:** Lower threshold (e.g. `50`), raise `--face-confirm-frames` (e.g. `5`), retrain with more samples in real lighting. **False negatives:** Raise threshold slightly (e.g. `65`) or reduce confirm frames.
 
 ### 4.7 Vision greetings (camera → speech)
 
@@ -314,9 +371,9 @@ Speech is synthesized on the PC and sent to the ESP via **`ESP_PLAY_WAV_URL`**. 
 
 | File | Role |
 |------|------|
-| `app.py` | Routes, MJPEG generator, voice WebSocket, CLI |
+| `app.py` | Routes, MJPEG generator, voice WebSocket, CLI, face tuning flags |
 | `camera.py` | Local / HTTP snapshot transport |
-| `face_service.py` | Detect, register, train, recognize, annotate |
+| `face_service.py` | Haar + LBPH, multi-frame confirm, annotate |
 | `tts_service.py` | Vision greetings queue, ESP WAV POST |
 | `voice_service.py` | Whisper + voice WAV pipeline |
 | `llm_service.py` | Ollama prompts (greeting, Q&A, errors) |
@@ -342,12 +399,19 @@ Sit in front of the camera → server recognizes you → LLM greeting plays on *
 
 ### 5.3 Voice question
 
-1. Face recognized in UI (green box).
+1. Face **confirmed** in UI (green box).
 2. Say **“Hi ESP”** → wake beep.
 3. Ask a question → wait for answer + done beep.
 4. Follow-up: say **“Hi ESP”** again; name should stay in replies while you remain in view / session memory.
 
-### 5.4 Two URLs (normal)
+### 5.4 Touch warning
+
+1. Flash firmware with touch sources (`bsp_qt2120`, `touch_sensor`, `PDTM.wav`).
+2. Let calibration finish (hands away on boot).
+3. Touch a pad firmly (~300 ms) → **“please don’t touch me”** on the speaker.
+4. If a server greeting is playing, the touch clip waits in the FIFO and plays **after** the current clip.
+
+### 5.5 Two URLs (normal)
 
 | URL | Role |
 |-----|------|
@@ -368,7 +432,10 @@ Sit in front of the camera → server recognizes you → LLM greeting plays on *
 | `OLLAMA_MODEL` | e.g. `qwen2.5:1.5b` |
 | `WHISPER_MODEL` | e.g. `tiny`, `base` |
 | `WHISPER_LANGUAGE` | `en` or `auto` |
-| `FACE_RECOGNITION_THRESHOLD` | LBPH threshold (default `72`) |
+| `FACE_RECOGNITION_THRESHOLD` | LBPH strict match (default `58`) |
+| `FACE_CONFIRM_FRAMES` | Frames before green / recognized (default `3`) |
+| `FACE_UNKNOWN_GRACE_DELTA` | Track grace above threshold (default `8`) |
+| `FACE_DETECT_MIN_NEIGHBORS` | Haar strictness (default `5`) |
 | `FACE_GREETING_INTERVAL_SECONDS` | Welcome-back interval (default `600`) |
 | `VISION_GREETING_AFTER_VOICE_SECONDS` | Pause vision greet after voice (default `90`) |
 | `VOICE_VIEWER_TTL_SECONDS` | Remember speaker for follow-ups (default `900`) |
@@ -382,6 +449,8 @@ Sit in front of the camera → server recognizes you → LLM greeting plays on *
 | `--camera-source` | `auto`, `0`, or `http://…/stream` |
 | `--esp-play-wav-url` | ESP `http://<ip>/play_wav` |
 | `--face-greeting-interval` | Seconds between welcome-back greets |
+| `--face-threshold` | LBPH max distance (lower = stricter) |
+| `--face-confirm-frames` | Consecutive matches before recognized |
 
 ---
 
@@ -390,7 +459,11 @@ Sit in front of the camera → server recognizes you → LLM greeting plays on *
 | Symptom | What to check |
 |---------|----------------|
 | No video on UI | ESP IP; open `http://<ip>/snapshot.jpg`; `/api/status` → `camera.last_error` |
-| **Unknown (score)** | Retrain; more samples; lighting; lower threshold slightly via `FACE_RECOGNITION_THRESHOLD` |
+| **Unknown (score)** | Retrain; more samples; lighting; try higher `FACE_RECOGNITION_THRESHOLD` or lower `--face-confirm-frames` |
+| **False recognition** | Stricter: `--face-threshold 50 --face-confirm-frames 5`; retrain; check `/api/status` → `faces` |
+| Stuck on **cyan** box | Wait for confirm frames; move closer; improve light |
+| **Touch** no sound | Serial: `Touch poll task started`; QT2120 at **0x1C**; speaker init OK |
+| Touch during greeting | Normal — touch plays **after** current FIFO clip |
 | Register **500** / OpenCV error | Update `face_service.py` (safe Haar); face centered; restart server |
 | No sound from ESP | Serial: speaker init; test `curl -X POST --data-binary @test.wav http://<ip>/play_wav` |
 | TTS on PC not ESP | Set `--esp-play-wav-url` before speaking |
@@ -421,7 +494,8 @@ sdkconfig.defaults          # IDF defaults
 
 main/
   main.c                    # UVC, Wi‑Fi, HTTP, voice CLI
-  audio_playback.c / .h     # Speaker, WAV, beeps
+  audio_queue.c / .h        # Speaker FIFO (server, touch, voice)
+  audio_playback.c / .h     # ES8311 play, volume, beeps
   audio_capture.c / .h      # Microphone
   voice_wake.cpp / .h       # “Hi ESP” WakeNet
   voice_assist.c / .h       # VAD, chimes, voice session
@@ -466,14 +540,16 @@ voice wake on
 
 ```powershell
 cd server
-python app.py --camera-source http://<ESP_IP>/stream --esp-play-wav-url http://<ESP_IP>/play_wav
+python app.py --camera-source http://<ESP_IP>/stream --esp-play-wav-url http://<ESP_IP>/play_wav --face-threshold 55 --face-confirm-frames 4
 ```
 
 **Browser:** `http://localhost:8000`
 
+**Touch:** Works after flash — no PC command; calibrate with hands away on boot.
+
 ---
 
-*NiNO Home — USB camera on the P4, face intelligence and voice on the PC, speech on the board speaker.*
+*NiNO Home — Voice, vision, and touch: camera and sensors on the P4; faces, LLM, and STT on the PC; one speaker FIFO on the board.*
 
 
 
@@ -487,9 +563,17 @@ git clone https://github.com/ESP32-P4/voice-vision-server-setup-esp32p4.git
 cd voice-vision-server-setup-esp32p4
 ```
 
-If the project is already cloned and you just want the latest changes:
+If the project is already cloned and you just want the latest changes, open a terminal in the project folder and run:
 
 ```powershell
+cd voice-vision-server-setup-esp32p4
+git pull origin main
+```
+
+Or use the full path to your clone (example):
+
+```powershell
+cd "D:\Sirena Stuff\Final Integrations\Voice Vision Touch"
 git pull origin main
 ```
 
@@ -497,4 +581,5 @@ If GitHub SSH access is configured, you can clone with SSH instead:
 
 ```powershell
 git clone git@github.com:ESP32-P4/voice-vision-server-setup-esp32p4.git
+cd voice-vision-server-setup-esp32p4
 ```
