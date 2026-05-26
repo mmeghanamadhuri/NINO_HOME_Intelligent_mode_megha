@@ -79,6 +79,7 @@ class RegisterRequest(BaseModel):
 
 @app.on_event("startup")
 def startup() -> None:
+    faces.apply_settings_from_environ()
     camera.start()
     stats = faces.stats()
     if not faces.recognizer_available:
@@ -89,9 +90,11 @@ def startup() -> None:
         logger.warning("Face samples on disk but model not trained — click Retrain on the web UI")
     else:
         logger.info(
-            "Face recognition ready: %d trained, threshold %.0f (lower LBPH score = better match)",
+            "Face recognition ready: %d trained, threshold %.0f, confirm %d frames "
+            "(lower LBPH score = better match)",
             stats["trained_people"],
             stats["threshold"],
+            stats.get("confirm_frames", 3),
         )
 
 
@@ -421,6 +424,20 @@ def main() -> None:
         metavar="SEC",
         help="Min seconds between vision welcome-backs for the same person (first sighting still greets once). Default 600 (10 min); use 300 for 5 min.",
     )
+    parser.add_argument(
+        "--face-threshold",
+        type=float,
+        default=None,
+        metavar="LBPH",
+        help="Max LBPH distance to accept a match (lower=stricter). Default 58 via FACE_RECOGNITION_THRESHOLD.",
+    )
+    parser.add_argument(
+        "--face-confirm-frames",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Consecutive matching frames before green/recognized (default 3).",
+    )
     args = parser.parse_args()
 
     camera_source = args.camera_url or args.camera_source
@@ -433,6 +450,11 @@ def main() -> None:
     os.environ["OLLAMA_URL"] = args.ollama_url.strip()
     os.environ["OLLAMA_MODEL"] = args.ollama_model.strip()
     os.environ["WHISPER_MODEL"] = args.whisper_model.strip()
+
+    if args.face_threshold is not None:
+        os.environ["FACE_RECOGNITION_THRESHOLD"] = str(args.face_threshold)
+    if args.face_confirm_frames is not None:
+        os.environ["FACE_CONFIRM_FRAMES"] = str(max(1, args.face_confirm_frames))
 
     tts.face_greeting_interval_seconds = max(1.0, float(args.face_greeting_interval))
 

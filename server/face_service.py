@@ -21,16 +21,13 @@ class FaceService:
         self.faces_dir = data_dir / "faces"
         self.model_path = data_dir / "face_model.yml"
         self.labels_path = data_dir / "labels.json"
-        if recognition_threshold is None:
-            recognition_threshold = float(os.environ.get("FACE_RECOGNITION_THRESHOLD", "72"))
-        self.recognition_threshold = recognition_threshold
-        self.unknown_grace_threshold = recognition_threshold + 15.0
-        self.track_hold_seconds = 1.4
-        self.track_match_iou = 0.18
         self._lock = threading.Lock()
         self._labels: dict[int, str] = {}
-        self._recent_known_tracks: list[dict[str, Any]] = []
+        self._confirm_tracks: list[dict[str, Any]] = []
         self._recognizer = self._create_recognizer()
+        if recognition_threshold is not None:
+            os.environ["FACE_RECOGNITION_THRESHOLD"] = str(recognition_threshold)
+        self.apply_settings_from_environ()
         self._cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         )
@@ -38,6 +35,21 @@ class FaceService:
 
         self.faces_dir.mkdir(parents=True, exist_ok=True)
         self._load_model()
+
+    def apply_settings_from_environ(self) -> None:
+        """Reload tunables from environment (also used at startup / CLI)."""
+        self.recognition_threshold = float(os.environ.get("FACE_RECOGNITION_THRESHOLD", "58"))
+        grace_delta = float(os.environ.get("FACE_UNKNOWN_GRACE_DELTA", "8"))
+        self.unknown_grace_threshold = self.recognition_threshold + grace_delta
+        self.track_hold_seconds = float(os.environ.get("FACE_TRACK_HOLD_SECONDS", "1.4"))
+        self.track_match_iou = float(os.environ.get("FACE_TRACK_MATCH_IOU", "0.22"))
+        self.confirm_frames = max(1, int(os.environ.get("FACE_CONFIRM_FRAMES", "3")))
+        self.detect_min_neighbors = int(os.environ.get("FACE_DETECT_MIN_NEIGHBORS", "5"))
+        self.detect_fallback_neighbors = int(os.environ.get("FACE_DETECT_FALLBACK_NEIGHBORS", "4"))
+        self.detect_min_size = int(os.environ.get("FACE_DETECT_MIN_SIZE", "56"))
+        self.min_face_area_ratio = float(os.environ.get("FACE_MIN_AREA_RATIO", "0.004"))
+        self.min_face_aspect = float(os.environ.get("FACE_MIN_ASPECT", "0.72"))
+        self.max_face_aspect = float(os.environ.get("FACE_MAX_ASPECT", "1.38"))
 
     @property
     def recognizer_available(self) -> bool:
@@ -61,7 +73,9 @@ class FaceService:
             "trained_people": len(self._labels),
             "threshold": self.recognition_threshold,
             "unknown_grace_threshold": self.unknown_grace_threshold,
+            "confirm_frames": self.confirm_frames,
             "track_hold_seconds": self.track_hold_seconds,
+            "detect_min_neighbors": self.detect_min_neighbors,
         }
 
     def detect(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
@@ -85,16 +99,27 @@ class FaceService:
                 interpolation=cv2.INTER_AREA,
             )
 
-        faces = self._detect_multiscale_safe(detect_gray, scale_factor=1.1, min_neighbors=4, min_size=48)
+        faces = self._detect_multiscale_safe(
+            detect_gray,
+            scale_factor=1.1,
+            min_neighbors=self.detect_min_neighbors,
+            min_size=self.detect_min_size,
+        )
         if len(faces) == 0:
             # Softer pass for soft MJPEG; avoid scaleFactor < 1.1 (OpenCV 4.11 scaleIdx crash).
-            faces = self._detect_multiscale_safe(detect_gray, scale_factor=1.1, min_neighbors=3, min_size=36)
+            faces = self._detect_multiscale_safe(
+                detect_gray,
+                scale_factor=1.1,
+                min_neighbors=self.detect_fallback_neighbors,
+                min_size=max(40, self.detect_min_size - 12),
+            )
 
         if scale_back != 1.0 and len(faces) > 0:
             inv = 1.0 / scale_back
             faces = np.round(faces.astype(np.float64) * inv).astype(np.int32)
 
-        return [(int(x), int(y), int(w), int(h)) for x, y, w, h in faces]
+        boxes = [(int(x), int(y), int(w), int(h)) for x, y, w, h in faces]
+        return self._filter_face_boxes(boxes, gray.shape)
 
     def _detect_multiscale_safe(
         self,
@@ -202,8 +227,10 @@ class FaceService:
         faces = self.detect(frame)
         results: list[dict[str, Any]] = []
         now = time.time()
-        self._recent_known_tracks = [
-            t for t in self._recent_known_tracks if (now - float(t["seen_at"])) <= self.track_hold_seconds
+        self._confirm_tracks = [
+            t
+            for t in self._confirm_tracks
+            if (now - float(t["seen_at"])) <= self.track_hold_seconds
         ]
 
         with self._lock:
@@ -215,34 +242,18 @@ class FaceService:
             confidence: float | None = None
             recognized = False
             used_track = False
+            pending = False
+            strict_name: str | None = None
 
             if recognizer is not None and labels:
                 face = self._normalize_face(frame, (x, y, w, h))
                 label_id, raw_confidence = recognizer.predict(face)
                 confidence = float(raw_confidence)
                 if confidence <= self.recognition_threshold:
-                    name = labels.get(int(label_id), "Unknown")
-                    recognized = True
-                else:
-                    name = "Unknown"
+                    strict_name = labels.get(int(label_id), "Unknown")
 
-                # Stabilize recognition across short head turns:
-                # if confidence is only moderately worse, keep the last known identity
-                # for a short time when the face box is in roughly the same place.
-                if (
-                    not recognized
-                    and confidence is not None
-                    and confidence <= self.unknown_grace_threshold
-                ):
-                    matched = self._match_recent_known((x, y, w, h), now)
-                    if matched:
-                        name = str(matched["name"])
-                        recognized = True
-                        used_track = True
-
-            if recognized and name not in {"Unknown", "Face"}:
-                self._recent_known_tracks.append(
-                    {"name": name, "box": (x, y, w, h), "seen_at": now}
+                name, recognized, used_track, pending = self._apply_confirmation(
+                    (x, y, w, h), strict_name, confidence, now
                 )
 
             results.append(
@@ -252,6 +263,7 @@ class FaceService:
                     "recognized": recognized,
                     "confidence": confidence,
                     "stabilized": used_track,
+                    "pending": pending,
                 }
             )
 
@@ -264,7 +276,12 @@ class FaceService:
         for result in results:
             box = result["box"]
             x, y, w, h = box["x"], box["y"], box["w"], box["h"]
-            color = (0, 200, 0) if result["recognized"] else (0, 180, 255)
+            if result["recognized"]:
+                color = (0, 200, 0)
+            elif result.get("pending"):
+                color = (0, 220, 220)
+            else:
+                color = (0, 180, 255)
             label = result["name"]
             if result["confidence"] is not None:
                 label = f"{label} ({result['confidence']:.0f})"
@@ -283,20 +300,91 @@ class FaceService:
 
         return output, results
 
-    def _match_recent_known(
+    def _filter_face_boxes(
+        self, boxes: list[tuple[int, int, int, int]], frame_shape: tuple[int, ...]
+    ) -> list[tuple[int, int, int, int]]:
+        fh, fw = frame_shape[:2]
+        frame_area = max(1, fh * fw)
+        kept: list[tuple[int, int, int, int]] = []
+        for x, y, w, h in boxes:
+            if w <= 0 or h <= 0:
+                continue
+            if (w * h) / frame_area < self.min_face_area_ratio:
+                continue
+            aspect = w / float(h)
+            if aspect < self.min_face_aspect or aspect > self.max_face_aspect:
+                continue
+            kept.append((x, y, w, h))
+        return kept
+
+    def _match_confirm_track(
         self, box: tuple[int, int, int, int], now: float
     ) -> dict[str, Any] | None:
         best: dict[str, Any] | None = None
         best_iou = 0.0
-        for track in self._recent_known_tracks:
-            age = now - float(track["seen_at"])
-            if age > self.track_hold_seconds:
+        for track in self._confirm_tracks:
+            if (now - float(track["seen_at"])) > self.track_hold_seconds:
                 continue
             iou = self._iou(box, tuple(track["box"]))
             if iou > self.track_match_iou and iou > best_iou:
                 best_iou = iou
                 best = track
         return best
+
+    def _apply_confirmation(
+        self,
+        box: tuple[int, int, int, int],
+        strict_name: str | None,
+        confidence: float | None,
+        now: float,
+    ) -> tuple[str, bool, bool, bool]:
+        """Returns (display_name, recognized, stabilized, pending)."""
+        track = self._match_confirm_track(box, now)
+        if track is None:
+            track = {
+                "box": box,
+                "seen_at": now,
+                "candidate": None,
+                "streak": 0,
+                "confirmed_name": None,
+            }
+            self._confirm_tracks.append(track)
+        else:
+            track["box"] = box
+            track["seen_at"] = now
+
+        stabilized = False
+        pending = False
+
+        if strict_name and strict_name not in {"Unknown", "Face"}:
+            if track.get("candidate") == strict_name:
+                track["streak"] = int(track.get("streak", 0)) + 1
+            else:
+                track["candidate"] = strict_name
+                track["streak"] = 1
+        else:
+            track["streak"] = 0
+            track["candidate"] = None
+
+        if int(track.get("streak", 0)) >= self.confirm_frames:
+            track["confirmed_name"] = str(track["candidate"])
+        elif track.get("confirmed_name") and confidence is not None:
+            # Grace: keep a previously confirmed identity through brief blur / turn.
+            if confidence <= self.unknown_grace_threshold:
+                stabilized = True
+            else:
+                track["confirmed_name"] = None
+                track["streak"] = 0
+
+        confirmed = track.get("confirmed_name")
+        if confirmed:
+            return str(confirmed), True, stabilized, False
+
+        if strict_name and strict_name not in {"Unknown", "Face"}:
+            pending = int(track.get("streak", 0)) > 0
+            return strict_name, False, False, pending
+
+        return "Unknown", False, False, False
 
     def _iou(
         self, a: tuple[int, int, int, int], b: tuple[int, int, int, int]

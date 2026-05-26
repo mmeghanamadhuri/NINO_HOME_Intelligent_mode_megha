@@ -1,6 +1,6 @@
 # NiNO Home — ESP32-P4 Camera, Face Recognition & Voice Assistant
 
-NiNO is a smart-home demo built around the **ESP32-P4 Function EV Board** with a **USB UVC camera**, **on-board speaker (ES8311)**, and a **Python server** on your PC. The server performs face detection and recognition, speaks personalized greetings, and answers voice questions when you say **“Hi ESP”**.
+NiNO is a smart-home demo built around the **ESP32-P4 Function EV Board** with a **USB UVC camera**, **QT2120 touch sensor (12 keys on I2C)**, **on-board speaker (ES8311)**, and a **Python server** on your PC. The server performs face detection and recognition, speaks personalized greetings, and answers voice questions when you say **“Hi ESP”**. A touch on the sensor plays an embedded **“please don’t touch me”** warning on the board speaker.
 
 ---
 
@@ -29,6 +29,7 @@ NiNO is a smart-home demo built around the **ESP32-P4 Function EV Board** with a
 │  • ES8311 mic + speaker (BSP)                                             │
 │  • Wake word “Hi ESP” → record question → WebSocket to PC                 │
 │  • Plays WAV replies + wake/done two-tone beeps on speaker                │
+│  • QT2120 touch (I2C 0x1C) → embedded “please don’t touch me” on speaker   │
 └───────────────────────────────┬──────────────────────────────────────────┘
                                 │  Same LAN as your PC
                                 ▼
@@ -85,6 +86,7 @@ Built with **ESP-IDF 5.5+** (ESP32-P4 target). Root `CMakeLists.txt` sets `BSP_C
 | **Wi‑Fi** | Default SoftAP `ESP32_P4_CAM` / `12345678`; STA via console |
 | **Speaker** | `POST /play_wav` — PCM 16-bit WAV (mono or stereo; stereo averaged) |
 | **Wake word** | ESP-SR WakeNet **`wn9_hiesp`** (“Hi ESP”) |
+| **Touch sensor** | **QT2120** on BSP I2C (addr **0x1C**, 12 keys); stable touch → **`PDTM.wav`** on speaker |
 | **Voice pipeline** | Wake beep → VAD capture → WebSocket to PC → play reply + done beep |
 | **Discovery** | UDP **1900** (`discover`), TCP **8888** (text log; not used for TTS) |
 | **Console** | Prompt `usb_cam>` |
@@ -130,7 +132,7 @@ Wi‑Fi uses the **ESP-Hosted** path (`esp_wifi_remote` + `esp_hosted`) for the 
 | GET | `/` | Short HTML; single snapshot preview |
 | GET | `/stream` | MJPEG multipart live stream |
 | GET | `/snapshot.jpg` | One JPEG still |
-| POST | `/play_wav` | Raw WAV body (max **384 KiB**). Response `{"ok":true}` |
+| POST | `/play_wav` | Raw WAV body (max **384 KiB**). Queued FIFO with touch/voice; **never dropped** when busy (blocks until queued). Response `{"ok":true,"queued":true}` |
 
 WAV format: PCM **16-bit**, **mono** preferred; **8–48 kHz** (server usually sends **16 kHz** for voice, **22.05 kHz** possible for some TTS paths).
 
@@ -169,6 +171,9 @@ Wake starts after USB/camera settle (on connect or ~5 s delay) to avoid boot wat
 | `main/voice_wake.cpp` | WakeNet feed/fetch, “Hi ESP” |
 | `main/voice_assist.c` | Chimes, VAD capture, WebSocket exchange |
 | `main/voice_ws_client.c` | WebSocket client to PC |
+| `main/touch_sensor.c` | QT2120 poll task, touch → warning WAV |
+| `main/bsp_qt2120.c` | QT2120 I2C driver |
+| `main/PDTM.wav` | Embedded “please don’t touch me” clip |
 | `partitions.csv` | Includes `srmodels` for wake word |
 
 ### 3.7 Useful console commands
@@ -421,6 +426,9 @@ main/
   voice_wake.cpp / .h       # “Hi ESP” WakeNet
   voice_assist.c / .h       # VAD, chimes, voice session
   voice_ws_client.c / .h    # WebSocket to PC
+  touch_sensor.c / .h       # QT2120 touch → warning speech
+  bsp_qt2120.c / .h         # QT2120 I2C driver
+  PDTM.wav                  # Touch warning audio (embedded)
   idf_component.yml
   CMakeLists.txt
 

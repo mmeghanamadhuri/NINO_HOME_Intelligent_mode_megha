@@ -30,6 +30,8 @@
 
 #include "audio_playback.h"
 #include "audio_capture.h"
+#include "audio_queue.h"
+#include "touch_sensor.h"
 #include "voice_assist.h"
 #include "voice_wake.h"
 
@@ -83,9 +85,6 @@ static bool s_sta_connected = false;
 #define HTTP_SERVER_PORT 80
 #define HTTP_STREAM_POLL_MS 25
 #define MAX_PLAY_WAV_BYTES (384 * 1024)
-#define AUDIO_PLAY_QUEUE_LEN 2
-#define AUDIO_PLAY_TASK_STACK_SIZE 6144
-#define AUDIO_PLAY_TASK_PRIORITY 6
 
 #if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
 #define APP_CORE_NET 0
@@ -112,12 +111,6 @@ typedef struct {
   bool ready;
 } latest_frame_t;
 
-typedef struct {
-  uint8_t *data;
-  size_t len;
-  bool play_done_chime;
-} audio_play_job_t;
-
 static const char *TAG = "usb_camera";
 
 static TaskHandle_t s_stream_task_handle;
@@ -132,7 +125,6 @@ static latest_frame_t s_latest_frame;
 
 static httpd_handle_t s_http_server;
 static esp_console_repl_t *s_repl;
-static QueueHandle_t s_audio_play_queue;
 static char s_voice_ws_url[160];
 static bool s_voice_wake_started;
 static int64_t s_last_uvc_timeout_log_us;
@@ -990,23 +982,10 @@ static esp_err_t play_wav_handler(httpd_req_t *req) {
     received += r;
   }
 
-  if (s_audio_play_queue == NULL) {
-    free(buf);
+  if (nino_audio_queue_wav(buf, total, false) != ESP_OK) {
     httpd_resp_set_status(req, "503 Service Unavailable");
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, "{\"ok\":false,\"error\":\"audio queue down\"}",
-                           HTTPD_RESP_USE_STRLEN);
-  }
-
-  audio_play_job_t job = {
-      .data = buf,
-      .len = total,
-  };
-  if (xQueueSendToBack(s_audio_play_queue, &job, 0) != pdPASS) {
-    free(buf);
-    httpd_resp_set_status(req, "429 Too Many Requests");
-    httpd_resp_set_type(req, "application/json");
-    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"audio busy\"}",
                            HTTPD_RESP_USE_STRLEN);
   }
 
@@ -1014,45 +993,6 @@ static esp_err_t play_wav_handler(httpd_req_t *req) {
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   return httpd_resp_send(req, "{\"ok\":true,\"queued\":true}",
                          HTTPD_RESP_USE_STRLEN);
-}
-
-void nino_main_queue_audio_wav(uint8_t *pcm_wav, size_t len, bool play_done_chime) {
-  if (pcm_wav == NULL || len == 0) {
-    free(pcm_wav);
-    return;
-  }
-  if (s_audio_play_queue == NULL) {
-    free(pcm_wav);
-    return;
-  }
-  audio_play_job_t job = {.data = pcm_wav, .len = len, .play_done_chime = play_done_chime};
-  if (xQueueSendToBack(s_audio_play_queue, &job, pdMS_TO_TICKS(5000)) != pdPASS) {
-    ESP_LOGW(TAG, "voice: audio queue busy");
-    free(pcm_wav);
-  }
-}
-
-static void audio_playback_task(void *arg) {
-  (void)arg;
-  audio_play_job_t job = {};
-
-  while (true) {
-    if (xQueueReceive(s_audio_play_queue, &job, portMAX_DELAY) != pdPASS) {
-      continue;
-    }
-
-    if (job.data == NULL || job.len == 0) {
-      continue;
-    }
-
-    esp_err_t play_err = nino_audio_play_wav(job.data, job.len);
-    if (play_err != ESP_OK) {
-      ESP_LOGW(TAG, "Queued WAV playback failed: %s", esp_err_to_name(play_err));
-    } else if (job.play_done_chime) {
-      (void)nino_voice_play_done_chime();
-    }
-    free(job.data);
-  }
 }
 
 static void load_voice_ws_from_nvs(void) {
@@ -1481,11 +1421,10 @@ void app_main(void) {
     ESP_LOGW(TAG,
              "Speaker (BSP audio) init failed; POST /play_wav may not work");
   }
-  s_audio_play_queue = xQueueCreate(AUDIO_PLAY_QUEUE_LEN, sizeof(audio_play_job_t));
-  assert(s_audio_play_queue != NULL);
-  xTaskCreatePinnedToCore(audio_playback_task, "audio_play",
-                          AUDIO_PLAY_TASK_STACK_SIZE, NULL,
-                          AUDIO_PLAY_TASK_PRIORITY, NULL, APP_CORE_NET);
+  ESP_ERROR_CHECK(nino_audio_queue_start());
+  if (nino_touch_sensor_start() != ESP_OK) {
+    ESP_LOGW(TAG, "QT2120 touch sensor task not started");
+  }
 
   xTaskCreatePinnedToCore(multicast_discovery_task, "discovery", 4096, NULL, 5,
                           NULL, APP_CORE_NET);

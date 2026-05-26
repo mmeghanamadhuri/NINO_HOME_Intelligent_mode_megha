@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-/** Implemented in main.c — queues WAV for `audio_playback_task`. */
+/** Queues WAV on the shared speaker FIFO (see audio_queue.c). */
 void nino_main_queue_audio_wav(uint8_t *pcm_wav, size_t len, bool play_done_chime);
 
 /** Copy current WebSocket URL (e.g. after `voice connect`). */
