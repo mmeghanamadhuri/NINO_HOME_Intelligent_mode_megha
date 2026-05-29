@@ -19,10 +19,10 @@ void nino_voice_assist_set_ws_uri(const char *uri);
 /** Create WS-URI mutex (call once from app_main before console). */
 esp_err_t nino_voice_assist_init_mutex(void);
 
-/** Short wake beep (16 kHz mono) — ascending two-tone on "Hi ESP". */
+/** Embedded main/beep.wav — played on "Hi ESP" wake. */
 esp_err_t nino_voice_play_wake_chime(void);
 
-/** Descending two-tone after voice-assistant reply playback. */
+/** Same embedded beep.wav — played after voice reply playback. */
 esp_err_t nino_voice_play_done_chime(void);
 
 /**

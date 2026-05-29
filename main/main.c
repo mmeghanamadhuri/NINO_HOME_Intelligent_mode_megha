@@ -31,6 +31,7 @@
 #include "audio_playback.h"
 #include "audio_capture.h"
 #include "audio_queue.h"
+#include "servo_dxl.h"
 #include "touch_sensor.h"
 #include "voice_assist.h"
 #include "voice_wake.h"
@@ -135,7 +136,19 @@ static void voice_wake_start_once(void) {
   }
   s_voice_wake_started = true;
   nino_voice_wake_init();
-  nino_voice_wake_set_enabled(s_voice_ws_url[0] != '\0');
+  if (nino_voice_wake_hw_ready()) {
+    nino_voice_wake_set_enabled(true);
+    if (s_voice_ws_url[0] == '\0') {
+      ESP_LOGW(TAG,
+               "Voice PC URL not set — serial: voice connect <YOUR_PC_LAN_IP> 8000 "
+               "(not the ESP camera IP)");
+    } else {
+      ESP_LOGI(TAG, "Voice assistant URL: %s", s_voice_ws_url);
+    }
+  } else {
+    nino_voice_wake_set_enabled(false);
+    ESP_LOGE(TAG, "Wake word not started — check srmodels partition / flash size");
+  }
 }
 
 static void delayed_voice_wake_task(void *arg) {
@@ -982,7 +995,7 @@ static esp_err_t play_wav_handler(httpd_req_t *req) {
     received += r;
   }
 
-  if (nino_audio_queue_wav(buf, total, false) != ESP_OK) {
+  if (nino_audio_queue_wav(buf, total, false, NINO_AUDIO_SERVO_FULL) != ESP_OK) {
     httpd_resp_set_status(req, "503 Service Unavailable");
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, "{\"ok\":false,\"error\":\"audio queue down\"}",
@@ -1061,6 +1074,13 @@ static int cmd_voice(int argc, char **argv) {
     nino_voice_wake_set_enabled(s_voice_ws_url[0] != '\0');
     return 0;
   }
+  if (argc >= 2 && strcmp(argv[1], "status") == 0) {
+    printf("voice wake hw: %s\n", nino_voice_wake_hw_ready() ? "ready" : "not loaded");
+    printf("voice wake: %s\n", nino_voice_wake_is_enabled() ? "on" : "off");
+    printf("voice url: \"%s\"\n", s_voice_ws_url[0] ? s_voice_ws_url : "(not set)");
+    printf("Tip: voice connect must use your PC LAN IP (where python app.py runs), not 192.168.x.x of the board.\n");
+    return 0;
+  }
   if (argc >= 2 && strcmp(argv[1], "wake") == 0) {
     if (argc < 3) {
       printf("voice wake: %s\n", nino_voice_wake_is_enabled() ? "on" : "off");
@@ -1077,14 +1097,14 @@ static int cmd_voice(int argc, char **argv) {
     printf("Usage: voice wake [on|off]\n");
     return 1;
   }
-  printf("Usage: voice connect <ip> [port]  |  voice url [<ws-uri>]  |  voice wake [on|off]\n");
+  printf("Usage: voice connect <ip> [port] | voice url [<ws-uri>] | voice wake [on|off] | voice status\n");
   return 0;
 }
 
 static void voice_cli_register(void) {
   const esp_console_cmd_t cmd = {
       .command = "voice",
-      .help = "voice connect <ip> [port] | voice url [<ws-uri>] | voice wake [on|off] (Hi ESP→beep→mic)",
+      .help = "voice connect <PC_IP> [port] | voice status | voice wake [on|off]",
       .hint = NULL,
       .func = &cmd_voice,
       .argtable = NULL,
@@ -1142,7 +1162,7 @@ static void usb_lib_task(void *arg) {
     usb_host_lib_handle_events(portMAX_DELAY, &event_flags);
 
     if (event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) {
-      usb_host_device_free_all();
+      ESP_LOGW(TAG, "USB host: no clients (do not free devices — hub+camera+U2D2)");
     }
     if (event_flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) {
       ESP_LOGI(TAG, "USB host reports all devices freed");
@@ -1409,6 +1429,9 @@ void app_main(void) {
   ESP_ERROR_CHECK(nino_voice_assist_init_mutex());
   load_voice_ws_from_nvs();
   nino_voice_assist_set_ws_uri(s_voice_ws_url);
+  if (s_voice_ws_url[0] != '\0') {
+    ESP_LOGI(TAG, "Loaded voice URL from NVS: %s", s_voice_ws_url);
+  }
 
   s_frame_mutex = xSemaphoreCreateMutex();
   assert(s_frame_mutex != NULL);
@@ -1441,10 +1464,16 @@ void app_main(void) {
   };
   ESP_ERROR_CHECK(usb_host_install(&usb_host_config));
 
+  /* Lib task must run before clients enumerate hub downstream devices (camera + U2D2). */
   BaseType_t ok = xTaskCreatePinnedToCore(
       usb_lib_task, "usb_lib", USB_LIB_TASK_STACK_SIZE, NULL,
       USB_LIB_TASK_PRIORITY, NULL, APP_CORE_USB);
   assert(ok == pdPASS);
+  vTaskDelay(pdMS_TO_TICKS(300));
+
+  if (nino_servo_dxl_start() != ESP_OK) {
+    ESP_LOGW(TAG, "Dynamixel servo task not started (connect U2D2 on J18 USB hub)");
+  }
 
   ESP_LOGI(TAG, "Installing UVC host driver");
   const uvc_host_driver_config_t uvc_driver_config = {
@@ -1461,7 +1490,7 @@ void app_main(void) {
   (void)xTaskCreatePinnedToCore(delayed_voice_wake_task, "wake_delay", 4096, NULL, 3, NULL,
                                 APP_CORE_NET);
 
-  ESP_LOGI(TAG, "Waiting for a UVC camera on J18");
+  ESP_LOGI(TAG, "J18: powered USB hub -> UVC camera + FTDI U2D2 (Dynamixel)");
   ESP_LOGI(
       TAG,
       "Open / in a browser on your camera's IP address (check 'wifi status')");

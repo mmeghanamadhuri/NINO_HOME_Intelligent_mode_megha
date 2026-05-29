@@ -9,6 +9,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "servo_dxl.h"
+#include "servo_motion.h"
 #include "voice_assist.h"
 
 static const char *TAG = "audio_q";
@@ -22,9 +24,25 @@ typedef struct {
   uint8_t *data;
   size_t len;
   bool play_done_chime;
+  nino_audio_servo_mode_t servo_mode;
 } audio_play_job_t;
 
 static QueueHandle_t s_audio_play_queue;
+
+static void servo_motion_for_mode(nino_audio_servo_mode_t mode, bool start) {
+  if (mode == NINO_AUDIO_SERVO_NONE) {
+    return;
+  }
+  if (start) {
+    if (!nino_servo_dxl_bus_open()) {
+      ESP_LOGW(TAG, "Speaker clip with servo motion — U2D2 not on USB yet (J18 hub?)");
+    }
+    nino_servo_motion_start(
+        mode == NINO_AUDIO_SERVO_NOD_LR ? NINO_SERVO_MOTION_NOD_LR : NINO_SERVO_MOTION_FULL);
+  } else {
+    nino_servo_motion_stop();
+  }
+}
 
 static void audio_playback_task(void *arg) {
   (void)arg;
@@ -39,7 +57,10 @@ static void audio_playback_task(void *arg) {
       continue;
     }
 
+    servo_motion_for_mode(job.servo_mode, true);
     esp_err_t play_err = nino_audio_play_wav(job.data, job.len);
+    servo_motion_for_mode(job.servo_mode, false);
+
     if (play_err != ESP_OK) {
       ESP_LOGW(TAG, "WAV playback failed: %s", esp_err_to_name(play_err));
     } else if (job.play_done_chime) {
@@ -92,7 +113,8 @@ esp_err_t nino_audio_queue_start(void) {
   return ESP_OK;
 }
 
-esp_err_t nino_audio_queue_wav(uint8_t *wav, size_t len, bool play_done_chime) {
+esp_err_t nino_audio_queue_wav(uint8_t *wav, size_t len, bool play_done_chime,
+                               nino_audio_servo_mode_t servo_mode) {
   if (wav == NULL || len == 0) {
     free(wav);
     return ESP_ERR_INVALID_ARG;
@@ -102,12 +124,13 @@ esp_err_t nino_audio_queue_wav(uint8_t *wav, size_t len, bool play_done_chime) {
       .data = wav,
       .len = len,
       .play_done_chime = play_done_chime,
+      .servo_mode = servo_mode,
   };
   return enqueue_job(job);
 }
 
-esp_err_t nino_audio_queue_wav_copy(const uint8_t *wav, size_t len,
-                                    bool play_done_chime) {
+esp_err_t nino_audio_queue_wav_copy(const uint8_t *wav, size_t len, bool play_done_chime,
+                                    nino_audio_servo_mode_t servo_mode) {
   if (wav == NULL || len == 0) {
     return ESP_ERR_INVALID_ARG;
   }
@@ -121,11 +144,12 @@ esp_err_t nino_audio_queue_wav_copy(const uint8_t *wav, size_t len,
     return ESP_ERR_NO_MEM;
   }
   memcpy(copy, wav, len);
-  return nino_audio_queue_wav(copy, len, play_done_chime);
+  return nino_audio_queue_wav(copy, len, play_done_chime, servo_mode);
 }
 
 void nino_main_queue_audio_wav(uint8_t *pcm_wav, size_t len, bool play_done_chime) {
-  esp_err_t err = nino_audio_queue_wav(pcm_wav, len, play_done_chime);
+  esp_err_t err =
+      nino_audio_queue_wav(pcm_wav, len, play_done_chime, NINO_AUDIO_SERVO_FULL);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "voice: queue WAV failed: %s", esp_err_to_name(err));
   }

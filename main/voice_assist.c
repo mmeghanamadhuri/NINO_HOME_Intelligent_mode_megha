@@ -1,7 +1,6 @@
 #include "voice_assist.h"
 
 #include <inttypes.h>
-#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -19,9 +18,8 @@
 #include "voice_wake.h"
 #include "voice_ws_client.h"
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
+extern const uint8_t beep_wav_start[] asm("_binary_beep_wav_start");
+extern const uint8_t beep_wav_end[] asm("_binary_beep_wav_end");
 
 static const char *TAG = "voice_ast";
 
@@ -172,48 +170,21 @@ static esp_err_t vad_append_frame(vad_cap_t *cap, size_t *pcm_samples, const int
   return ESP_OK;
 }
 
-static void append_tone_with_fade(int16_t *dst, int start, int count, float freq_hz, int sample_rate,
-                                  float amp) {
-  const int fade = sample_rate / 200;
-  for (int i = 0; i < count; ++i) {
-    float env = 1.0f;
-    if (i < fade) {
-      env = (float)i / (float)fade;
-    } else if (i > (count - fade)) {
-      env = (float)(count - i) / (float)fade;
-    }
-    const float t = (float)i / (float)sample_rate;
-    const float s = sinf(2.0f * (float)M_PI * freq_hz * t);
-    dst[start + i] = (int16_t)(amp * env * s);
+static esp_err_t play_embedded_beep(void) {
+  const size_t len = (size_t)(beep_wav_end - beep_wav_start);
+  if (len < WAV_HEADER_SIZE) {
+    ESP_LOGE(TAG, "embedded beep.wav missing or too small");
+    return ESP_ERR_INVALID_SIZE;
   }
-}
-
-static esp_err_t play_two_tone_chime(int s1_ms, int gap_ms, int s2_ms, float freq1, float freq2,
-                                     float amp1, float amp2) {
-  const int sr = VOICE_MIC_RATE;
-  const int s1 = (sr * s1_ms) / 1000;
-  const int gap = (sr * gap_ms) / 1000;
-  const int s2 = (sr * s2_ms) / 1000;
-  const int total = s1 + gap + s2;
-
-  int16_t *tone = (int16_t *)calloc((size_t)total, sizeof(int16_t));
-  if (tone == NULL) {
-    return ESP_ERR_NO_MEM;
-  }
-  append_tone_with_fade(tone, 0, s1, freq1, sr, amp1);
-  append_tone_with_fade(tone, s1 + gap, s2, freq2, sr, amp2);
-
-  esp_err_t e = nino_audio_play_pcm16_mono(tone, (size_t)total, (uint32_t)sr);
-  free(tone);
-  return e;
+  return nino_audio_play_wav(beep_wav_start, len);
 }
 
 esp_err_t nino_voice_play_wake_chime(void) {
-  return play_two_tone_chime(90, 30, 120, 700.0f, 980.0f, 10000.0f, 11500.0f);
+  return play_embedded_beep();
 }
 
 esp_err_t nino_voice_play_done_chime(void) {
-  return play_two_tone_chime(110, 25, 90, 1040.0f, 760.0f, 9000.0f, 9000.0f);
+  return play_embedded_beep();
 }
 
 esp_err_t nino_voice_capture_vad_wav(int max_seconds, uint8_t **out_wav, size_t *out_len) {

@@ -113,8 +113,9 @@ def shutdown() -> None:
 @app.get("/")
 def index(request: Request):
     return templates.TemplateResponse(
+        request,
         "index.html",
-        {"request": request, "camera_source": camera.source},
+        {"camera_source": camera.source},
     )
 
 

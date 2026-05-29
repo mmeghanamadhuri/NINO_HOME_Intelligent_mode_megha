@@ -49,6 +49,7 @@ static const esp_afe_sr_iface_t *s_afe = NULL;
 static esp_afe_sr_data_t *s_afe_data = NULL;
 
 static volatile bool s_wake_enabled = true;
+static volatile bool s_wake_hw_ready = false;
 static volatile bool s_after_wake_busy = false;
 static int64_t s_last_wake_us = 0;
 
@@ -91,8 +92,17 @@ static esp_err_t open_wake_mic(void) {
 
 static void after_wake_task(void *arg) {
   (void)arg;
-  ESP_LOGI(TAG, "Hi ESP → chime → VAD → server");
-  (void)nino_voice_play_wake_chime();
+  ESP_LOGI(TAG, "Hi ESP detected → chime → VAD → PC server");
+  if (!nino_voice_assist_has_ws_uri()) {
+    ESP_LOGW(TAG, "Voice URL not set — on serial run: voice connect <YOUR_PC_LAN_IP> 8000");
+    s_after_wake_busy = false;
+    vTaskDelete(NULL);
+    return;
+  }
+  esp_err_t chime = nino_voice_play_wake_chime();
+  if (chime != ESP_OK) {
+    ESP_LOGW(TAG, "wake chime failed (speaker busy?): %s", esp_err_to_name(chime));
+  }
   esp_err_t e = nino_voice_assist_run_query_only();
   if (e != ESP_OK) {
     ESP_LOGW(TAG, "voice query failed: %s", esp_err_to_name(e));
@@ -116,7 +126,7 @@ static void wake_feed_task(void *arg) {
   ESP_LOGI(TAG, "wake feed: chunksize=%d nch=%d", feed_chunksize, feed_nch);
 
   while (true) {
-    const bool armed = s_wake_enabled && nino_voice_assist_has_ws_uri();
+    const bool armed = s_wake_enabled && !s_after_wake_busy;
     const bool busy = s_after_wake_busy;
 
     if (!armed && !busy) {
@@ -176,8 +186,7 @@ static void wake_fetch_task(void *arg) {
 
     if (res == NULL || res->ret_value == ESP_FAIL) {
       yield = pdMS_TO_TICKS(WAKE_FETCH_FAIL_DELAY_MS);
-    } else if (res->wakeup_state == WAKENET_DETECTED && s_wake_enabled && nino_voice_assist_has_ws_uri() &&
-               !s_after_wake_busy) {
+    } else if (res->wakeup_state == WAKENET_DETECTED && s_wake_enabled && !s_after_wake_busy) {
       const int64_t now = esp_timer_get_time();
       if (s_last_wake_us == 0 || (now - s_last_wake_us) >= (int64_t)WAKE_COOLDOWN_MS * 1000LL) {
         s_last_wake_us = now;
@@ -234,7 +243,11 @@ extern "C" void nino_voice_wake_init(void) {
                                          WAKE_FETCH_CORE);
   if (f != pdPASS || g != pdPASS) {
     ESP_LOGE(TAG, "wake task create failed");
+    s_wake_hw_ready = false;
+    return;
   }
+  s_wake_hw_ready = true;
+  ESP_LOGI(TAG, "Wake word ready — say \"Hi ESP\" (needs voice connect <PC_IP> 8000 for replies)");
 }
 
 extern "C" void nino_voice_wake_drop_mic_locked(void) {
@@ -248,3 +261,7 @@ extern "C" void nino_voice_wake_set_enabled(bool on) {
 }
 
 extern "C" bool nino_voice_wake_is_enabled(void) { return s_wake_enabled; }
+
+extern "C" bool nino_voice_wake_hw_ready(void) {
+  return s_wake_hw_ready && s_afe_data != NULL;
+}
