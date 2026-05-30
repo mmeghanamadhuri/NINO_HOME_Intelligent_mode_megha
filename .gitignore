@@ -79,3 +79,6 @@ Desktop.ini
 
 server/data/face_model.yml
 
+
+server/data/faces/**/*.jpg
+
