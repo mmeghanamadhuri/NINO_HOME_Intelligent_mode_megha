@@ -32,6 +32,7 @@
 #include "audio_capture.h"
 #include "audio_queue.h"
 #include "servo_dxl.h"
+#include "servo_motion.h"
 #include "touch_sensor.h"
 #include "voice_assist.h"
 #include "voice_wake.h"
@@ -73,7 +74,7 @@ static bool s_sta_connected = false;
 
 #define UVC_TARGET_WIDTH 640
 #define UVC_TARGET_HEIGHT 480
-#define UVC_TARGET_FPS 20.0f
+#define UVC_TARGET_FPS 15.0f
 #define UVC_FRAME_QUEUE_LEN 3
 #define UVC_FRAME_BUFFERS 3
 #define UVC_URB_COUNT 6
@@ -433,6 +434,7 @@ static void wifi_cli_register(void) {
 }
 
 static void voice_cli_register(void);
+static void servo_cli_register(void);
 
 static void console_init(void) {
   esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
@@ -441,6 +443,7 @@ static void console_init(void) {
   esp_console_register_help_command();
   wifi_cli_register();
   voice_cli_register();
+  servo_cli_register();
 
   const esp_console_cmd_t cpu_dump_cmd = {
       .command = "cpu_dump",
@@ -1008,6 +1011,51 @@ static esp_err_t play_wav_handler(httpd_req_t *req) {
                          HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t servo_360_handler(httpd_req_t *req) {
+  if (req->method != HTTP_POST) {
+    httpd_resp_set_status(req, "405 Method Not Allowed");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"POST only\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+
+  if (req->content_len > 0) {
+    char discard[64];
+    int remaining = req->content_len;
+    while (remaining > 0) {
+      int chunk = remaining > (int)sizeof(discard) ? (int)sizeof(discard) : remaining;
+      int r = httpd_req_recv(req, discard, chunk);
+      if (r <= 0) {
+        break;
+      }
+      remaining -= r;
+    }
+  }
+
+  nino_servo_motion_stop();
+
+  esp_err_t err = nino_servo_dxl_spin_360();
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+  if (err == ESP_ERR_INVALID_STATE) {
+    if (!nino_servo_dxl_is_ready()) {
+      httpd_resp_set_status(req, "503 Service Unavailable");
+      return httpd_resp_send(req, "{\"ok\":false,\"error\":\"servos_not_ready\"}",
+                             HTTPD_RESP_USE_STRLEN);
+    }
+    httpd_resp_set_status(req, "409 Conflict");
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"already_running\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+  if (err != ESP_OK) {
+    return httpd_resp_send_500(req);
+  }
+
+  ESP_LOGI(TAG, "Voice/HTTP: ID2 360 spin started");
+  return httpd_resp_send(req, "{\"ok\":true,\"started\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
 static void load_voice_ws_from_nvs(void) {
   s_voice_ws_url[0] = '\0';
   nvs_handle_t h;
@@ -1112,11 +1160,45 @@ static void voice_cli_register(void) {
   ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
 }
 
+static int cmd_servo_360(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+
+  if (!nino_servo_dxl_is_ready()) {
+    printf("Servos not ready — connect U2D2 on J18 hub and wait for joint mode\n");
+    return 1;
+  }
+
+  esp_err_t err = nino_servo_dxl_spin_360();
+  if (err == ESP_ERR_INVALID_STATE) {
+    printf("360 spin already running\n");
+    return 1;
+  }
+  if (err != ESP_OK) {
+    printf("360 spin failed: %s\n", esp_err_to_name(err));
+    return 1;
+  }
+
+  printf("ID2 360 spin started (512 -> 0 -> 1023 -> 512)\n");
+  return 0;
+}
+
+static void servo_cli_register(void) {
+  const esp_console_cmd_t cmd = {
+      .command = "360",
+      .help = "ID2 full rotation: home to 512 if needed, then 512->0->1023->512",
+      .hint = NULL,
+      .func = &cmd_servo_360,
+      .argtable = NULL,
+  };
+  ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+}
+
 static void start_http_server(void) {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = HTTP_SERVER_PORT;
   config.stack_size = 8192;
-  config.max_uri_handlers = 12;
+  config.max_uri_handlers = 13;
   config.recv_wait_timeout = 45;
   config.send_wait_timeout = 45;
   config.core_id = APP_CORE_NET;
@@ -1147,11 +1229,18 @@ static void start_http_server(void) {
       .handler = play_wav_handler,
       .user_ctx = NULL,
   };
+  const httpd_uri_t servo_360_uri = {
+      .uri = "/servo/360",
+      .method = HTTP_POST,
+      .handler = servo_360_handler,
+      .user_ctx = NULL,
+  };
 
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &index_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &stream_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &snapshot_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &play_wav_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &servo_360_uri));
 }
 
 static void usb_lib_task(void *arg) {

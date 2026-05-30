@@ -213,11 +213,80 @@ esp_err_t nino_audio_play_pcm16_mono(const int16_t *samples, size_t sample_count
   return (cr == ESP_CODEC_DEV_OK) ? ESP_OK : ESP_FAIL;
 }
 
-esp_err_t nino_audio_play_wav(const uint8_t *wav_bytes, size_t wav_len) {
+esp_err_t nino_audio_decode_wav(const uint8_t *wav_bytes, size_t wav_len,
+                                nino_decoded_wav_t *out) {
+  if (out == NULL) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  memset(out, 0, sizeof(*out));
+
   wav_pcm_t wav;
   if (!parse_wav_pcm(wav_bytes, wav_len, &wav)) {
     ESP_LOGE(TAG, "Invalid WAV (need PCM 16-bit mono or stereo, 8–48 kHz; fmt 1 or 0xFFFE)");
     return ESP_ERR_INVALID_ARG;
+  }
+
+  const int16_t *in_samples = (const int16_t *)wav.pcm;
+  size_t in_bytes = wav.pcm_len;
+  int16_t *pcm_owned = NULL;
+  const int16_t *samples = in_samples;
+  size_t num_bytes = wav.pcm_len;
+
+  if (wav.channels == 2) {
+    size_t frames = in_bytes / (sizeof(int16_t) * 2);
+    size_t mono_bytes = frames * sizeof(int16_t);
+    pcm_owned = (int16_t *)heap_caps_malloc(
+        mono_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (pcm_owned == NULL) {
+      pcm_owned = (int16_t *)malloc(mono_bytes);
+    }
+    if (pcm_owned == NULL) {
+      return ESP_ERR_NO_MEM;
+    }
+    for (size_t i = 0; i < frames; i++) {
+      int32_t L = in_samples[i * 2];
+      int32_t R = in_samples[i * 2 + 1];
+      pcm_owned[i] = (int16_t)((L + R) / 2);
+    }
+    samples = pcm_owned;
+    num_bytes = mono_bytes;
+  } else {
+    pcm_owned = (int16_t *)heap_caps_malloc(num_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (pcm_owned == NULL) {
+      pcm_owned = (int16_t *)malloc(num_bytes);
+    }
+    if (pcm_owned == NULL) {
+      return ESP_ERR_NO_MEM;
+    }
+    memcpy(pcm_owned, in_samples, num_bytes);
+    samples = pcm_owned;
+  }
+
+  out->samples = samples;
+  out->num_bytes = num_bytes;
+  out->sample_rate_hz = wav.sample_rate;
+  out->mono_heap = pcm_owned;
+  return ESP_OK;
+}
+
+void nino_decoded_wav_free(nino_decoded_wav_t *decoded) {
+  if (decoded == NULL) {
+    return;
+  }
+  free(decoded->mono_heap);
+  memset(decoded, 0, sizeof(*decoded));
+}
+
+esp_err_t nino_audio_play_decoded(const nino_decoded_wav_t *decoded, size_t *pcm_byte_offset,
+                                  volatile bool *stop_requested, bool *completed) {
+  if (decoded == NULL || pcm_byte_offset == NULL || completed == NULL) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  *completed = false;
+
+  if (decoded->samples == NULL || decoded->num_bytes == 0) {
+    *completed = true;
+    return ESP_OK;
   }
 
   if (!s_ready) {
@@ -227,31 +296,13 @@ esp_err_t nino_audio_play_wav(const uint8_t *wav_bytes, size_t wav_len) {
     }
   }
 
-  const int16_t *in_samples = (const int16_t *)wav.pcm;
-  size_t in_bytes = wav.pcm_len;
-  int16_t *mono_heap = NULL;
-  const uint8_t *play_ptr = wav.pcm;
-  size_t play_len = wav.pcm_len;
-
-  if (wav.channels == 2) {
-    size_t frames = in_bytes / (sizeof(int16_t) * 2);
-    size_t mono_bytes = frames * sizeof(int16_t);
-    mono_heap = (int16_t *)heap_caps_malloc(
-        mono_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (mono_heap == NULL) {
-      mono_heap = (int16_t *)malloc(mono_bytes);
-    }
-    if (mono_heap == NULL) {
-      return ESP_ERR_NO_MEM;
-    }
-    for (size_t i = 0; i < frames; i++) {
-      int32_t L = in_samples[i * 2];
-      int32_t R = in_samples[i * 2 + 1];
-      mono_heap[i] = (int16_t)((L + R) / 2);
-    }
-    play_ptr = (const uint8_t *)mono_heap;
-    play_len = mono_bytes;
+  size_t offset = *pcm_byte_offset;
+  if (offset >= decoded->num_bytes) {
+    *completed = true;
+    return ESP_OK;
   }
+
+  const uint8_t *play_ptr = (const uint8_t *)decoded->samples;
 
   xSemaphoreTake(s_mutex, portMAX_DELAY);
 
@@ -259,22 +310,27 @@ esp_err_t nino_audio_play_wav(const uint8_t *wav_bytes, size_t wav_len) {
       .bits_per_sample = 16,
       .channel = 1,
       .channel_mask = 0,
-      .sample_rate = wav.sample_rate,
+      .sample_rate = decoded->sample_rate_hz,
       .mclk_multiple = 0,
   };
 
   int cr = esp_codec_dev_open(s_spk, &fs);
   if (cr != ESP_CODEC_DEV_OK) {
     ESP_LOGE(TAG, "esp_codec_dev_open failed: %d", cr);
-    free(mono_heap);
     xSemaphoreGive(s_mutex);
     return ESP_FAIL;
   }
 
+  const size_t session_start = offset;
   const TickType_t write_started = xTaskGetTickCount();
-  size_t offset = 0;
-  while (offset < play_len) {
-    int block = (int)(play_len - offset);
+  bool stopped = false;
+  while (offset < decoded->num_bytes) {
+    if (stop_requested != NULL && *stop_requested) {
+      stopped = true;
+      break;
+    }
+
+    int block = (int)(decoded->num_bytes - offset);
     if (block > 4096) {
       block = 4096;
     }
@@ -286,16 +342,39 @@ esp_err_t nino_audio_play_wav(const uint8_t *wav_bytes, size_t wav_len) {
     offset += (size_t)block;
   }
 
-  if (cr == ESP_CODEC_DEV_OK) {
-    wait_pcm_pipeline_done(wav.sample_rate, play_len, write_started);
+  *pcm_byte_offset = offset;
+
+  if (!stopped && cr == ESP_CODEC_DEV_OK && offset >= decoded->num_bytes) {
+    const size_t written = offset - session_start;
+    wait_pcm_pipeline_done(decoded->sample_rate_hz, written, write_started);
+    *completed = true;
   }
 
   esp_codec_dev_close(s_spk);
   nino_voice_wake_drop_mic_locked();
-  free(mono_heap);
   xSemaphoreGive(s_mutex);
 
-  return (cr == ESP_CODEC_DEV_OK) ? ESP_OK : ESP_FAIL;
+  if (cr != ESP_CODEC_DEV_OK) {
+    return ESP_FAIL;
+  }
+  return ESP_OK;
+}
+
+esp_err_t nino_audio_play_wav(const uint8_t *wav_bytes, size_t wav_len) {
+  nino_decoded_wav_t decoded = {};
+  esp_err_t err = nino_audio_decode_wav(wav_bytes, wav_len, &decoded);
+  if (err != ESP_OK) {
+    return err;
+  }
+
+  size_t offset = 0;
+  bool completed = false;
+  err = nino_audio_play_decoded(&decoded, &offset, NULL, &completed);
+  nino_decoded_wav_free(&decoded);
+  if (err != ESP_OK) {
+    return err;
+  }
+  return completed ? ESP_OK : ESP_FAIL;
 }
 
 void nino_audio_bus_lock(void) {

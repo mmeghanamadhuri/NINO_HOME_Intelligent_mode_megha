@@ -1,18 +1,27 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
 
+logger = logging.getLogger(__name__)
 
 FACE_SIZE = (200, 200)
+YUNET_FILENAME = "face_detection_yunet_2023mar.onnx"
+YUNET_MODEL_URL = (
+    "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/"
+    + YUNET_FILENAME
+)
 
 
 class FaceService:
@@ -21,10 +30,13 @@ class FaceService:
         self.faces_dir = data_dir / "faces"
         self.model_path = data_dir / "face_model.yml"
         self.labels_path = data_dir / "labels.json"
+        self._yunet_model_path = data_dir / "models" / YUNET_FILENAME
         self._lock = threading.Lock()
         self._labels: dict[int, str] = {}
         self._confirm_tracks: list[dict[str, Any]] = []
         self._recognizer = self._create_recognizer()
+        self._yunet: Any | None = None
+        self._yunet_enabled = False
         if recognition_threshold is not None:
             os.environ["FACE_RECOGNITION_THRESHOLD"] = str(recognition_threshold)
         self.apply_settings_from_environ()
@@ -35,21 +47,30 @@ class FaceService:
 
         self.faces_dir.mkdir(parents=True, exist_ok=True)
         self._load_model()
+        self._init_yunet_detector()
 
     def apply_settings_from_environ(self) -> None:
         """Reload tunables from environment (also used at startup / CLI)."""
-        self.recognition_threshold = float(os.environ.get("FACE_RECOGNITION_THRESHOLD", "58"))
-        grace_delta = float(os.environ.get("FACE_UNKNOWN_GRACE_DELTA", "8"))
+        self.recognition_threshold = float(os.environ.get("FACE_RECOGNITION_THRESHOLD", "80"))
+        self.soft_recognition_threshold = float(
+            os.environ.get("FACE_SOFT_RECOGNITION_THRESHOLD", "92")
+        )
+        grace_delta = float(os.environ.get("FACE_UNKNOWN_GRACE_DELTA", "16"))
         self.unknown_grace_threshold = self.recognition_threshold + grace_delta
-        self.track_hold_seconds = float(os.environ.get("FACE_TRACK_HOLD_SECONDS", "1.4"))
-        self.track_match_iou = float(os.environ.get("FACE_TRACK_MATCH_IOU", "0.22"))
-        self.confirm_frames = max(1, int(os.environ.get("FACE_CONFIRM_FRAMES", "3")))
-        self.detect_min_neighbors = int(os.environ.get("FACE_DETECT_MIN_NEIGHBORS", "5"))
-        self.detect_fallback_neighbors = int(os.environ.get("FACE_DETECT_FALLBACK_NEIGHBORS", "4"))
-        self.detect_min_size = int(os.environ.get("FACE_DETECT_MIN_SIZE", "56"))
-        self.min_face_area_ratio = float(os.environ.get("FACE_MIN_AREA_RATIO", "0.004"))
-        self.min_face_aspect = float(os.environ.get("FACE_MIN_ASPECT", "0.72"))
-        self.max_face_aspect = float(os.environ.get("FACE_MAX_ASPECT", "1.38"))
+        self.track_hold_seconds = float(os.environ.get("FACE_TRACK_HOLD_SECONDS", "2.0"))
+        self.track_match_iou = float(os.environ.get("FACE_TRACK_MATCH_IOU", "0.20"))
+        self.confirm_frames = max(1, int(os.environ.get("FACE_CONFIRM_FRAMES", "2")))
+        self.weak_confirm_frames = max(
+            self.confirm_frames, int(os.environ.get("FACE_WEAK_CONFIRM_FRAMES", "3"))
+        )
+        self.detect_min_neighbors = int(os.environ.get("FACE_DETECT_MIN_NEIGHBORS", "4"))
+        self.detect_fallback_neighbors = int(os.environ.get("FACE_DETECT_FALLBACK_NEIGHBORS", "3"))
+        self.detect_min_size = int(os.environ.get("FACE_DETECT_MIN_SIZE", "32"))
+        self.yunet_score_threshold = float(os.environ.get("FACE_YUNET_SCORE", "0.45"))
+        self.face_pad_ratio = float(os.environ.get("FACE_CROP_PAD_RATIO", "0.24"))
+        self.min_face_area_ratio = float(os.environ.get("FACE_MIN_AREA_RATIO", "0.0025"))
+        self.min_face_aspect = float(os.environ.get("FACE_MIN_ASPECT", "0.68"))
+        self.max_face_aspect = float(os.environ.get("FACE_MAX_ASPECT", "1.42"))
 
     @property
     def recognizer_available(self) -> bool:
@@ -72,27 +93,68 @@ class FaceService:
             "people": people,
             "trained_people": len(self._labels),
             "threshold": self.recognition_threshold,
+            "soft_threshold": self.soft_recognition_threshold,
             "unknown_grace_threshold": self.unknown_grace_threshold,
             "confirm_frames": self.confirm_frames,
+            "weak_confirm_frames": self.weak_confirm_frames,
             "track_hold_seconds": self.track_hold_seconds,
             "detect_min_neighbors": self.detect_min_neighbors,
+            "detector": "yunet" if self._yunet_enabled else "haar",
         }
 
     def detect(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
         if frame is None or frame.size == 0:
             return []
 
-        gray = self._frame_gray(frame)
-        h, w = gray.shape[:2]
+        h, w = frame.shape[:2]
         if h < 32 or w < 32:
             return []
 
-        # Downscale for the detector on large ESP frames (faster, fewer OpenCV pyramid bugs).
+        boxes: list[tuple[int, int, int, int]] = []
+        if self._yunet_enabled and self._yunet is not None:
+            boxes = self._detect_yunet(frame)
+
+        if not boxes:
+            boxes = self._detect_haar(frame)
+
+        gray_shape = (h, w) if frame.ndim == 2 else frame.shape[:2]
+        return self._filter_face_boxes(boxes, gray_shape)
+
+    def _detect_yunet(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
+        assert self._yunet is not None
+        h, w = frame.shape[:2]
+        bgr = frame if frame.ndim == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        try:
+            self._yunet.setInputSize((w, h))
+            _, faces = self._yunet.detect(bgr)
+        except cv2.error:
+            return []
+
+        if faces is None or len(faces) == 0:
+            return []
+
+        boxes: list[tuple[int, int, int, int]] = []
+        for row in faces:
+            if len(row) < 15:
+                continue
+            score = float(row[14])
+            if score < self.yunet_score_threshold:
+                continue
+            x, y, bw, bh = int(row[0]), int(row[1]), int(row[2]), int(row[3])
+            if bw <= 0 or bh <= 0:
+                continue
+            boxes.append((x, y, bw, bh))
+        return boxes
+
+    def _detect_haar(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
+        gray = self._frame_gray(frame)
+        h, w = gray.shape[:2]
+
         detect_gray = gray
         scale_back = 1.0
         max_side = max(h, w)
-        if max_side > 720:
-            scale_back = 720.0 / max_side
+        if max_side > 960:
+            scale_back = 960.0 / max_side
             detect_gray = cv2.resize(
                 gray,
                 (max(32, int(w * scale_back)), max(32, int(h * scale_back))),
@@ -101,25 +163,23 @@ class FaceService:
 
         faces = self._detect_multiscale_safe(
             detect_gray,
-            scale_factor=1.1,
+            scale_factor=1.08,
             min_neighbors=self.detect_min_neighbors,
             min_size=self.detect_min_size,
         )
         if len(faces) == 0:
-            # Softer pass for soft MJPEG; avoid scaleFactor < 1.1 (OpenCV 4.11 scaleIdx crash).
             faces = self._detect_multiscale_safe(
                 detect_gray,
-                scale_factor=1.1,
+                scale_factor=1.08,
                 min_neighbors=self.detect_fallback_neighbors,
-                min_size=max(40, self.detect_min_size - 12),
+                min_size=max(28, self.detect_min_size - 8),
             )
 
         if scale_back != 1.0 and len(faces) > 0:
             inv = 1.0 / scale_back
             faces = np.round(faces.astype(np.float64) * inv).astype(np.int32)
 
-        boxes = [(int(x), int(y), int(w), int(h)) for x, y, w, h in faces]
-        return self._filter_face_boxes(boxes, gray.shape)
+        return [(int(x), int(y), int(w), int(h)) for x, y, w, h in faces]
 
     def _detect_multiscale_safe(
         self,
@@ -133,7 +193,6 @@ class FaceService:
         if h < 32 or w < 32:
             return np.empty((0, 4), dtype=np.int32)
 
-        # minSize must be clearly smaller than the image or Haar pyramid asserts (scaleIdx).
         cap = min(h, w) - 8
         ms = min(min_size, cap)
         if ms < 24:
@@ -202,8 +261,9 @@ class FaceService:
                 if image is None:
                     continue
                 face = cv2.resize(image, FACE_SIZE)
-                images.append(self._enhance_gray(face))
-                label_ids.append(label_id)
+                for variant in self._augment_training_face(face):
+                    images.append(self._enhance_gray(variant))
+                    label_ids.append(label_id)
 
         if not images:
             raise ValueError("No registered face samples found")
@@ -244,16 +304,20 @@ class FaceService:
             used_track = False
             pending = False
             strict_name: str | None = None
+            weak_name: str | None = None
 
             if recognizer is not None and labels:
                 face = self._normalize_face(frame, (x, y, w, h))
                 label_id, raw_confidence = recognizer.predict(face)
                 confidence = float(raw_confidence)
+                best_name = labels.get(int(label_id), "Unknown")
                 if confidence <= self.recognition_threshold:
-                    strict_name = labels.get(int(label_id), "Unknown")
+                    strict_name = best_name
+                elif confidence <= self.soft_recognition_threshold:
+                    weak_name = best_name
 
                 name, recognized, used_track, pending = self._apply_confirmation(
-                    (x, y, w, h), strict_name, confidence, now
+                    (x, y, w, h), strict_name, weak_name, confidence, now
                 )
 
             results.append(
@@ -335,6 +399,7 @@ class FaceService:
         self,
         box: tuple[int, int, int, int],
         strict_name: str | None,
+        weak_name: str | None,
         confidence: float | None,
         now: float,
     ) -> tuple[str, bool, bool, bool]:
@@ -347,6 +412,7 @@ class FaceService:
                 "candidate": None,
                 "streak": 0,
                 "confirmed_name": None,
+                "weak_streak": False,
             }
             self._confirm_tracks.append(track)
         else:
@@ -356,20 +422,29 @@ class FaceService:
         stabilized = False
         pending = False
 
-        if strict_name and strict_name not in {"Unknown", "Face"}:
-            if track.get("candidate") == strict_name:
+        active_name = strict_name
+        confirm_needed = self.confirm_frames
+        is_weak = False
+        if not active_name and weak_name:
+            active_name = weak_name
+            confirm_needed = self.weak_confirm_frames
+            is_weak = True
+
+        if active_name and active_name not in {"Unknown", "Face"}:
+            if track.get("candidate") == active_name and bool(track.get("weak_streak")) == is_weak:
                 track["streak"] = int(track.get("streak", 0)) + 1
             else:
-                track["candidate"] = strict_name
+                track["candidate"] = active_name
                 track["streak"] = 1
-        else:
+                track["weak_streak"] = is_weak
+        elif not track.get("confirmed_name"):
             track["streak"] = 0
             track["candidate"] = None
+            track["weak_streak"] = False
 
-        if int(track.get("streak", 0)) >= self.confirm_frames:
+        if int(track.get("streak", 0)) >= confirm_needed:
             track["confirmed_name"] = str(track["candidate"])
         elif track.get("confirmed_name") and confidence is not None:
-            # Grace: keep a previously confirmed identity through brief blur / turn.
             if confidence <= self.unknown_grace_threshold:
                 stabilized = True
             else:
@@ -380,9 +455,9 @@ class FaceService:
         if confirmed:
             return str(confirmed), True, stabilized, False
 
-        if strict_name and strict_name not in {"Unknown", "Face"}:
+        if active_name and active_name not in {"Unknown", "Face"}:
             pending = int(track.get("streak", 0)) > 0
-            return strict_name, False, False, pending
+            return active_name, False, False, pending
 
         return "Unknown", False, False, False
 
@@ -419,6 +494,41 @@ class FaceService:
         self._labels = {int(key): value for key, value in labels_raw.items()}
         self._recognizer.read(str(self.model_path))
 
+    def _init_yunet_detector(self) -> None:
+        if not hasattr(cv2, "FaceDetectorYN"):
+            logger.warning("YuNet unavailable — using Haar cascade for face detection")
+            return
+        if not self._ensure_yunet_model():
+            logger.warning("YuNet model missing — using Haar cascade for face detection")
+            return
+        try:
+            self._yunet = cv2.FaceDetectorYN.create(
+                str(self._yunet_model_path),
+                "",
+                (320, 320),
+                self.yunet_score_threshold,
+                0.35,
+                5000,
+            )
+            self._yunet_enabled = True
+            logger.info("YuNet face detector ready (better at ~1 m distance)")
+        except cv2.error as exc:
+            logger.warning("YuNet init failed (%s) — using Haar cascade", exc)
+
+    def _ensure_yunet_model(self) -> bool:
+        if self._yunet_model_path.is_file() and self._yunet_model_path.stat().st_size > 100_000:
+            return True
+        self._yunet_model_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            logger.info("Downloading YuNet model to %s", self._yunet_model_path)
+            with urllib.request.urlopen(YUNET_MODEL_URL, timeout=60) as resp:
+                data = resp.read()
+            self._yunet_model_path.write_bytes(data)
+            return True
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            logger.warning("Could not download YuNet model: %s", exc)
+            return False
+
     def _frame_gray(self, frame: np.ndarray) -> np.ndarray:
         if frame.ndim == 2:
             gray = frame
@@ -433,14 +543,73 @@ class FaceService:
         self, frame: np.ndarray, box: tuple[int, int, int, int]
     ) -> np.ndarray:
         x, y, w, h = box
+        fh, fw = frame.shape[:2]
+        pad = int(max(w, h) * self.face_pad_ratio)
+        x1 = max(0, x - pad)
+        y1 = max(0, y - pad)
+        x2 = min(fw, x + w + pad)
+        y2 = min(fh, y + h + pad)
+
         gray = self._frame_gray(frame)
-        face = gray[y : y + h, x : x + w]
-        return cv2.resize(face, FACE_SIZE)
+        face = gray[y1:y2, x1:x2]
+        if face.size == 0:
+            face = gray[y : y + h, x : x + w]
+
+        face = cv2.bilateralFilter(face, d=5, sigmaColor=28, sigmaSpace=28)
+
+        min_side = min(face.shape[:2])
+        if min_side < 72:
+            scale = 72.0 / max(1, min_side)
+            face = cv2.resize(
+                face,
+                (max(1, int(face.shape[1] * scale)), max(1, int(face.shape[0] * scale))),
+                interpolation=cv2.INTER_CUBIC,
+            )
+
+        return cv2.resize(face, FACE_SIZE, interpolation=cv2.INTER_CUBIC)
+
+    @staticmethod
+    def _augment_training_face(face: np.ndarray) -> list[np.ndarray]:
+        """Synthetic views for distance, blur, and lighting (ESP MJPEG stream)."""
+        base = cv2.resize(face, FACE_SIZE)
+        variants: list[np.ndarray] = []
+
+        def add(img: np.ndarray) -> None:
+            variants.append(img)
+
+        for scale in (0.75, 0.86, 1.0, 1.10):
+            if abs(scale - 1.0) < 1e-3:
+                add(base)
+                continue
+            h, w = base.shape[:2]
+            nh, nw = max(16, int(h * scale)), max(16, int(w * scale))
+            scaled = cv2.resize(
+                base,
+                (nw, nh),
+                interpolation=cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA,
+            )
+            if scale < 1.0:
+                scaled = cv2.resize(scaled, FACE_SIZE, interpolation=cv2.INTER_CUBIC)
+            else:
+                sh, sw = scaled.shape[:2]
+                y0 = max(0, (sh - FACE_SIZE[0]) // 2)
+                x0 = max(0, (sw - FACE_SIZE[1]) // 2)
+                crop = scaled[y0 : y0 + FACE_SIZE[0], x0 : x0 + FACE_SIZE[1]]
+                scaled = crop if crop.shape[:2] == FACE_SIZE else cv2.resize(crop, FACE_SIZE)
+            add(scaled)
+
+        out: list[np.ndarray] = []
+        for v in variants:
+            out.append(v)
+            out.append(cv2.GaussianBlur(v, (0, 0), 0.85))
+            out.append(cv2.convertScaleAbs(v, alpha=1.10, beta=10))
+            out.append(cv2.convertScaleAbs(v, alpha=0.90, beta=-10))
+        return out
 
     def _create_recognizer(self) -> Any | None:
         if not hasattr(cv2, "face"):
             return None
-        return cv2.face.LBPHFaceRecognizer_create()
+        return cv2.face.LBPHFaceRecognizer_create(radius=2, neighbors=8, grid_x=8, grid_y=8)
 
     def _person_id(self, name: str) -> str:
         cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "_", name.strip().lower())

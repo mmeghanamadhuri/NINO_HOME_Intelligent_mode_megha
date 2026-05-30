@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import os
@@ -90,11 +91,13 @@ def startup() -> None:
         logger.warning("Face samples on disk but model not trained — click Retrain on the web UI")
     else:
         logger.info(
-            "Face recognition ready: %d trained, threshold %.0f, confirm %d frames "
-            "(lower LBPH score = better match)",
+            "Face recognition ready: %d trained, threshold %.0f (soft %.0f), confirm %d frames, "
+            "detector=%s — click Retrain if recognition at 1 m is still weak",
             stats["trained_people"],
             stats["threshold"],
-            stats.get("confirm_frames", 3),
+            stats.get("soft_threshold", stats["threshold"]),
+            stats.get("confirm_frames", 2),
+            stats.get("detector", "haar"),
         )
 
 
@@ -312,10 +315,51 @@ def _viewer_for_voice_query() -> str | None:
     return name
 
 
+def _camera_identity_snapshot() -> tuple[str | None, Literal["recognized", "unknown", "no_face"]]:
+    """Live camera identity for 'who am I?' — recognized name or unknown / no face."""
+    results: list[dict] = []
+    frame = camera.read()
+    if frame is not None:
+        results = faces.recognize(frame)
+    elif latest_results:
+        results = latest_results
+
+    if not results:
+        return None, "no_face"
+
+    primary = max(
+        results,
+        key=lambda r: int(r["box"]["w"]) * int(r["box"]["h"]),
+    )
+    if primary.get("recognized"):
+        name = str(primary.get("name", "")).strip()
+        if name and name.lower() not in {"unknown", "face"}:
+            return name, "recognized"
+
+    return None, "unknown"
+
+
+async def _delayed_esp_servo_360(delay_seconds: float) -> None:
+    from voice_service import SERVO_360_TRIGGER_DELAY_SECONDS, trigger_esp_servo_360
+
+    wait = delay_seconds if delay_seconds > 0 else SERVO_360_TRIGGER_DELAY_SECONDS
+    await asyncio.sleep(wait)
+    ok, err = await run_in_threadpool(trigger_esp_servo_360)
+    if ok:
+        logger.info("ESP servo 360 started after voice confirmation")
+    else:
+        logger.warning("ESP servo 360 failed after voice confirmation: %s", err or "unknown")
+
+
 async def _voice_ws_pipeline(websocket: WebSocket) -> None:
     """Whisper STT → Ollama → SAPI WAV. Multiple receive_bytes → send_bytes cycles per connection."""
     await websocket.accept()
-    from voice_service import minimal_voice_reply_wav, process_voice_wav
+    from voice_service import (
+        SERVO_360_TRIGGER_DELAY_SECONDS,
+        VoiceReplyMeta,
+        minimal_voice_reply_wav,
+        process_voice_wav,
+    )
 
     session_viewer: str | None = None
 
@@ -327,6 +371,7 @@ async def _voice_ws_pipeline(websocket: WebSocket) -> None:
                 break
 
             wav_out: bytes | None = None
+            reply_meta = VoiceReplyMeta()
             active_viewer: str | None = session_viewer
             try:
                 viewer = await run_in_threadpool(_viewer_for_voice_query)
@@ -335,7 +380,19 @@ async def _voice_ws_pipeline(websocket: WebSocket) -> None:
                     active_viewer = viewer
                 elif session_viewer:
                     active_viewer = session_viewer
-                wav_out = await run_in_threadpool(process_voice_wav, wav_in, active_viewer)
+                identity_name, identity_state = await run_in_threadpool(
+                    _camera_identity_snapshot
+                )
+
+                def _run_voice() -> tuple[bytes, VoiceReplyMeta]:
+                    return process_voice_wav(
+                        wav_in,
+                        active_viewer,
+                        camera_identity_name=identity_name,
+                        camera_identity_state=identity_state,
+                    )
+
+                wav_out, reply_meta = await run_in_threadpool(_run_voice)
             except Exception as exc:
                 logger.exception("Voice pipeline failed")
                 err_note = str(exc)[:512]
@@ -366,6 +423,11 @@ async def _voice_ws_pipeline(websocket: WebSocket) -> None:
                 await websocket.send_bytes(wav_out)
             except WebSocketDisconnect:
                 break
+
+            if reply_meta.trigger_servo_360:
+                asyncio.create_task(
+                    _delayed_esp_servo_360(SERVO_360_TRIGGER_DELAY_SECONDS)
+                )
     finally:
         try:
             await websocket.close()
@@ -430,14 +492,14 @@ def main() -> None:
         type=float,
         default=None,
         metavar="LBPH",
-        help="Max LBPH distance to accept a match (lower=stricter). Default 58 via FACE_RECOGNITION_THRESHOLD.",
+        help="Max LBPH distance to accept a match (lower=stricter). Default 80 via FACE_RECOGNITION_THRESHOLD.",
     )
     parser.add_argument(
         "--face-confirm-frames",
         type=int,
         default=None,
         metavar="N",
-        help="Consecutive matching frames before green/recognized (default 3).",
+        help="Consecutive matching frames before green/recognized (default 2).",
     )
     args = parser.parse_args()
 

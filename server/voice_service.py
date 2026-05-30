@@ -4,21 +4,77 @@ from __future__ import annotations
 
 import io
 import os
+import random
+import re
 import wave
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import urlparse
 
 import numpy as np
+import requests
 
 logger = logging.getLogger(__name__)
 
-from llm_service import answer_voice_query, DEFAULT_MODEL, DEFAULT_OLLAMA_URL
+from llm_service import (
+    answer_identity_question,
+    answer_voice_query,
+    DEFAULT_MODEL,
+    DEFAULT_OLLAMA_URL,
+)
 from tts_service import synthesize_sapi_wav_bytes
 from wav_resample import resample_wav_bytes_to_mono_16bit
 
 # Voice assistant path uses 16 kHz on device (ESP-SR WakeNet + VAD); face TTS stays 22050 in tts_service.
 VOICE_ASSIST_PLAYBACK_HZ = 16000
+
+CameraIdentityState = Literal["recognized", "unknown", "no_face"]
+
+_IDENTITY_QUESTION_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bwho am i\b",
+        r"\bwhat(?:'s| is) my name\b",
+        r"\bdo you know me\b",
+        r"\bdo you know who i am\b",
+        r"\bwho is this\b",
+        r"\bidentify me\b",
+        r"\brecogni[sz]e me\b",
+        r"\bwhat do you call me\b",
+        r"\bwhat(?:'s| is) my identity\b",
+    )
+)
+
+_SERVO_360_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bmake a 360\b",
+        r"\bdo a 360\b",
+        r"\bmake (?:a )?360\b",
+        r"\bdo (?:a )?360\b",
+        r"\bspin 360\b",
+        r"\bspin a 360\b",
+        r"\b(?:make|do) (?:a )?(?:three[\s-]?sixty|360)\b",
+        r"\b(?:spin|rotate|turn)(?: around)? (?:a )?360\b",
+        r"\b360 (?:degree|degrees|spin|rotation)\b",
+        r"\bfull 360\b",
+        r"\b(?:servo|motor|head).{0,20}(?:spin|rotate|360)\b",
+        r"\b(?:spin|rotate|360).{0,20}(?:servo|motor|head)\b",
+    )
+)
+
+# Seconds after TTS is sent before POST /servo/360 (lets confirmation play first).
+SERVO_360_TRIGGER_DELAY_SECONDS = float(os.environ.get("SERVO_360_TRIGGER_DELAY_SECONDS", "2.0"))
+
+
+@dataclass
+class VoiceReplyMeta:
+    trigger_servo_360: bool = False
+
+
+# Roughly 2–3 personalized voice replies per 10–20 (override with VOICE_PERSONALIZE_PROB).
+DEFAULT_VOICE_PERSONALIZE_PROB = 0.18
 
 
 @dataclass
@@ -29,6 +85,7 @@ class VoiceSettings:
     whisper_language: str | None = "en"
     max_request_bytes: int = 512_000
     max_words_reply: int = 55
+    personalize_prob: float = DEFAULT_VOICE_PERSONALIZE_PROB
 
 
 SETTINGS = VoiceSettings()
@@ -56,6 +113,83 @@ def configure_from_environ() -> None:
     SETTINGS.whisper_model = os.environ.get("WHISPER_MODEL", "tiny").strip()
     lang = os.environ.get("WHISPER_LANGUAGE", "en").strip()
     SETTINGS.whisper_language = None if lang.lower() in {"", "auto"} else lang
+    SETTINGS.personalize_prob = float(
+        os.environ.get("VOICE_PERSONALIZE_PROB", str(DEFAULT_VOICE_PERSONALIZE_PROB))
+    )
+    SETTINGS.personalize_prob = min(1.0, max(0.0, SETTINGS.personalize_prob))
+
+
+def _viewer_for_this_reply(viewer_name: str | None) -> str | None:
+    """Randomly include the camera viewer name (~2–3 of every 10–20 voice replies)."""
+    if not viewer_name:
+        return None
+    cleaned = viewer_name.strip()
+    if not cleaned or cleaned.lower() in {"unknown", "face"}:
+        return None
+    if random.random() < SETTINGS.personalize_prob:
+        return cleaned
+    return None
+
+
+def is_identity_question(user_text: str) -> bool:
+    text = user_text.strip()
+    if not text:
+        return False
+    return any(p.search(text) for p in _IDENTITY_QUESTION_PATTERNS)
+
+
+def is_servo_360_command(user_text: str) -> bool:
+    text = user_text.strip()
+    if not text:
+        return False
+    return any(p.search(text) for p in _SERVO_360_PATTERNS)
+
+
+def esp_servo_360_url() -> str | None:
+    play_url = os.environ.get("ESP_PLAY_WAV_URL", "").strip()
+    if not play_url:
+        return None
+    parsed = urlparse(play_url)
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}/servo/360"
+
+
+def trigger_esp_servo_360() -> tuple[bool, str | None]:
+    """POST /servo/360 on the ESP. Returns (ok, error_code)."""
+    url = esp_servo_360_url()
+    if not url:
+        return False, "no_esp_url"
+    try:
+        resp = requests.post(url, timeout=8)
+        if resp.status_code == 200:
+            return True, None
+        try:
+            payload = resp.json()
+            err = str(payload.get("error", "request_failed"))
+        except Exception:
+            err = f"http_{resp.status_code}"
+        logger.warning("ESP servo 360 failed: %s %s", resp.status_code, err)
+        return False, err
+    except requests.RequestException as exc:
+        logger.warning("ESP servo 360 request failed: %s", exc)
+        return False, "request_failed"
+
+
+def reply_for_servo_360_command(*, error: str | None = None) -> str:
+    """Fixed spoken reply for servo 360 voice commands — no LLM."""
+    if error == "no_esp_url":
+        return (
+            "I cannot reach the robot. "
+            "Set ESP play WAV URL on the server to the board IP."
+        )
+    if error == "servos_not_ready":
+        return "The servos are not ready. Connect the U2D2 on the USB hub and power the motors."
+    if error == "already_running":
+        return "A spin is already running."
+    if error == "request_failed":
+        return "I tried to start the spin but the robot did not respond."
+    return "OK, doing the spin now."
 
 
 def _ensure_whisper() -> Any:
@@ -123,23 +257,65 @@ def transcribe_wav(wav_bytes: bytes) -> str:
     return text
 
 
-def process_voice_wav(wav_bytes: bytes, viewer_name: str | None = None) -> bytes:
+def process_voice_wav(
+    wav_bytes: bytes,
+    viewer_name: str | None = None,
+    *,
+    camera_identity_name: str | None = None,
+    camera_identity_state: CameraIdentityState = "no_face",
+) -> tuple[bytes, VoiceReplyMeta]:
+    meta = VoiceReplyMeta()
     if not wav_bytes:
         raise RuntimeError("Empty audio.")
     if len(wav_bytes) > SETTINGS.max_request_bytes:
         raise RuntimeError("Audio exceeds size limit.")
 
     user_text = transcribe_wav(wav_bytes)
-    if viewer_name:
-        logger.info("Voice query viewer: %s | heard: %s", viewer_name, user_text[:120])
+
+    if is_servo_360_command(user_text):
+        logger.info("Voice servo 360 command | heard: %s", user_text[:120])
+        if esp_servo_360_url() is None:
+            reply = reply_for_servo_360_command(error="no_esp_url")
+        else:
+            meta.trigger_servo_360 = True
+            reply = reply_for_servo_360_command()
+    elif is_identity_question(user_text):
+        logger.info(
+            "Voice identity query | state=%s name=%s | heard: %s",
+            camera_identity_state,
+            camera_identity_name or "(none)",
+            user_text[:120],
+        )
+        reply = answer_identity_question(
+            user_text,
+            registered_name=camera_identity_name,
+            recognition_state=camera_identity_state,
+            model=SETTINGS.ollama_model,
+            api_url=SETTINGS.ollama_url,
+            max_words=SETTINGS.max_words_reply,
+        )
     else:
-        logger.info("Voice query (no recognized viewer) | heard: %s", user_text[:120])
-    reply = answer_voice_query(
-        user_text,
-        viewer_name=viewer_name,
-        model=SETTINGS.ollama_model,
-        api_url=SETTINGS.ollama_url,
-        max_words=SETTINGS.max_words_reply,
-    )
+        effective_viewer = _viewer_for_this_reply(viewer_name)
+        if effective_viewer:
+            logger.info(
+                "Voice query (personalized) viewer: %s | heard: %s",
+                effective_viewer,
+                user_text[:120],
+            )
+        elif viewer_name:
+            logger.info(
+                "Voice query (generic; %s in frame) | heard: %s",
+                viewer_name.strip(),
+                user_text[:120],
+            )
+        else:
+            logger.info("Voice query (no recognized viewer) | heard: %s", user_text[:120])
+        reply = answer_voice_query(
+            user_text,
+            viewer_name=effective_viewer,
+            model=SETTINGS.ollama_model,
+            api_url=SETTINGS.ollama_url,
+            max_words=SETTINGS.max_words_reply,
+        )
     wav, _voice = synthesize_sapi_wav_bytes(reply)
-    return resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
+    return resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ), meta

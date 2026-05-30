@@ -1,11 +1,34 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include "esp_err.h"
 
 esp_err_t nino_audio_init(void);
 
 esp_err_t nino_audio_play_wav(const uint8_t *wav_bytes, size_t wav_len);
+
+/** Decoded 16-bit mono PCM ready for speaker output. */
+typedef struct {
+  const int16_t *samples;
+  size_t num_bytes;
+  uint32_t sample_rate_hz;
+  int16_t *mono_heap;
+} nino_decoded_wav_t;
+
+/** Parse WAV into mono PCM. Caller frees with nino_decoded_wav_free(). */
+esp_err_t nino_audio_decode_wav(const uint8_t *wav_bytes, size_t wav_len,
+                                nino_decoded_wav_t *out);
+
+void nino_decoded_wav_free(nino_decoded_wav_t *decoded);
+
+/**
+ * Play decoded PCM from @p pcm_byte_offset. Updates @p pcm_byte_offset on exit.
+ * @p completed is set true when the entire clip finishes; false if @p stop_requested
+ * interrupted playback mid-clip.
+ */
+esp_err_t nino_audio_play_decoded(const nino_decoded_wav_t *decoded, size_t *pcm_byte_offset,
+                                  volatile bool *stop_requested, bool *completed);
 
 /** Play 16-bit mono PCM; waits for the DAC pipeline to finish before closing the codec. */
 esp_err_t nino_audio_play_pcm16_mono(const int16_t *samples, size_t sample_count,

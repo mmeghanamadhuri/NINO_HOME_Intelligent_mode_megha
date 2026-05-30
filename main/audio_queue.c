@@ -15,8 +15,8 @@
 
 static const char *TAG = "audio_q";
 
-/** Deep FIFO so server + touch + voice never drop; enqueue blocks when full. */
-#define AUDIO_PLAY_QUEUE_LEN 32
+#define NORMAL_QUEUE_LEN 32
+#define TOUCH_QUEUE_LEN 8
 #define AUDIO_PLAY_TASK_STACK_SIZE 6144
 #define AUDIO_PLAY_TASK_PRIORITY 6
 
@@ -27,7 +27,22 @@ typedef struct {
   nino_audio_servo_mode_t servo_mode;
 } audio_play_job_t;
 
-static QueueHandle_t s_audio_play_queue;
+typedef struct {
+  nino_decoded_wav_t decoded;
+  size_t pcm_offset;
+  bool play_done_chime;
+  nino_audio_servo_mode_t servo_mode;
+} suspended_playback_t;
+
+static QueueHandle_t s_normal_queue;
+static QueueHandle_t s_touch_queue;
+static volatile bool s_stop_requested;
+static suspended_playback_t s_suspended;
+static bool s_has_suspended;
+
+static bool is_touch_job(const audio_play_job_t *job) {
+  return job->servo_mode == NINO_AUDIO_SERVO_NOD_LR;
+}
 
 static void servo_motion_for_mode(nino_audio_servo_mode_t mode, bool start) {
   if (mode == NINO_AUDIO_SERVO_NONE) {
@@ -44,12 +59,129 @@ static void servo_motion_for_mode(nino_audio_servo_mode_t mode, bool start) {
   }
 }
 
+static bool play_decoded_job(nino_decoded_wav_t *decoded, size_t *pcm_offset,
+                             nino_audio_servo_mode_t servo_mode, bool allow_interrupt) {
+  if (decoded->samples == NULL || decoded->num_bytes == 0) {
+    return true;
+  }
+
+  servo_motion_for_mode(servo_mode, true);
+  volatile bool *stop_ptr = allow_interrupt ? &s_stop_requested : NULL;
+  bool completed = false;
+  esp_err_t err =
+      nino_audio_play_decoded(decoded, pcm_offset, stop_ptr, &completed);
+  servo_motion_for_mode(servo_mode, false);
+
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "WAV playback failed: %s", esp_err_to_name(err));
+    return true;
+  }
+  return completed;
+}
+
+static bool play_touch_job(audio_play_job_t *job) {
+  nino_decoded_wav_t decoded = {};
+  if (nino_audio_decode_wav(job->data, job->len, &decoded) != ESP_OK) {
+    ESP_LOGW(TAG, "Touch WAV decode failed");
+    free(job->data);
+    return true;
+  }
+  free(job->data);
+  job->data = NULL;
+
+  size_t offset = 0;
+  (void)play_decoded_job(&decoded, &offset, job->servo_mode, false);
+  nino_decoded_wav_free(&decoded);
+  return true;
+}
+
+static bool play_normal_job(audio_play_job_t *job) {
+  nino_decoded_wav_t decoded = {};
+  if (nino_audio_decode_wav(job->data, job->len, &decoded) != ESP_OK) {
+    ESP_LOGW(TAG, "WAV decode failed");
+    free(job->data);
+    return true;
+  }
+  free(job->data);
+  job->data = NULL;
+
+  size_t offset = 0;
+  const bool completed =
+      play_decoded_job(&decoded, &offset, job->servo_mode, true);
+
+  if (!completed && offset < decoded.num_bytes) {
+    s_suspended.decoded = decoded;
+    s_suspended.pcm_offset = offset;
+    s_suspended.play_done_chime = job->play_done_chime;
+    s_suspended.servo_mode = job->servo_mode;
+    s_has_suspended = true;
+    s_stop_requested = false;
+    ESP_LOGI(TAG, "Server WAV paused at %u/%u bytes for touch",
+             (unsigned)offset, (unsigned)decoded.num_bytes);
+    return false;
+  }
+
+  if (job->play_done_chime) {
+    (void)nino_voice_play_done_chime();
+  }
+  nino_decoded_wav_free(&decoded);
+  return true;
+}
+
+static bool play_suspended(void) {
+  if (!s_has_suspended) {
+    return true;
+  }
+
+  suspended_playback_t snap = s_suspended;
+  s_has_suspended = false;
+  memset(&s_suspended, 0, sizeof(s_suspended));
+
+  const bool completed = play_decoded_job(&snap.decoded, &snap.pcm_offset, snap.servo_mode, true);
+
+  if (!completed && snap.pcm_offset < snap.decoded.num_bytes) {
+    s_suspended = snap;
+    s_has_suspended = true;
+    s_stop_requested = false;
+    ESP_LOGI(TAG, "Server WAV paused again at %u/%u bytes for touch",
+             (unsigned)snap.pcm_offset, (unsigned)snap.decoded.num_bytes);
+    return false;
+  }
+
+  if (snap.play_done_chime) {
+    (void)nino_voice_play_done_chime();
+  }
+  nino_decoded_wav_free(&snap.decoded);
+  return true;
+}
+
+static bool try_receive_touch(audio_play_job_t *job) {
+  return xQueueReceive(s_touch_queue, job, 0) == pdPASS;
+}
+
 static void audio_playback_task(void *arg) {
   (void)arg;
-  audio_play_job_t job = {};
 
   while (true) {
-    if (xQueueReceive(s_audio_play_queue, &job, portMAX_DELAY) != pdPASS) {
+    audio_play_job_t job = {};
+
+    if (try_receive_touch(&job)) {
+      (void)play_touch_job(&job);
+      continue;
+    }
+
+    if (s_has_suspended) {
+      if (!play_suspended()) {
+        continue;
+      }
+    }
+
+    if (try_receive_touch(&job)) {
+      (void)play_touch_job(&job);
+      continue;
+    }
+
+    if (xQueueReceive(s_normal_queue, &job, pdMS_TO_TICKS(50)) != pdPASS) {
       continue;
     }
     if (job.data == NULL || job.len == 0) {
@@ -57,21 +189,12 @@ static void audio_playback_task(void *arg) {
       continue;
     }
 
-    servo_motion_for_mode(job.servo_mode, true);
-    esp_err_t play_err = nino_audio_play_wav(job.data, job.len);
-    servo_motion_for_mode(job.servo_mode, false);
-
-    if (play_err != ESP_OK) {
-      ESP_LOGW(TAG, "WAV playback failed: %s", esp_err_to_name(play_err));
-    } else if (job.play_done_chime) {
-      (void)nino_voice_play_done_chime();
-    }
-    free(job.data);
+    (void)play_normal_job(&job);
   }
 }
 
-static esp_err_t enqueue_job(audio_play_job_t job) {
-  if (s_audio_play_queue == NULL) {
+static esp_err_t enqueue_job(audio_play_job_t job, QueueHandle_t queue) {
+  if (queue == NULL) {
     free(job.data);
     return ESP_ERR_INVALID_STATE;
   }
@@ -80,7 +203,7 @@ static esp_err_t enqueue_job(audio_play_job_t job) {
     return ESP_ERR_INVALID_ARG;
   }
 
-  if (xQueueSendToBack(s_audio_play_queue, &job, portMAX_DELAY) != pdPASS) {
+  if (xQueueSendToBack(queue, &job, portMAX_DELAY) != pdPASS) {
     free(job.data);
     return ESP_FAIL;
   }
@@ -88,14 +211,22 @@ static esp_err_t enqueue_job(audio_play_job_t job) {
 }
 
 esp_err_t nino_audio_queue_start(void) {
-  if (s_audio_play_queue != NULL) {
+  if (s_normal_queue != NULL) {
     return ESP_OK;
   }
 
-  s_audio_play_queue =
-      xQueueCreate(AUDIO_PLAY_QUEUE_LEN, sizeof(audio_play_job_t));
-  if (s_audio_play_queue == NULL) {
-    ESP_LOGE(TAG, "Failed to create audio play queue");
+  s_normal_queue = xQueueCreate(NORMAL_QUEUE_LEN, sizeof(audio_play_job_t));
+  s_touch_queue = xQueueCreate(TOUCH_QUEUE_LEN, sizeof(audio_play_job_t));
+  if (s_normal_queue == NULL || s_touch_queue == NULL) {
+    if (s_normal_queue != NULL) {
+      vQueueDelete(s_normal_queue);
+      s_normal_queue = NULL;
+    }
+    if (s_touch_queue != NULL) {
+      vQueueDelete(s_touch_queue);
+      s_touch_queue = NULL;
+    }
+    ESP_LOGE(TAG, "Failed to create audio play queues");
     return ESP_ERR_NO_MEM;
   }
 
@@ -103,13 +234,15 @@ esp_err_t nino_audio_queue_start(void) {
       xTaskCreate(audio_playback_task, "audio_play", AUDIO_PLAY_TASK_STACK_SIZE,
                   NULL, AUDIO_PLAY_TASK_PRIORITY, NULL);
   if (ok != pdPASS) {
-    vQueueDelete(s_audio_play_queue);
-    s_audio_play_queue = NULL;
+    vQueueDelete(s_normal_queue);
+    vQueueDelete(s_touch_queue);
+    s_normal_queue = NULL;
+    s_touch_queue = NULL;
     ESP_LOGE(TAG, "Failed to create audio play task");
     return ESP_ERR_NO_MEM;
   }
 
-  ESP_LOGI(TAG, "Audio FIFO ready (depth %d, blocking enqueue)", AUDIO_PLAY_QUEUE_LEN);
+  ESP_LOGI(TAG, "Audio queue ready (touch priority, server pause/resume)");
   return ESP_OK;
 }
 
@@ -126,7 +259,12 @@ esp_err_t nino_audio_queue_wav(uint8_t *wav, size_t len, bool play_done_chime,
       .play_done_chime = play_done_chime,
       .servo_mode = servo_mode,
   };
-  return enqueue_job(job);
+
+  if (is_touch_job(&job)) {
+    s_stop_requested = true;
+    return enqueue_job(job, s_touch_queue);
+  }
+  return enqueue_job(job, s_normal_queue);
 }
 
 esp_err_t nino_audio_queue_wav_copy(const uint8_t *wav, size_t len, bool play_done_chime,
@@ -148,8 +286,9 @@ esp_err_t nino_audio_queue_wav_copy(const uint8_t *wav, size_t len, bool play_do
 }
 
 void nino_main_queue_audio_wav(uint8_t *pcm_wav, size_t len, bool play_done_chime) {
+  /* No head motion during voice replies — avoids fighting ID2 during /servo/360. */
   esp_err_t err =
-      nino_audio_queue_wav(pcm_wav, len, play_done_chime, NINO_AUDIO_SERVO_FULL);
+      nino_audio_queue_wav(pcm_wav, len, play_done_chime, NINO_AUDIO_SERVO_NONE);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "voice: queue WAV failed: %s", esp_err_to_name(err));
   }

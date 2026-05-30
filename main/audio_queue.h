@@ -13,7 +13,7 @@ typedef enum {
   NINO_AUDIO_SERVO_NONE = 2,
 } nino_audio_servo_mode_t;
 
-/** Start the shared FIFO playback worker (server, touch, voice replies). */
+/** Start the shared playback worker (touch priority; server/voice pause/resume). */
 esp_err_t nino_audio_queue_start(void);
 
 /**

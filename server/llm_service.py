@@ -79,6 +79,61 @@ def greeting_for_face(
     )
 
 
+def answer_identity_question(
+    user_text: str,
+    *,
+    registered_name: str | None,
+    recognition_state: str,
+    model: str | None = None,
+    api_url: str | None = None,
+    max_words: int = 45,
+) -> str:
+    """Answer 'who am I?' style questions using live camera recognition context."""
+    if recognition_state == "recognized" and registered_name:
+        camera_ctx = (
+            f"The camera face recognition system has identified the person in front "
+            f"of the camera as: {registered_name.strip()}."
+        )
+        rules = (
+            "Answer the user's identity question using ONLY that recognized name. "
+            "Do not guess, invent, or mention any other name."
+        )
+    elif recognition_state == "unknown":
+        camera_ctx = (
+            "The camera sees a face, but that person is NOT registered in the system "
+            "(recognition state: unknown)."
+        )
+        rules = (
+            "Tell them politely they are not registered yet and should register their "
+            "face on the NiNO camera web page. Do not invent or guess a name."
+        )
+    else:
+        camera_ctx = (
+            "No face is clearly visible in front of the camera right now "
+            "(recognition state: no face)."
+        )
+        rules = (
+            "Explain you cannot identify them right now — ask them to step in front of "
+            "the camera, or register on the NiNO camera web page if they have not yet. "
+            "Do not invent or guess a name."
+        )
+
+    prompt = (
+        "You are NiNO, a concise voice assistant for a smart home with a camera.\n"
+        f"{camera_ctx}\n"
+        f"{rules}\n"
+        f"Rules: one short spoken reply under {max_words} words, plain sentences, "
+        "no lists, no markdown, no stage directions, suitable to read aloud.\n"
+        f"The user asked: {user_text}"
+    )
+    return ollama_generate(
+        prompt,
+        model=model,
+        api_url=api_url,
+        num_predict=128,
+    )
+
+
 def answer_voice_query(
     user_text: str,
     *,
@@ -90,12 +145,8 @@ def answer_voice_query(
     if viewer_name:
         who = (
             f"You are speaking to {viewer_name.strip()}, identified by the home camera. "
-            "This may be a follow-up question in the same conversation. "
-            "On EVERY reply you must start by using their name in a brief, natural way "
-            "(not only the first time), then answer what they asked. "
-            "Never skip their name when they are identified. "
-            "Example tone (do not copy verbatim): "
-            f"\"Hi {viewer_name.strip()}, here is what you asked for — …\""
+            "Use their name once in a brief, natural way (start or end), then answer "
+            "what they asked. Do not repeat the name more than once."
         )
     else:
         who = (
