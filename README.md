@@ -1,14 +1,15 @@
-# NiNO Home — Voice, Vision & Touch (ESP32-P4)
+# NiNO Home — Voice, Vision, Touch & Servo  (ESP32-P4)
 
-NiNO is a smart-home demo for the ESP32-P4 Function EV Board that uses vision, voice, and touch interaction together.
+NiNO is a smart-home demo for the ESP32-P4 Function EV Board that uses vision, voice, touch, and servo motion together.
 
 - **Vision**: USB UVC camera on the board, face detection/recognition on the PC, personalized greetings played through the ESP speaker.
 - **Voice**: Wake-word capture on the board, Whisper speech recognition and Ollama LLM responses on the PC, audio returned to the board.
 - **Touch**: QT2120 capacitive touch sensor triggers an embedded warning audio clip.
+- **Servo**: embedded servo motion control for connected actuators on the ESP board.
 
 ## Features
 
-- ESP32-P4 firmware with UVC camera support, HTTP streaming, WAV playback, voice wake capture, and touch handling.
+- ESP32-P4 firmware with UVC camera support, HTTP streaming, WAV playback, voice wake capture, touch handling, and servo motion control.
 - Python FastAPI server for face UI, Whisper STT, Ollama LLM prompts, and TTS delivery to the board.
 - Single shared speaker queue on the ESP to serialize touch warnings, greetings, and voice replies.
 - Recommended Windows server support for default SAPI text-to-speech.
@@ -46,6 +47,7 @@ The ESP firmware provides:
 - Wake-word support using ESP-SR WakeNet
 - VAD-based voice capture and WebSocket transport
 - QT2120 touch sensor warnings
+- Embedded servo motion control for board actuators
 - Shared speaker FIFO queue in `main/audio_queue.c`
 
 ### Key firmware files
@@ -59,6 +61,10 @@ The ESP firmware provides:
 - `main/voice_ws_client.c` — WebSocket client to PC
 - `main/touch_sensor.c` — QT2120 capacitive touch handling
 - `main/bsp_qt2120.c` — QT2120 I2C driver
+- `main/servo_dxl.c` — Dynamixel servo control interface
+- `main/servo_dxl.h` — Dynamixel servo control definitions
+- `main/servo_motion.c` — servo motion sequencing
+- `main/servo_motion.h` — servo motion control helpers
 - `main/PDTM.wav` — embedded touch warning audio
 
 ## Build and flash firmware
