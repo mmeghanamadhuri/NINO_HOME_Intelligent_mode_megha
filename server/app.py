@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 
+from alarm_service import get_alarm_service
 from camera import CameraStream
 from face_service import FaceService
 from tts_service import TTSService, synthesize_sapi_wav_bytes
@@ -81,6 +82,7 @@ class RegisterRequest(BaseModel):
 @app.on_event("startup")
 def startup() -> None:
     faces.apply_settings_from_environ()
+    get_alarm_service().start()
     camera.start()
     stats = faces.stats()
     if not faces.recognizer_available:
@@ -103,6 +105,10 @@ def startup() -> None:
 
 @app.on_event("shutdown")
 def shutdown() -> None:
+    try:
+        get_alarm_service().stop()
+    except BaseException:
+        pass
     try:
         tts.stop()
     except BaseException:
@@ -134,8 +140,27 @@ def status() -> dict:
         "camera": camera.status(),
         "faces": faces.stats(),
         "tts": tts.status(),
+        "alarms": get_alarm_service().status(),
         "latest_results": latest_results,
     }
+
+
+@app.get("/api/alarms")
+def list_alarms() -> dict:
+    return {"ok": True, **get_alarm_service().status()}
+
+
+@app.delete("/api/alarms")
+def cancel_all_alarms() -> dict:
+    count = get_alarm_service().cancel_all()
+    return {"ok": True, "cancelled": count}
+
+
+@app.delete("/api/alarms/{alarm_id}")
+def cancel_alarm(alarm_id: str) -> dict:
+    if not get_alarm_service().cancel_alarm(alarm_id):
+        raise HTTPException(status_code=404, detail="Alarm not found or already fired")
+    return {"ok": True, "id": alarm_id}
 
 
 @app.post("/api/register")
@@ -501,6 +526,11 @@ def main() -> None:
         metavar="N",
         help="Consecutive matching frames before green/recognized (default 2).",
     )
+    parser.add_argument(
+        "--alarm-wav",
+        default=os.environ.get("ALARM_WAV_PATH", ""),
+        help="WAV file POSTed to ESP when an alarm fires (default: ../main/beep.wav)",
+    )
     args = parser.parse_args()
 
     camera_source = args.camera_url or args.camera_source
@@ -509,6 +539,9 @@ def main() -> None:
 
     if args.esp_play_wav_url.strip():
         os.environ["ESP_PLAY_WAV_URL"] = args.esp_play_wav_url.strip()
+
+    if args.alarm_wav.strip():
+        os.environ["ALARM_WAV_PATH"] = args.alarm_wav.strip()
 
     os.environ["OLLAMA_URL"] = args.ollama_url.strip()
     os.environ["OLLAMA_MODEL"] = args.ollama_model.strip()

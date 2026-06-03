@@ -184,6 +184,10 @@ Example voice commands after wake:
 |-----|----------|
 | “Who am I?” / “What’s my name?” | Ollama answer using live face recognition |
 | “Make a 360” / “Spin 360” | Fixed TTS, then ID2 full rotation |
+| “Set an alarm at 4:30 AM today” | Saves alarm; at fire time POSTs TTS + alarm WAV to ESP |
+| “Remind me to take medicines at 6 AM” | Saves labeled reminder; fires with *“Alarm. Time to take medicines.”* |
+| “Remind me to go to school at 8 AM” | Same — multiple reminders stack in `alarms.json` |
+| “List my alarms” / “Cancel my alarm” | List or clear pending alarms |
 | General questions | Whisper → Ollama → TTS (name used ~18% of the time) |
 
 Serial CLI servo test (U2D2 ready):
@@ -209,6 +213,9 @@ Serial CLI servo test (U2D2 ready):
 - `POST /api/camera` — change camera source
 - `POST /api/register` — register face data
 - `POST /api/retrain` — retrain face recognition model
+- `GET /api/alarms` — list pending alarms
+- `DELETE /api/alarms` — cancel all pending alarms
+- `DELETE /api/alarms/{id}` — cancel one alarm
 - `WS /voice-query` — voice assistant WebSocket (also `/ws/voice`)
 
 ### Server environment (optional)
@@ -219,6 +226,9 @@ Serial CLI servo test (U2D2 ready):
 | `VOICE_PERSONALIZE_PROB` | `0.18` | Fraction of voice replies that use viewer name |
 | `SERVO_360_TRIGGER_DELAY_SECONDS` | `2.0` | Delay after 360 confirmation TTS before POST spin |
 | `VOICE_VIEWER_TTL_SECONDS` | `900` | How long last recognized face is remembered for voice |
+| `ALARM_WAV_PATH` | `../main/beep.wav` | WAV POSTed to ESP when an alarm fires (after spoken alert) |
+| `ALARM_TICK_SECONDS` | `1.0` | Scheduler poll interval for due alarms |
+| `ALARM_NLP_FALLBACK` | `1` | Use Ollama JSON when regex fails (`0` to disable) |
 
 ## Repository layout
 
@@ -251,12 +261,16 @@ docs/
 
 server/
   app.py
+  alarm_service.py
+  alarm_voice.py
+  esp_playback.py
   camera.py
   face_service.py
   llm_service.py
   tts_service.py
   voice_service.py
   wav_resample.py
+  data/alarms.json
   requirements.txt
   server_config.json
   templates/

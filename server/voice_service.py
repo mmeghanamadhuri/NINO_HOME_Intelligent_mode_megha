@@ -272,7 +272,13 @@ def process_voice_wav(
 
     user_text = transcribe_wav(wav_bytes)
 
-    if is_servo_360_command(user_text):
+    from alarm_voice import handle_alarm_voice
+
+    alarm_result = handle_alarm_voice(user_text)
+    if alarm_result.handled:
+        logger.info("Voice alarm command | heard: %s", user_text[:120])
+        reply = alarm_result.reply
+    elif is_servo_360_command(user_text):
         logger.info("Voice servo 360 command | heard: %s", user_text[:120])
         if esp_servo_360_url() is None:
             reply = reply_for_servo_360_command(error="no_esp_url")
