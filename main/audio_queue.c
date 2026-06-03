@@ -286,9 +286,9 @@ esp_err_t nino_audio_queue_wav_copy(const uint8_t *wav, size_t len, bool play_do
 }
 
 void nino_main_queue_audio_wav(uint8_t *pcm_wav, size_t len, bool play_done_chime) {
-  /* No head motion during voice replies — avoids fighting ID2 during /servo/360. */
+  /* Same L/R/U/D as POST /play_wav; motion stops when clip ends (/servo/360 stops it too). */
   esp_err_t err =
-      nino_audio_queue_wav(pcm_wav, len, play_done_chime, NINO_AUDIO_SERVO_NONE);
+      nino_audio_queue_wav(pcm_wav, len, play_done_chime, NINO_AUDIO_SERVO_FULL);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "voice: queue WAV failed: %s", esp_err_to_name(err));
   }

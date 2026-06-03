@@ -23,7 +23,7 @@ Power the servos and ensure the U2D2 enumerates before motion commands will run.
 | `main/servo_dxl.h` | Public servo API |
 | `main/servo_motion.c` | Cyclic head motion during face/touch TTS (L/R/U/D) |
 | `main/main.c` | HTTP `POST /servo/360`, CLI command `360` |
-| `main/audio_queue.c` | Speaker queue; **voice replies use no head motion** so ID2 spin is not fought |
+| `main/audio_queue.c` | Speaker queue; **voice WebSocket replies use L/R/U/D** (same as `/play_wav`) |
 
 ### Key API
 
@@ -85,7 +85,7 @@ sequenceDiagram
     PC->>PC: Whisper STT
     alt Phrase matches 360 command
         PC->>PC: Fixed TTS "OK, doing the spin now."
-        PC->>ESP: reply WAV (no head motion)
+        PC->>ESP: reply WAV (L/R/U/D during playback)
         ESP->>User: speaks confirmation
         Note over PC: wait SERVO_360_TRIGGER_DELAY_SECONDS (default 2s)
         PC->>ESP: POST /servo/360
