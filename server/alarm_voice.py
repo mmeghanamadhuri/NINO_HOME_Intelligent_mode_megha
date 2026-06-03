@@ -131,10 +131,37 @@ def is_reminder_command(user_text: str) -> bool:
     return any(p.search(text) for p in _REMINDER_PATTERNS)
 
 
-def handle_alarm_voice(user_text: str) -> AlarmVoiceResult:
+def _resolve_person_name(
+    viewer_name: str | None = None,
+    camera_identity_name: str | None = None,
+    camera_identity_state: str = "no_face",
+) -> str:
+    """Best name from live face recognition, then voice session viewer."""
+    if camera_identity_state == "recognized" and camera_identity_name:
+        name = str(camera_identity_name).strip()
+        if name and name.lower() not in {"unknown", "face"}:
+            return name[:64]
+    if viewer_name:
+        name = str(viewer_name).strip()
+        if name and name.lower() not in {"unknown", "face"}:
+            return name[:64]
+    return ""
+
+
+def handle_alarm_voice(
+    user_text: str,
+    *,
+    viewer_name: str | None = None,
+    camera_identity_name: str | None = None,
+    camera_identity_state: str = "no_face",
+) -> AlarmVoiceResult:
     text = user_text.strip()
     if not text:
         return AlarmVoiceResult(handled=False)
+
+    person_name = _resolve_person_name(
+        viewer_name, camera_identity_name, camera_identity_state
+    )
 
     if is_cancel_alarm_command(text):
         return _handle_cancel_alarms()
@@ -146,19 +173,19 @@ def handle_alarm_voice(user_text: str) -> AlarmVoiceResult:
 
     if is_reminder_command(text):
         regex_set_attempted = True
-        result = _handle_set_reminder(text)
+        result = _handle_set_reminder(text, person_name=person_name)
         if result.handled:
             return result
     elif is_set_alarm_command(text):
         regex_set_attempted = True
-        result = _handle_set_alarm(text)
+        result = _handle_set_alarm(text, person_name=person_name)
         if result.handled:
             return result
 
     from alarm_nlp import looks_alarm_related, nlp_fallback_enabled, try_nlp_alarm
 
     if nlp_fallback_enabled() and (regex_set_attempted or looks_alarm_related(text)):
-        nlp_result = try_nlp_alarm(text)
+        nlp_result = try_nlp_alarm(text, person_name=person_name)
         if nlp_result.handled:
             logger.info("Alarm handled via Ollama NLP fallback | heard: %s", text[:120])
             return nlp_result
@@ -303,16 +330,23 @@ def parse_alarm_datetime(phrase: str) -> AlarmParseResult:
     return AlarmParseResult(fire_at=fire_at, rolled_to_tomorrow=rolled_to_tomorrow)
 
 
+def _ok_prefix(person_name: str) -> str:
+    name = (person_name or "").strip()
+    return f"OK {name}, " if name else "OK, "
+
+
 def _save_alarm(
     fire_at: datetime,
     parsed: AlarmParseResult,
     *,
     label: str = "",
+    person_name: str = "",
 ) -> AlarmVoiceResult:
     service = get_alarm_service()
-    alarm = service.add_alarm(fire_at, label=label)
+    alarm = service.add_alarm(fire_at, label=label, person_name=person_name)
     when = _spoken_alarm_time(alarm)
     label = _clean_reminder_label(label)
+    ok = _ok_prefix(person_name)
 
     if label:
         if parsed.rolled_to_tomorrow:
@@ -320,24 +354,24 @@ def _save_alarm(
                 handled=True,
                 reply=(
                     f"That time already passed today. "
-                    f"OK, I will remind you to {label} at {when} tomorrow."
+                    f"{ok}I will remind you to {label} at {when} tomorrow."
                 ),
             )
         day_note = _day_note_for(fire_at)
         return AlarmVoiceResult(
             handled=True,
-            reply=f"OK, I will remind you to {label} at {when}{day_note}.",
+            reply=f"{ok}I will remind you to {label} at {when}{day_note}.",
         )
 
     if parsed.rolled_to_tomorrow:
         return AlarmVoiceResult(
             handled=True,
-            reply=f"That time already passed today. OK, alarm set for {when} tomorrow.",
+            reply=f"That time already passed today. {ok}alarm set for {when} tomorrow.",
         )
 
     return AlarmVoiceResult(
         handled=True,
-        reply=f"OK, alarm set for {when}{_day_note_for(fire_at)}.",
+        reply=f"{ok}alarm set for {when}{_day_note_for(fire_at)}.",
     )
 
 
@@ -350,7 +384,7 @@ def _day_note_for(fire_at: datetime) -> str:
     return ""
 
 
-def _handle_set_reminder(user_text: str) -> AlarmVoiceResult:
+def _handle_set_reminder(user_text: str, *, person_name: str = "") -> AlarmVoiceResult:
     tail = _extract_reminder_tail(user_text)
     if not tail:
         return AlarmVoiceResult(handled=False)
@@ -365,11 +399,16 @@ def _handle_set_reminder(user_text: str) -> AlarmVoiceResult:
     if parsed.error or parsed.fire_at is None:
         return AlarmVoiceResult(handled=False)
 
-    logger.info("Voice reminder (regex) | label=%r time_phrase=%r", label, time_phrase)
-    return _save_alarm(parsed.fire_at, parsed, label=label)
+    logger.info(
+        "Voice reminder (regex) | person=%r label=%r time_phrase=%r",
+        person_name or "(none)",
+        label,
+        time_phrase,
+    )
+    return _save_alarm(parsed.fire_at, parsed, label=label, person_name=person_name)
 
 
-def _handle_set_alarm(user_text: str) -> AlarmVoiceResult:
+def _handle_set_alarm(user_text: str, *, person_name: str = "") -> AlarmVoiceResult:
     phrase = _extract_time_phrase(user_text)
     if not phrase:
         return AlarmVoiceResult(handled=False)
@@ -378,8 +417,8 @@ def _handle_set_alarm(user_text: str) -> AlarmVoiceResult:
     if parsed.error or parsed.fire_at is None:
         return AlarmVoiceResult(handled=False)
 
-    logger.info("Voice alarm (regex) | time_phrase=%r", phrase)
-    return _save_alarm(parsed.fire_at, parsed)
+    logger.info("Voice alarm (regex) | person=%r time_phrase=%r", person_name or "(none)", phrase)
+    return _save_alarm(parsed.fire_at, parsed, person_name=person_name)
 
 
 def _handle_cancel_alarms() -> AlarmVoiceResult:
@@ -425,10 +464,12 @@ def _describe_alarm(alarm: Alarm) -> str:
     day_word = ""
     if fire.date() == (now + timedelta(days=1)).date():
         day_word = "tomorrow "
+    name = (alarm.person_name or "").strip()
+    name_bit = f"{name}: " if name else ""
     label = (alarm.label or "").strip()
     if label:
-        return f"{day_word}{when}, {label}"
-    return f"{day_word}{when}".strip()
+        return f"{name_bit}{day_word}{when}, {label}"
+    return f"{name_bit}{day_word}{when}".strip()
 
 
 def _spoken_alarm_time(alarm: Alarm) -> str:

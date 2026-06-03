@@ -274,7 +274,12 @@ def process_voice_wav(
 
     from alarm_voice import handle_alarm_voice
 
-    alarm_result = handle_alarm_voice(user_text)
+    alarm_result = handle_alarm_voice(
+        user_text,
+        viewer_name=viewer_name,
+        camera_identity_name=camera_identity_name,
+        camera_identity_state=camera_identity_state,
+    )
     if alarm_result.handled:
         logger.info("Voice alarm command | heard: %s", user_text[:120])
         reply = alarm_result.reply

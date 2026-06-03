@@ -56,7 +56,7 @@ def looks_alarm_related(user_text: str) -> bool:
     return any(p.search(text) for p in _ALARM_HINT_PATTERNS)
 
 
-def try_nlp_alarm(user_text: str) -> AlarmVoiceResult:
+def try_nlp_alarm(user_text: str, *, person_name: str = "") -> AlarmVoiceResult:
     """Call Ollama for structured intent; validate with parse_alarm_datetime before save."""
     if not nlp_fallback_enabled():
         return AlarmVoiceResult(handled=False)
@@ -88,7 +88,7 @@ def try_nlp_alarm(user_text: str) -> AlarmVoiceResult:
         return _handle_list_alarms()
 
     if intent in {"set_alarm", "set_reminder", "reminder", "alarm"}:
-        return _apply_set_intent(payload, user_text)
+        return _apply_set_intent(payload, user_text, person_name=person_name)
 
     return AlarmVoiceResult(handled=False)
 
@@ -140,7 +140,9 @@ def _parse_json_object(raw: str) -> dict[str, Any] | None:
         return None
 
 
-def _apply_set_intent(payload: dict[str, Any], user_text: str) -> AlarmVoiceResult:
+def _apply_set_intent(
+    payload: dict[str, Any], user_text: str, *, person_name: str = ""
+) -> AlarmVoiceResult:
     label = str(payload.get("label", "") or "").strip()
     time_phrase = _payload_to_time_phrase(payload)
     if not time_phrase:
@@ -163,12 +165,13 @@ def _apply_set_intent(payload: dict[str, Any], user_text: str) -> AlarmVoiceResu
         )
 
     logger.info(
-        "Alarm NLP accepted | label=%r time_phrase=%r fire_at=%s",
+        "Alarm NLP accepted | person=%r label=%r time_phrase=%r fire_at=%s",
+        person_name or "(none)",
         label,
         time_phrase,
         parsed.fire_at.isoformat(timespec="seconds"),
     )
-    return _save_alarm(parsed.fire_at, parsed, label=label)
+    return _save_alarm(parsed.fire_at, parsed, label=label, person_name=person_name)
 
 
 def _payload_to_time_phrase(payload: dict[str, Any]) -> str:

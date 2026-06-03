@@ -199,7 +199,7 @@ Whisper text
 - Use clear digits: **“3:50 AM”** works best.
 - Check server log: `Voice reminder | label=…` or `Voice alarm command | heard: …`
 
-**When a labeled reminder fires**, the ESP speaks e.g. *“Alarm. Time to go to school.”* then plays the alarm WAV.
+**When a labeled reminder fires**, the ESP speaks e.g. *“Krishna, it's 8 AM, time for go to school.”* (name from face recognition when the alarm was set). Plain alarms: *“Krishna, alarm. It's 3:20 AM.”* or generic if no face was recognized.
 
 ---
 
@@ -231,3 +231,5 @@ GET    /api/status           # includes "alarms" block
 3. **Numeric time only** — word numbers (*"three fifty"*) not supported.
 4. **AM/PM default** — if Whisper drops AM/PM, small hours default to AM.
 5. **Whisper errors** can still produce wrong times when digits are badly garbled.
+
+NOTE **IMPLEMENT ACK BASED ALARMS**

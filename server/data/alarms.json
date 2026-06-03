@@ -1,100 +1,26 @@
 [
   {
-    "id": "d231651af537",
-    "fire_at": "2026-06-03T08:00:00",
-    "label": "go to school",
-    "created_at": "2026-06-03T04:26:41",
-    "fired": true
-  },
-  {
-    "id": "f61f2d9348a8",
-    "fire_at": "2026-06-03T04:33:00",
-    "label": "go to school",
-    "created_at": "2026-06-03T04:29:52",
-    "fired": true
-  },
-  {
-    "id": "34ebe8065a81",
-    "fire_at": "2026-06-03T04:35:00",
-    "label": "go to school",
-    "created_at": "2026-06-03T04:33:31",
-    "fired": true
-  },
-  {
-    "id": "ccbda14d2084",
-    "fire_at": "2026-06-03T04:40:00",
-    "label": "go to a family dinner",
-    "created_at": "2026-06-03T04:37:33",
-    "fired": true
-  },
-  {
-    "id": "b144fdb25020",
-    "fire_at": "2026-06-03T04:45:00",
-    "label": "go to school (verb phrase)",
-    "created_at": "2026-06-03T04:42:41",
-    "fired": true
-  },
-  {
-    "id": "cad1e4ec8144",
-    "fire_at": "2026-06-03T04:46:00",
-    "label": "go for a coffee",
-    "created_at": "2026-06-03T04:44:14",
-    "fired": true
-  },
-  {
-    "id": "6afd5d978dbb",
-    "fire_at": "2026-06-03T04:50:00",
-    "label": "meet my girlfriend",
-    "created_at": "2026-06-03T04:48:39",
-    "fired": true
-  },
-  {
-    "id": "e2f2a396042c",
-    "fire_at": "2026-06-04T04:00:00",
-    "label": "",
-    "created_at": "2026-06-03T04:54:22",
+    "id": "ab28d210111e",
+    "fire_at": "2026-06-05T03:20:00",
+    "label": "get a coffee",
+    "person_name": "Krishna",
+    "created_at": "2026-06-04T04:08:15",
     "fired": false
   },
   {
-    "id": "2d2f7bfffe8f",
-    "fire_at": "2026-06-03T04:58:00",
+    "id": "46f997ea5639",
+    "fire_at": "2026-06-04T04:20:00",
     "label": "",
-    "created_at": "2026-06-03T04:55:20",
+    "person_name": "Sameera",
+    "created_at": "2026-06-04T04:17:02",
     "fired": true
   },
   {
-    "id": "4de6ef11eca6",
-    "fire_at": "2026-06-03T05:00:00",
+    "id": "6f33e43f414f",
+    "fire_at": "2026-06-05T04:00:00",
     "label": "",
-    "created_at": "2026-06-03T04:58:51",
-    "fired": true
-  },
-  {
-    "id": "2221f6f1f22d",
-    "fire_at": "2026-06-03T05:03:00",
-    "label": "",
-    "created_at": "2026-06-03T04:59:47",
-    "fired": true
-  },
-  {
-    "id": "64b623635280",
-    "fire_at": "2026-06-03T05:09:00",
-    "label": "",
-    "created_at": "2026-06-03T05:06:48",
-    "fired": true
-  },
-  {
-    "id": "64b623635281",
-    "fire_at": "2026-06-03T05:11:00",
-    "label": "",
-    "created_at": "2026-06-03T05:06:48",
-    "fired": true
-  },
-  {
-    "id": "64b623635282",
-    "fire_at": "2026-06-03T05:12:00",
-    "label": "go to a family dinner",
-    "created_at": "2026-06-03T05:06:48",
-    "fired": true
+    "person_name": "Chakri",
+    "created_at": "2026-06-04T04:17:50",
+    "fired": false
   }
 ]

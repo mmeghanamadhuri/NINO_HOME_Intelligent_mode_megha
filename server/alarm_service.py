@@ -31,6 +31,7 @@ class Alarm:
     id: str
     fire_at: str  # ISO 8601 local datetime
     label: str = ""
+    person_name: str = ""  # from face recognition when alarm was set
     created_at: str = field(default_factory=system_now_iso)
     fired: bool = False
 
@@ -48,10 +49,16 @@ class Alarm:
 
     def spoken_fire_message(self) -> str:
         """Spoken alert when the alarm fires on the ESP."""
+        when = self.spoken_time()
+        name = (self.person_name or "").strip()
         if self.label:
             label = self.label.strip()
-            return f"Alarm. Time to {label}."
-        return f"Alarm. It is {self.spoken_time()}."
+            if name:
+                return f"{name}, it's {when}, time for {label}."
+            return f"It's {when}, time for {label}."
+        if name:
+            return f"{name}, alarm. It's {when}."
+        return f"Alarm. It's {when}."
 
 
 class AlarmService:
@@ -103,6 +110,7 @@ class AlarmService:
                         "id": a.id,
                         "fire_at": a.fire_at,
                         "label": a.label,
+                        "person_name": a.person_name,
                         "spoken_time": a.spoken_time(),
                     }
                     for a in sorted(pending, key=lambda x: x.fire_at)
@@ -114,16 +122,29 @@ class AlarmService:
                 "last_error": self._last_error,
             }
 
-    def add_alarm(self, fire_at: datetime, *, label: str = "") -> Alarm:
+    def add_alarm(
+        self,
+        fire_at: datetime,
+        *,
+        label: str = "",
+        person_name: str = "",
+    ) -> Alarm:
         alarm = Alarm(
             id=uuid.uuid4().hex[:12],
             fire_at=fire_at.replace(second=0, microsecond=0).isoformat(timespec="seconds"),
             label=label.strip(),
+            person_name=person_name.strip()[:64],
         )
         with self._lock:
             self._alarms.append(alarm)
             self._save_locked()
-        logger.info("Alarm set id=%s fire_at=%s label=%r", alarm.id, alarm.fire_at, alarm.label)
+        logger.info(
+            "Alarm set id=%s fire_at=%s label=%r person=%r",
+            alarm.id,
+            alarm.fire_at,
+            alarm.label,
+            alarm.person_name or "(none)",
+        )
         return alarm
 
     def list_pending(self) -> list[Alarm]:
@@ -156,7 +177,13 @@ class AlarmService:
         try:
             raw = json.loads(self._data_path.read_text(encoding="utf-8"))
             items = raw if isinstance(raw, list) else raw.get("alarms", [])
-            self._alarms = [Alarm(**item) for item in items]
+            loaded: list[Alarm] = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                item.setdefault("person_name", "")
+                loaded.append(Alarm(**item))
+            self._alarms = loaded
         except Exception as exc:
             logger.warning("Could not load alarms from %s: %s", self._data_path, exc)
             self._alarms = []

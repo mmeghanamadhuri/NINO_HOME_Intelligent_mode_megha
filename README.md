@@ -185,7 +185,7 @@ Example voice commands after wake:
 | “Who am I?” / “What’s my name?” | Ollama answer using live face recognition |
 | “Make a 360” / “Spin 360” | Fixed TTS, then ID2 full rotation |
 | “Set an alarm at 4:30 AM today” | Saves alarm; at fire time POSTs TTS + alarm WAV to ESP |
-| “Remind me to take medicines at 6 AM” | Saves labeled reminder; fires with *“Alarm. Time to take medicines.”* |
+| “Remind me to take medicines at 6 AM” | Saves labeled reminder; fires with *“It's 6 AM, time for take medicines.”* + beep |
 | “Remind me to go to school at 8 AM” | Same — multiple reminders stack in `alarms.json` |
 | “List my alarms” / “Cancel my alarm” | List or clear pending alarms |
 | General questions | Whisper → Ollama → TTS (name used ~18% of the time) |
