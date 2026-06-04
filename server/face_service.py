@@ -17,6 +17,8 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 FACE_SIZE = (200, 200)
+MAX_GLOBAL_MODEL_BYTES = 50 * 1024 * 1024
+CALIBRATION_PREDICT_MAX = 24
 YUNET_FILENAME = "face_detection_yunet_2023mar.onnx"
 YUNET_MODEL_URL = (
     "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/"
@@ -33,7 +35,13 @@ class FaceService:
         self._yunet_model_path = data_dir / "models" / YUNET_FILENAME
         self._lock = threading.Lock()
         self._labels: dict[int, str] = {}
+        self._person_recognizers: dict[int, Any] = {}
+        self._person_thresholds: dict[int, float] = {}
+        self.person_thresholds_path = data_dir / "person_thresholds.json"
+        self.person_lbph_dir = data_dir / "person_lbph"
+        self.person_lbph_meta_path = data_dir / "person_lbph_meta.json"
         self._confirm_tracks: list[dict[str, Any]] = []
+        self._person_models_ready = threading.Event()
         self._recognizer = self._create_recognizer()
         self._yunet: Any | None = None
         self._yunet_enabled = False
@@ -46,31 +54,40 @@ class FaceService:
         self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
         self.faces_dir.mkdir(parents=True, exist_ok=True)
+        self.person_lbph_dir.mkdir(parents=True, exist_ok=True)
         self._load_model()
         self._init_yunet_detector()
+        self._person_models_ready.set()
 
     def apply_settings_from_environ(self) -> None:
         """Reload tunables from environment (also used at startup / CLI)."""
-        self.recognition_threshold = float(os.environ.get("FACE_RECOGNITION_THRESHOLD", "80"))
+        self.recognition_threshold = float(os.environ.get("FACE_RECOGNITION_THRESHOLD", "62"))
         self.soft_recognition_threshold = float(
-            os.environ.get("FACE_SOFT_RECOGNITION_THRESHOLD", "92")
+            os.environ.get("FACE_SOFT_RECOGNITION_THRESHOLD", "76")
         )
-        grace_delta = float(os.environ.get("FACE_UNKNOWN_GRACE_DELTA", "16"))
+        self.recognition_margin_min = float(
+            os.environ.get("FACE_RECOGNITION_MARGIN", "10")
+        )
+        self.excellent_match_max = float(os.environ.get("FACE_EXCELLENT_MATCH_MAX", "44"))
+        grace_delta = float(os.environ.get("FACE_UNKNOWN_GRACE_DELTA", "12"))
         self.unknown_grace_threshold = self.recognition_threshold + grace_delta
-        self.track_hold_seconds = float(os.environ.get("FACE_TRACK_HOLD_SECONDS", "2.0"))
-        self.track_match_iou = float(os.environ.get("FACE_TRACK_MATCH_IOU", "0.20"))
-        self.confirm_frames = max(1, int(os.environ.get("FACE_CONFIRM_FRAMES", "2")))
+        self.track_hold_seconds = float(os.environ.get("FACE_TRACK_HOLD_SECONDS", "2.5"))
+        self.track_match_iou = float(os.environ.get("FACE_TRACK_MATCH_IOU", "0.18"))
+        self.confirm_frames = max(1, int(os.environ.get("FACE_CONFIRM_FRAMES", "3")))
         self.weak_confirm_frames = max(
-            self.confirm_frames, int(os.environ.get("FACE_WEAK_CONFIRM_FRAMES", "3"))
+            self.confirm_frames, int(os.environ.get("FACE_WEAK_CONFIRM_FRAMES", "4"))
         )
-        self.detect_min_neighbors = int(os.environ.get("FACE_DETECT_MIN_NEIGHBORS", "4"))
-        self.detect_fallback_neighbors = int(os.environ.get("FACE_DETECT_FALLBACK_NEIGHBORS", "3"))
-        self.detect_min_size = int(os.environ.get("FACE_DETECT_MIN_SIZE", "32"))
-        self.yunet_score_threshold = float(os.environ.get("FACE_YUNET_SCORE", "0.45"))
-        self.face_pad_ratio = float(os.environ.get("FACE_CROP_PAD_RATIO", "0.24"))
-        self.min_face_area_ratio = float(os.environ.get("FACE_MIN_AREA_RATIO", "0.0025"))
+        self.detect_min_neighbors = int(os.environ.get("FACE_DETECT_MIN_NEIGHBORS", "3"))
+        self.detect_fallback_neighbors = int(os.environ.get("FACE_DETECT_FALLBACK_NEIGHBORS", "2"))
+        self.detect_min_size = int(os.environ.get("FACE_DETECT_MIN_SIZE", "24"))
+        self.yunet_score_threshold = float(os.environ.get("FACE_YUNET_SCORE", "0.38"))
+        self.face_pad_ratio = float(os.environ.get("FACE_CROP_PAD_RATIO", "0.30"))
+        self.min_face_area_ratio = float(os.environ.get("FACE_MIN_AREA_RATIO", "0.0010"))
         self.min_face_aspect = float(os.environ.get("FACE_MIN_ASPECT", "0.68"))
         self.max_face_aspect = float(os.environ.get("FACE_MAX_ASPECT", "1.42"))
+        self.max_samples_per_person = max(
+            8, int(os.environ.get("FACE_MAX_SAMPLES_PER_PERSON", "36"))
+        )
 
     @property
     def recognizer_available(self) -> bool:
@@ -94,6 +111,7 @@ class FaceService:
             "trained_people": len(self._labels),
             "threshold": self.recognition_threshold,
             "soft_threshold": self.soft_recognition_threshold,
+            "margin_min": self.recognition_margin_min,
             "unknown_grace_threshold": self.unknown_grace_threshold,
             "confirm_frames": self.confirm_frames,
             "weak_confirm_frames": self.weak_confirm_frames,
@@ -153,8 +171,8 @@ class FaceService:
         detect_gray = gray
         scale_back = 1.0
         max_side = max(h, w)
-        if max_side > 960:
-            scale_back = 960.0 / max_side
+        if max_side > 1280:
+            scale_back = 1280.0 / max_side
             detect_gray = cv2.resize(
                 gray,
                 (max(32, int(w * scale_back)), max(32, int(h * scale_back))),
@@ -251,7 +269,7 @@ class FaceService:
             if not person_dir.is_dir():
                 continue
 
-            sample_paths = sorted(person_dir.glob("*.jpg"))
+            sample_paths = self._select_sample_paths(person_dir)
             if not sample_paths:
                 continue
 
@@ -261,7 +279,7 @@ class FaceService:
                 if image is None:
                     continue
                 face = cv2.resize(image, FACE_SIZE)
-                for variant in self._augment_training_face(face):
+                for variant in self._augment_training_face(face, lite=False):
                     images.append(self._enhance_gray(variant))
                     label_ids.append(label_id)
 
@@ -280,6 +298,7 @@ class FaceService:
         with self._lock:
             self._recognizer = recognizer
             self._labels = labels
+            self._rebuild_person_recognizers_locked()
 
         return {"people": len(labels), "samples": len(images)}
 
@@ -296,6 +315,7 @@ class FaceService:
         with self._lock:
             recognizer = self._recognizer
             labels = dict(self._labels)
+            person_recs = dict(self._person_recognizers)
 
         for x, y, w, h in faces:
             name = "Face"
@@ -308,17 +328,23 @@ class FaceService:
 
             if recognizer is not None and labels:
                 face = self._normalize_face(frame, (x, y, w, h))
-                label_id, raw_confidence = recognizer.predict(face)
-                confidence = float(raw_confidence)
-                best_name = labels.get(int(label_id), "Unknown")
-                if confidence <= self.recognition_threshold:
-                    strict_name = best_name
-                elif confidence <= self.soft_recognition_threshold:
-                    weak_name = best_name
-
-                name, recognized, used_track, pending = self._apply_confirmation(
-                    (x, y, w, h), strict_name, weak_name, confidence, now
+                strict_name, weak_name, confidence, margin_ok = self._classify_face(
+                    face, labels, person_recs
                 )
+
+                display_name, used_track, pending_track = self._apply_confirmation(
+                    (x, y, w, h), strict_name, weak_name, confidence, now, margin_ok
+                )
+                recognized = strict_name is not None
+                pending = strict_name is None and (
+                    weak_name is not None or pending_track
+                )
+                if recognized:
+                    name = strict_name
+                elif pending and weak_name:
+                    name = weak_name
+                else:
+                    name = display_name
 
             results.append(
                 {
@@ -402,8 +428,9 @@ class FaceService:
         weak_name: str | None,
         confidence: float | None,
         now: float,
-    ) -> tuple[str, bool, bool, bool]:
-        """Returns (display_name, recognized, stabilized, pending)."""
+        margin_ok: bool = True,
+    ) -> tuple[str, bool, bool]:
+        """Returns (display_name, stabilized, pending_track). Green box uses strict match in recognize()."""
         track = self._match_confirm_track(box, now)
         if track is None:
             track = {
@@ -418,6 +445,14 @@ class FaceService:
         else:
             track["box"] = box
             track["seen_at"] = now
+
+        confirmed_name = track.get("confirmed_name")
+        if confirmed_name and strict_name and strict_name != confirmed_name:
+            track["confirmed_name"] = None
+            track["streak"] = 0
+            track["candidate"] = None
+            track["weak_streak"] = False
+            confirmed_name = None
 
         stabilized = False
         pending = False
@@ -442,7 +477,9 @@ class FaceService:
             track["candidate"] = None
             track["weak_streak"] = False
 
-        if int(track.get("streak", 0)) >= confirm_needed:
+        if int(track.get("streak", 0)) >= confirm_needed and (
+            not is_weak or (margin_ok and int(track.get("streak", 0)) >= self.weak_confirm_frames)
+        ):
             track["confirmed_name"] = str(track["candidate"])
         elif track.get("confirmed_name") and confidence is not None:
             if confidence <= self.unknown_grace_threshold:
@@ -453,13 +490,12 @@ class FaceService:
 
         confirmed = track.get("confirmed_name")
         if confirmed:
-            return str(confirmed), True, stabilized, False
+            return str(confirmed), stabilized, False
 
         if active_name and active_name not in {"Unknown", "Face"}:
-            pending = int(track.get("streak", 0)) > 0
-            return active_name, False, False, pending
+            return active_name, False, int(track.get("streak", 0)) > 0
 
-        return "Unknown", False, False, False
+        return "Unknown", False, False
 
     def _iou(
         self, a: tuple[int, int, int, int], b: tuple[int, int, int, int]
@@ -486,13 +522,271 @@ class FaceService:
             return 0.0
         return float(inter) / float(union)
 
+    def _classify_face(
+        self,
+        face: np.ndarray,
+        labels: dict[int, str],
+        person_recs: dict[int, Any] | None = None,
+    ) -> tuple[str | None, str | None, float | None, bool]:
+        """Return (strict_name, weak_name, best_lbph_distance, margin_ok)."""
+        ranked = self._predict_ranked(face, labels, person_recs)
+        if not ranked:
+            if self._recognizer is None:
+                return None, None, None, False
+            label_id, raw_confidence = self._recognizer.predict(face)
+            confidence = float(raw_confidence)
+            best_name = labels.get(int(label_id), "Unknown")
+            if confidence <= self.recognition_threshold:
+                return best_name, None, confidence, True
+            if confidence <= self.soft_recognition_threshold:
+                return None, best_name, confidence, True
+            return None, None, confidence, False
+
+        best_conf, best_id, best_name = ranked[0]
+        second_conf = ranked[1][0] if len(ranked) > 1 else best_conf + self.recognition_margin_min
+        margin = second_conf - best_conf
+        margin_ok = margin >= self.recognition_margin_min
+        excellent = best_conf <= self.excellent_match_max and margin >= max(
+            6.0, self.recognition_margin_min * 0.6
+        )
+        person_cap = self._person_thresholds.get(
+            int(best_id), self.recognition_threshold
+        )
+        accept_cap = max(self.recognition_threshold, person_cap)
+
+        strict_name: str | None = None
+        weak_name: str | None = None
+        if (margin_ok or excellent) and best_conf <= accept_cap:
+            strict_name = best_name
+        elif (margin_ok or excellent) and best_conf <= self.soft_recognition_threshold:
+            weak_name = best_name
+        return strict_name, weak_name, best_conf, margin_ok or excellent
+
+    def _predict_ranked(
+        self,
+        face: np.ndarray,
+        labels: dict[int, str],
+        person_recs: dict[int, Any] | None = None,
+    ) -> list[tuple[float, int, str]]:
+        recs = person_recs if person_recs is not None else self._person_recognizers
+        ranked: list[tuple[float, int, str]] = []
+        for label_id, name in labels.items():
+            rec = recs.get(int(label_id))
+            if rec is None:
+                continue
+            try:
+                _, conf = rec.predict(face)
+            except cv2.error:
+                continue
+            ranked.append((float(conf), int(label_id), name))
+        ranked.sort(key=lambda item: item[0])
+        return ranked
+
+    def _select_sample_paths(self, person_dir: Path) -> list[Path]:
+        """Use the newest N photos so hundreds of old captures do not slow startup."""
+        paths = sorted(person_dir.glob("*.jpg"), key=lambda p: p.stat().st_mtime, reverse=True)
+        return paths[: self.max_samples_per_person]
+
+    def _person_fingerprint(self, person_dir: Path) -> tuple[int, float]:
+        paths = list(person_dir.glob("*.jpg"))
+        if not paths:
+            return (0, 0.0)
+        return (len(paths), max(p.stat().st_mtime for p in paths))
+
+    def _load_person_thresholds_file(self) -> None:
+        if not self.person_thresholds_path.is_file():
+            return
+        raw = json.loads(self.person_thresholds_path.read_text(encoding="utf-8"))
+        self._person_thresholds = {int(k): float(v) for k, v in raw.items()}
+
+    def _collect_person_training_images(
+        self, person_dir: Path, *, lite: bool
+    ) -> list[np.ndarray]:
+        images: list[np.ndarray] = []
+        for sample_path in self._select_sample_paths(person_dir):
+            image = cv2.imread(str(sample_path), cv2.IMREAD_GRAYSCALE)
+            if image is None:
+                continue
+            face = cv2.resize(image, FACE_SIZE)
+            for variant in self._augment_training_face(face, lite=lite):
+                images.append(self._enhance_gray(variant))
+        return images
+
+    def _calibrate_person_cap(self, rec: Any, images: list[np.ndarray]) -> float:
+        if len(images) < 3:
+            return self.recognition_threshold
+        step = max(1, len(images) // CALIBRATION_PREDICT_MAX)
+        dists: list[float] = []
+        for sample in images[::step]:
+            try:
+                _, conf = rec.predict(sample)
+                dists.append(float(conf))
+            except cv2.error:
+                continue
+        if not dists:
+            return self.recognition_threshold
+        cap = float(np.percentile(dists, 88)) + 16.0
+        return max(self.recognition_threshold, min(80.0, cap))
+
+    def _try_load_person_lbph_cache(self) -> str:
+        """Return 'full', 'partial', or 'miss'."""
+        if not self.person_lbph_meta_path.is_file() or self._create_recognizer() is None:
+            return "miss"
+        try:
+            meta = json.loads(self.person_lbph_meta_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return "miss"
+        if meta.get("version") != 1:
+            return "miss"
+        people_meta: dict[str, Any] = meta.get("people", {})
+        if not people_meta:
+            return "miss"
+
+        loaded: dict[int, Any] = {}
+        need_ids: list[int] = []
+        for label_id, display_name in self._labels.items():
+            person_id = self._person_id(display_name)
+            if not person_id:
+                continue
+            person_dir = self.faces_dir / person_id
+            if not person_dir.is_dir():
+                need_ids.append(int(label_id))
+                continue
+            fp = self._person_fingerprint(person_dir)
+            entry = people_meta.get(person_id)
+            model_file = self.person_lbph_dir / f"{int(label_id)}.yml"
+            if not entry or entry.get("fingerprint") != list(fp) or not model_file.is_file():
+                need_ids.append(int(label_id))
+                continue
+            rec = self._create_recognizer()
+            if rec is None:
+                return "miss"
+            rec.read(str(model_file))
+            loaded[int(label_id)] = rec
+
+        if not loaded:
+            return "miss"
+
+        self._person_recognizers = loaded
+        if need_ids:
+            logger.info(
+                "Loaded per-person LBPH cache (%d); rebuild needed for %d",
+                len(loaded),
+                len(need_ids),
+            )
+            return "partial"
+
+        logger.info("Loaded per-person LBPH cache (%d people)", len(loaded))
+        return "full"
+
+    def _save_person_lbph_cache(self, meta_people: dict[str, Any]) -> None:
+        self.person_lbph_meta_path.write_text(
+            json.dumps({"version": 1, "people": meta_people}, indent=2),
+            encoding="utf-8",
+        )
+
+    def _rebuild_person_recognizers_locked(self, *, only_missing: bool = False) -> None:
+        """Per-person LBPH + calibrated distance caps (capped samples, lite aug)."""
+        if not only_missing:
+            self._person_recognizers = {}
+        if self._create_recognizer() is None:
+            return
+
+        thresholds_out: dict[str, float] = {}
+        if self.person_thresholds_path.is_file():
+            try:
+                raw = json.loads(self.person_thresholds_path.read_text(encoding="utf-8"))
+                thresholds_out = {k: float(v) for k, v in raw.items()}
+            except json.JSONDecodeError:
+                pass
+        meta_people: dict[str, Any] = {}
+        if self.person_lbph_meta_path.is_file():
+            try:
+                existing = json.loads(self.person_lbph_meta_path.read_text(encoding="utf-8"))
+                meta_people = dict(existing.get("people", {}))
+            except json.JSONDecodeError:
+                pass
+        t0 = time.time()
+
+        for label_id, display_name in self._labels.items():
+            lid = int(label_id)
+            if only_missing and lid in self._person_recognizers:
+                continue
+            person_id = self._person_id(display_name)
+            if not person_id:
+                continue
+            person_dir = self.faces_dir / person_id
+            if not person_dir.is_dir():
+                continue
+
+            images = self._collect_person_training_images(person_dir, lite=True)
+            if len(images) < 3:
+                continue
+
+            rec = self._create_recognizer()
+            if rec is None:
+                continue
+            rec.train(images, np.zeros(len(images), dtype=np.int32))
+            self._person_recognizers[lid] = rec
+
+            cap = self._calibrate_person_cap(rec, images)
+            self._person_thresholds[lid] = cap
+            thresholds_out[str(lid)] = round(cap, 1)
+
+            model_file = self.person_lbph_dir / f"{lid}.yml"
+            rec.write(str(model_file))
+            meta_people[person_id] = {
+                "label_id": lid,
+                "fingerprint": list(self._person_fingerprint(person_dir)),
+            }
+            logger.info(
+                "Built LBPH for %s (%d aug samples, cap %.1f)",
+                display_name,
+                len(images),
+                cap,
+            )
+
+        if thresholds_out:
+            self.person_thresholds_path.write_text(
+                json.dumps(thresholds_out, indent=2), encoding="utf-8"
+            )
+        if meta_people:
+            self._save_person_lbph_cache(meta_people)
+        logger.info("Per-person models ready in %.1fs", time.time() - t0)
+
     def _load_model(self) -> None:
-        if self._recognizer is None or not self.model_path.exists() or not self.labels_path.exists():
+        if self._recognizer is None or not self.labels_path.exists():
             return
 
         labels_raw = json.loads(self.labels_path.read_text(encoding="utf-8"))
         self._labels = {int(key): value for key, value in labels_raw.items()}
-        self._recognizer.read(str(self.model_path))
+        self._load_person_thresholds_file()
+
+        cache_state = self._try_load_person_lbph_cache()
+        if cache_state == "full":
+            model_bytes = self.model_path.stat().st_size if self.model_path.exists() else 0
+            if model_bytes > MAX_GLOBAL_MODEL_BYTES:
+                logger.warning(
+                    "face_model.yml is %d MB — skipped. Click Retrain to rebuild a small file.",
+                    model_bytes // (1024 * 1024),
+                )
+            elif self.model_path.is_file():
+                self._recognizer.read(str(self.model_path))
+            return
+
+        model_bytes = self.model_path.stat().st_size if self.model_path.is_file() else 0
+        if self.model_path.is_file():
+            if model_bytes > MAX_GLOBAL_MODEL_BYTES:
+                logger.warning(
+                    "face_model.yml is %d MB — skipped loading; click Retrain to rebuild.",
+                    model_bytes // (1024 * 1024),
+                )
+            else:
+                self._recognizer.read(str(self.model_path))
+
+        self._rebuild_person_recognizers_locked(only_missing=(cache_state == "partial"))
+        if not self._person_thresholds:
+            self._load_person_thresholds_file()
 
     def _init_yunet_detector(self) -> None:
         if not hasattr(cv2, "FaceDetectorYN"):
@@ -558,8 +852,9 @@ class FaceService:
         face = cv2.bilateralFilter(face, d=5, sigmaColor=28, sigmaSpace=28)
 
         min_side = min(face.shape[:2])
-        if min_side < 72:
-            scale = 72.0 / max(1, min_side)
+        target_min = 96 if min_side < 56 else 80
+        if min_side < target_min:
+            scale = float(target_min) / max(1, min_side)
             face = cv2.resize(
                 face,
                 (max(1, int(face.shape[1] * scale)), max(1, int(face.shape[0] * scale))),
@@ -569,7 +864,7 @@ class FaceService:
         return cv2.resize(face, FACE_SIZE, interpolation=cv2.INTER_CUBIC)
 
     @staticmethod
-    def _augment_training_face(face: np.ndarray) -> list[np.ndarray]:
+    def _augment_training_face(face: np.ndarray, *, lite: bool = False) -> list[np.ndarray]:
         """Synthetic views for distance, blur, and lighting (ESP MJPEG stream)."""
         base = cv2.resize(face, FACE_SIZE)
         variants: list[np.ndarray] = []
@@ -577,7 +872,8 @@ class FaceService:
         def add(img: np.ndarray) -> None:
             variants.append(img)
 
-        for scale in (0.75, 0.86, 1.0, 1.10):
+        scales = (0.65, 0.85, 1.0) if lite else (0.52, 0.65, 0.75, 0.86, 1.0, 1.08)
+        for scale in scales:
             if abs(scale - 1.0) < 1e-3:
                 add(base)
                 continue
@@ -599,11 +895,24 @@ class FaceService:
             add(scaled)
 
         out: list[np.ndarray] = []
+        rot_angles = () if lite else (-8.0, -4.0, 4.0, 8.0)
         for v in variants:
             out.append(v)
             out.append(cv2.GaussianBlur(v, (0, 0), 0.85))
+            if lite:
+                out.append(cv2.convertScaleAbs(v, alpha=1.06, beta=8))
+                continue
             out.append(cv2.convertScaleAbs(v, alpha=1.10, beta=10))
             out.append(cv2.convertScaleAbs(v, alpha=0.90, beta=-10))
+            h, w = v.shape[:2]
+            center = (w // 2, h // 2)
+            for angle in rot_angles:
+                rot = cv2.getRotationMatrix2D(center, angle, 1.0)
+                out.append(
+                    cv2.warpAffine(
+                        v, rot, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
+                    )
+                )
         return out
 
     def _create_recognizer(self) -> Any | None:

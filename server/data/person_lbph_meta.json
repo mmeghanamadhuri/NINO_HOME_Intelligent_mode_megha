@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "people": {
+    "dimple": {
+      "label_id": 1,
+      "fingerprint": [
+        15,
+        1778163284.0
+      ]
+    },
+    "sameera": {
+      "label_id": 2,
+      "fingerprint": [
+        15,
+        1778163308.0
+      ]
+    },
+    "teja": {
+      "label_id": 3,
+      "fingerprint": [
+        15,
+        1778163374.0
+      ]
+    },
+    "uday": {
+      "label_id": 4,
+      "fingerprint": [
+        65,
+        1778236924.0
+      ]
+    },
+    "chakri": {
+      "label_id": 0,
+      "fingerprint": [
+        25,
+        1780597276.239618
+      ]
+    }
+  }
+}

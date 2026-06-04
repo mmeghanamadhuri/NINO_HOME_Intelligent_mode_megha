@@ -9,23 +9,35 @@ import urllib.request
 
 logger = logging.getLogger(__name__)
 
+# ESP32 main.c MAX_PLAY_WAV_BYTES — keep a little under for safety
+ESP_MAX_PLAY_WAV_BYTES = int(os.environ.get("ESP_MAX_PLAY_WAV_BYTES", str(380 * 1024)))
+
 
 def esp_play_wav_url() -> str | None:
     url = os.environ.get("ESP_PLAY_WAV_URL", "").strip()
     return url if url else None
 
 
-def post_wav_to_esp(wav: bytes, *, timeout: float = 60.0) -> None:
+def post_wav_to_esp(wav: bytes, *, timeout: float = 60.0, prompt_ack: bool = False) -> None:
     """Queue raw WAV bytes on the board speaker via POST /play_wav."""
     url = esp_play_wav_url()
     if not url:
         raise RuntimeError("ESP_PLAY_WAV_URL is not set")
+    if not wav:
+        raise RuntimeError("WAV payload is empty")
+    if len(wav) > ESP_MAX_PLAY_WAV_BYTES:
+        raise RuntimeError(
+            f"WAV too large for ESP ({len(wav)} bytes; max {ESP_MAX_PLAY_WAV_BYTES})"
+        )
 
+    headers = {"Content-Type": "audio/wav"}
+    if prompt_ack:
+        headers["X-Nino-Prompt-Ack"] = "1"
     req = urllib.request.Request(
         url,
         data=wav,
         method="POST",
-        headers={"Content-Type": "audio/wav"},
+        headers=headers,
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:

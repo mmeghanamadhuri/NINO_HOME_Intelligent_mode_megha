@@ -7,6 +7,8 @@ const retrain = document.querySelector("#retrain");
 const statusBox = document.querySelector("#statusBox");
 const connectionStatus = document.querySelector("#connectionStatus");
 const stream = document.querySelector("#stream");
+const alarmList = document.querySelector("#alarmList");
+const clearAllAlarms = document.querySelector("#clearAllAlarms");
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -25,6 +27,85 @@ function refreshStream() {
   stream.src = `/video_feed?t=${Date.now()}`;
 }
 
+function renderAlarms(pending, awaiting) {
+  alarmList.innerHTML = "";
+  const rows = [
+    ...awaiting.map((a) => ({ ...a, _awaiting: true })),
+    ...pending,
+  ];
+  for (const alarm of rows) {
+    const li = document.createElement("li");
+    li.className = "alarm-item";
+
+    const text = document.createElement("div");
+    const p0 = alarm.priority === 0 || alarm.category === "medical";
+    const title = alarm._awaiting
+      ? `${alarm.label || "Medication"} — awaiting confirmation`
+      : alarm.label || (p0 ? "Medical reminder" : "Alarm");
+    const badge = p0 ? "P0 · " : "";
+    const who = alarm.person_name ? ` · ${alarm.person_name}` : "";
+    const repeat = alarm.next_repeat_at ? ` · repeats ${alarm.next_repeat_at}` : "";
+    text.innerHTML = `<strong>${badge}${title}</strong><span>${alarm.spoken_time || alarm.fire_at}${who}${repeat}</span>`;
+
+    if (alarm._awaiting) {
+      const yes = document.createElement("button");
+      yes.type = "button";
+      yes.textContent = "Yes";
+      yes.className = "ack-yes";
+      yes.addEventListener("click", async () => {
+        yes.disabled = true;
+        try {
+          await api(`/api/alarms/${alarm.id}/ack`, {
+            method: "POST",
+            body: JSON.stringify({ response: "yes" }),
+          });
+          await refreshStatus();
+        } catch (error) {
+          alert(error.message);
+        }
+      });
+
+      const no = document.createElement("button");
+      no.type = "button";
+      no.textContent = "No";
+      no.className = "ack-no";
+      no.addEventListener("click", async () => {
+        no.disabled = true;
+        try {
+          const res = await api(`/api/alarms/${alarm.id}/ack`, {
+            method: "POST",
+            body: JSON.stringify({ response: "no" }),
+          });
+          if (res.message) alert(res.message);
+          await refreshStatus();
+        } catch (error) {
+          alert(error.message);
+        }
+      });
+
+      li.append(yes, no);
+    }
+
+    const del = document.createElement("button");
+    del.type = "button";
+    del.textContent = "Delete";
+    del.addEventListener("click", async () => {
+      del.disabled = true;
+      try {
+        await api(`/api/alarms/${alarm.id}`, { method: "DELETE" });
+        await refreshStatus();
+      } catch (error) {
+        alert(error.message);
+      } finally {
+        del.disabled = false;
+      }
+    });
+
+    li.append(text, del);
+    alarmList.append(li);
+  }
+}
+
 async function refreshStatus() {
   try {
     const data = await api("/api/status");
@@ -32,10 +113,12 @@ async function refreshStatus() {
     connectionStatus.textContent = connected ? "Camera connected" : "Waiting for camera";
     connectionStatus.classList.toggle("connected", connected);
     statusBox.textContent = JSON.stringify(data, null, 2);
+    renderAlarms(data.alarms?.pending || [], data.alarms?.awaiting_ack || []);
   } catch (error) {
     connectionStatus.textContent = "Server error";
     connectionStatus.classList.remove("connected");
     statusBox.textContent = error.message;
+    renderAlarms([], []);
   }
 }
 
@@ -73,6 +156,21 @@ registerPerson.addEventListener("click", async () => {
   } finally {
     registerPerson.disabled = false;
     registerPerson.textContent = "Capture Samples and Train";
+  }
+});
+
+clearAllAlarms.addEventListener("click", async () => {
+  if (!confirm("Delete all pending alarms?")) {
+    return;
+  }
+  clearAllAlarms.disabled = true;
+  try {
+    await api("/api/alarms", { method: "DELETE" });
+    await refreshStatus();
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    clearAllAlarms.disabled = false;
   }
 });
 

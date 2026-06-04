@@ -172,6 +172,57 @@ code {
   padding: 2px 5px;
 }
 
+.alarm-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.alarm-list:empty::before {
+  content: "No pending alarms.";
+  color: #aebbd0;
+  font-size: 0.88rem;
+}
+
+.alarm-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border-radius: 9px;
+  background: #050b13;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.alarm-item strong {
+  display: block;
+  font-size: 0.9rem;
+}
+
+.alarm-item span {
+  color: #aebbd0;
+  font-size: 0.82rem;
+}
+
+.alarm-item button {
+  width: auto;
+  margin: 0;
+  padding: 6px 10px;
+  font-size: 0.8rem;
+  background: #8b2f3a;
+}
+
+.alarm-item button.ack-yes {
+  background: #1f7a4a;
+}
+
+.alarm-item button.ack-no {
+  background: #9a6b1a;
+}
+
 pre {
   overflow: auto;
   max-height: min(33vh, 300px);

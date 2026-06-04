@@ -108,6 +108,7 @@ def _extract_via_ollama(user_text: str) -> dict[str, Any] | None:
         "Rules:\n"
         "- set_reminder: user wants a labeled reminder (label = verb phrase, e.g. take medicines, go to school)\n"
         "- set_alarm: only a clock time, no task\n"
+        "- set_reminder with medicine/medication/pills in label = priority medical (requires yes/no ack)\n"
         "- cancel / list: user wants to clear or hear pending alarms\n"
         "- time: digits only like 6:00 or 8:30; use ampm when user said AM/PM/morning/evening\n"
         "- morning -> AM, evening/night -> PM unless clearly otherwise\n"
@@ -171,7 +172,13 @@ def _apply_set_intent(
         time_phrase,
         parsed.fire_at.isoformat(timespec="seconds"),
     )
-    return _save_alarm(parsed.fire_at, parsed, label=label, person_name=person_name)
+    return _save_alarm(
+        parsed.fire_at,
+        parsed,
+        label=label,
+        person_name=person_name,
+        source_text=user_text,
+    )
 
 
 def _payload_to_time_phrase(payload: dict[str, Any]) -> str:

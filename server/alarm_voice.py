@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+from alarm_medical import is_medical_set_command
 from alarm_service import Alarm, get_alarm_service
 from alarm_time import system_now
 
@@ -22,13 +23,22 @@ _SET_ALARM_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     )
 )
 
-_CANCEL_ALARM_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+_DELETE_ONE_ALARM_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p, re.IGNORECASE)
     for p in (
-        r"\bcancel\s+(?:my\s+)?alarms?\b",
-        r"\bdelete\s+(?:my\s+)?alarms?\b",
-        r"\bturn\s+off\s+(?:my\s+)?alarms?\b",
-        r"\bstop\s+(?:my\s+)?alarms?\b",
+        r"\b(?:cancel|delete|remove)\s+(?:my\s+)?(?:the\s+)?(?:alarm|reminder)\s+(?:at|for)\s+(.+)",
+        r"\b(?:cancel|delete|remove)\s+(?:my\s+)?(.+?)\s+(?:alarm|reminder)\b",
+        r"\b(?:cancel|delete|remove)\s+(?:the\s+)?(?:alarm|reminder)\s+(?:called|named)\s+(.+)",
+    )
+)
+
+_CANCEL_ALL_ALARM_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\b(?:cancel|delete|remove|turn\s+off|stop)\s+(?:all\s+)?(?:my\s+)?alarms?\s*$",
+        r"\b(?:cancel|delete|remove|turn\s+off|stop)\s+(?:all\s+)?(?:my\s+)?reminders?\s*$",
+        r"\b(?:cancel|delete|remove)\s+(?:all\s+)?(?:my\s+)?(?:alarms?|reminders?)\b",
+        r"\bclear\s+(?:all\s+)?(?:my\s+)?(?:alarms?|reminders?)\b",
     )
 )
 
@@ -99,11 +109,20 @@ def is_set_alarm_command(user_text: str) -> bool:
     return any(p.search(text) for p in _SET_ALARM_PATTERNS)
 
 
-def is_cancel_alarm_command(user_text: str) -> bool:
+def is_delete_one_alarm_command(user_text: str) -> bool:
     text = user_text.strip()
     if not text:
         return False
-    return any(p.search(text) for p in _CANCEL_ALARM_PATTERNS)
+    return any(p.search(text) for p in _DELETE_ONE_ALARM_PATTERNS)
+
+
+def is_cancel_all_alarm_command(user_text: str) -> bool:
+    text = user_text.strip()
+    if not text:
+        return False
+    if is_delete_one_alarm_command(text):
+        return False
+    return any(p.search(text) for p in _CANCEL_ALL_ALARM_PATTERNS)
 
 
 def is_list_alarm_command(user_text: str) -> bool:
@@ -163,7 +182,17 @@ def handle_alarm_voice(
         viewer_name, camera_identity_name, camera_identity_state
     )
 
-    if is_cancel_alarm_command(text):
+    from alarm_ack import handle_alarm_ack_voice
+
+    ack_result = handle_alarm_ack_voice(text)
+    if ack_result.handled:
+        return ack_result
+
+    if is_delete_one_alarm_command(text):
+        result = _handle_delete_one_alarm(text)
+        if result.handled:
+            return result
+    if is_cancel_all_alarm_command(text):
         return _handle_cancel_alarms()
     if is_list_alarm_command(text):
         logger.info("Voice list alarms (regex) | heard: %s", text[:120])
@@ -171,6 +200,11 @@ def handle_alarm_voice(
 
     regex_set_attempted = False
 
+    if is_medical_set_command(text):
+        regex_set_attempted = True
+        result = _handle_set_medical_alarm(text, person_name=person_name)
+        if result.handled:
+            return result
     if is_reminder_command(text):
         regex_set_attempted = True
         result = _handle_set_reminder(text, person_name=person_name)
@@ -341,12 +375,22 @@ def _save_alarm(
     *,
     label: str = "",
     person_name: str = "",
+    source_text: str = "",
+    force_medical: bool = False,
 ) -> AlarmVoiceResult:
     service = get_alarm_service()
-    alarm = service.add_alarm(fire_at, label=label, person_name=person_name)
-    when = _spoken_alarm_time(alarm)
     label = _clean_reminder_label(label)
+    alarm = service.add_alarm(
+        fire_at,
+        label=label,
+        person_name=person_name,
+        source_text=source_text or label,
+        force_medical=force_medical,
+    )
+    when = _spoken_alarm_time(alarm)
     ok = _ok_prefix(person_name)
+    medical = alarm.is_medical()
+    priority_note = " Priority medical reminder." if medical else ""
 
     if label:
         if parsed.rolled_to_tomorrow:
@@ -354,13 +398,13 @@ def _save_alarm(
                 handled=True,
                 reply=(
                     f"That time already passed today. "
-                    f"{ok}I will remind you to {label} at {when} tomorrow."
+                    f"{ok}I will remind you to {label} at {when} tomorrow.{priority_note}"
                 ),
             )
         day_note = _day_note_for(fire_at)
         return AlarmVoiceResult(
             handled=True,
-            reply=f"{ok}I will remind you to {label} at {when}{day_note}.",
+            reply=f"{ok}I will remind you to {label} at {when}{day_note}.{priority_note}",
         )
 
     if parsed.rolled_to_tomorrow:
@@ -405,7 +449,43 @@ def _handle_set_reminder(user_text: str, *, person_name: str = "") -> AlarmVoice
         label,
         time_phrase,
     )
-    return _save_alarm(parsed.fire_at, parsed, label=label, person_name=person_name)
+    return _save_alarm(
+        parsed.fire_at,
+        parsed,
+        label=label,
+        person_name=person_name,
+        source_text=user_text,
+    )
+
+
+def _handle_set_medical_alarm(user_text: str, *, person_name: str = "") -> AlarmVoiceResult:
+    from alarm_medical import _MEDICAL_SET_PATTERNS
+
+    phrase = ""
+    for pattern in _MEDICAL_SET_PATTERNS:
+        match = pattern.search(user_text)
+        if match:
+            phrase = (match.group(1) or "").strip()
+            break
+    if not phrase:
+        phrase = _extract_time_phrase(user_text) or ""
+    if not phrase:
+        return AlarmVoiceResult(handled=False)
+
+    parsed = parse_alarm_datetime(phrase)
+    if parsed.error or parsed.fire_at is None:
+        return AlarmVoiceResult(handled=False)
+
+    label = "take medication"
+    logger.info("Voice medical alarm | person=%r phrase=%r", person_name or "(none)", phrase)
+    return _save_alarm(
+        parsed.fire_at,
+        parsed,
+        label=label,
+        person_name=person_name,
+        source_text=user_text,
+        force_medical=True,
+    )
 
 
 def _handle_set_alarm(user_text: str, *, person_name: str = "") -> AlarmVoiceResult:
@@ -418,7 +498,52 @@ def _handle_set_alarm(user_text: str, *, person_name: str = "") -> AlarmVoiceRes
         return AlarmVoiceResult(handled=False)
 
     logger.info("Voice alarm (regex) | person=%r time_phrase=%r", person_name or "(none)", phrase)
-    return _save_alarm(parsed.fire_at, parsed, person_name=person_name)
+    return _save_alarm(parsed.fire_at, parsed, person_name=person_name, source_text=user_text)
+
+
+def _extract_delete_target(user_text: str) -> str | None:
+    text = user_text.strip()
+    for pattern in _DELETE_ONE_ALARM_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            target = (match.group(1) or "").strip()
+            if target:
+                return target
+    return None
+
+
+def _handle_delete_one_alarm(user_text: str) -> AlarmVoiceResult:
+    target = _extract_delete_target(user_text)
+    if not target:
+        return AlarmVoiceResult(handled=False)
+
+    parsed = parse_alarm_datetime(target)
+    fire_at = parsed.fire_at if parsed.error is None else None
+    label_hint = target if fire_at is None else ""
+
+    removed = get_alarm_service().remove_pending_matching(
+        fire_at=fire_at,
+        label_hint=label_hint,
+    )
+    if removed is None:
+        if fire_at is not None:
+            return AlarmVoiceResult(
+                handled=True,
+                reply="I could not find a pending alarm at that time.",
+            )
+        return AlarmVoiceResult(
+            handled=True,
+            reply="I could not find a pending alarm matching that.",
+        )
+
+    when = _spoken_alarm_time(removed)
+    label = (removed.label or "").strip()
+    if label:
+        return AlarmVoiceResult(
+            handled=True,
+            reply=f"OK, I deleted your {label} reminder for {when}.",
+        )
+    return AlarmVoiceResult(handled=True, reply=f"OK, I deleted your alarm for {when}.")
 
 
 def _handle_cancel_alarms() -> AlarmVoiceResult:
@@ -427,14 +552,28 @@ def _handle_cancel_alarms() -> AlarmVoiceResult:
     if count == 0:
         return AlarmVoiceResult(handled=True, reply="You have no alarms set.")
     if count == 1:
-        return AlarmVoiceResult(handled=True, reply="OK, I cancelled your alarm.")
-    return AlarmVoiceResult(handled=True, reply=f"OK, I cancelled {count} alarms.")
+        return AlarmVoiceResult(handled=True, reply="OK, I deleted your alarm.")
+    return AlarmVoiceResult(handled=True, reply=f"OK, I deleted {count} alarms.")
 
 
 def _handle_list_alarms() -> AlarmVoiceResult:
-    pending = sorted(get_alarm_service().list_pending(), key=lambda a: a.fire_at)
-    logger.info("Voice list alarms | pending=%d", len(pending))
-    if not pending:
+    service = get_alarm_service()
+    pending = sorted(service.list_pending(), key=lambda a: (a.priority, a.fire_at))
+    awaiting = service.list_awaiting_ack()
+    logger.info(
+        "Voice list alarms | pending=%d awaiting_ack=%d",
+        len(pending),
+        len(awaiting),
+    )
+    if awaiting and not pending:
+        return AlarmVoiceResult(
+            handled=True,
+            reply=(
+                f"You have {len(awaiting)} medication reminder(s) waiting for confirmation. "
+                "Please say yes when you have taken it, or no if not."
+            ),
+        )
+    if not pending and not awaiting:
         return AlarmVoiceResult(handled=True, reply="You have no alarms or reminders set.")
 
     if len(pending) == 1:
@@ -459,6 +598,9 @@ def _handle_list_alarms() -> AlarmVoiceResult:
 
 def _describe_alarm(alarm: Alarm) -> str:
     when = _spoken_alarm_time(alarm)
+    kind = "priority medication reminder" if alarm.is_medical() else (
+        "reminder" if alarm.label else "alarm"
+    )
     now = system_now()
     fire = alarm.fire_datetime()
     day_word = ""
@@ -468,8 +610,8 @@ def _describe_alarm(alarm: Alarm) -> str:
     name_bit = f"{name}: " if name else ""
     label = (alarm.label or "").strip()
     if label:
-        return f"{name_bit}{day_word}{when}, {label}"
-    return f"{name_bit}{day_word}{when}".strip()
+        return f"{name_bit}{kind} {day_word}at {when}, {label}"
+    return f"{name_bit}{kind} {day_word}at {when}".strip()
 
 
 def _spoken_alarm_time(alarm: Alarm) -> str:

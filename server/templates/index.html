@@ -55,6 +55,21 @@
           </div>
 
           <div class="card">
+            <h2>Alarms &amp; Reminders</h2>
+            <ul id="alarmList" class="alarm-list"></ul>
+            <button class="secondary" id="clearAllAlarms" type="button">
+              Delete all pending
+            </button>
+            <p class="hint">
+              <strong>Board ack (recommended):</strong> on ESP serial once:
+              <code>voice connect &lt;PC_IP&gt; 8000</code> then <code>voice wake on</code>.
+              After a medical alarm plays, the board listens for <strong>5 seconds</strong> — say
+              <strong>yes</strong> or <strong>no</strong> (no &ldquo;Hi ESP&rdquo; needed).
+              Or use <strong>Yes</strong> / <strong>No</strong> here. Flash firmware after updates.
+            </p>
+          </div>
+
+          <div class="card">
             <h2>Recognition Status</h2>
             <pre id="statusBox">Loading...</pre>
           </div>

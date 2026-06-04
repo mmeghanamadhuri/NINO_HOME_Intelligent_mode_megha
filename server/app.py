@@ -79,6 +79,10 @@ class RegisterRequest(BaseModel):
     interval_ms: int = Field(150, ge=50, le=2000)
 
 
+class AlarmAckRequest(BaseModel):
+    response: str = Field(..., min_length=1, max_length=32)
+
+
 @app.on_event("startup")
 def startup() -> None:
     faces.apply_settings_from_environ()
@@ -93,12 +97,13 @@ def startup() -> None:
         logger.warning("Face samples on disk but model not trained — click Retrain on the web UI")
     else:
         logger.info(
-            "Face recognition ready: %d trained, threshold %.0f (soft %.0f), confirm %d frames, "
-            "detector=%s — click Retrain if recognition at 1 m is still weak",
+            "Face recognition ready: %d trained, threshold %.0f (soft %.0f), margin %.0f, "
+            "confirm %d frames, detector=%s — Retrain after changes; add 20+ Chakri samples",
             stats["trained_people"],
             stats["threshold"],
             stats.get("soft_threshold", stats["threshold"]),
-            stats.get("confirm_frames", 2),
+            stats.get("margin_min", 14),
+            stats.get("confirm_frames", 5),
             stats.get("detector", "haar"),
         )
 
@@ -159,8 +164,34 @@ def cancel_all_alarms() -> dict:
 @app.delete("/api/alarms/{alarm_id}")
 def cancel_alarm(alarm_id: str) -> dict:
     if not get_alarm_service().cancel_alarm(alarm_id):
-        raise HTTPException(status_code=404, detail="Alarm not found or already fired")
+        raise HTTPException(status_code=404, detail="Alarm not found")
     return {"ok": True, "id": alarm_id}
+
+
+@app.post("/api/alarms/{alarm_id}/ack")
+def ack_alarm(alarm_id: str, req: AlarmAckRequest) -> dict:
+    """Confirm or decline a medical alarm awaiting ack (same as voice yes/no)."""
+    from alarm_medical import is_negative_ack, is_positive_ack
+
+    service = get_alarm_service()
+    text = req.response.strip()
+    if is_positive_ack(text):
+        if not service.confirm_ack(alarm_id):
+            raise HTTPException(status_code=404, detail="No medical alarm awaiting confirmation")
+        return {"ok": True, "id": alarm_id, "action": "confirmed"}
+    if is_negative_ack(text):
+        if not service.decline_ack(alarm_id):
+            raise HTTPException(status_code=404, detail="No medical alarm awaiting confirmation")
+        return {
+            "ok": True,
+            "id": alarm_id,
+            "action": "declined",
+            "message": "Reschedule or cancel? Use voice or set a new time on the server.",
+        }
+    raise HTTPException(
+        status_code=400,
+        detail="Use response yes or no (or I took it / not yet)",
+    )
 
 
 @app.post("/api/register")
@@ -517,14 +548,21 @@ def main() -> None:
         type=float,
         default=None,
         metavar="LBPH",
-        help="Max LBPH distance to accept a match (lower=stricter). Default 80 via FACE_RECOGNITION_THRESHOLD.",
+        help="Max LBPH distance for strict green (lower=stricter). Default 62; per-person cap after Retrain.",
+    )
+    parser.add_argument(
+        "--face-margin",
+        type=float,
+        default=None,
+        metavar="LBPH",
+        help="Min LBPH gap vs 2nd person (default 10). Lower = stricter anti mix-up.",
     )
     parser.add_argument(
         "--face-confirm-frames",
         type=int,
         default=None,
         metavar="N",
-        help="Consecutive matching frames before green/recognized (default 2).",
+        help="Frames to stabilize name for voice (UI green is immediate on strict match). Default 3.",
     )
     parser.add_argument(
         "--alarm-wav",
@@ -549,6 +587,8 @@ def main() -> None:
 
     if args.face_threshold is not None:
         os.environ["FACE_RECOGNITION_THRESHOLD"] = str(args.face_threshold)
+    if args.face_margin is not None:
+        os.environ["FACE_RECOGNITION_MARGIN"] = str(args.face_margin)
     if args.face_confirm_frames is not None:
         os.environ["FACE_CONFIRM_FRAMES"] = str(max(1, args.face_confirm_frames))
 
