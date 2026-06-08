@@ -1,6 +1,6 @@
-# NiNO Home — Voice, Vision, Touch & Servo  (ESP32-P4)
+# NiNO Home — Voice, Vision, Touch, Alarms & Servo  (ESP32-P4)
 
-NiNO is a smart-home demo for the ESP32-P4 Function EV Board that uses vision, voice, touch, and servo motion together.
+NiNO is a smart-home demo for the ESP32-P4 Function EV Board that uses vision, voice, alarms, touch, and servo motion together.
 
 - **Vision**: USB UVC camera on the board, face detection/recognition on the PC, personalized greetings played through the ESP speaker.
 - **Voice**: Wake-word capture on the board, Whisper speech recognition and Ollama LLM responses on the PC, audio returned to the board. Supports identity questions and servo voice commands.
@@ -10,13 +10,16 @@ NiNO is a smart-home demo for the ESP32-P4 Function EV Board that uses vision, v
 
 ## Features
 
-- ESP32-P4 firmware with UVC camera support, HTTP streaming, WAV playback, voice wake capture, touch handling, and Dynamixel servo control.
-- Python FastAPI server for face UI, Whisper STT, Ollama LLM prompts, and TTS delivery to the board.
+- ESP32-P4 firmware with UVC camera support, HTTP streaming, WAV playback, voice wake capture, touch handling, **medical alarm auto-listen**, and Dynamixel servo control.
+- Python FastAPI server for face UI, Whisper STT, Ollama LLM prompts, **alarm scheduler**, and TTS delivery to the board.
+- **Voice & NLP alarms**: set/list/cancel reminders by voice (“remind me to go to school at 8 AM”); regex parsing with **Ollama fallback** for natural phrasing; persists to `server/data/alarms.json`.
+- **Medical (P0) reminders**: medication labels get priority, spoken TTS on the ESP, **yes/no auto-listen** (no wake word), repeat every 3 min until confirmed; **reschedule or cancel** follow-up with mic re-open.
+- **Alarm web UI**: view pending and awaiting-ack alarms; **Yes** / **No** / **Delete** per row at `http://localhost:8000`.
 - **Dual-priority speaker queue** on the ESP: touch warnings preempt server/voice audio and resume playback afterward.
 - **YuNet face detector** + LBPH recognition tuned for ~1 m range; vision greetings always personalized; general voice replies personalized ~18% of the time.
 - **Voice identity** (“who am I?”) answered using live camera recognition context via Ollama.
 - **Voice servo 360** (“make a 360”, “spin 360”) — fixed TTS confirmation, then `POST /servo/360` on the board (no LLM for this command).
-- Single shared speaker path on the ESP to serialize touch, greetings, and voice replies.
+- Single shared speaker path on the ESP to serialize touch, greetings, alarms, and voice replies.
 - Recommended Windows server support for default SAPI text-to-speech.
 
 ## Recent changes
@@ -82,7 +85,7 @@ Summary of enhancements made in this integration branch:
 
 - Python 3.10+
 - Windows recommended for SAPI TTS
-- Ollama installed and running locally
+- Ollama installed and running locally (voice replies + alarm NLP fallback)
 - `opencv-contrib-python`
 
 ## Hardware
@@ -103,6 +106,7 @@ The ESP firmware provides:
 - HTTP endpoints for `/stream`, `/snapshot.jpg`, `/play_wav`, and **`/servo/360`**
 - Wake-word support using ESP-SR WakeNet (“Hi ESP”)
 - VAD-based voice capture and WebSocket transport to the PC
+- **Medical alarm ack**: after `/play_wav` with `X-Nino-Prompt-Ack`, auto-listen for yes/no; WebSocket `prompt_medical_ack` for reschedule/cancel follow-up
 - QT2120 touch sensor warnings with **preemptive playback priority**
 - Dynamixel joint-mode servo control (neutral **512**, position 0–1023)
 - **ID2 full 360° spin** task (`nino_servo_dxl_spin_360`)
@@ -115,8 +119,8 @@ The ESP firmware provides:
 - `main/audio_playback.c` — ES8311 playback, WAV decode, interruptible partial play
 - `main/audio_capture.c` — microphone capture
 - `main/voice_wake.cpp` — wake word detection
-- `main/voice_assist.c` — VAD and voice session management
-- `main/voice_ws_client.c` — WebSocket client to PC
+- `main/voice_assist.c` — VAD, voice session, **medical ack listen** (`nino_voice_assist_prompt_medical_ack`)
+- `main/voice_ws_client.c` — WebSocket client to PC (parses `prompt_medical_ack` metadata)
 - `main/touch_sensor.c` — QT2120 capacitive touch handling
 - `main/bsp_qt2120.c` — QT2120 I2C driver
 - `main/servo_dxl.c` — Dynamixel USB host, read/write, **360 spin**
@@ -128,6 +132,10 @@ The ESP firmware provides:
 ### Servo documentation
 
 See **[docs/SERVO.md](docs/SERVO.md)** for wiring, 360 sequence, voice trigger flow, CLI/HTTP API, and troubleshooting.
+
+### Alarm documentation
+
+See **[docs/ALARM.md](docs/ALARM.md)** for voice commands, medical ack flow, NLP time parsing, scheduler, and troubleshooting.
 
 ## Build and flash firmware
 
@@ -188,8 +196,8 @@ wifi connect <SSID> <PASSWORD>
 wifi status
 ```
 
-4. Start the Python server with the ESP camera and `play_wav` URL.
-5. Visit `http://localhost:8000` to register faces and monitor the system.
+4. Start the Python server with the ESP camera and `play_wav` URL (required for face TTS, **alarms**, and vision greetings).
+5. Visit `http://localhost:8000` to register faces, **view/manage alarms**, and monitor the system.
 6. On the ESP console, connect voice to the PC:
 
 ```text
@@ -257,6 +265,7 @@ Serial CLI servo test (U2D2 ready):
 - `POST /api/register` — register face data
 - `POST /api/retrain` — retrain face recognition model
 - `GET /api/alarms` — list pending alarms
+- `POST /api/alarms/{id}/ack` — confirm or decline a medical alarm awaiting ack (same as voice yes/no)
 - `DELETE /api/alarms` — delete all pending alarms
 - `DELETE /api/alarms/{id}` — delete one alarm (web UI **Delete** button per row)
 - `WS /voice-query` — voice assistant WebSocket (also `/ws/voice`)
@@ -341,6 +350,7 @@ managed_components/
 ## Notes
 
 - Touch audio **preempts** server/voice playback and resumes afterward; server/voice uses a separate queue from touch.
+- **Alarms** require `--esp-play-wav-url` (or `ESP_PLAY_WAV_URL`); medical alarms need `voice connect` on the board for yes/no and follow-up.
 - Face greeting and alarm TTS from the server use head motion during `/play_wav`.
 - Voice WebSocket `/voice-query` replies also queue with head motion unless interrupted by touch or `/servo/360`.
 - `POST /play_wav` and `POST /servo/360` have no authentication — use only on a trusted LAN.
