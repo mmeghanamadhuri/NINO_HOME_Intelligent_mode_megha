@@ -1,4 +1,4 @@
-﻿#include <stdbool.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -23,6 +23,9 @@
 #define ROBOTIS_U2D2_PID                    0x06a7
 #define FTDI_DEFAULT_INDEX                  0x0001
 #define FTDI_RX_HEADER_SIZE                 2
+/** FT232 bulk OUT: byte0 = 0x01 | ((payload_len & 0x3F) << 2) per ftdi_sio. */
+#define FTDI_TX_HEADER_SIZE                 1
+#define FTDI_TX_MAX_PAYLOAD                 63
 #define FTDI_BAUD_BASE                      3000000UL
 
 #define FTDI_SIO_RESET                      0x00
@@ -71,7 +74,7 @@
 #define DXL_WHEEL_SPEED_MAX                 1023
 #define DXL_POSITION_SPEED_MIN              1
 #define DXL_POSITION_SPEED_MAX              1023
-#define DXL_DEFAULT_POSITION_SPEED          35
+#define DXL_DEFAULT_POSITION_SPEED          22
 #define DXL_AX_JOINT_CCW_LIMIT              1023
 
 #define DXL_MAX_PARAMS                      64
@@ -92,6 +95,7 @@ typedef enum {
     DXL_SYNC_IDLE = 0,
     DXL_SYNC_READ_PENDING,
     DXL_SYNC_READ_WAIT_RSP,
+    DXL_SYNC_PING_WAIT_RSP,
 } dxl_sync_state_t;
 
 typedef struct {
@@ -209,6 +213,7 @@ static void dynamixel_queue_goal_all(int goal);
 static int clamp_goal(int goal);
 static int servo_index_for_id(uint8_t id);
 static esp_err_t dynamixel_read_word_blocking(uint8_t id, uint8_t addr, uint16_t *out, TickType_t timeout);
+static esp_err_t dynamixel_ping_blocking(uint8_t id, TickType_t timeout);
 static bool dynamixel_wait_servo_at(uint8_t id, int target, TickType_t timeout_ms);
 static void spin360_task(void *arg);
 static bool usb_is_obvious_non_u2d2(uint16_t vid, uint16_t pid);
@@ -446,6 +451,52 @@ static void spin360_task(void *arg)
 done:
     s_spin360_task = NULL;
     vTaskDelete(NULL);
+}
+
+static esp_err_t dynamixel_ping_blocking(uint8_t id, TickType_t timeout)
+{
+    if (s_sync_mutex == NULL || s_read_done_sem == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_ftdi.device_ready || s_ftdi.client_hdl == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    (void)xSemaphoreTake(s_read_done_sem, 0);
+
+    xSemaphoreTake(s_sync_mutex, portMAX_DELAY);
+    s_sync.state = DXL_SYNC_PING_WAIT_RSP;
+    s_sync.id = id;
+    s_sync.result = ESP_FAIL;
+    xSemaphoreGive(s_sync_mutex);
+
+    esp_err_t err = dynamixel_send_ping(&s_ftdi, id);
+    if (err != ESP_OK) {
+        xSemaphoreTake(s_sync_mutex, portMAX_DELAY);
+        s_sync.state = DXL_SYNC_IDLE;
+        xSemaphoreGive(s_sync_mutex);
+        return err;
+    }
+
+    const TickType_t start = xTaskGetTickCount();
+    while ((xTaskGetTickCount() - start) < timeout) {
+        if (xSemaphoreTake(s_read_done_sem, pdMS_TO_TICKS(20)) == pdTRUE) {
+            xSemaphoreTake(s_sync_mutex, portMAX_DELAY);
+            const esp_err_t rsp = s_sync.result;
+            s_sync.state = DXL_SYNC_IDLE;
+            xSemaphoreGive(s_sync_mutex);
+            return rsp;
+        }
+        if (s_ftdi.device_gone) {
+            break;
+        }
+        (void)usb_host_client_handle_events(s_ftdi.client_hdl, pdMS_TO_TICKS(20));
+    }
+
+    xSemaphoreTake(s_sync_mutex, portMAX_DELAY);
+    s_sync.state = DXL_SYNC_IDLE;
+    xSemaphoreGive(s_sync_mutex);
+    return ESP_ERR_TIMEOUT;
 }
 
 static esp_err_t dynamixel_read_word_blocking(uint8_t id, uint8_t addr, uint16_t *out,
@@ -731,7 +782,8 @@ static esp_err_t ftdi_open_device(ftdi_device_t *dev)
     ESP_RETURN_ON_ERROR(usb_host_interface_claim(dev->client_hdl, dev->dev_hdl, dev->interface_number, dev->interface_alt), TAG, "interface claim failed");
     ESP_RETURN_ON_ERROR(usb_host_transfer_alloc(USB_SETUP_PACKET_SIZE, 0, &dev->ctrl_xfer), TAG, "control alloc failed");
     ESP_RETURN_ON_ERROR(usb_host_transfer_alloc(dev->ep_mps_in, 0, &dev->bulk_in_xfer), TAG, "bulk IN alloc failed");
-    ESP_RETURN_ON_ERROR(usb_host_transfer_alloc(dev->ep_mps_out, 0, &dev->bulk_out_xfer), TAG, "bulk OUT alloc failed");
+    ESP_RETURN_ON_ERROR(usb_host_transfer_alloc(dev->ep_mps_out + FTDI_TX_HEADER_SIZE, 0, &dev->bulk_out_xfer),
+                        TAG, "bulk OUT alloc failed");
 
     dev->bulk_in_xfer->device_handle = dev->dev_hdl;
     dev->bulk_in_xfer->bEndpointAddress = dev->ep_in;
@@ -838,18 +890,30 @@ static esp_err_t ftdi_uart_write(ftdi_device_t *dev, const uint8_t *data, size_t
     if (!dev->device_ready || dev->bulk_out_xfer == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (len > dev->bulk_out_xfer->data_buffer_size) {
+    if (len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (dev->is_ftdi && len > FTDI_TX_MAX_PAYLOAD) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    const size_t tx_len = dev->is_ftdi ? (len + FTDI_TX_HEADER_SIZE) : len;
+    if (tx_len > (size_t)dev->bulk_out_xfer->data_buffer_size) {
         return ESP_ERR_INVALID_SIZE;
     }
 
-    memcpy(dev->bulk_out_xfer->data_buffer, data, len);
+    if (dev->is_ftdi) {
+        dev->bulk_out_xfer->data_buffer[0] = (uint8_t)(0x01 | ((len & 0x3F) << 2));
+        memcpy(dev->bulk_out_xfer->data_buffer + FTDI_TX_HEADER_SIZE, data, len);
+    } else {
+        memcpy(dev->bulk_out_xfer->data_buffer, data, len);
+    }
 
     transfer_wait_t waiter = {
         .done = false,
         .result = ESP_FAIL,
     };
 
-    dev->bulk_out_xfer->num_bytes = (int)len;
+    dev->bulk_out_xfer->num_bytes = (int)tx_len;
     dev->bulk_out_xfer->actual_num_bytes = 0;
     dev->bulk_out_xfer->flags = 0;
     dev->bulk_out_xfer->timeout_ms = 1000;
@@ -895,7 +959,7 @@ static esp_err_t dynamixel_send_ping(ftdi_device_t *dev, uint8_t id)
         return ESP_ERR_INVALID_SIZE;
     }
 
-    ESP_LOGI(TAG, "Sending PING to Dynamixel ID %u", id);
+    ESP_LOGD(TAG, "Sending PING to Dynamixel ID %u", id);
     return ftdi_uart_write(dev, packet, packet_len);
 }
 
@@ -1013,9 +1077,12 @@ static void dynamixel_handle_status_packet(const dynamixel_status_packet_t *pack
         return;
     }
 
-    if (s_sync.state == DXL_SYNC_READ_WAIT_RSP && packet->id == s_sync.id) {
+    if ((s_sync.state == DXL_SYNC_READ_WAIT_RSP || s_sync.state == DXL_SYNC_PING_WAIT_RSP) &&
+        packet->id == s_sync.id) {
         if (packet->error != 0) {
             s_sync.result = ESP_FAIL;
+        } else if (s_sync.state == DXL_SYNC_PING_WAIT_RSP) {
+            s_sync.result = ESP_OK;
         } else if (packet->param_len >= s_sync.length) {
             s_sync.value = packet->params[0];
             if (s_sync.length >= 2) {
@@ -1368,20 +1435,29 @@ static void usb_client_task(void *arg)
                 }
 
                 if (!s_torque_enabled) {
-                    err = dynamixel_send_ping(&s_ftdi, DXL_PRIMARY_ID);
+                    err = dynamixel_ping_blocking(DXL_PRIMARY_ID, pdMS_TO_TICKS(400));
                     if (err != ESP_OK) {
                         s_ping_fail_streak++;
                         if (s_ping_fail_streak == 1 || (s_ping_fail_streak % 4) == 0) {
-                            ESP_LOGW(TAG, "PING failed (%d): %s", s_ping_fail_streak,
-                                     esp_err_to_name(err));
+                            if (err == ESP_ERR_TIMEOUT) {
+                                ESP_LOGW(TAG,
+                                         "No Dynamixel reply to PING ID%u (%d) — check servo "
+                                         "power, TTL wiring, IDs 1&2, 1 Mbps baud, U2D2 on J18",
+                                         DXL_PRIMARY_ID, s_ping_fail_streak);
+                            } else {
+                                ESP_LOGW(TAG, "PING failed (%d): %s", s_ping_fail_streak,
+                                         esp_err_to_name(err));
+                            }
                         }
-                        if (s_ping_fail_streak >= DXL_PING_FAIL_RECONNECT) {
-                            ESP_LOGW(TAG, "Servo bus lost — reopening U2D2");
+                        if (err != ESP_ERR_TIMEOUT &&
+                            s_ping_fail_streak >= DXL_PING_FAIL_RECONNECT) {
+                            ESP_LOGW(TAG, "U2D2 USB write failed — reopening adapter");
                             s_ping_fail_streak = 0;
                             s_ftdi.actions |= DEVICE_ACTION_CLOSE;
                         }
                     } else {
                         s_ping_fail_streak = 0;
+                        ESP_LOGI(TAG, "Dynamixel ID%u responded to PING", DXL_PRIMARY_ID);
                         err = dynamixel_set_joint_mode(&s_ftdi);
                         if (err == ESP_OK) {
                             s_position_speed_pending = true;

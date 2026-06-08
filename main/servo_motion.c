@@ -9,10 +9,10 @@
 
 static const char *TAG = "servo_motion";
 
-#define POSE_HOLD_MS          550
+#define POSE_HOLD_MS          700
 #define DXL_CENTER            512
-/** ~10° on AX-scale 0–1023 (≈34 ticks); slightly less is fine per user. */
-#define DXL_POSE_DELTA        34
+/** ~8° on AX-scale 0–1023; smaller sweep = less camera shake on the head. */
+#define DXL_POSE_DELTA        28
 
 #define PAN_LEFT              (DXL_CENTER - DXL_POSE_DELTA)
 #define PAN_RIGHT             (DXL_CENTER + DXL_POSE_DELTA)
@@ -99,9 +99,10 @@ void nino_servo_motion_start(nino_servo_motion_mode_t mode) {
     xSemaphoreTake(s_motion_done, 0);
   }
 
-  ESP_LOGI(TAG, "Head motion start (%s), servo bus %s",
+  ESP_LOGI(TAG, "Head motion start (%s), U2D2 %s, servos %s",
            mode == NINO_SERVO_MOTION_NOD_LR ? "nod L/R" : "L/R/U/D",
-           nino_servo_dxl_bus_open() ? "open" : "waiting for U2D2");
+           nino_servo_dxl_bus_open() ? "open" : "waiting",
+           nino_servo_dxl_is_ready() ? "ready" : "not ready (no PING yet?)");
 
   BaseType_t ok = xTaskCreate(motion_task, "servo_motion", MOTION_TASK_STACK, NULL,
                               MOTION_TASK_PRIO, &s_motion_task);

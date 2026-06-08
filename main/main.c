@@ -36,9 +36,11 @@
 #include "touch_sensor.h"
 #include "voice_assist.h"
 #include "voice_wake.h"
-
-#define WIFI_SSID "ESP32_P4_CAM"
-#define WIFI_PASS "12345678"
+#include "wifi_config.h"
+#include "wifi_prov_ble.h"
+#if CONFIG_ESP_HOSTED_ENABLED
+#include "esp_hosted.h"
+#endif
 #define MAX_STA_CONN 4
 
 #define NVS_NAMESPACE "wifi_cfg"
@@ -55,12 +57,9 @@
 #define DISCOVERY_BUF 192
 #define MESSAGE_BUF 256
 
-/* Stored STA credentials for wifi connect (max 32 chars each) */
-#define STA_SSID_MAX 32
-#define STA_PASS_MAX 64
 #define STA_RECONNECT_DELAY_MS 5000
-static char s_sta_ssid[STA_SSID_MAX] = "";
-static char s_sta_pass[STA_PASS_MAX] = "";
+static char s_sta_ssid[WIFI_CONFIG_STA_SSID_MAX] = "";
+static char s_sta_pass[WIFI_CONFIG_STA_PASS_MAX] = "";
 
 static wifi_mode_t s_wifi_mode = WIFI_MODE_AP;
 static bool s_sta_connected = false;
@@ -72,13 +71,13 @@ static bool s_sta_connected = false;
 #define UVC_STREAM_TASK_STACK_SIZE 8192
 #define UVC_STREAM_TASK_PRIORITY 19
 
-#define UVC_TARGET_WIDTH 640
-#define UVC_TARGET_HEIGHT 480
+#define UVC_TARGET_WIDTH 480
+#define UVC_TARGET_HEIGHT 320
 #define UVC_TARGET_FPS 15.0f
 #define UVC_FRAME_QUEUE_LEN 3
 #define UVC_FRAME_BUFFERS 3
-#define UVC_URB_COUNT 6
-#define UVC_URB_SIZE (32 * 1024)
+#define UVC_URB_COUNT 4
+#define UVC_URB_SIZE (24 * 1024)
 #define UVC_FRAME_SIZE_BYTES (92 * 1024)
 #define UVC_FRAME_TIMEOUT_LOG_INTERVAL_MS 15000
 #define UVC_OPEN_TIMEOUT_MS 5000
@@ -182,7 +181,7 @@ static void sta_reconnect_task(void *arg) {
 
 static esp_err_t wifi_switch_mode(wifi_mode_t mode);
 
-static void get_ap_ip_str(char *buf, size_t buf_size) {
+void wifi_config_get_ap_ip(char *buf, size_t buf_size) {
   esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
   if (ap_netif == NULL) {
     snprintf(buf, buf_size, "0.0.0.0");
@@ -198,7 +197,7 @@ static void get_ap_ip_str(char *buf, size_t buf_size) {
   snprintf(buf, buf_size, "%s", ip4addr_ntoa(&addr));
 }
 
-static void get_sta_ip_str(char *buf, size_t buf_size) {
+void wifi_config_get_sta_ip(char *buf, size_t buf_size) {
   esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
   if (sta_netif == NULL) {
     snprintf(buf, buf_size, "0.0.0.0");
@@ -216,12 +215,12 @@ static void get_sta_ip_str(char *buf, size_t buf_size) {
 
 static void get_primary_ip_str(char *buf, size_t buf_size) {
   if (s_wifi_mode == WIFI_MODE_AP || s_wifi_mode == WIFI_MODE_APSTA) {
-    get_ap_ip_str(buf, buf_size);
+    wifi_config_get_ap_ip(buf, buf_size);
     if (strcmp(buf, "0.0.0.0") != 0)
       return;
   }
   if (s_wifi_mode == WIFI_MODE_STA || s_wifi_mode == WIFI_MODE_APSTA) {
-    get_sta_ip_str(buf, buf_size);
+    wifi_config_get_sta_ip(buf, buf_size);
   }
 }
 
@@ -333,18 +332,64 @@ static void wifi_save_to_nvs(wifi_mode_t mode) {
   ESP_LOGI(TAG, "Saved mode %d to NVS", (int)mode);
 }
 
+esp_err_t wifi_config_sta_connect(wifi_mode_t mode_to_save) {
+  if (s_sta_ssid[0] == '\0') {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  wifi_mode_t cur = WIFI_MODE_AP;
+  if (esp_wifi_get_mode(&cur) != ESP_OK) {
+    return ESP_FAIL;
+  }
+
+  esp_err_t err;
+  if (cur != WIFI_MODE_STA && cur != WIFI_MODE_APSTA) {
+    err = wifi_switch_mode(WIFI_MODE_APSTA);
+  } else {
+    wifi_config_t cfg = {};
+    copy_cstr_field(cfg.sta.ssid, sizeof(cfg.sta.ssid), s_sta_ssid);
+    copy_cstr_field(cfg.sta.password, sizeof(cfg.sta.password), s_sta_pass);
+    err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    if (err == ESP_OK) {
+      err = esp_wifi_connect();
+    }
+    s_wifi_mode = cur;
+  }
+  if (err != ESP_OK) {
+    return err;
+  }
+  wifi_save_to_nvs(mode_to_save);
+  return ESP_OK;
+}
+
+esp_err_t wifi_config_set_sta_credentials(const char *ssid, const char *pass) {
+  if (ssid == NULL || ssid[0] == '\0') {
+    return ESP_ERR_INVALID_ARG;
+  }
+  strncpy(s_sta_ssid, ssid, WIFI_CONFIG_STA_SSID_MAX - 1);
+  s_sta_ssid[WIFI_CONFIG_STA_SSID_MAX - 1] = '\0';
+  if (pass != NULL) {
+    strncpy(s_sta_pass, pass, WIFI_CONFIG_STA_PASS_MAX - 1);
+    s_sta_pass[WIFI_CONFIG_STA_PASS_MAX - 1] = '\0';
+  } else {
+    s_sta_pass[0] = '\0';
+  }
+  return ESP_OK;
+}
+
+bool wifi_config_sta_connected(void) { return s_sta_connected; }
+
+bool wifi_config_is_provisioned(void) { return s_sta_ssid[0] != '\0'; }
+
 static int cmd_wifi_connect(int argc, char **argv) {
   if (argc < 2) {
     printf("Usage: wifi connect <ssid> [password]\n");
     return 0;
   }
-  strncpy(s_sta_ssid, argv[1], STA_SSID_MAX - 1);
-  s_sta_ssid[STA_SSID_MAX - 1] = '\0';
-  if (argc >= 3) {
-    strncpy(s_sta_pass, argv[2], STA_PASS_MAX - 1);
-    s_sta_pass[STA_PASS_MAX - 1] = '\0';
-  } else {
-    s_sta_pass[0] = '\0';
+  if (wifi_config_set_sta_credentials(argv[1], (argc >= 3) ? argv[2] : "") !=
+      ESP_OK) {
+    printf("Invalid SSID\n");
+    return 0;
   }
 
   wifi_mode_t cur;
@@ -352,17 +397,13 @@ static int cmd_wifi_connect(int argc, char **argv) {
     printf("Failed to get WiFi mode\n");
     return 0;
   }
-  if (cur != WIFI_MODE_STA && cur != WIFI_MODE_APSTA) {
-    wifi_switch_mode(WIFI_MODE_APSTA);
-  } else {
-    wifi_config_t cfg = {};
-    copy_cstr_field(cfg.sta.ssid, sizeof(cfg.sta.ssid), s_sta_ssid);
-    copy_cstr_field(cfg.sta.password, sizeof(cfg.sta.password), s_sta_pass);
-    esp_wifi_set_config(WIFI_IF_STA, &cfg);
-    esp_wifi_connect();
-    wifi_save_to_nvs(cur);
+  wifi_mode_t save = (cur == WIFI_MODE_STA || cur == WIFI_MODE_APSTA) ? cur
+                                                                    : WIFI_MODE_APSTA;
+  esp_err_t err = wifi_config_sta_connect(save);
+  printf("%s\n", (err == ESP_OK) ? "Connecting..." : "Failed");
+  if (err == ESP_OK) {
+    printf("Connecting to %s...\n", s_sta_ssid);
   }
-  printf("Connecting to %s...\n", s_sta_ssid);
   return 0;
 }
 
@@ -385,8 +426,8 @@ static int cmd_wifi_status(int argc, char **argv) {
   printf("Mode: %s\n", mode_str);
 
   char ap_ip[16], sta_ip[16];
-  get_ap_ip_str(ap_ip, sizeof(ap_ip));
-  get_sta_ip_str(sta_ip, sizeof(sta_ip));
+  wifi_config_get_ap_ip(ap_ip, sizeof(ap_ip));
+  wifi_config_get_sta_ip(sta_ip, sizeof(sta_ip));
 
   if (strcmp(ap_ip, "0.0.0.0") != 0) {
     printf("AP IP: %s\n", ap_ip);
@@ -588,6 +629,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 
   if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
     s_sta_connected = false;
+    wifi_prov_ble_on_sta_ip_changed(false);
     wifi_event_sta_disconnected_t *ev =
         (wifi_event_sta_disconnected_t *)event_data;
     ESP_LOGW(TAG, "STA: Disconnected (reason %d)", ev->reason);
@@ -602,6 +644,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
     s_sta_connected = true;
     ESP_LOGI(TAG, "STA: Got IP " IPSTR, IP2STR(&event->ip_info.ip));
+    wifi_prov_ble_on_sta_ip_changed(true);
   }
 }
 
@@ -614,15 +657,18 @@ static wifi_mode_t wifi_load_from_nvs(void) {
   if (err == ESP_OK && m >= WIFI_MODE_STA && m <= WIFI_MODE_APSTA) {
     s_wifi_mode = (wifi_mode_t)m;
   }
-  size_t len = STA_SSID_MAX;
+  size_t len = WIFI_CONFIG_STA_SSID_MAX;
   if (nvs_get_str(h, NVS_KEY_STA_SSID, s_sta_ssid, &len) != ESP_OK) {
     s_sta_ssid[0] = '\0';
   }
-  len = STA_PASS_MAX;
+  len = WIFI_CONFIG_STA_PASS_MAX;
   if (nvs_get_str(h, NVS_KEY_STA_PASS, s_sta_pass, &len) != ESP_OK) {
     s_sta_pass[0] = '\0';
   }
   nvs_close(h);
+  if (s_sta_ssid[0] == '\0' && s_wifi_mode != WIFI_MODE_AP) {
+    s_wifi_mode = WIFI_MODE_AP;
+  }
   return s_wifi_mode;
 }
 
@@ -640,13 +686,13 @@ static esp_err_t wifi_switch_mode(wifi_mode_t mode) {
 
   if (mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA) {
     copy_cstr_field(wifi_config.ap.ssid, sizeof(wifi_config.ap.ssid),
-                    WIFI_SSID);
+                    WIFI_CONFIG_AP_SSID);
     copy_cstr_field(wifi_config.ap.password, sizeof(wifi_config.ap.password),
-                    WIFI_PASS);
-    wifi_config.ap.ssid_len = strlen(WIFI_SSID);
+                    WIFI_CONFIG_AP_PASS);
+    wifi_config.ap.ssid_len = strlen(WIFI_CONFIG_AP_SSID);
     wifi_config.ap.max_connection = MAX_STA_CONN;
     wifi_config.ap.authmode =
-        (strlen(WIFI_PASS) == 0) ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
+        (strlen(WIFI_CONFIG_AP_PASS) == 0) ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
   }
 
@@ -773,8 +819,8 @@ static void multicast_discovery_task(void *arg) {
         recvbuf[len] = '\0';
         if (is_discovery_request(recvbuf, (size_t)len)) {
           char ap_ip[16], sta_ip[16];
-          get_ap_ip_str(ap_ip, sizeof(ap_ip));
-          get_sta_ip_str(sta_ip, sizeof(sta_ip));
+          wifi_config_get_ap_ip(ap_ip, sizeof(ap_ip));
+          wifi_config_get_sta_ip(sta_ip, sizeof(sta_ip));
 
           uint8_t mac[6];
           esp_wifi_get_mac(WIFI_IF_AP, mac);
@@ -782,7 +828,7 @@ static void multicast_discovery_task(void *arg) {
           snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-          const char *device_name = WIFI_SSID;
+          const char *device_name = WIFI_CONFIG_AP_SSID;
           char response[DISCOVERY_BUF];
           int rlen;
 
@@ -998,7 +1044,15 @@ static esp_err_t play_wav_handler(httpd_req_t *req) {
     received += r;
   }
 
-  if (nino_audio_queue_wav(buf, total, false, NINO_AUDIO_SERVO_FULL) != ESP_OK) {
+  bool prompt_ack = false;
+  char ack_hdr[4] = {0};
+  if (httpd_req_get_hdr_value_str(req, "X-Nino-Prompt-Ack", ack_hdr,
+                                  sizeof(ack_hdr)) == ESP_OK) {
+    prompt_ack = (ack_hdr[0] == '1');
+  }
+
+  if (nino_audio_queue_wav(buf, total, false, NINO_AUDIO_SERVO_FULL, prompt_ack) !=
+      ESP_OK) {
     httpd_resp_set_status(req, "503 Service Unavailable");
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, "{\"ok\":false,\"error\":\"audio queue down\"}",
@@ -1054,6 +1108,175 @@ static esp_err_t servo_360_handler(httpd_req_t *req) {
 
   ESP_LOGI(TAG, "Voice/HTTP: ID2 360 spin started");
   return httpd_resp_send(req, "{\"ok\":true,\"started\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+#define WIFI_PROV_JSON_MAX 384
+
+static void wifi_http_set_cors(httpd_req_t *req) {
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
+}
+
+static const char *json_value_start(const char *body, const char *key) {
+  if (body == NULL || key == NULL) {
+    return NULL;
+  }
+  char needle[48];
+  snprintf(needle, sizeof(needle), "\"%s\"", key);
+  const char *p = strstr(body, needle);
+  if (p == NULL) {
+    return NULL;
+  }
+  p = strchr(p + strlen(needle), ':');
+  if (p == NULL) {
+    return NULL;
+  }
+  p++;
+  while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+    p++;
+  }
+  if (*p != '"') {
+    return NULL;
+  }
+  return p + 1;
+}
+
+static bool json_copy_quoted_value(const char *start, char *out, size_t out_sz) {
+  if (start == NULL || out == NULL || out_sz == 0) {
+    return false;
+  }
+  size_t n = 0;
+  for (const char *p = start; *p != '\0'; ++p) {
+    if (*p == '"' && (p == start || *(p - 1) != '\\')) {
+      break;
+    }
+    if (*p == '\\' && *(p + 1) != '\0') {
+      ++p;
+    }
+    if (n + 1 >= out_sz) {
+      return false;
+    }
+    out[n++] = *p;
+  }
+  out[n] = '\0';
+  return true;
+}
+
+int wifi_config_status_json(char *buf, size_t buf_sz) {
+  wifi_mode_t mode;
+  if (esp_wifi_get_mode(&mode) != ESP_OK) {
+    mode = s_wifi_mode;
+  }
+  const char *mode_str = (mode == WIFI_MODE_AP)    ? "ap"
+                         : (mode == WIFI_MODE_STA) ? "sta"
+                                                   : "apsta";
+  char ap_ip[16] = "0.0.0.0";
+  char sta_ip[16] = "0.0.0.0";
+  wifi_config_get_ap_ip(ap_ip, sizeof(ap_ip));
+  wifi_config_get_sta_ip(sta_ip, sizeof(sta_ip));
+  return snprintf(
+      buf, buf_sz,
+      "{\"ok\":true,\"ap_ssid\":\"%s\",\"ble_name\":\"%s\","
+      "\"ble_service\":\"%s\",\"mode\":\"%s\",\"sta_connected\":%s,"
+      "\"sta_ssid\":\"%s\",\"ap_ip\":\"%s\",\"sta_ip\":\"%s\","
+      "\"provisioned\":%s}",
+      WIFI_CONFIG_AP_SSID, WIFI_PROV_BLE_DEVICE_NAME, WIFI_PROV_BLE_SVC_UUID,
+      mode_str, s_sta_connected ? "true" : "false", s_sta_ssid, ap_ip, sta_ip,
+      wifi_config_is_provisioned() ? "true" : "false");
+}
+
+static esp_err_t wifi_prov_status_handler(httpd_req_t *req) {
+  if (req->method != HTTP_GET) {
+    httpd_resp_set_status(req, "405 Method Not Allowed");
+    return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"GET only\"}");
+  }
+  char body[320];
+  int n = wifi_config_status_json(body, sizeof(body));
+  if (n < 0 || n >= (int)sizeof(body)) {
+    return httpd_resp_send_500(req);
+  }
+  httpd_resp_set_type(req, "application/json");
+  wifi_http_set_cors(req);
+  return httpd_resp_send(req, body, (size_t)n);
+}
+
+static esp_err_t wifi_prov_config_handler(httpd_req_t *req) {
+  if (req->method == HTTP_OPTIONS) {
+    httpd_resp_set_status(req, "204 No Content");
+    wifi_http_set_cors(req);
+    return httpd_resp_send(req, NULL, 0);
+  }
+  if (req->method != HTTP_POST) {
+    httpd_resp_set_status(req, "405 Method Not Allowed");
+    httpd_resp_set_type(req, "application/json");
+    wifi_http_set_cors(req);
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"POST only\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+  if (req->content_len <= 0 || req->content_len >= WIFI_PROV_JSON_MAX) {
+    httpd_resp_set_status(req, "400 Bad Request");
+    httpd_resp_set_type(req, "application/json");
+    wifi_http_set_cors(req);
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"bad_body\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+
+  char *body = malloc((size_t)req->content_len + 1);
+  if (body == NULL) {
+    return httpd_resp_send_500(req);
+  }
+  int received = 0;
+  while (received < req->content_len) {
+    int r = httpd_req_recv(req, body + received, req->content_len - received);
+    if (r <= 0) {
+      free(body);
+      httpd_resp_set_status(req, "400 Bad Request");
+      httpd_resp_set_type(req, "application/json");
+      wifi_http_set_cors(req);
+      return httpd_resp_send(req, "{\"ok\":false,\"error\":\"recv\"}",
+                             HTTPD_RESP_USE_STRLEN);
+    }
+    received += r;
+  }
+  body[received] = '\0';
+
+  char ssid[WIFI_CONFIG_STA_SSID_MAX] = "";
+  char pass[WIFI_CONFIG_STA_PASS_MAX] = "";
+  const char *ssid_start = json_value_start(body, "ssid");
+  if (!json_copy_quoted_value(ssid_start, ssid, sizeof(ssid)) || ssid[0] == '\0') {
+    free(body);
+    httpd_resp_set_status(req, "400 Bad Request");
+    httpd_resp_set_type(req, "application/json");
+    wifi_http_set_cors(req);
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"missing_ssid\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+  const char *pass_start = json_value_start(body, "password");
+  if (pass_start != NULL) {
+    (void)json_copy_quoted_value(pass_start, pass, sizeof(pass));
+  }
+  free(body);
+
+  ESP_LOGI(TAG, "WiFi provision: SSID %s", ssid);
+  if (wifi_config_set_sta_credentials(ssid, pass) != ESP_OK) {
+    httpd_resp_set_status(req, "400 Bad Request");
+    httpd_resp_set_type(req, "application/json");
+    wifi_http_set_cors(req);
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"invalid_ssid\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+
+  esp_err_t err = wifi_config_sta_connect(WIFI_MODE_STA);
+  httpd_resp_set_type(req, "application/json");
+  wifi_http_set_cors(req);
+  if (err != ESP_OK) {
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"connect_failed\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+  return httpd_resp_send(req, "{\"ok\":true,\"status\":\"connecting\"}",
+                         HTTPD_RESP_USE_STRLEN);
 }
 
 static void load_voice_ws_from_nvs(void) {
@@ -1198,7 +1421,7 @@ static void start_http_server(void) {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = HTTP_SERVER_PORT;
   config.stack_size = 8192;
-  config.max_uri_handlers = 13;
+  config.max_uri_handlers = 16;
   config.recv_wait_timeout = 45;
   config.send_wait_timeout = 45;
   config.core_id = APP_CORE_NET;
@@ -1235,12 +1458,36 @@ static void start_http_server(void) {
       .handler = servo_360_handler,
       .user_ctx = NULL,
   };
+  const httpd_uri_t wifi_prov_config_uri = {
+      .uri = "/api/wifi/config",
+      .method = HTTP_POST,
+      .handler = wifi_prov_config_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t wifi_prov_config_opts_uri = {
+      .uri = "/api/wifi/config",
+      .method = HTTP_OPTIONS,
+      .handler = wifi_prov_config_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t wifi_prov_status_uri = {
+      .uri = "/api/wifi/status",
+      .method = HTTP_GET,
+      .handler = wifi_prov_status_handler,
+      .user_ctx = NULL,
+  };
 
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &index_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &stream_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &snapshot_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &play_wav_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &servo_360_uri));
+  ESP_ERROR_CHECK(
+      httpd_register_uri_handler(s_http_server, &wifi_prov_config_uri));
+  ESP_ERROR_CHECK(
+      httpd_register_uri_handler(s_http_server, &wifi_prov_config_opts_uri));
+  ESP_ERROR_CHECK(
+      httpd_register_uri_handler(s_http_server, &wifi_prov_status_uri));
 }
 
 static void usb_lib_task(void *arg) {
@@ -1497,8 +1744,7 @@ static void uvc_driver_event_callback(const uvc_host_driver_event_data_t *event,
     assert(ok == pdPASS);
     s_stream_task_created = true;
   }
-
-  voice_wake_start_once();
+  /* Wake word starts from delayed_voice_wake_task — avoids racing UVC USB DMA alloc. */
 }
 
 void app_main(void) {
@@ -1514,6 +1760,11 @@ void app_main(void) {
     err = nvs_flash_init();
   }
   ESP_ERROR_CHECK(err);
+
+#if CONFIG_ESP_HOSTED_ENABLED
+  /* After scheduler start; constructor init exhausts internal DRAM (idle-task assert). */
+  ESP_ERROR_CHECK(esp_hosted_init());
+#endif
 
   ESP_ERROR_CHECK(nino_voice_assist_init_mutex());
   load_voice_ws_from_nvs();
@@ -1574,6 +1825,12 @@ void app_main(void) {
       .user_ctx = NULL,
   };
   ESP_ERROR_CHECK(uvc_host_install(&uvc_driver_config));
+
+  esp_err_t ble_err = wifi_prov_ble_start();
+  if (ble_err != ESP_OK && ble_err != ESP_ERR_NOT_SUPPORTED) {
+    ESP_LOGW(TAG, "BLE Wi-Fi provisioning not started: %s",
+             esp_err_to_name(ble_err));
+  }
 
   /* If no camera plugs in, still start wake after USB/SDIO settle (HP WDT on boot). */
   (void)xTaskCreatePinnedToCore(delayed_voice_wake_task, "wake_delay", 4096, NULL, 3, NULL,

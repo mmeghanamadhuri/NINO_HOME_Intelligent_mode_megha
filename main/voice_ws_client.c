@@ -22,7 +22,33 @@ typedef struct {
   size_t cap;
   bool complete;
   bool error;
+  bool prompt_medical_ack;
 } vws_ctx_t;
+
+static bool chunk_contains(const char *hay, size_t hay_len, const char *needle) {
+  const size_t needle_len = strlen(needle);
+  if (needle_len == 0 || hay_len < needle_len) {
+    return false;
+  }
+  for (size_t i = 0; i + needle_len <= hay_len; ++i) {
+    if (memcmp(hay + i, needle, needle_len) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void parse_metadata_text(vws_ctx_t *ctx, const char *text, size_t len) {
+  if (ctx == NULL || text == NULL || len == 0) {
+    return;
+  }
+  if (!chunk_contains(text, len, "prompt_medical_ack")) {
+    return;
+  }
+  if (chunk_contains(text, len, "true")) {
+    ctx->prompt_medical_ack = true;
+  }
+}
 
 static void append_chunk(vws_ctx_t *ctx, const void *data, size_t len) {
   if (len == 0) {
@@ -76,7 +102,10 @@ static void on_event(void *handler_args, esp_event_base_t base, int32_t event_id
       break;
     }
     if (ws->op_code != 0x02 && ws->op_code != 0x00) {
-      break; /* skip text (0x01), close (0x08), ping/pong, etc. */
+      if (ws->op_code == 0x01 && ws->data_ptr != NULL && ws->data_len > 0) {
+        parse_metadata_text(ctx, (const char *)ws->data_ptr, (size_t)ws->data_len);
+      }
+      break;
     }
     append_chunk(ctx, (const uint8_t *)ws->data_ptr, (size_t)ws->data_len);
     if (ws->fin) {
@@ -101,13 +130,17 @@ static void on_event(void *handler_args, esp_event_base_t base, int32_t event_id
 
 esp_err_t nino_voice_ws_exchange(const char *ws_uri, const uint8_t *wav_in,
                                    size_t wav_in_len, uint8_t **wav_out,
-                                   size_t *wav_out_len, int timeout_ms) {
+                                   size_t *wav_out_len, int timeout_ms,
+                                   bool *prompt_medical_ack_out) {
   if (ws_uri == NULL || wav_in == NULL || wav_out == NULL || wav_out_len == NULL ||
       wav_in_len == 0) {
     return ESP_ERR_INVALID_ARG;
   }
   *wav_out = NULL;
   *wav_out_len = 0;
+  if (prompt_medical_ack_out != NULL) {
+    *prompt_medical_ack_out = false;
+  }
 
   vws_ctx_t ctx = {.done = xSemaphoreCreateBinary(),
                    .client = NULL,
@@ -115,7 +148,8 @@ esp_err_t nino_voice_ws_exchange(const char *ws_uri, const uint8_t *wav_in,
                    .len = 0,
                    .cap = 0,
                    .complete = false,
-                   .error = false};
+                   .error = false,
+                   .prompt_medical_ack = false};
   if (ctx.done == NULL) {
     return ESP_ERR_NO_MEM;
   }
@@ -188,5 +222,8 @@ cleanup:
 
   *wav_out = ctx.buf;
   *wav_out_len = ctx.len;
+  if (prompt_medical_ack_out != NULL) {
+    *prompt_medical_ack_out = ctx.prompt_medical_ack;
+  }
   return ESP_OK;
 }

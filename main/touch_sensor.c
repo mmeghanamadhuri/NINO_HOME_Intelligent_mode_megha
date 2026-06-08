@@ -111,7 +111,8 @@ static void touch_poll_task(void *arg) {
         touch_armed = false;
         spoken_latch_keys |= active_keys;
         ESP_LOGI(TAG, "Touch detected — queue warning");
-        err = nino_audio_queue_wav_copy(pdtm_wav_start, wav_len, false, NINO_AUDIO_SERVO_NOD_LR);
+        err = nino_audio_queue_wav_copy(pdtm_wav_start, wav_len, false,
+                                        NINO_AUDIO_SERVO_NOD_LR, false);
         if (err != ESP_OK) {
           ESP_LOGW(TAG, "Warning queue failed: %s", esp_err_to_name(err));
         }

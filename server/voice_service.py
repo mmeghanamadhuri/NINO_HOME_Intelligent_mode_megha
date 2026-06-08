@@ -71,6 +71,7 @@ SERVO_360_TRIGGER_DELAY_SECONDS = float(os.environ.get("SERVO_360_TRIGGER_DELAY_
 @dataclass
 class VoiceReplyMeta:
     trigger_servo_360: bool = False
+    prompt_medical_ack: bool = False
 
 
 # Roughly 2–3 personalized voice replies per 10–20 (override with VOICE_PERSONALIZE_PROB).
@@ -283,6 +284,10 @@ def process_voice_wav(
     if alarm_result.handled:
         logger.info("Voice alarm command | heard: %s", user_text[:120])
         reply = alarm_result.reply
+        from alarm_service import get_alarm_service
+
+        if get_alarm_service().get_reschedule_prompt_alarm() is not None:
+            meta.prompt_medical_ack = True
     elif is_servo_360_command(user_text):
         logger.info("Voice servo 360 command | heard: %s", user_text[:120])
         if esp_servo_360_url() is None:

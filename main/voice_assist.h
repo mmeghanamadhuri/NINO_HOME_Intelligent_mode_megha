@@ -11,7 +11,8 @@ extern "C" {
 #endif
 
 /** Queues WAV on the shared speaker FIFO (see audio_queue.c). */
-void nino_main_queue_audio_wav(uint8_t *pcm_wav, size_t len, bool play_done_chime);
+void nino_main_queue_audio_wav(uint8_t *pcm_wav, size_t len, bool play_done_chime,
+                               bool prompt_ack_after);
 
 /** Copy current WebSocket URL (e.g. after `voice connect`). */
 void nino_voice_assist_set_ws_uri(const char *uri);
@@ -35,6 +36,9 @@ bool nino_voice_assist_has_ws_uri(void);
 
 /** After wake word: VAD + WebSocket + queue TTS reply (no chime here). */
 esp_err_t nino_voice_assist_run_query_only(void);
+
+/** After a medical alarm WAV from the PC: chime + listen for yes/no (needs voice connect). */
+void nino_voice_assist_prompt_medical_ack(void);
 
 #ifdef __cplusplus
 }

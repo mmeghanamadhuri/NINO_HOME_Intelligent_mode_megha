@@ -44,6 +44,8 @@ static const char *TAG = "voice_ast";
 #define VAD_PRE_ROLL_FRAMES (VAD_PRE_ROLL_MS / VAD_FRAME_MS)
 
 #define VOICE_WS_URI_MAX 200
+#define VOICE_QUERY_VAD_MAX_SEC 10
+#define MED_ACK_VAD_MAX_SEC 8
 
 static char s_ws_uri[VOICE_WS_URI_MAX];
 static SemaphoreHandle_t s_ws_uri_mutex;
@@ -370,7 +372,7 @@ esp_err_t nino_voice_assist_init_mutex(void) {
   return ESP_OK;
 }
 
-static esp_err_t run_ws_and_queue(void) {
+static esp_err_t run_ws_and_queue(int max_seconds, bool *prompt_after_out) {
   char uri[VOICE_WS_URI_MAX];
   if (s_ws_uri_mutex == NULL) {
     return ESP_ERR_INVALID_STATE;
@@ -387,7 +389,7 @@ static esp_err_t run_ws_and_queue(void) {
 
   uint8_t *cap = NULL;
   size_t cap_len = 0;
-  esp_err_t e = nino_voice_capture_vad_wav(10, &cap, &cap_len);
+  esp_err_t e = nino_voice_capture_vad_wav(max_seconds, &cap, &cap_len);
   if (e != ESP_OK) {
     ESP_LOGE(TAG, "VAD capture failed: %s", esp_err_to_name(e));
     return e;
@@ -395,7 +397,8 @@ static esp_err_t run_ws_and_queue(void) {
 
   uint8_t *resp = NULL;
   size_t resp_len = 0;
-  e = nino_voice_ws_exchange(uri, cap, cap_len, &resp, &resp_len, 300000);
+  bool prompt_after = false;
+  e = nino_voice_ws_exchange(uri, cap, cap_len, &resp, &resp_len, 300000, &prompt_after);
   nino_audio_capture_free(cap);
 
   if (e != ESP_OK || resp == NULL || resp_len == 0) {
@@ -404,11 +407,50 @@ static esp_err_t run_ws_and_queue(void) {
     return (e != ESP_OK) ? e : ESP_ERR_NOT_FOUND;
   }
 
-  nino_main_queue_audio_wav(resp, resp_len, true);
+  nino_main_queue_audio_wav(resp, resp_len, true, prompt_after);
+  if (prompt_after_out != NULL) {
+    *prompt_after_out = prompt_after;
+  }
   return ESP_OK;
 }
 
-esp_err_t nino_voice_assist_run_query_only(void) { return run_ws_and_queue(); }
+esp_err_t nino_voice_assist_run_query_only(void) {
+  return run_ws_and_queue(VOICE_QUERY_VAD_MAX_SEC, NULL);
+}
+
+#define MED_ACK_TASK_STACK 20480
+
+static void medical_ack_prompt_task(void *arg) {
+  (void)arg;
+  vTaskDelay(pdMS_TO_TICKS(500));
+  if (!nino_voice_assist_has_ws_uri()) {
+    ESP_LOGW(TAG,
+             "Medical ack: PC voice not linked — serial: voice connect <PC_LAN_IP> 8000");
+    vTaskDelete(NULL);
+    return;
+  }
+  ESP_LOGI(TAG, "Medical reminder — listening (%d s)", MED_ACK_VAD_MAX_SEC);
+  esp_err_t chime = nino_voice_play_wake_chime();
+  if (chime != ESP_OK) {
+    ESP_LOGW(TAG, "Medical ack chime failed: %s", esp_err_to_name(chime));
+  }
+  bool prompt_after = false;
+  esp_err_t e = run_ws_and_queue(MED_ACK_VAD_MAX_SEC, &prompt_after);
+  if (e != ESP_OK) {
+    ESP_LOGW(TAG, "Medical ack voice query failed: %s", esp_err_to_name(e));
+  } else if (prompt_after) {
+    ESP_LOGI(TAG, "Medical follow-up listen scheduled after reply");
+  }
+  vTaskDelete(NULL);
+}
+
+void nino_voice_assist_prompt_medical_ack(void) {
+  BaseType_t ok = xTaskCreate(medical_ack_prompt_task, "med_ack", MED_ACK_TASK_STACK,
+                              NULL, 3, NULL);
+  if (ok != pdPASS) {
+    ESP_LOGW(TAG, "Could not start medical ack listen task");
+  }
+}
 
 bool nino_voice_assist_has_ws_uri(void) {
   if (s_ws_uri_mutex == NULL) {

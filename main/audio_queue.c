@@ -25,6 +25,7 @@ typedef struct {
   size_t len;
   bool play_done_chime;
   nino_audio_servo_mode_t servo_mode;
+  bool prompt_ack_after;
 } audio_play_job_t;
 
 typedef struct {
@@ -123,6 +124,9 @@ static bool play_normal_job(audio_play_job_t *job) {
 
   if (job->play_done_chime) {
     (void)nino_voice_play_done_chime();
+  }
+  if (job->prompt_ack_after) {
+    nino_voice_assist_prompt_medical_ack();
   }
   nino_decoded_wav_free(&decoded);
   return true;
@@ -247,7 +251,8 @@ esp_err_t nino_audio_queue_start(void) {
 }
 
 esp_err_t nino_audio_queue_wav(uint8_t *wav, size_t len, bool play_done_chime,
-                               nino_audio_servo_mode_t servo_mode) {
+                               nino_audio_servo_mode_t servo_mode,
+                               bool prompt_ack_after) {
   if (wav == NULL || len == 0) {
     free(wav);
     return ESP_ERR_INVALID_ARG;
@@ -258,6 +263,7 @@ esp_err_t nino_audio_queue_wav(uint8_t *wav, size_t len, bool play_done_chime,
       .len = len,
       .play_done_chime = play_done_chime,
       .servo_mode = servo_mode,
+      .prompt_ack_after = prompt_ack_after,
   };
 
   if (is_touch_job(&job)) {
@@ -268,7 +274,8 @@ esp_err_t nino_audio_queue_wav(uint8_t *wav, size_t len, bool play_done_chime,
 }
 
 esp_err_t nino_audio_queue_wav_copy(const uint8_t *wav, size_t len, bool play_done_chime,
-                                    nino_audio_servo_mode_t servo_mode) {
+                                    nino_audio_servo_mode_t servo_mode,
+                                    bool prompt_ack_after) {
   if (wav == NULL || len == 0) {
     return ESP_ERR_INVALID_ARG;
   }
@@ -282,13 +289,14 @@ esp_err_t nino_audio_queue_wav_copy(const uint8_t *wav, size_t len, bool play_do
     return ESP_ERR_NO_MEM;
   }
   memcpy(copy, wav, len);
-  return nino_audio_queue_wav(copy, len, play_done_chime, servo_mode);
+  return nino_audio_queue_wav(copy, len, play_done_chime, servo_mode, prompt_ack_after);
 }
 
-void nino_main_queue_audio_wav(uint8_t *pcm_wav, size_t len, bool play_done_chime) {
+void nino_main_queue_audio_wav(uint8_t *pcm_wav, size_t len, bool play_done_chime,
+                               bool prompt_ack_after) {
   /* Same L/R/U/D as POST /play_wav; motion stops when clip ends (/servo/360 stops it too). */
-  esp_err_t err =
-      nino_audio_queue_wav(pcm_wav, len, play_done_chime, NINO_AUDIO_SERVO_FULL);
+  esp_err_t err = nino_audio_queue_wav(pcm_wav, len, play_done_chime,
+                                       NINO_AUDIO_SERVO_FULL, prompt_ack_after);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "voice: queue WAV failed: %s", esp_err_to_name(err));
   }

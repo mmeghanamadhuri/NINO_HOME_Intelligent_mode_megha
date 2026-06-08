@@ -149,7 +149,7 @@ voice wake on
 | No spin after confirmation | Server log: `ESP servo 360 failed…`; flash firmware with `/servo/360`; U2D2 ready? |
 | `servos_not_ready` | Servo power, U2D2 on J18 hub, wait for joint mode in log |
 | Phrase not detected | Server log: `Voice query` vs `Voice servo 360 command`; speak clearly after wake chime |
-| Spin stops mid-way | Timeout per segment (60 s); check mechanical bind or low speed (default moving speed 35) |
+| Spin stops mid-way | Timeout per segment (60 s); check mechanical bind or low speed (default moving speed 22) |
 | CLI `360` works, voice does not | `voice connect` IP/port; server running; restart server after code changes |
 
 ## Related files (quick index)

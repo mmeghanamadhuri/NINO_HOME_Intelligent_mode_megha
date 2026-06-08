@@ -14,6 +14,7 @@ from alarm_voice import (
     _handle_cancel_alarms,
     _handle_list_alarms,
     _save_alarm,
+    format_time_phrase_parts,
     parse_alarm_datetime,
 )
 from llm_service import DEFAULT_MODEL, DEFAULT_OLLAMA_URL, ollama_generate
@@ -193,8 +194,13 @@ def _payload_to_time_phrase(payload: dict[str, Any]) -> str:
     if day not in {"today", "tomorrow"}:
         day = ""
 
+    time_raw = re.sub(r"(\d)[.](\d)", r"\1:\2", time_raw)
+
     if ":" in time_raw:
         hour_s, minute_s = time_raw.split(":", 1)
+        minute_s = re.sub(r"\D.*$", "", minute_s)
+        if not minute_s:
+            return ""
         hour = int(hour_s)
         minute = int(minute_s)
     else:
@@ -208,13 +214,4 @@ def _payload_to_time_phrase(payload: dict[str, Any]) -> str:
         else:
             return ""
 
-    if ampm in {"AM", "PM"}:
-        core = f"{hour}:{minute:02d} {ampm}"
-    elif hour >= 13:
-        core = f"{hour}:{minute:02d}"
-    else:
-        core = f"{hour}:{minute:02d}"
-
-    if day:
-        return f"{core} {day}"
-    return core
+    return format_time_phrase_parts(hour, minute, ampm, day=day)

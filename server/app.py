@@ -27,6 +27,50 @@ from tts_service import TTSService, synthesize_sapi_wav_bytes
 
 logger = logging.getLogger(__name__)
 
+
+class _GracefulShutdownFilter(logging.Filter):
+    """Suppress expected Ctrl+C / CancelledError tracebacks during uvicorn shutdown."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.exc_info and record.exc_info[0] is not None:
+            exc_type = record.exc_info[0]
+            if exc_type.__name__ in {"KeyboardInterrupt", "CancelledError"}:
+                return False
+            exc_val = record.exc_info[1]
+            while exc_val is not None:
+                if isinstance(exc_val, KeyboardInterrupt):
+                    return False
+                if isinstance(exc_val, asyncio.CancelledError):
+                    return False
+                exc_val = exc_val.__cause__ or exc_val.__context__
+        if record.levelno >= logging.ERROR:
+            msg = record.getMessage()
+            if "CancelledError" in msg or "KeyboardInterrupt" in msg:
+                return False
+        return True
+
+
+def _configure_shutdown_logging() -> None:
+    filt = _GracefulShutdownFilter()
+    logging.getLogger().addFilter(filt)
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access", "starlette", "fastapi"):
+        logging.getLogger(name).addFilter(filt)
+
+
+async def _serve_uvicorn(host: str, port: int) -> None:
+    import uvicorn
+
+    config = uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        log_level="info",
+        timeout_graceful_shutdown=3,
+    )
+    server = uvicorn.Server(config)
+    await server.serve()
+
+
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "server_config.json"
 
@@ -291,7 +335,7 @@ def _mjpeg_generator():
                 + payload
                 + b"\r\n"
             )
-    except (GeneratorExit, BrokenPipeError, ConnectionResetError):
+    except (GeneratorExit, BrokenPipeError, ConnectionResetError, KeyboardInterrupt):
         return
 
 
@@ -319,7 +363,9 @@ def _recall_voice_viewer() -> str | None:
 def _update_tts_face_state(results: list[dict]) -> None:
     recognized_names: list[str] = []
     for result in results:
-        if result.get("recognized"):
+        if not result.get("primary", True):
+            continue
+        if result.get("recognized") or result.get("stabilized"):
             recognized_names.append(str(result.get("name", "")))
     primary = _primary_recognized_viewer(results)
     tts.update_face_state(recognized_names, primary_name=primary)
@@ -328,21 +374,8 @@ def _update_tts_face_state(results: list[dict]) -> None:
 
 
 def _primary_recognized_viewer(results: list[dict]) -> str | None:
-    """Largest recognized face in frame (closest to the camera)."""
-    best_name: str | None = None
-    best_area = 0
-    for result in results:
-        if not result.get("recognized"):
-            continue
-        name = str(result.get("name", "")).strip()
-        if not name or name.lower() in {"unknown", "face"}:
-            continue
-        box = result.get("box") or {}
-        area = int(box.get("w", 0)) * int(box.get("h", 0))
-        if area > best_area:
-            best_area = area
-            best_name = name
-    return best_name
+    """Largest primary face in frame with a confident identity."""
+    return faces.primary_viewer(results)
 
 
 def _viewer_for_voice_query() -> str | None:
@@ -372,26 +405,16 @@ def _viewer_for_voice_query() -> str | None:
 
 
 def _camera_identity_snapshot() -> tuple[str | None, Literal["recognized", "unknown", "no_face"]]:
-    """Live camera identity for 'who am I?' — recognized name or unknown / no face."""
-    results: list[dict] = []
-    frame = camera.read()
-    if frame is not None:
-        results = faces.recognize(frame)
-    elif latest_results:
-        results = latest_results
-
-    if not results:
+    """Live camera identity for 'who am I?' — multi-frame vote on the primary viewer."""
+    name, state = faces.recognize_identity(camera.read)
+    if state == "recognized" and name:
+        _remember_voice_viewer(name)
+        return name, "recognized"
+    if state == "no_face":
+        recalled = _recall_voice_viewer()
+        if recalled:
+            return recalled, "recognized"
         return None, "no_face"
-
-    primary = max(
-        results,
-        key=lambda r: int(r["box"]["w"]) * int(r["box"]["h"]),
-    )
-    if primary.get("recognized"):
-        name = str(primary.get("name", "")).strip()
-        if name and name.lower() not in {"unknown", "face"}:
-            return name, "recognized"
-
     return None, "unknown"
 
 
@@ -476,6 +499,9 @@ async def _voice_ws_pipeline(websocket: WebSocket) -> None:
             await run_in_threadpool(tts.notify_voice_interaction, active_viewer)
 
             try:
+                await websocket.send_json(
+                    {"prompt_medical_ack": reply_meta.prompt_medical_ack}
+                )
                 await websocket.send_bytes(wav_out)
             except WebSocketDisconnect:
                 break
@@ -533,7 +559,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--whisper-model",
-        default=os.environ.get("WHISPER_MODEL", "tiny"),
+        default=os.environ.get("WHISPER_MODEL", "small"),
         help="faster-whisper model for /ws/voice (tiny, base, small, ...)",
     )
     parser.add_argument(
@@ -602,13 +628,15 @@ def main() -> None:
     from voice_service import configure_from_environ
 
     configure_from_environ()
-    import uvicorn
+    _configure_shutdown_logging()
 
     try:
-        uvicorn.run(app, host=args.host, port=args.port)
-    except KeyboardInterrupt:
-        # Graceful Ctrl+C without noisy traceback.
+        asyncio.run(_serve_uvicorn(args.host, args.port))
+    except (KeyboardInterrupt, asyncio.CancelledError):
         pass
+    finally:
+        shutdown()
+    logger.info("Server stopped.")
 
 
 if __name__ == "__main__":

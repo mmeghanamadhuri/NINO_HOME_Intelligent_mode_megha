@@ -27,7 +27,7 @@ from alarm_medical import (
     repeat_prompt_suffix,
 )
 from alarm_time import system_clock_info, system_now, system_now_iso
-from esp_playback import esp_play_wav_url, post_wav_to_esp
+from esp_playback import ESP_MAX_PLAY_WAV_BYTES, esp_play_wav_url, post_wav_to_esp
 from tts_service import synthesize_sapi_wav_bytes
 from wav_resample import ESP_PCM_SAMPLE_RATE_HZ, resample_wav_bytes_to_mono_16bit
 
@@ -38,6 +38,8 @@ DEFAULT_ALARM_WAV = BASE_DIR.parent / "main" / "beep.wav"
 DEFAULT_DATA_PATH = BASE_DIR / "data" / "alarms.json"
 
 TICK_SECONDS = float(os.environ.get("ALARM_TICK_SECONDS", "1.0"))
+# 16 kHz keeps alarm TTS under ESP /play_wav limit (384 KiB); voice WS uses the same rate.
+ALARM_TTS_SAMPLE_RATE_HZ = int(os.environ.get("ALARM_TTS_SAMPLE_RATE", "16000"))
 
 
 @dataclass
@@ -77,9 +79,14 @@ class Alarm:
         """Spoken alert when the alarm fires on the ESP."""
         when = self.spoken_time()
         name = (self.person_name or "").strip()
-        suffix = repeat_prompt_suffix() if repeat and self.requires_ack else ""
-        if not suffix and self.requires_ack and not repeat:
-            suffix = ack_prompt_suffix()
+        if repeat and self.requires_ack:
+            if self.is_medical():
+                if name:
+                    return f"{name}, medication reminder. Yes or no?"
+                return "Medication reminder. Yes or no?"
+            suffix = ""
+        else:
+            suffix = ack_prompt_suffix() if self.requires_ack else ""
 
         if self.label:
             label = self.label.strip()
@@ -482,6 +489,26 @@ class AlarmService:
                 self._save_locked()
                 break
 
+    def _synthesize_alarm_wav_for_esp(self, spoken: str) -> bytes:
+        """TTS for /play_wav — must fit ESP_MAX_PLAY_WAV_BYTES (384 KiB on device)."""
+        for rate in (168, 200, 220):
+            wav, _ = synthesize_sapi_wav_bytes(spoken, rate=rate)
+            out = resample_wav_bytes_to_mono_16bit(wav, ALARM_TTS_SAMPLE_RATE_HZ)
+            if len(out) <= ESP_MAX_PLAY_WAV_BYTES:
+                return out
+
+        trimmed = spoken.strip()
+        if len(trimmed) > 96:
+            trimmed = trimmed[:93].rstrip(" ,.") + "."
+        wav, _ = synthesize_sapi_wav_bytes(trimmed, rate=220)
+        out = resample_wav_bytes_to_mono_16bit(wav, ALARM_TTS_SAMPLE_RATE_HZ)
+        if len(out) > ESP_MAX_PLAY_WAV_BYTES:
+            raise RuntimeError(
+                f"WAV too large for ESP ({len(out)} bytes; max {ESP_MAX_PLAY_WAV_BYTES})"
+            )
+        logger.warning("Alarm TTS trimmed to fit ESP: %r", trimmed)
+        return out
+
     def _fire_alarm(self, alarm: Alarm, *, repeat: bool = False) -> None:
         logger.info(
             "Alarm firing id=%s fire_at=%s priority=%s category=%s repeat=%s",
@@ -497,9 +524,7 @@ class AlarmService:
                 raise RuntimeError("ESP_PLAY_WAV_URL is not set")
 
             spoken = alarm.spoken_fire_message(repeat=repeat)
-            # Faster speech keeps WAV under ESP MAX_PLAY_WAV_BYTES (384 KiB).
-            tts_wav, _ = synthesize_sapi_wav_bytes(spoken, rate=168)
-            tts_wav = resample_wav_bytes_to_mono_16bit(tts_wav, ESP_PCM_SAMPLE_RATE_HZ)
+            tts_wav = self._synthesize_alarm_wav_for_esp(spoken)
             post_wav_to_esp(tts_wav, prompt_ack=alarm.requires_ack)
 
             # Medical: TTS only (two long WAVs often exceed ESP limit). Normal: TTS + beep.

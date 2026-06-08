@@ -20,7 +20,11 @@ def _sapi_rate_value(rate: int) -> int:
         return -3
     if rate <= 160:
         return -1
-    return 0
+    if rate <= 180:
+        return 1
+    if rate <= 200:
+        return 2
+    return 3
 
 
 def synthesize_sapi_wav_bytes(

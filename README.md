@@ -31,9 +31,11 @@ Summary of enhancements made in this integration branch:
 ### Face recognition (server)
 
 - **YuNet** detector (auto-download to `server/data/models/`) with Haar fallback.
-- LBPH distance tuning for ~1 m: strict threshold ≤ 80, soft ≤ 92, multi-frame confirm.
+- LBPH with **per-person models**, **calibrated caps per person**, and a **1st vs 2nd margin** (blocks wrong-name swaps).
+- **Green box** on a confident strict match (not only after many confirm frames). Yellow = close but not strict yet.
+- Better **distance** detection (smaller faces, stronger upscale) and training augments (far + slight rotation).
 - Face crop padding, upscale, bilateral filter, training augmentation.
-- **Retrain** required on the web UI after pulling recognition changes.
+- **Retrain** on the web UI after pulling recognition changes (required once).
 
 ### Voice assistant (server + firmware)
 
@@ -143,8 +145,8 @@ Replace `<ESP_IP>` with the ESP board address:
 python app.py --host 0.0.0.0 --port 8000 \
   --camera-source http://<ESP_IP>/stream \
   --esp-play-wav-url http://<ESP_IP>/play_wav \
-  --face-threshold 55 \
-  --face-confirm-frames 4
+  --face-threshold 62 \
+  --face-margin 10
 ```
 
 To use a local webcam instead of the ESP stream:
@@ -159,7 +161,10 @@ Open the UI at `http://localhost:8000`.
 
 1. Flash the ESP firmware.
 2. Power the board and connect the camera.
-3. Configure Wi-Fi from the ESP serial console:
+3. Configure Wi-Fi:
+
+   - **Android app (recommended):** BLE GATT to device **PROV_NINO** (service `4facb001-5a2e-4b7c-9e1f-a8d3e6f20401`) — write SSID, password, then command `0x01`. HTTP fallback via soft AP `ESP32_P4_CAM`. See **[docs/WIFI_PROVISION.md](docs/WIFI_PROVISION.md)**.
+   - **Serial console:**
 
 ```text
 wifi mode sta
@@ -176,7 +181,16 @@ voice connect <PC_IP> 8000
 voice wake on
 ```
 
-7. Say **"Hi ESP"** to trigger the voice assistant.
+7. Say **"Hi ESP"** to trigger the voice assistant (general questions).
+
+**Medical alarm ack on the board** (one-time serial setup):
+
+```text
+voice connect <PC_LAN_IP> 8000
+voice wake on
+```
+
+After a **medical** reminder plays from the server, the board **automatically listens** for **5 s** for **yes** / **no** — you do **not** need to say “Hi ESP” for that step. Rebuild and flash firmware so `/play_wav` honors `X-Nino-Prompt-Ack`. You can also ack from the server web UI (**Yes** / **No** buttons).
 
 Example voice commands after wake:
 
@@ -186,8 +200,15 @@ Example voice commands after wake:
 | “Make a 360” / “Spin 360” | Fixed TTS, then ID2 full rotation |
 | “Set an alarm at 4:30 AM today” | Saves alarm; at fire time POSTs TTS + alarm WAV to ESP |
 | “Remind me to take medicines at 6 AM” | Saves labeled reminder; fires with *“It's 6 AM, time for take medicines.”* + beep |
-| “Remind me to go to school at 8 AM” | Same — multiple reminders stack in `alarms.json` |
-| “List my alarms” / “Cancel my alarm” | List or clear pending alarms |
+| “Remind me to take my medicine at 8 AM” | **P0 medical** — fires before other alarms at the same time; asks for yes/no ack; repeats every 3 min until confirmed |
+| “Remind me to go to school at 8 AM” | Normal priority — one-shot alarm |
+| After medical alarm: “yes” / “I took it” | Confirms and clears the reminder (auto-listen on board if `voice connect` is set) |
+| After medical alarm: “no” | Asks to **reschedule** or **cancel** |
+| Web UI **Yes** / **No** on awaiting row | Same ack without voice |
+| “Reschedule for 6 PM” / “cancel it” | Follow-up after a negative ack |
+| “List my alarms” | Hear pending alarms |
+| “Cancel all alarms” / “Delete my alarms” | Remove every pending alarm |
+| “Cancel alarm at 4 AM” / “Delete my coffee reminder” | Remove one matching alarm |
 | General questions | Whisper → Ollama → TTS (name used ~18% of the time) |
 
 Serial CLI servo test (U2D2 ready):
@@ -214,8 +235,8 @@ Serial CLI servo test (U2D2 ready):
 - `POST /api/register` — register face data
 - `POST /api/retrain` — retrain face recognition model
 - `GET /api/alarms` — list pending alarms
-- `DELETE /api/alarms` — cancel all pending alarms
-- `DELETE /api/alarms/{id}` — cancel one alarm
+- `DELETE /api/alarms` — delete all pending alarms
+- `DELETE /api/alarms/{id}` — delete one alarm (web UI **Delete** button per row)
 - `WS /voice-query` — voice assistant WebSocket (also `/ws/voice`)
 
 ### Server environment (optional)
@@ -228,6 +249,7 @@ Serial CLI servo test (U2D2 ready):
 | `VOICE_VIEWER_TTL_SECONDS` | `900` | How long last recognized face is remembered for voice |
 | `ALARM_WAV_PATH` | `../main/beep.wav` | WAV POSTed to ESP when an alarm fires (after spoken alert) |
 | `ALARM_TICK_SECONDS` | `1.0` | Scheduler poll interval for due alarms |
+| `ALARM_MEDICAL_REPEAT_MINUTES` | `3` | Re-fire medical alarms until user confirms |
 | `ALARM_NLP_FALLBACK` | `1` | Use Ollama JSON when regex fails (`0` to disable) |
 
 ## Repository layout

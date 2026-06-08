@@ -128,8 +128,8 @@ def wants_cancel(user_text: str) -> bool:
 
 
 def ack_prompt_suffix() -> str:
-    return " Say yes when taken, or no."
+    return " Say yes or no."
 
 
 def repeat_prompt_suffix() -> str:
-    return " Medication reminder. Say yes or no."
+    return " Yes or no?"

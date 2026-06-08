@@ -274,9 +274,50 @@ def _clean_reminder_label(label: str) -> str:
     return cleaned[:120]
 
 
+def format_time_phrase_parts(
+    hour: int, minute: int, ampm: str = "", *, day: str = ""
+) -> str:
+    """Build a parser-friendly time phrase; fix Ollama 24h + AM/PM mixes like 20:36 PM."""
+    ampm_clean = (ampm or "").strip().upper()
+    if ampm_clean in {"EMPTY", "NONE", "NULL"}:
+        ampm_clean = ""
+
+    if ampm_clean in {"AM", "PM"}:
+        if hour > 12:
+            hour -= 12
+        elif hour == 0:
+            hour = 12
+        core = f"{hour}:{minute:02d} {ampm_clean}"
+    elif hour >= 13:
+        core = f"{hour}:{minute:02d}"
+    else:
+        core = f"{hour}:{minute:02d}"
+
+    if day in {"today", "tomorrow"}:
+        return f"{core} {day}"
+    return core
+
+
 def _normalize_time_phrase(phrase: str) -> str:
     """Whisper-friendly fixes before regex parse (3.50 → 3:50, 350 AM → 3:50 AM)."""
     text = phrase.strip()
+
+    def _fix_24h_ampm(match: re.Match[str]) -> str:
+        hour = int(match.group("hour"))
+        minute = int(match.group("minute"))
+        ampm = match.group("ampm")
+        if hour > 12:
+            hour -= 12
+        elif hour == 0:
+            hour = 12
+        return f"{hour}:{minute:02d} {ampm}"
+
+    text = re.sub(
+        r"\b(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*(?P<ampm>a\.?m\.?|p\.?m\.?)\b",
+        _fix_24h_ampm,
+        text,
+        flags=re.IGNORECASE,
+    )
 
     def _compact_replace(match: re.Match[str]) -> str:
         digits = match.group("digits")

@@ -41,6 +41,8 @@ class FaceService:
         self.person_lbph_dir = data_dir / "person_lbph"
         self.person_lbph_meta_path = data_dir / "person_lbph_meta.json"
         self._confirm_tracks: list[dict[str, Any]] = []
+        self._session_primary_name: str | None = None
+        self._session_primary_at: float = 0.0
         self._person_models_ready = threading.Event()
         self._recognizer = self._create_recognizer()
         self._yunet: Any | None = None
@@ -71,11 +73,23 @@ class FaceService:
         self.excellent_match_max = float(os.environ.get("FACE_EXCELLENT_MATCH_MAX", "44"))
         grace_delta = float(os.environ.get("FACE_UNKNOWN_GRACE_DELTA", "12"))
         self.unknown_grace_threshold = self.recognition_threshold + grace_delta
-        self.track_hold_seconds = float(os.environ.get("FACE_TRACK_HOLD_SECONDS", "2.5"))
+        self.track_hold_seconds = float(os.environ.get("FACE_TRACK_HOLD_SECONDS", "8.0"))
         self.track_match_iou = float(os.environ.get("FACE_TRACK_MATCH_IOU", "0.18"))
-        self.confirm_frames = max(1, int(os.environ.get("FACE_CONFIRM_FRAMES", "3")))
+        self.confirm_frames = max(1, int(os.environ.get("FACE_CONFIRM_FRAMES", "2")))
         self.weak_confirm_frames = max(
-            self.confirm_frames, int(os.environ.get("FACE_WEAK_CONFIRM_FRAMES", "4"))
+            self.confirm_frames, int(os.environ.get("FACE_WEAK_CONFIRM_FRAMES", "3"))
+        )
+        self.session_primary_hold_seconds = float(
+            os.environ.get("FACE_SESSION_PRIMARY_HOLD_SECONDS", "90")
+        )
+        self.secondary_face_area_ratio = float(
+            os.environ.get("FACE_SECONDARY_AREA_RATIO", "0.40")
+        )
+        self.identity_sample_frames = max(
+            3, int(os.environ.get("FACE_IDENTITY_SAMPLE_FRAMES", "5"))
+        )
+        self.identity_sample_gap_s = float(
+            os.environ.get("FACE_IDENTITY_SAMPLE_GAP_S", "0.06")
         )
         self.detect_min_neighbors = int(os.environ.get("FACE_DETECT_MIN_NEIGHBORS", "3"))
         self.detect_fallback_neighbors = int(os.environ.get("FACE_DETECT_FALLBACK_NEIGHBORS", "2"))
@@ -118,7 +132,95 @@ class FaceService:
             "track_hold_seconds": self.track_hold_seconds,
             "detect_min_neighbors": self.detect_min_neighbors,
             "detector": "yunet" if self._yunet_enabled else "haar",
+            "session_primary_hold_seconds": self.session_primary_hold_seconds,
+            "secondary_face_area_ratio": self.secondary_face_area_ratio,
         }
+
+    @staticmethod
+    def _box_area(box: tuple[int, int, int, int] | dict[str, Any]) -> int:
+        if isinstance(box, dict):
+            return int(box.get("w", 0)) * int(box.get("h", 0))
+        _x, _y, w, h = box
+        return int(w) * int(h)
+
+    @staticmethod
+    def _is_known_name(name: str | None) -> bool:
+        if not name:
+            return False
+        return str(name).strip().lower() not in {"unknown", "face", ""}
+
+    def _session_primary_hint(self) -> str | None:
+        if not self._session_primary_name:
+            return None
+        if (time.time() - self._session_primary_at) > self.session_primary_hold_seconds:
+            return None
+        return self._session_primary_name
+
+    def _update_session_primary(self, name: str | None) -> None:
+        if not self._is_known_name(name):
+            return
+        self._session_primary_name = str(name).strip()
+        self._session_primary_at = time.time()
+
+    def primary_viewer(self, results: list[dict[str, Any]]) -> str | None:
+        """Largest face in frame with a confident identity (closest viewer)."""
+        best_name: str | None = None
+        best_area = 0
+        for result in results:
+            if not result.get("recognized") and not result.get("stabilized"):
+                continue
+            if not result.get("primary", True):
+                continue
+            name = str(result.get("name", "")).strip()
+            if not self._is_known_name(name):
+                continue
+            area = self._box_area(result.get("box") or {})
+            if area > best_area:
+                best_area = area
+                best_name = name
+        return best_name
+
+    def recognize_identity(
+        self, read_frame: Any, *, samples: int | None = None
+    ) -> tuple[str | None, str]:
+        """Multi-frame vote for voice identity ('who am I?'). Returns (name, state)."""
+        sample_count = samples if samples is not None else self.identity_sample_frames
+        votes: dict[str, int] = {}
+        saw_face = False
+
+        for _ in range(sample_count):
+            frame = read_frame()
+            if frame is None:
+                time.sleep(self.identity_sample_gap_s)
+                continue
+
+            results = self.recognize(frame)
+            if not results:
+                time.sleep(self.identity_sample_gap_s)
+                continue
+
+            saw_face = True
+            primary = self.primary_viewer(results)
+            if primary:
+                votes[primary] = votes.get(primary, 0) + 1
+            time.sleep(self.identity_sample_gap_s)
+
+        if not saw_face:
+            hint = self._session_primary_hint()
+            if hint:
+                return hint, "recognized"
+            return None, "no_face"
+
+        if votes:
+            winner = max(votes, key=lambda key: votes[key])
+            if votes[winner] >= max(2, (sample_count + 1) // 2):
+                return winner, "recognized"
+
+        hint = self._session_primary_hint()
+        if hint:
+            return hint, "recognized"
+
+        return None, "unknown"
 
     def detect(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
         if frame is None or frame.size == 0:
@@ -317,7 +419,18 @@ class FaceService:
             labels = dict(self._labels)
             person_recs = dict(self._person_recognizers)
 
-        for x, y, w, h in faces:
+        session_hint = self._session_primary_hint()
+        sorted_faces = sorted(faces, key=self._box_area, reverse=True)
+        largest_area = self._box_area(sorted_faces[0]) if sorted_faces else 0
+
+        for index, (x, y, w, h) in enumerate(sorted_faces):
+            box = (x, y, w, h)
+            face_area = self._box_area(box)
+            is_primary = index == 0 or (
+                largest_area > 0
+                and face_area >= int(largest_area * self.secondary_face_area_ratio)
+            )
+
             name = "Face"
             confidence: float | None = None
             recognized = False
@@ -327,22 +440,39 @@ class FaceService:
             weak_name: str | None = None
 
             if recognizer is not None and labels:
-                face = self._normalize_face(frame, (x, y, w, h))
+                face = self._normalize_face(frame, box)
                 strict_name, weak_name, confidence, margin_ok = self._classify_face(
-                    face, labels, person_recs
+                    face, labels, person_recs, session_hint=session_hint
                 )
 
+                if not is_primary and strict_name:
+                    weak_name = strict_name
+                    strict_name = None
+                    margin_ok = False
+
                 display_name, used_track, pending_track = self._apply_confirmation(
-                    (x, y, w, h), strict_name, weak_name, confidence, now, margin_ok
+                    box,
+                    strict_name,
+                    weak_name,
+                    confidence,
+                    now,
+                    margin_ok,
+                    session_hint=session_hint,
                 )
-                recognized = strict_name is not None
-                pending = strict_name is None and (
-                    weak_name is not None or pending_track
+                recognized = strict_name is not None or (
+                    used_track and self._is_known_name(display_name)
+                )
+                pending = (
+                    not recognized
+                    and self._is_known_name(display_name)
+                    and (weak_name is not None or pending_track)
                 )
                 if recognized:
-                    name = strict_name
-                elif pending and weak_name:
-                    name = weak_name
+                    name = display_name if self._is_known_name(display_name) else (
+                        strict_name or display_name
+                    )
+                elif pending:
+                    name = display_name
                 else:
                     name = display_name
 
@@ -354,8 +484,13 @@ class FaceService:
                     "confidence": confidence,
                     "stabilized": used_track,
                     "pending": pending,
+                    "primary": is_primary,
                 }
             )
+
+        primary_name = self.primary_viewer(results)
+        if primary_name:
+            self._update_session_primary(primary_name)
 
         return results
 
@@ -366,7 +501,7 @@ class FaceService:
         for result in results:
             box = result["box"]
             x, y, w, h = box["x"], box["y"], box["w"], box["h"]
-            if result["recognized"]:
+            if result["recognized"] or result.get("stabilized"):
                 color = (0, 200, 0)
             elif result.get("pending"):
                 color = (0, 220, 220)
@@ -429,9 +564,12 @@ class FaceService:
         confidence: float | None,
         now: float,
         margin_ok: bool = True,
+        *,
+        session_hint: str | None = None,
     ) -> tuple[str, bool, bool]:
-        """Returns (display_name, stabilized, pending_track). Green box uses strict match in recognize()."""
+        """Returns (display_name, stabilized, pending_track)."""
         track = self._match_confirm_track(box, now)
+        is_new_track = track is None
         if track is None:
             track = {
                 "box": box,
@@ -448,14 +586,12 @@ class FaceService:
 
         confirmed_name = track.get("confirmed_name")
         if confirmed_name and strict_name and strict_name != confirmed_name:
-            track["confirmed_name"] = None
-            track["streak"] = 0
-            track["candidate"] = None
-            track["weak_streak"] = False
-            confirmed_name = None
-
-        stabilized = False
-        pending = False
+            if margin_ok or confidence is None or confidence <= self.unknown_grace_threshold:
+                track["confirmed_name"] = None
+                track["streak"] = 0
+                track["candidate"] = None
+                track["weak_streak"] = False
+                confirmed_name = None
 
         active_name = strict_name
         confirm_needed = self.confirm_frames
@@ -465,7 +601,17 @@ class FaceService:
             confirm_needed = self.weak_confirm_frames
             is_weak = True
 
-        if active_name and active_name not in {"Unknown", "Face"}:
+        if (
+            is_new_track
+            and session_hint
+            and active_name == session_hint
+            and self._is_known_name(active_name)
+        ):
+            track["candidate"] = active_name
+            track["weak_streak"] = is_weak
+            track["streak"] = max(1, confirm_needed - 1)
+
+        if active_name and self._is_known_name(active_name):
             if track.get("candidate") == active_name and bool(track.get("weak_streak")) == is_weak:
                 track["streak"] = int(track.get("streak", 0)) + 1
             else:
@@ -482,18 +628,19 @@ class FaceService:
         ):
             track["confirmed_name"] = str(track["candidate"])
         elif track.get("confirmed_name") and confidence is not None:
-            if confidence <= self.unknown_grace_threshold:
-                stabilized = True
-            else:
+            if confidence > self.unknown_grace_threshold:
                 track["confirmed_name"] = None
                 track["streak"] = 0
 
         confirmed = track.get("confirmed_name")
         if confirmed:
-            return str(confirmed), stabilized, False
+            return str(confirmed), True, False
 
-        if active_name and active_name not in {"Unknown", "Face"}:
+        if active_name and self._is_known_name(active_name):
             return active_name, False, int(track.get("streak", 0)) > 0
+
+        if confirmed_name and self._is_known_name(str(confirmed_name)):
+            return str(confirmed_name), True, False
 
         return "Unknown", False, False
 
@@ -527,6 +674,8 @@ class FaceService:
         face: np.ndarray,
         labels: dict[int, str],
         person_recs: dict[int, Any] | None = None,
+        *,
+        session_hint: str | None = None,
     ) -> tuple[str | None, str | None, float | None, bool]:
         """Return (strict_name, weak_name, best_lbph_distance, margin_ok)."""
         ranked = self._predict_ranked(face, labels, person_recs)
@@ -546,6 +695,7 @@ class FaceService:
         second_conf = ranked[1][0] if len(ranked) > 1 else best_conf + self.recognition_margin_min
         margin = second_conf - best_conf
         margin_ok = margin >= self.recognition_margin_min
+        relaxed_margin_ok = margin >= max(4.0, self.recognition_margin_min * 0.5)
         excellent = best_conf <= self.excellent_match_max and margin >= max(
             6.0, self.recognition_margin_min * 0.6
         )
@@ -559,6 +709,20 @@ class FaceService:
         if (margin_ok or excellent) and best_conf <= accept_cap:
             strict_name = best_name
         elif (margin_ok or excellent) and best_conf <= self.soft_recognition_threshold:
+            weak_name = best_name
+        elif (
+            session_hint
+            and best_name == session_hint
+            and best_conf <= self.soft_recognition_threshold
+            and (relaxed_margin_ok or excellent)
+        ):
+            strict_name = best_name
+            margin_ok = True
+        elif (
+            session_hint
+            and best_name == session_hint
+            and best_conf <= self.soft_recognition_threshold
+        ):
             weak_name = best_name
         return strict_name, weak_name, best_conf, margin_ok or excellent
 
