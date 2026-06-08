@@ -32,17 +32,31 @@ Summary of enhancements made in this integration branch:
 
 - **YuNet** detector (auto-download to `server/data/models/`) with Haar fallback.
 - LBPH with **per-person models**, **calibrated caps per person**, and a **1st vs 2nd margin** (blocks wrong-name swaps).
-- **Green box** on a confident strict match (not only after many confirm frames). Yellow = close but not strict yet.
+- **Primary viewer only**: smaller background faces cannot steal a strict green match (closest/largest face wins).
+- **Session memory** (~90 s): faster re-confirm when you walk away and return; stabilizes voice/TTS identity.
+- **Multi-frame “who am I?”** vote (5 frames) instead of a single snapshot.
+- **Green box** on strict match or stabilized confirm (~2 frames); yellow = pending weak match.
 - Better **distance** detection (smaller faces, stronger upscale) and training augments (far + slight rotation).
 - Face crop padding, upscale, bilateral filter, training augmentation.
-- **Retrain** on the web UI after pulling recognition changes (required once).
+- **Retrain** on the web UI after pulling recognition changes (aim for **25+ varied samples per person**).
 
 ### Voice assistant (server + firmware)
 
+- **Whisper** STT via `faster-whisper` (default model **`small`**; override with `--whisper-model`).
 - **Identity questions** (“who am I?”, “what’s my name?”, …): Ollama reply grounded in live camera recognition (recognized name / unknown / no face).
 - **Random personalization**: ~18% of general voice replies include the viewer’s name (`VOICE_PERSONALIZE_PROB` env override). Vision greetings always use the name.
 - **Servo 360 voice command**: phrases like “make a 360”, “do a 360”, “spin 360” → fixed TTS (*“OK, doing the spin now.”*) → delayed `POST http://<ESP_IP>/servo/360`. Does **not** use Ollama.
 - Voice reply playback uses **L/R/U/D head motion** during WebSocket TTS (same as `/play_wav`). `/servo/360` stops motion before the spin.
+- **Medical alarm follow-up listen**: after you say **no** to a medical reminder, the server asks *reschedule or cancel?* and the board **opens the mic again** automatically (WebSocket `prompt_medical_ack` metadata + firmware re-listen).
+
+### Alarms (server + firmware)
+
+- Regex alarm parsing first; **Ollama NLP fallback** when phrasing is non-standard (`ALARM_NLP_FALLBACK=1`).
+- Normalizes Whisper/Ollama time quirks (e.g. `8.36pm`, `20:36 PM` → valid 12-hour parse).
+- **Medical (P0)** reminders: TTS on ESP with **yes/no auto-listen** (`X-Nino-Prompt-Ack` on `/play_wav`); repeat every 3 min until confirmed.
+- Alarm TTS resampled to **16 kHz** with faster-speech fallback so WAV fits ESP **`/play_wav` limit (384 KiB)**.
+- Medical fires **TTS only** (no beep clip — avoids exceeding size limit). Normal alarms: TTS + beep.
+- Details: **[docs/ALARM.md](docs/ALARM.md)**.
 
 ### Dynamixel servo 360 (firmware + server)
 
@@ -75,7 +89,7 @@ Summary of enhancements made in this integration branch:
 - **Board**: ESP32-P4 Function EV Board
 - **Camera**: USB UVC webcam on J18 host port
 - **Servos**: ROBOTIS Dynamixel AX (ID **1** = tilt, ID **2** = pan) via **U2D2** on the same J18 hub
-- **Touch**: QT2120 capacitive sensor, I2C address `0x1C`
+- **Touch**: QT2120 capacitive sensor on shared **I2C** bus (**SDA GPIO 7**, **SCL GPIO 8**), address `0x1C`
 - **Audio**: ES8311 codec for microphone and speaker
 - **Network**: PC and ESP on the same LAN
 - **LLM**: Ollama model such as `qwen2.5:1.5b`
@@ -142,11 +156,12 @@ pip install -r requirements.txt
 Replace `<ESP_IP>` with the ESP board address:
 
 ```powershell
-python app.py --host 0.0.0.0 --port 8000 \
-  --camera-source http://<ESP_IP>/stream \
-  --esp-play-wav-url http://<ESP_IP>/play_wav \
-  --face-threshold 62 \
-  --face-margin 10
+python app.py --host 0.0.0.0 --port 8000 `
+  --camera-source http://<ESP_IP>/stream `
+  --esp-play-wav-url http://<ESP_IP>/play_wav `
+  --face-threshold 62 `
+  --face-margin 10 `
+  --whisper-model small
 ```
 
 To use a local webcam instead of the ESP stream:
@@ -190,7 +205,13 @@ voice connect <PC_LAN_IP> 8000
 voice wake on
 ```
 
-After a **medical** reminder plays from the server, the board **automatically listens** for **5 s** for **yes** / **no** — you do **not** need to say “Hi ESP” for that step. Rebuild and flash firmware so `/play_wav` honors `X-Nino-Prompt-Ack`. You can also ack from the server web UI (**Yes** / **No** buttons).
+After a **medical** reminder plays from the server, the board **automatically listens** for **8 s** for **yes** / **no** — you do **not** need to say “Hi ESP” for that step. Flash firmware that supports `/play_wav` **`X-Nino-Prompt-Ack`** and WebSocket **`prompt_medical_ack`** follow-up listens. You can also ack from the server web UI (**Yes** / **No** buttons).
+
+**Medical flow after “no”:**
+
+1. Board asks *reschedule or cancel?* (spoken by server TTS).
+2. Mic opens again automatically — say **“cancel”** or **“reschedule for 6 PM”** (no wake word).
+3. Repeat listens continue while the alarm is in `reschedule_prompt` state.
 
 Example voice commands after wake:
 
@@ -198,14 +219,14 @@ Example voice commands after wake:
 |-----|----------|
 | “Who am I?” / “What’s my name?” | Ollama answer using live face recognition |
 | “Make a 360” / “Spin 360” | Fixed TTS, then ID2 full rotation |
-| “Set an alarm at 4:30 AM today” | Saves alarm; at fire time POSTs TTS + alarm WAV to ESP |
-| “Remind me to take medicines at 6 AM” | Saves labeled reminder; fires with *“It's 6 AM, time for take medicines.”* + beep |
-| “Remind me to take my medicine at 8 AM” | **P0 medical** — fires before other alarms at the same time; asks for yes/no ack; repeats every 3 min until confirmed |
-| “Remind me to go to school at 8 AM” | Normal priority — one-shot alarm |
+| “Set an alarm at 4:30 AM today” | Saves alarm; at fire time POSTs TTS + beep to ESP |
+| “Remind me to take medicines at 6 AM” | **P0 medical** — spoken TTS on ESP; yes/no auto-listen; repeats every 3 min (no beep) |
+| “Remind me to take my medicine at 8 AM” | Same as medical — priority over normal alarms at the same time |
+| “Remind me to go to school at 8 AM” | Normal priority — spoken TTS + beep; one-shot |
 | After medical alarm: “yes” / “I took it” | Confirms and clears the reminder (auto-listen on board if `voice connect` is set) |
-| After medical alarm: “no” | Asks to **reschedule** or **cancel** |
+| After medical alarm: “no” / “not taken” | Asks to **reschedule** or **cancel**; mic re-opens automatically |
 | Web UI **Yes** / **No** on awaiting row | Same ack without voice |
-| “Reschedule for 6 PM” / “cancel it” | Follow-up after a negative ack |
+| “Reschedule for 6 PM” / “cancel it” | Follow-up after negative ack (mic already listening) |
 | “List my alarms” | Hear pending alarms |
 | “Cancel all alarms” / “Delete my alarms” | Remove every pending alarm |
 | “Cancel alarm at 4 AM” / “Delete my coffee reminder” | Remove one matching alarm |
@@ -224,7 +245,7 @@ Serial CLI servo test (U2D2 ready):
 - `GET /` — simple device page and snapshot link
 - `GET /stream` — MJPEG live stream
 - `GET /snapshot.jpg` — one JPEG snapshot
-- `POST /play_wav` — queue WAV audio for playback
+- `POST /play_wav` — queue WAV audio for playback (optional header `X-Nino-Prompt-Ack: 1` for medical yes/no listen after play)
 - `POST /servo/360` — start ID2 full rotation (512 → 0 → 1023 → 512)
 
 ### Server endpoints
@@ -244,13 +265,21 @@ Serial CLI servo test (U2D2 ready):
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `ESP_PLAY_WAV_URL` | CLI / config | Face TTS + derives `/servo/360` host for voice spin |
+| `ESP_MAX_PLAY_WAV_BYTES` | `389120` | Server-side cap (ESP `/play_wav` hard limit is 384 KiB) |
+| `WHISPER_MODEL` | `small` | faster-whisper model (`--whisper-model`) |
 | `VOICE_PERSONALIZE_PROB` | `0.18` | Fraction of voice replies that use viewer name |
 | `SERVO_360_TRIGGER_DELAY_SECONDS` | `2.0` | Delay after 360 confirmation TTS before POST spin |
 | `VOICE_VIEWER_TTL_SECONDS` | `900` | How long last recognized face is remembered for voice |
-| `ALARM_WAV_PATH` | `../main/beep.wav` | WAV POSTed to ESP when an alarm fires (after spoken alert) |
+| `FACE_RECOGNITION_THRESHOLD` | `62` | LBPH strict match cap (`--face-threshold`) |
+| `FACE_RECOGNITION_MARGIN` | `10` | Min gap vs 2nd person (`--face-margin`) |
+| `FACE_SESSION_PRIMARY_HOLD_SECONDS` | `90` | Remember primary viewer across brief gaps |
+| `FACE_SECONDARY_AREA_RATIO` | `0.40` | Suppress strict ID on small background faces |
+| `ALARM_WAV_PATH` | `../main/beep.wav` | Beep POSTed after **normal** (non-medical) alarm TTS |
+| `ALARM_TTS_SAMPLE_RATE` | `16000` | Alarm TTS resample rate (keeps WAV under ESP limit) |
 | `ALARM_TICK_SECONDS` | `1.0` | Scheduler poll interval for due alarms |
 | `ALARM_MEDICAL_REPEAT_MINUTES` | `3` | Re-fire medical alarms until user confirms |
 | `ALARM_NLP_FALLBACK` | `1` | Use Ollama JSON when regex fails (`0` to disable) |
+| `OLLAMA_MODEL` | `qwen2.5:1.5b` | LLM for voice + alarm NLP fallback |
 
 ## Repository layout
 
@@ -280,11 +309,16 @@ main/
 
 docs/
   SERVO.md
+  ALARM.md
+  WIFI_PROVISION.md
 
 server/
   app.py
   alarm_service.py
   alarm_voice.py
+  alarm_nlp.py
+  alarm_ack.py
+  alarm_medical.py
   esp_playback.py
   camera.py
   face_service.py
@@ -306,8 +340,8 @@ managed_components/
 ## Notes
 
 - Touch audio **preempts** server/voice playback and resumes afterward; server/voice uses a separate queue from touch.
-- Voice WebSocket replies play **without** head motion so servo 360 is not blocked.
-- Face greeting TTS from the server still uses head motion during `/play_wav`.
+- Face greeting and alarm TTS from the server use head motion during `/play_wav`.
+- Voice WebSocket `/voice-query` replies also queue with head motion unless interrupted by touch or `/servo/360`.
 - `POST /play_wav` and `POST /servo/360` have no authentication — use only on a trusted LAN.
 - Windows is the recommended platform for the default speech synthesis path.
 - **`server/data/face_model.yml`** can grow very large after retraining; do not commit files over GitHub’s 100 MB limit — retrain locally on each machine or share the model out of band.
@@ -315,9 +349,13 @@ managed_components/
 ## Troubleshooting
 
 - If video is missing, verify `http://<ESP_IP>/snapshot.jpg`.
-- If faces are not recognized, retrain with more samples and improve lighting; check server log for YuNet/LBPH detector.
+- If faces are not recognized, retrain with **25+ varied samples per person** and improve lighting; check server log for `detector=yunet`.
+- If the wrong person is recognized with two people in frame, stand closest to the camera (primary face) or increase `--face-margin`.
 - If voice does not connect, verify the PC IP is reachable from the ESP (`voice connect <PC_IP> 8000`) and the server is running.
-- If touch audio fails, check QT2120 initialization and speaker setup in the serial logs.
+- If **medical alarm ack** works for yes/no but not after *reschedule or cancel?*, flash latest firmware (WebSocket `prompt_medical_ack`) and restart the server.
+- If alarm fire logs **`WAV too large for ESP`**, restart server (16 kHz + shorter repeat TTS); medical alarms use TTS only, no beep.
+- If alarm time voice fails with *“Please use a 12-hour time”*, restart server (NLP normalizes `20:36 PM` / `8.36pm` style output).
+- If touch audio fails, check QT2120 init on I2C (GPIO 7/8) and speaker setup in serial logs.
 - If **360 spin** does not run from voice, confirm `--esp-play-wav-url http://<ESP_IP>/play_wav` is set, firmware includes `/servo/360`, and U2D2/servos show ready in logs.
 - If **`git push` fails** on `face_model.yml`, exclude it from commits (see `.gitignore`); the trained model is machine-local.
 - USB hub: U2D2 scan errors alongside UVC camera on J18 are common when the Dynamixel adapter is unplugged or still enumerating.
