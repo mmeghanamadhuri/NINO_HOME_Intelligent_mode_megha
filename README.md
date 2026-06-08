@@ -4,6 +4,7 @@ NiNO is a smart-home demo for the ESP32-P4 Function EV Board that uses vision, v
 
 - **Vision**: USB UVC camera on the board, face detection/recognition on the PC, personalized greetings played through the ESP speaker.
 - **Voice**: Wake-word capture on the board, Whisper speech recognition and Ollama LLM responses on the PC, audio returned to the board. Supports identity questions and servo voice commands.
+- **Alarms**: Voice-set reminders and alarms on the PC; medical (P0) reminders with yes/no ack, auto-repeat, and reschedule/cancel follow-up — spoken TTS fired to the ESP at the scheduled time.
 - **Touch**: QT2120 capacitive touch sensor triggers an embedded warning audio clip with **priority over** server/voice playback.
 - **Servo**: Dynamixel AX servos (IDs 1 & 2) via U2D2 on the J18 USB hub — head motion during TTS, **ID2 full 360° spin** via CLI, HTTP, or voice.
 
