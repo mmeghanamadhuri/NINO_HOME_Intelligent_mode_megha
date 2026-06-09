@@ -31,6 +31,8 @@
 #include "audio_playback.h"
 #include "audio_capture.h"
 #include "audio_queue.h"
+#include "nino_eye.h"
+#include "ssd1351.h"
 #include "servo_dxl.h"
 #include "servo_motion.h"
 #include "touch_sensor.h"
@@ -477,6 +479,27 @@ static void wifi_cli_register(void) {
 static void voice_cli_register(void);
 static void servo_cli_register(void);
 
+static int cmd_eye(int argc, char **argv) {
+  if (argc >= 2 && nino_eye_apply_command(argv[1])) {
+    printf("eye -> state %d\n", (int)nino_eye_get_state());
+    return 0;
+  }
+  printf("Usage: eye <idle|listening|thinking>   (current state: %d)\n",
+         (int)nino_eye_get_state());
+  return 0;
+}
+
+static void eye_cli_register(void) {
+  const esp_console_cmd_t eye_cmd = {
+      .command = "eye",
+      .help = "Set NINO eye state: eye <idle|listening|thinking>",
+      .hint = NULL,
+      .func = &cmd_eye,
+      .argtable = NULL,
+  };
+  ESP_ERROR_CHECK(esp_console_cmd_register(&eye_cmd));
+}
+
 static void console_init(void) {
   esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
   repl_config.prompt = "usb_cam> ";
@@ -485,6 +508,7 @@ static void console_init(void) {
   wifi_cli_register();
   voice_cli_register();
   servo_cli_register();
+  eye_cli_register();
 
   const esp_console_cmd_t cpu_dump_cmd = {
       .command = "cpu_dump",
@@ -1765,6 +1789,13 @@ void app_main(void) {
   /* After scheduler start; constructor init exhausts internal DRAM (idle-task assert). */
   ESP_ERROR_CHECK(esp_hosted_init());
 #endif
+
+  /* Eye OLEDs come up first so the robot shows its idle face during boot. */
+  if (ssd1351_init() == ESP_OK) {
+    nino_eye_begin(); /* defaults to NINO_EYE_IDLE */
+  } else {
+    ESP_LOGW(TAG, "SSD1351 eye displays init failed; running without eyes");
+  }
 
   ESP_ERROR_CHECK(nino_voice_assist_init_mutex());
   load_voice_ws_from_nvs();

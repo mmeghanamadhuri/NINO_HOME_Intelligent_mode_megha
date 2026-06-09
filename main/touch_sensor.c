@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "audio_playback.h"
 #include "audio_queue.h"
 #include "bsp/esp32_p4_function_ev_board.h"
 #include "bsp_qt2120.h"
@@ -28,9 +29,12 @@ extern const uint8_t pdtm_wav_end[] asm("_binary_PDTM_wav_end");
 static void touch_poll_task(void *arg) {
   (void)arg;
 
+  nino_audio_bus_lock();
+
   esp_err_t err = bsp_i2c_init();
   if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
     ESP_LOGE(TAG, "bsp_i2c_init failed: %s", esp_err_to_name(err));
+    nino_audio_bus_unlock();
     vTaskDelete(NULL);
     return;
   }
@@ -38,12 +42,14 @@ static void touch_poll_task(void *arg) {
   i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
   if (bus == NULL) {
     ESP_LOGE(TAG, "BSP I2C bus handle is NULL");
+    nino_audio_bus_unlock();
     vTaskDelete(NULL);
     return;
   }
 
   if (qt2120_init_with_bus(bus) != ESP_OK) {
     ESP_LOGE(TAG, "QT2120 init failed (check I2C wiring / sensor at 0x1C)");
+    nino_audio_bus_unlock();
     vTaskDelete(NULL);
     return;
   }
@@ -52,14 +58,18 @@ static void touch_poll_task(void *arg) {
   if (qt2120_calibrate() != ESP_OK) {
     ESP_LOGW(TAG, "QT2120 calibrate command failed");
   }
+  nino_audio_bus_unlock();
   vTaskDelay(pdMS_TO_TICKS(TOUCH_STARTUP_SETTLE_MS));
 
   uint16_t idle_keys = 0;
+  nino_audio_bus_lock();
   if (qt2120_read_keys12(&idle_keys) != ESP_OK) {
     ESP_LOGE(TAG, "Failed to read QT2120 idle state");
+    nino_audio_bus_unlock();
     vTaskDelete(NULL);
     return;
   }
+  nino_audio_bus_unlock();
 
   const size_t wav_len = (size_t)(pdtm_wav_end - pdtm_wav_start);
   ESP_LOGI(TAG, "Touch sensor ready, idle mask 0x%03" PRIx16 ", warning clip %u bytes",
@@ -74,7 +84,11 @@ static void touch_poll_task(void *arg) {
 
   while (true) {
     uint16_t raw_keys = 0;
-    if (qt2120_read_keys12(&raw_keys) == ESP_OK) {
+    nino_audio_bus_lock();
+    esp_err_t read_err = qt2120_read_keys12(&raw_keys);
+    nino_audio_bus_unlock();
+
+    if (read_err == ESP_OK) {
       uint16_t active_keys = raw_keys & (uint16_t)~idle_keys;
       bool is_touched = (active_keys != 0);
       int64_t now_us = esp_timer_get_time();

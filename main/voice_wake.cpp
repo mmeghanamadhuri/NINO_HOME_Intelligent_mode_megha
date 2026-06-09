@@ -13,6 +13,7 @@
 extern "C" {
 #include "audio_playback.h"
 #include "model_path.h"
+#include "nino_eye.h"
 #include "voice_assist.h"
 }
 
@@ -99,6 +100,10 @@ static void after_wake_task(void *arg) {
     vTaskDelete(NULL);
     return;
   }
+  /* Listening face from the moment the wake word is accepted; it stays on
+   * through chime + VAD capture and is cleared once the audio reaches the
+   * server (or any step fails). */
+  nino_eye_listening();
   esp_err_t chime = nino_voice_play_wake_chime();
   if (chime != ESP_OK) {
     ESP_LOGW(TAG, "wake chime failed (speaker busy?): %s", esp_err_to_name(chime));

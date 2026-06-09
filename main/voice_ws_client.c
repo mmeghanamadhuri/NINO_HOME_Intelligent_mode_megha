@@ -5,6 +5,7 @@
 
 #include "esp_log.h"
 #include "esp_websocket_client.h"
+#include "nino_eye.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -201,6 +202,8 @@ esp_err_t nino_voice_ws_exchange(const char *ws_uri, const uint8_t *wav_in,
     goto cleanup;
   }
   ESP_LOGI(TAG, "Sent %u bytes to voice WS", (unsigned)wav_in_len);
+  /* Voice has reached the server: listening ends, ponder until the reply. */
+  nino_eye_thinking();
 
   if (xSemaphoreTake(ctx.done, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
     ESP_LOGE(TAG, "Response timeout");
@@ -208,6 +211,9 @@ esp_err_t nino_voice_ws_exchange(const char *ws_uri, const uint8_t *wav_in,
   }
 
 cleanup:
+  /* Reply WAV received (or connect/send/wait failed): back to idle. Also
+   * guarantees the eyes never stick in listening/thinking. */
+  nino_eye_idle();
   esp_websocket_client_stop(ctx.client);
   esp_websocket_client_destroy(ctx.client);
   vSemaphoreDelete(ctx.done);

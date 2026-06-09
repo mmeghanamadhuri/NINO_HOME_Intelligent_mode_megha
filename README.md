@@ -1,12 +1,13 @@
-# NiNO Home — Voice, Vision, Touch, Alarms & Servo  (ESP32-P4)
+# NiNO Home — Voice, Vision, Touch, Alarms, Servo & Eyes  (ESP32-P4)
 
-NiNO is a smart-home demo for the ESP32-P4 Function EV Board that uses vision, voice, alarms, touch, and servo motion together.
+NiNO is a smart-home demo for the ESP32-P4 Function EV Board that uses vision, voice, alarms, touch, servo motion, and animated OLED eyes together.
 
 - **Vision**: USB UVC camera on the board, face detection/recognition on the PC, personalized greetings played through the ESP speaker.
 - **Voice**: Wake-word capture on the board, Whisper speech recognition and Ollama LLM responses on the PC, audio returned to the board. Supports identity questions and servo voice commands.
 - **Alarms**: Voice-set reminders and alarms on the PC; medical (P0) reminders with yes/no ack, auto-repeat, and reschedule/cancel follow-up — spoken TTS fired to the ESP at the scheduled time.
 - **Touch**: QT2120 capacitive touch sensor triggers an embedded warning audio clip with **priority over** server/voice playback.
 - **Servo**: Dynamixel AX servos (IDs 1 & 2) via U2D2 on the J18 USB hub — head motion during TTS, **ID2 full 360° spin** via CLI, HTTP, or voice.
+- **Eyes**: Dual SSD1351 OLED displays animate NINO's eyes — **idle**, **listening**, and **thinking** expressions follow the voice-assistant state automatically (wake word → listening, query sent → thinking, reply received → idle).
 
 ## Features
 
@@ -20,6 +21,7 @@ NiNO is a smart-home demo for the ESP32-P4 Function EV Board that uses vision, v
 - **Voice identity** (“who am I?”) answered using live camera recognition context via Ollama.
 - **Voice servo 360** (“make a 360”, “spin 360”) — fixed TTS confirmation, then `POST /servo/360` on the board (no LLM for this command).
 - Single shared speaker path on the ESP to serialize touch, greetings, alarms, and voice replies.
+- **NINO eye displays**: two mirrored 1.27" SSD1351 OLEDs (128×96) on one SPI bus render flicker-free eye animations; expressions are driven by firmware events and testable from the serial console (`eye <idle|listening|thinking>`).
 - Recommended Windows server support for default SAPI text-to-speech.
 
 ## Recent changes
@@ -69,6 +71,18 @@ Summary of enhancements made in this integration branch:
 - Present-position read over Dynamixel bus; background `servo_360` task.
 - Details: **[docs/SERVO.md](docs/SERVO.md)**.
 
+### NINO eye displays (firmware)
+
+- **Dual SSD1351 OLED driver** (`main/ssd1351.c`): two 1.27" 128×96 panels share one SPI bus (SPI2, 20 MHz); only CS differs per panel, so both eyes render mirrored by default (`ssd1351_target()` can address one eye).
+- **Eye animation engine** (`main/nino_eye.c`): dedicated FreeRTOS task; state switches are instant and non-blocking from any task via `nino_eye_<emotion>()`.
+- **Expressions integrated so far** (taken from the standalone display project):
+  - **Idle** — neutral black eye on white, slow ~5 s eyelid blink (boot default).
+  - **Listening** — wider/taller eye, snappier ~3 s blink.
+  - **Thinking** — eye slowly rolls around the top (up / up-left / up-right), no blink.
+- **Voice pipeline hooks**: wake word accepted → **listening** (through chime, VAD capture, and upload); WAV sent to server → **thinking**; reply WAV received (or any failure) → **idle**. Eyes can never stick in a state — every error path falls back to idle.
+- **Flicker-free rendering**: the previous shape is "un-drawn" along its own outline instead of erasing rectangles, so the static white background is never re-touched (no full-screen flash on state changes).
+- Serial test command on the existing console: `eye <idle|listening|thinking>`.
+
 ### Hardware note
 
 - U2D2 and UVC camera share the **J18 USB hub**. Servo USB scan may log `ESP_ERR_INVALID_STATE` if the camera holds devices — normal when U2D2 is not connected or still enumerating.
@@ -94,6 +108,7 @@ Summary of enhancements made in this integration branch:
 - **Camera**: USB UVC webcam on J18 host port
 - **Servos**: ROBOTIS Dynamixel AX (ID **1** = tilt, ID **2** = pan) via **U2D2** on the same J18 hub
 - **Touch**: QT2120 capacitive sensor on shared **I2C** bus (**SDA GPIO 7**, **SCL GPIO 8**), address `0x1C`
+- **Eyes**: 2× Waveshare 1.27" RGB OLED (SSD1351, 128×96, 4-wire SPI) on the J1 header — shared **CLK GPIO 23**, **DIN GPIO 22**, **DC GPIO 21**, **RST GPIO 20**; per-panel **CS GPIO 26** (left) / **GPIO 27** (right); 3.3 V + GND
 - **Audio**: ES8311 codec for microphone and speaker
 - **Network**: PC and ESP on the same LAN
 - **LLM**: Ollama model such as `qwen2.5:1.5b`
@@ -111,6 +126,7 @@ The ESP firmware provides:
 - Dynamixel joint-mode servo control (neutral **512**, position 0–1023)
 - **ID2 full 360° spin** task (`nino_servo_dxl_spin_360`)
 - Dual-queue speaker system with touch interrupt/resume in `main/audio_queue.c`
+- **Animated OLED eyes** synced to the voice assistant (idle / listening / thinking), with a `eye` console command for manual testing
 
 ### Key firmware files
 
@@ -127,6 +143,8 @@ The ESP firmware provides:
 - `main/servo_dxl.h` — Dynamixel servo API
 - `main/servo_motion.c` — cyclic head motion during face/touch TTS
 - `main/servo_motion.h` — servo motion helpers
+- `main/nino_eye.c` — eye animation engine (idle/listening/thinking states, blink renderer)
+- `main/ssd1351.c` — dual SSD1351 OLED SPI driver (mirrored eyes, per-panel targeting)
 - `main/PDTM.wav` — embedded touch warning audio
 
 ### Servo documentation
@@ -206,6 +224,14 @@ voice wake on
 ```
 
 7. Say **"Hi ESP"** to trigger the voice assistant (general questions).
+
+   The OLED eyes follow along automatically: **listening** (wide eye) from the wake word through your question, **thinking** (eye rolls upward) while the PC transcribes and generates the answer, and back to **idle** as the reply plays. You can also drive them manually from the serial console:
+
+```text
+eye listening
+eye thinking
+eye idle
+```
 
 **Medical alarm ack on the board** (one-time serial setup):
 
@@ -315,6 +341,8 @@ main/
   voice_wake.cpp
   servo_dxl.c
   servo_motion.c
+  nino_eye.c
+  ssd1351.c
   PDTM.wav
 
 docs/
@@ -354,6 +382,8 @@ managed_components/
 - Face greeting and alarm TTS from the server use head motion during `/play_wav`.
 - Voice WebSocket `/voice-query` replies also queue with head motion unless interrupted by touch or `/servo/360`.
 - `POST /play_wav` and `POST /servo/360` have no authentication — use only on a trusted LAN.
+- Eye displays initialize first in `app_main`, so the idle face shows during the rest of boot; if OLED init fails the firmware logs a warning and runs without eyes.
+- Both OLEDs mirror the same eye by default; the driver supports per-eye drawing (`ssd1351_target()`) for future asymmetric expressions.
 - Windows is the recommended platform for the default speech synthesis path.
 - **`server/data/face_model.yml`** can grow very large after retraining; do not commit files over GitHub’s 100 MB limit — retrain locally on each machine or share the model out of band.
 
@@ -367,6 +397,8 @@ managed_components/
 - If alarm fire logs **`WAV too large for ESP`**, restart server (16 kHz + shorter repeat TTS); medical alarms use TTS only, no beep.
 - If alarm time voice fails with *“Please use a 12-hour time”*, restart server (NLP normalizes `20:36 PM` / `8.36pm` style output).
 - If touch audio fails, check QT2120 init on I2C (GPIO 7/8) and speaker setup in serial logs.
+- If the **eyes stay black**, check the boot log for `SSD1351 ready: 2 panel(s) 128x96`; verify wiring on J1 (CLK 23, DIN 22, DC 21, RST 20, CS 26/27) and that both panels share 3.3 V/GND. If red/blue look swapped, set `SSD1351_SWAP_RB` to `1` in `main/ssd1351.h`.
+- If the eyes show but never change during a voice query, confirm the wake word fires (`Hi ESP detected` in the log) — the listening/thinking expressions are driven by the voice pipeline, and `eye listening` on the console tests the display path alone.
 - If **360 spin** does not run from voice, confirm `--esp-play-wav-url http://<ESP_IP>/play_wav` is set, firmware includes `/servo/360`, and U2D2/servos show ready in logs.
 - If **`git push` fails** on `face_model.yml`, exclude it from commits (see `.gitignore`); the trained model is machine-local.
 - USB hub: U2D2 scan errors alongside UVC camera on J18 are common when the Dynamixel adapter is unplugged or still enumerating.

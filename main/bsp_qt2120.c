@@ -20,8 +20,9 @@ static const char *TAG = "QT2120";
 #define QT2120_REG_KEY0_DTHR 0x10
 
 #define QT2120_KEY_COUNT 12
-#define QT2120_DETECT_THRESHOLD 50
-#define QT2120_DETECTION_INTEGRATOR 10
+/* QT2120 power-on defaults: DTHR=10, DI=4. Older firmware used 50/10 and missed weak pads. */
+#define QT2120_DETECT_THRESHOLD 12
+#define QT2120_DETECTION_INTEGRATOR 4
 
 /* Expected Chip ID */
 #define QT2120_CHIP_ID_VALUE 0x3E
@@ -144,7 +145,7 @@ esp_err_t qt2120_configure_conservative(void) {
   }
 
   if (ret == ESP_OK) {
-    ESP_LOGI(TAG, "Conservative touch config: threshold=%d, DI=%d",
+    ESP_LOGI(TAG, "Touch config: threshold=%d, DI=%d",
              QT2120_DETECT_THRESHOLD, QT2120_DETECTION_INTEGRATOR);
   }
 

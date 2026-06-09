@@ -15,6 +15,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "nino_eye.h"
 #include "voice_wake.h"
 #include "voice_ws_client.h"
 
@@ -258,6 +259,9 @@ esp_err_t nino_voice_capture_vad_wav(int max_seconds, uint8_t **out_wav, size_t 
     goto unlock_cleanup;
   }
 
+  /* Mic is live: show the listening face until this capture session ends. */
+  nino_eye_listening();
+
   ESP_LOGI(TAG, "VAD armed (max %d s)", max_seconds);
 
   while (1) {
@@ -348,6 +352,8 @@ esp_err_t nino_voice_capture_vad_wav(int max_seconds, uint8_t **out_wav, size_t 
   }
 
 unlock_cleanup:
+  /* Eyes stay in listening here: the captured audio still has to reach the
+   * server. nino_voice_ws_exchange() (or the caller on failure) ends it. */
   if (mic != NULL) {
     esp_codec_dev_close(mic);
     mic = NULL;
@@ -392,6 +398,7 @@ static esp_err_t run_ws_and_queue(int max_seconds, bool *prompt_after_out) {
   esp_err_t e = nino_voice_capture_vad_wav(max_seconds, &cap, &cap_len);
   if (e != ESP_OK) {
     ESP_LOGE(TAG, "VAD capture failed: %s", esp_err_to_name(e));
+    nino_eye_idle(); /* nothing to send; end the listening face */
     return e;
   }
 
