@@ -1,4 +1,4 @@
-"""STT (Whisper) + LLM (Ollama) + WAV TTS for /ws/voice and helpers."""
+"""STT (ElevenLabs Scribe / Whisper) + LLM (Ollama) + WAV TTS for /ws/voice and helpers."""
 
 from __future__ import annotations
 
@@ -6,9 +6,10 @@ import io
 import os
 import random
 import re
+import time
 import wave
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 from urllib.parse import urlparse
 
@@ -72,6 +73,9 @@ SERVO_360_TRIGGER_DELAY_SECONDS = float(os.environ.get("SERVO_360_TRIGGER_DELAY_
 class VoiceReplyMeta:
     trigger_servo_360: bool = False
     prompt_medical_ack: bool = False
+    # Per-stage latency info for this query (stt/reply/tts seconds, heard text,
+    # reply path, audio sizes). Filled by process_voice_wav; logged by app.py.
+    timings: dict[str, Any] = field(default_factory=dict)
 
 
 # Roughly 2–3 personalized voice replies per 10–20 (override with VOICE_PERSONALIZE_PROB).
@@ -84,8 +88,12 @@ class VoiceSettings:
     ollama_model: str = DEFAULT_MODEL
     whisper_model: str = "tiny"
     whisper_language: str | None = "en"
+    # "elevenlabs" (cloud Scribe API; needs ELEVENLABS_API_KEY) or "whisper" (local).
+    stt_provider: str = "whisper"
+    elevenlabs_api_key: str = ""
+    elevenlabs_stt_model: str = "scribe_v1"
     max_request_bytes: int = 512_000
-    max_words_reply: int = 55
+    max_words_reply: int = 45
     personalize_prob: float = DEFAULT_VOICE_PERSONALIZE_PROB
 
 
@@ -114,6 +122,21 @@ def configure_from_environ() -> None:
     SETTINGS.whisper_model = os.environ.get("WHISPER_MODEL", "tiny").strip()
     lang = os.environ.get("WHISPER_LANGUAGE", "en").strip()
     SETTINGS.whisper_language = None if lang.lower() in {"", "auto"} else lang
+    SETTINGS.elevenlabs_api_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+    SETTINGS.elevenlabs_stt_model = os.environ.get(
+        "ELEVENLABS_STT_MODEL", "scribe_v1"
+    ).strip()
+    provider = os.environ.get("STT_PROVIDER", "").strip().lower()
+    if not provider:
+        # Default to ElevenLabs whenever a key is available, else local Whisper.
+        provider = "elevenlabs" if SETTINGS.elevenlabs_api_key else "whisper"
+    SETTINGS.stt_provider = provider
+    if provider == "elevenlabs" and not SETTINGS.elevenlabs_api_key:
+        logger.warning(
+            "STT provider is elevenlabs but ELEVENLABS_API_KEY is not set; "
+            "falling back to local Whisper."
+        )
+        SETTINGS.stt_provider = "whisper"
     SETTINGS.personalize_prob = float(
         os.environ.get("VOICE_PERSONALIZE_PROB", str(DEFAULT_VOICE_PERSONALIZE_PROB))
     )
@@ -240,7 +263,7 @@ def _resample_linear(samples: np.ndarray, src_rate: int, dst_rate: int) -> np.nd
     return np.interp(x_new, x_old, samples).astype(np.float32)
 
 
-def transcribe_wav(wav_bytes: bytes) -> str:
+def _transcribe_whisper(wav_bytes: bytes) -> str:
     model = _ensure_whisper()
     audio = _wav_bytes_to_float_mono(wav_bytes)
     segments, _ = model.transcribe(
@@ -258,6 +281,45 @@ def transcribe_wav(wav_bytes: bytes) -> str:
     return text
 
 
+def _transcribe_elevenlabs(wav_bytes: bytes) -> str:
+    """ElevenLabs Scribe speech-to-text API."""
+    api_key = SETTINGS.elevenlabs_api_key
+    if not api_key:
+        raise RuntimeError("ELEVENLABS_API_KEY is not set.")
+    data: dict[str, str] = {
+        "model_id": SETTINGS.elevenlabs_stt_model,
+        "tag_audio_events": "false",
+    }
+    if SETTINGS.whisper_language:
+        data["language_code"] = SETTINGS.whisper_language
+    resp = requests.post(
+        "https://api.elevenlabs.io/v1/speech-to-text",
+        headers={"xi-api-key": api_key},
+        data=data,
+        files={"file": ("voice.wav", wav_bytes, "audio/wav")},
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"ElevenLabs STT HTTP {resp.status_code}: {resp.text[:200]}"
+        )
+    text = str(resp.json().get("text", "")).strip()
+    if not text:
+        raise RuntimeError("No speech recognized from input audio.")
+    return text
+
+
+def transcribe_wav(wav_bytes: bytes) -> tuple[str, str]:
+    """Transcribe device WAV. Returns (text, engine_used)."""
+    if SETTINGS.stt_provider == "elevenlabs":
+        try:
+            return _transcribe_elevenlabs(wav_bytes), "elevenlabs"
+        except Exception as exc:
+            # Network/API hiccup must not brick the robot — fall back to local Whisper.
+            logger.warning("ElevenLabs STT failed (%s); falling back to Whisper.", exc)
+    return _transcribe_whisper(wav_bytes), "whisper"
+
+
 def process_voice_wav(
     wav_bytes: bytes,
     viewer_name: str | None = None,
@@ -271,7 +333,10 @@ def process_voice_wav(
     if len(wav_bytes) > SETTINGS.max_request_bytes:
         raise RuntimeError("Audio exceeds size limit.")
 
-    user_text = transcribe_wav(wav_bytes)
+    t_start = time.perf_counter()
+
+    user_text, stt_engine = transcribe_wav(wav_bytes)
+    t_stt = time.perf_counter()
 
     from alarm_voice import handle_alarm_voice
 
@@ -281,7 +346,9 @@ def process_voice_wav(
         camera_identity_name=camera_identity_name,
         camera_identity_state=camera_identity_state,
     )
+    reply_path = "llm"
     if alarm_result.handled:
+        reply_path = "alarm"
         logger.info("Voice alarm command | heard: %s", user_text[:120])
         reply = alarm_result.reply
         from alarm_service import get_alarm_service
@@ -289,6 +356,7 @@ def process_voice_wav(
         if get_alarm_service().get_reschedule_prompt_alarm() is not None:
             meta.prompt_medical_ack = True
     elif is_servo_360_command(user_text):
+        reply_path = "servo_360"
         logger.info("Voice servo 360 command | heard: %s", user_text[:120])
         if esp_servo_360_url() is None:
             reply = reply_for_servo_360_command(error="no_esp_url")
@@ -296,6 +364,7 @@ def process_voice_wav(
             meta.trigger_servo_360 = True
             reply = reply_for_servo_360_command()
     elif is_identity_question(user_text):
+        reply_path = "identity_llm"
         logger.info(
             "Voice identity query | state=%s name=%s | heard: %s",
             camera_identity_state,
@@ -333,5 +402,38 @@ def process_voice_wav(
             api_url=SETTINGS.ollama_url,
             max_words=SETTINGS.max_words_reply,
         )
+    t_reply = time.perf_counter()
+
     wav, _voice = synthesize_sapi_wav_bytes(reply)
-    return resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ), meta
+    wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
+    t_tts = time.perf_counter()
+
+    # Input is 16 kHz 16-bit mono WAV from the device (44-byte header).
+    audio_in_seconds = max(0, len(wav_bytes) - 44) / (16000 * 2)
+    audio_out_seconds = max(0, len(wav_out) - 44) / (VOICE_ASSIST_PLAYBACK_HZ * 2)
+    meta.timings = {
+        "heard": user_text[:200],
+        "reply_text": reply[:200],
+        "reply_path": reply_path,
+        "audio_in_seconds": round(audio_in_seconds, 2),
+        "audio_in_bytes": len(wav_bytes),
+        "audio_out_seconds": round(audio_out_seconds, 2),
+        "audio_out_bytes": len(wav_out),
+        "stt_engine": stt_engine,
+        "stt_seconds": round(t_stt - t_start, 3),
+        "reply_seconds": round(t_reply - t_stt, 3),
+        "tts_seconds": round(t_tts - t_reply, 3),
+        "process_total_seconds": round(t_tts - t_start, 3),
+    }
+    logger.info(
+        "Latency | stt(%s)=%.2fs reply(%s)=%.2fs tts=%.2fs total=%.2fs | in=%.1fs out=%.1fs audio",
+        stt_engine,
+        meta.timings["stt_seconds"],
+        reply_path,
+        meta.timings["reply_seconds"],
+        meta.timings["tts_seconds"],
+        meta.timings["process_total_seconds"],
+        audio_in_seconds,
+        audio_out_seconds,
+    )
+    return wav_out, meta

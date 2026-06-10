@@ -350,6 +350,8 @@ class FaceService:
 
         x, y, w, h = max(faces, key=lambda box: box[2] * box[3])
         face = self._normalize_face(frame, (x, y, w, h))
+        if face is None:
+            raise ValueError("Face is partially outside the frame — recenter and retry")
 
         person_dir = self.faces_dir / person_id
         person_dir.mkdir(parents=True, exist_ok=True)
@@ -439,8 +441,12 @@ class FaceService:
             strict_name: str | None = None
             weak_name: str | None = None
 
-            if recognizer is not None and labels:
-                face = self._normalize_face(frame, box)
+            face = (
+                self._normalize_face(frame, box)
+                if recognizer is not None and labels
+                else None
+            )
+            if face is not None:
                 strict_name, weak_name, confidence, margin_ok = self._classify_face(
                     face, labels, person_recs, session_hint=session_hint
                 )
@@ -999,7 +1005,7 @@ class FaceService:
 
     def _normalize_face(
         self, frame: np.ndarray, box: tuple[int, int, int, int]
-    ) -> np.ndarray:
+    ) -> np.ndarray | None:
         x, y, w, h = box
         fh, fw = frame.shape[:2]
         pad = int(max(w, h) * self.face_pad_ratio)
@@ -1011,7 +1017,10 @@ class FaceService:
         gray = self._frame_gray(frame)
         face = gray[y1:y2, x1:x2]
         if face.size == 0:
-            face = gray[y : y + h, x : x + w]
+            face = gray[max(0, y) : min(fh, y + h), max(0, x) : min(fw, x + w)]
+        if face.size == 0:
+            # Detector box fell outside the frame (partial/stale frame edge).
+            return None
 
         face = cv2.bilateralFilter(face, d=5, sigmaColor=28, sigmaSpace=28)
 

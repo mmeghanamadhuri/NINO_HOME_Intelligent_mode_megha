@@ -7,6 +7,7 @@ import logging
 import os
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
@@ -430,6 +431,26 @@ async def _delayed_esp_servo_360(delay_seconds: float) -> None:
         logger.warning("ESP servo 360 failed after voice confirmation: %s", err or "unknown")
 
 
+LATENCY_LOG_PATH = BASE_DIR / "data" / "latency_log.json"
+
+
+def _append_latency_record(record: dict) -> None:
+    """Append one per-query latency record to data/latency_log.json (JSON array)."""
+    try:
+        records: list = []
+        if LATENCY_LOG_PATH.exists():
+            with open(LATENCY_LOG_PATH, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, list):
+                records = loaded
+        records.append(record)
+        LATENCY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(LATENCY_LOG_PATH, "w", encoding="utf-8") as f:
+            json.dump(records, f, indent=2)
+    except Exception:
+        logger.exception("Failed to write latency log")
+
+
 async def _voice_ws_pipeline(websocket: WebSocket) -> None:
     """Whisper STT → Ollama → SAPI WAV. Multiple receive_bytes → send_bytes cycles per connection."""
     await websocket.accept()
@@ -452,6 +473,8 @@ async def _voice_ws_pipeline(websocket: WebSocket) -> None:
             wav_out: bytes | None = None
             reply_meta = VoiceReplyMeta()
             active_viewer: str | None = session_viewer
+            t_query_start = time.perf_counter()
+            pipeline_error: str | None = None
             try:
                 viewer = await run_in_threadpool(_viewer_for_voice_query)
                 if viewer:
@@ -474,6 +497,7 @@ async def _voice_ws_pipeline(websocket: WebSocket) -> None:
                 wav_out, reply_meta = await run_in_threadpool(_run_voice)
             except Exception as exc:
                 logger.exception("Voice pipeline failed")
+                pipeline_error = str(exc)[:200]
                 err_note = str(exc)[:512]
                 try:
                     from llm_service import brief_spoken_message
@@ -495,6 +519,18 @@ async def _voice_ws_pipeline(websocket: WebSocket) -> None:
 
             if not wav_out:
                 wav_out = minimal_voice_reply_wav()
+
+            # Server total = WAV received -> reply WAV ready (incl. viewer
+            # lookup and error recovery). Device-side VAD/Wi-Fi time is not
+            # visible here; audio_in/out sizes help estimate transfer cost.
+            record = {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                **reply_meta.timings,
+                "server_total_seconds": round(time.perf_counter() - t_query_start, 3),
+            }
+            if pipeline_error is not None:
+                record["error"] = pipeline_error
+            await run_in_threadpool(_append_latency_record, record)
 
             await run_in_threadpool(tts.notify_voice_interaction, active_viewer)
 
@@ -563,6 +599,18 @@ def main() -> None:
         help="faster-whisper model for /ws/voice (tiny, base, small, ...)",
     )
     parser.add_argument(
+        "--stt-provider",
+        default=os.environ.get("STT_PROVIDER", ""),
+        choices=["", "whisper", "elevenlabs"],
+        help="STT engine: elevenlabs (cloud Scribe, needs API key) or whisper (local). "
+        "Default: elevenlabs when an API key is set, else whisper.",
+    )
+    parser.add_argument(
+        "--elevenlabs-api-key",
+        default=os.environ.get("ELEVENLABS_API_KEY", ""),
+        help="ElevenLabs API key for cloud STT (or set ELEVENLABS_API_KEY env var)",
+    )
+    parser.add_argument(
         "--face-greeting-interval",
         type=float,
         default=float(os.environ.get("FACE_GREETING_INTERVAL_SECONDS", "600")),
@@ -610,6 +658,10 @@ def main() -> None:
     os.environ["OLLAMA_URL"] = args.ollama_url.strip()
     os.environ["OLLAMA_MODEL"] = args.ollama_model.strip()
     os.environ["WHISPER_MODEL"] = args.whisper_model.strip()
+    if args.stt_provider.strip():
+        os.environ["STT_PROVIDER"] = args.stt_provider.strip().lower()
+    if args.elevenlabs_api_key.strip():
+        os.environ["ELEVENLABS_API_KEY"] = args.elevenlabs_api_key.strip()
 
     if args.face_threshold is not None:
         os.environ["FACE_RECOGNITION_THRESHOLD"] = str(args.face_threshold)

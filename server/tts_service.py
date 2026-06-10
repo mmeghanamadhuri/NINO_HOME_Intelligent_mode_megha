@@ -31,7 +31,17 @@ def synthesize_sapi_wav_bytes(
     text: str, rate: int = 135, volume: float = 0.75
 ) -> tuple[bytes, str]:
     """Windows SAPI via PowerShell → mono/stereo PCM WAV bytes. Returns (wav, voice_name)."""
-    escaped = text.replace("'", "''")
+    # PowerShell treats curly quotes (U+2018/2019/201B) as string-quote chars,
+    # so an LLM "Here’s" would terminate the single-quoted Speak() argument.
+    # Normalize them to plain quotes BEFORE doubling the single quotes.
+    escaped = (
+        text.replace("\u2018", "'")
+        .replace("\u2019", "'")
+        .replace("\u201B", "'")
+        .replace("\u201C", '"')
+        .replace("\u201D", '"')
+        .replace("'", "''")
+    )
     sapi_rate = _sapi_rate_value(rate)
     vol = int(max(0.0, min(1.0, volume)) * 100)
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
