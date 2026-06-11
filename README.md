@@ -3,7 +3,7 @@
 NiNO is a smart-home demo for the ESP32-P4 Function EV Board that uses vision, voice, alarms, touch, servo motion, and animated OLED eyes together.
 
 - **Vision**: USB UVC camera on the board, face detection/recognition on the PC, personalized greetings played through the ESP speaker.
-- **Voice**: Wake-word capture on the board, Whisper speech recognition and Ollama LLM responses on the PC, audio returned to the board. Supports identity questions and servo voice commands.
+- **Voice**: Wake-word capture on the board, ElevenLabs Scribe (cloud) or Whisper (local) speech recognition and Ollama LLM responses on the PC, audio returned to the board. Supports identity questions and servo voice commands.
 - **Alarms**: Voice-set reminders and alarms on the PC; medical (P0) reminders with yes/no ack, auto-repeat, and reschedule/cancel follow-up — spoken TTS fired to the ESP at the scheduled time.
 - **Touch**: QT2120 capacitive touch sensor triggers an embedded warning audio clip with **priority over** server/voice playback.
 - **Servo**: Dynamixel AX servos (IDs 1 & 2) via U2D2 on the J18 USB hub — head motion during TTS, **ID2 full 360° spin** via CLI, HTTP, or voice.
@@ -12,12 +12,13 @@ NiNO is a smart-home demo for the ESP32-P4 Function EV Board that uses vision, v
 ## Features
 
 - ESP32-P4 firmware with UVC camera support, HTTP streaming, WAV playback, voice wake capture, touch handling, **medical alarm auto-listen**, and Dynamixel servo control.
-- Python FastAPI server for face UI, Whisper STT, Ollama LLM prompts, **alarm scheduler**, and TTS delivery to the board.
+- Python FastAPI server for face UI, **ElevenLabs/Whisper STT**, Ollama LLM prompts, **alarm scheduler**, and TTS delivery to the board.
+- **Per-query latency log** (`server/data/latency_log.json`): STT engine + STT/LLM/TTS/total seconds for every voice query.
 - **Voice & NLP alarms**: set/list/cancel reminders by voice (“remind me to go to school at 8 AM”); regex parsing with **Ollama fallback** for natural phrasing; persists to `server/data/alarms.json`.
 - **Medical (P0) reminders**: medication labels get priority, spoken TTS on the ESP, **yes/no auto-listen** (no wake word), repeat every 3 min until confirmed; **reschedule or cancel** follow-up with mic re-open.
 - **Alarm web UI**: view pending and awaiting-ack alarms; **Yes** / **No** / **Delete** per row at `http://localhost:8000`.
 - **Dual-priority speaker queue** on the ESP: touch warnings preempt server/voice audio and resume playback afterward.
-- **YuNet face detector** + LBPH recognition tuned for ~1 m range; vision greetings always personalized; general voice replies personalized ~18% of the time.
+- **YuNet face detector** + **SFace deep-embedding recognition** (128-D vectors, cosine similarity); vision greetings always personalized; general voice replies personalized ~18% of the time.
 - **Voice identity** (“who am I?”) answered using live camera recognition context via Ollama.
 - **Voice servo 360** (“make a 360”, “spin 360”) — fixed TTS confirmation, then `POST /servo/360` on the board (no LLM for this command).
 - Single shared speaker path on the ESP to serialize touch, greetings, alarms, and voice replies.
@@ -36,19 +37,21 @@ Summary of enhancements made in this integration branch:
 
 ### Face recognition (server)
 
+- **Migrated from LBPH to SFace deep embeddings**: each registered sample is encoded once into a 128-D vector (`face_recognition_sface_2021dec.onnx`, auto-download to `server/data/models/`); live faces are matched by **cosine similarity** against the store. No LBPH training, augmentation, or per-person thresholds.
 - **YuNet** detector (auto-download to `server/data/models/`) with Haar fallback.
-- LBPH with **per-person models**, **calibrated caps per person**, and a **1st vs 2nd margin** (blocks wrong-name swaps).
-- **Primary viewer only**: smaller background faces cannot steal a strict green match (closest/largest face wins).
+- Single tunable acceptance threshold: `FACE_MATCH_THRESHOLD` (cosine, default **0.36**; higher = stricter).
+- Embeddings persist in **`server/data/face_embeddings.json`** — small and portable (no more 100 MB `face_model.yml`).
+- **Register encodes instantly**: new samples are matchable immediately, no retrain needed. **Retrain** on the web UI just re-encodes stored crops (fast — useful after the LBPH → SFace migration, which also runs automatically on first start).
+- **Primary viewer only**: smaller background faces cannot steal a match (closest/largest face wins).
 - **Session memory** (~90 s): faster re-confirm when you walk away and return; stabilizes voice/TTS identity.
 - **Multi-frame “who am I?”** vote (5 frames) instead of a single snapshot.
-- **Green box** on strict match or stabilized confirm (~2 frames); yellow = pending weak match.
-- Better **distance** detection (smaller faces, stronger upscale) and training augments (far + slight rotation).
-- Face crop padding, upscale, bilateral filter, training augmentation.
-- **Retrain** on the web UI after pulling recognition changes (aim for **25+ varied samples per person**).
+- Firmware UVC stream bumped from 480×320 to **640×480** for better detection/recognition range.
 
 ### Voice assistant (server + firmware)
 
-- **Whisper** STT via `faster-whisper` (default model **`small`**; override with `--whisper-model`).
+- **ElevenLabs Scribe STT** (cloud, default `scribe_v1`): used automatically when an API key is set via `ELEVENLABS_API_KEY`, `--elevenlabs-api-key`, or `elevenlabs_api_key` in `server/server_config.json` (precedence: CLI > env > config file); typically ~1–2 s vs 6–30 s for local Whisper on CPU. Falls back to Whisper automatically if the API call fails, so the assistant keeps working offline.
+- **Whisper** STT via `faster-whisper` (default model **`small`**; override with `--whisper-model`) — local fallback or forced with `--stt-provider whisper`.
+- **Latency logging**: every voice query appends a record to `server/data/latency_log.json` (heard text, reply path, STT engine, `stt_seconds`, `reply_seconds`, `tts_seconds`, totals).
 - **Identity questions** (“who am I?”, “what’s my name?”, …): Ollama reply grounded in live camera recognition (recognized name / unknown / no face).
 - **Random personalization**: ~18% of general voice replies include the viewer’s name (`VOICE_PERSONALIZE_PROB` env override). Vision greetings always use the name.
 - **Servo 360 voice command**: phrases like “make a 360”, “do a 360”, “spin 360” → fixed TTS (*“OK, doing the spin now.”*) → delayed `POST http://<ESP_IP>/servo/360`. Does **not** use Ollama.
@@ -186,10 +189,18 @@ Replace `<ESP_IP>` with the ESP board address:
 python app.py --host 0.0.0.0 --port 8000 `
   --camera-source http://<ESP_IP>/stream `
   --esp-play-wav-url http://<ESP_IP>/play_wav `
-  --face-threshold 62 `
-  --face-margin 10 `
   --whisper-model small
 ```
+
+Face matching uses a cosine-similarity threshold (default **0.36**); tune with `FACE_MATCH_THRESHOLD` if needed (higher = stricter). Legacy LBPH-style `--face-threshold` values above 1 are ignored.
+
+For fast cloud STT, set an ElevenLabs API key (with the **Speech to Text** permission) before starting the server — it is picked up automatically:
+
+```powershell
+setx ELEVENLABS_API_KEY "sk_your_key_here"   # then open a new terminal
+```
+
+or pass `--elevenlabs-api-key sk_...` on the command line. Force a specific engine with `--stt-provider elevenlabs` or `--stt-provider whisper`.
 
 To use a local webcam instead of the ESP stream:
 
@@ -265,7 +276,7 @@ Example voice commands after wake:
 | “List my alarms” | Hear pending alarms |
 | “Cancel all alarms” / “Delete my alarms” | Remove every pending alarm |
 | “Cancel alarm at 4 AM” / “Delete my coffee reminder” | Remove one matching alarm |
-| General questions | Whisper → Ollama → TTS (name used ~18% of the time) |
+| General questions | STT (ElevenLabs/Whisper) → Ollama → TTS (name used ~18% of the time) |
 
 Serial CLI servo test (U2D2 ready):
 
@@ -302,12 +313,14 @@ Serial CLI servo test (U2D2 ready):
 |----------|---------|---------|
 | `ESP_PLAY_WAV_URL` | CLI / config | Face TTS + derives `/servo/360` host for voice spin |
 | `ESP_MAX_PLAY_WAV_BYTES` | `389120` | Server-side cap (ESP `/play_wav` hard limit is 384 KiB) |
-| `WHISPER_MODEL` | `small` | faster-whisper model (`--whisper-model`) |
+| `STT_PROVIDER` | auto | `elevenlabs` or `whisper` (`--stt-provider`); defaults to ElevenLabs when an API key is set |
+| `ELEVENLABS_API_KEY` | — | ElevenLabs API key for cloud STT (`--elevenlabs-api-key`); needs the **Speech to Text** permission |
+| `ELEVENLABS_STT_MODEL` | `scribe_v1` | ElevenLabs Scribe model id |
+| `WHISPER_MODEL` | `small` | faster-whisper model (`--whisper-model`); local fallback engine |
 | `VOICE_PERSONALIZE_PROB` | `0.18` | Fraction of voice replies that use viewer name |
 | `SERVO_360_TRIGGER_DELAY_SECONDS` | `2.0` | Delay after 360 confirmation TTS before POST spin |
 | `VOICE_VIEWER_TTL_SECONDS` | `900` | How long last recognized face is remembered for voice |
-| `FACE_RECOGNITION_THRESHOLD` | `62` | LBPH strict match cap (`--face-threshold`) |
-| `FACE_RECOGNITION_MARGIN` | `10` | Min gap vs 2nd person (`--face-margin`) |
+| `FACE_MATCH_THRESHOLD` | `0.36` | SFace cosine-similarity acceptance (higher = stricter) |
 | `FACE_SESSION_PRIMARY_HOLD_SECONDS` | `90` | Remember primary viewer across brief gaps |
 | `FACE_SECONDARY_AREA_RATIO` | `0.40` | Suppress strict ID on small background faces |
 | `ALARM_WAV_PATH` | `../main/beep.wav` | Beep POSTed after **normal** (non-medical) alarm TTS |
@@ -365,6 +378,8 @@ server/
   voice_service.py
   wav_resample.py
   data/alarms.json
+  data/latency_log.json
+  data/face_embeddings.json
   requirements.txt
   server_config.json
   templates/
@@ -385,14 +400,17 @@ managed_components/
 - Eye displays initialize first in `app_main`, so the idle face shows during the rest of boot; if OLED init fails the firmware logs a warning and runs without eyes.
 - Both OLEDs mirror the same eye by default; the driver supports per-eye drawing (`ssd1351_target()`) for future asymmetric expressions.
 - Windows is the recommended platform for the default speech synthesis path.
-- **`server/data/face_model.yml`** can grow very large after retraining; do not commit files over GitHub’s 100 MB limit — retrain locally on each machine or share the model out of band.
+- Face data lives in `server/data/faces/` (JPEG crops) and `server/data/face_embeddings.json` (small JSON) — the old LBPH `face_model.yml` is no longer generated and can be deleted.
+- If you store `elevenlabs_api_key` in `server/server_config.json`, keep that file out of public commits — it contains a secret.
 
 ## Troubleshooting
 
 - If video is missing, verify `http://<ESP_IP>/snapshot.jpg`.
-- If faces are not recognized, retrain with **25+ varied samples per person** and improve lighting; check server log for `detector=yunet`.
-- If the wrong person is recognized with two people in frame, stand closest to the camera (primary face) or increase `--face-margin`.
+- If faces are not recognized, register **a handful of varied samples per person** (angles, lighting, distance) and check the server log for `detector=yunet` and the SFace model in `server/data/models/`; lower `FACE_MATCH_THRESHOLD` slightly (e.g. `0.32`) if matches are too strict.
+- If the wrong person is recognized, raise `FACE_MATCH_THRESHOLD` (e.g. `0.42`) and stand closest to the camera (primary face wins).
 - If voice does not connect, verify the PC IP is reachable from the ESP (`voice connect <PC_IP> 8000`) and the server is running.
+- If the log shows **`ElevenLabs STT failed ... missing_permissions`**, your API key was created without the **Speech to Text** scope — edit the key in the ElevenLabs dashboard (or create one with full access), update `ELEVENLABS_API_KEY`, and restart the server in a new terminal.
+- If STT is slow (6–30 s `stt_seconds` in `server/data/latency_log.json`), the server is using local Whisper — check that `ELEVENLABS_API_KEY` is set and the log line reads `stt(elevenlabs)=...`.
 - If **medical alarm ack** works for yes/no but not after *reschedule or cancel?*, flash latest firmware (WebSocket `prompt_medical_ack`) and restart the server.
 - If alarm fire logs **`WAV too large for ESP`**, restart server (16 kHz + shorter repeat TTS); medical alarms use TTS only, no beep.
 - If alarm time voice fails with *“Please use a 12-hour time”*, restart server (NLP normalizes `20:36 PM` / `8.36pm` style output).
@@ -400,5 +418,4 @@ managed_components/
 - If the **eyes stay black**, check the boot log for `SSD1351 ready: 2 panel(s) 128x96`; verify wiring on J1 (CLK 23, DIN 22, DC 21, RST 20, CS 26/27) and that both panels share 3.3 V/GND. If red/blue look swapped, set `SSD1351_SWAP_RB` to `1` in `main/ssd1351.h`.
 - If the eyes show but never change during a voice query, confirm the wake word fires (`Hi ESP detected` in the log) — the listening/thinking expressions are driven by the voice pipeline, and `eye listening` on the console tests the display path alone.
 - If **360 spin** does not run from voice, confirm `--esp-play-wav-url http://<ESP_IP>/play_wav` is set, firmware includes `/servo/360`, and U2D2/servos show ready in logs.
-- If **`git push` fails** on `face_model.yml`, exclude it from commits (see `.gitignore`); the trained model is machine-local.
 - USB hub: U2D2 scan errors alongside UVC camera on J18 are common when the Dynamixel adapter is unplugged or still enumerating.

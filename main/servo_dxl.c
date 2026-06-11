@@ -288,13 +288,28 @@ bool nino_servo_dxl_bus_open(void)
     return s_ftdi.device_ready && !s_ftdi.device_gone;
 }
 
+bool nino_servo_dxl_spin_is_active(void)
+{
+    return s_spin360_task != NULL;
+}
+
 void nino_servo_dxl_go_neutral(void)
 {
+    /* Audio-playback cleanup and head-motion stop call this; while a 360 spin
+     * is running it must not yank ID2 back to center mid-rotation (the spin
+     * ends at neutral anyway). */
+    if (nino_servo_dxl_spin_is_active()) {
+        return;
+    }
     dynamixel_queue_goal_all(DXL_CENTER_POSITION);
 }
 
 void nino_servo_dxl_set_pan_tilt(int pan_goal, int tilt_goal)
 {
+    /* Head-motion poses must not override the spin waypoints. */
+    if (nino_servo_dxl_spin_is_active()) {
+        return;
+    }
     if (s_goal_mutex != NULL) {
         xSemaphoreTake(s_goal_mutex, portMAX_DELAY);
     }

@@ -94,6 +94,11 @@ DEFAULT_ESP_PLAY_WAV_URL = os.getenv(
     "ESP_PLAY_WAV_URL", SERVER_CONFIG.get("esp_play_wav_url", "")
 )
 
+# Precedence: CLI flag > env var > server_config.json.
+_CONFIG_ELEVENLABS_KEY = str(SERVER_CONFIG.get("elevenlabs_api_key", "")).strip()
+if _CONFIG_ELEVENLABS_KEY and not os.environ.get("ELEVENLABS_API_KEY", "").strip():
+    os.environ["ELEVENLABS_API_KEY"] = _CONFIG_ELEVENLABS_KEY
+
 app = FastAPI(title="NiNO Camera Face Server")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")

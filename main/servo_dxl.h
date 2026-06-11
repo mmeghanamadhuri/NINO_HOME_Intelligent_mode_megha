@@ -30,3 +30,6 @@ esp_err_t nino_servo_dxl_get_present_position(uint8_t id, int *position);
  * Runs in a background task; returns ESP_ERR_INVALID_STATE if already running or bus not ready.
  */
 esp_err_t nino_servo_dxl_spin_360(void);
+
+/** True while the 360 spin task is running (pose/neutral writes are ignored then). */
+bool nino_servo_dxl_spin_is_active(void);

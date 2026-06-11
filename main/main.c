@@ -73,8 +73,8 @@ static bool s_sta_connected = false;
 #define UVC_STREAM_TASK_STACK_SIZE 8192
 #define UVC_STREAM_TASK_PRIORITY 19
 
-#define UVC_TARGET_WIDTH 480
-#define UVC_TARGET_HEIGHT 320
+#define UVC_TARGET_WIDTH 640
+#define UVC_TARGET_HEIGHT 480
 #define UVC_TARGET_FPS 15.0f
 #define UVC_FRAME_QUEUE_LEN 3
 #define UVC_FRAME_BUFFERS 3
