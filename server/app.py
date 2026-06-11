@@ -138,6 +138,19 @@ def startup() -> None:
     faces.apply_settings_from_environ()
     get_alarm_service().start()
     camera.start()
+    import threading
+
+    from llm_service import warm_ollama_model
+
+    threading.Thread(
+        target=warm_ollama_model,
+        kwargs={
+            "model": os.environ.get("OLLAMA_MODEL"),
+            "api_url": os.environ.get("OLLAMA_URL"),
+        },
+        daemon=True,
+        name="ollama-warmup",
+    ).start()
     stats = faces.stats()
     if not faces.recognizer_available:
         logger.warning(
@@ -189,12 +202,31 @@ def set_camera(req: CameraRequest) -> dict:
     return {"ok": True, "camera": camera.status()}
 
 
+@app.get("/api/latency-log")
+def latency_log(limit: int = 50) -> dict:
+    """Return recent voice latency records (newest last)."""
+    limit = max(1, min(limit, 500))
+    records = _load_latency_records()
+    return {
+        "ok": True,
+        "total": len(records),
+        "records": records[-limit:],
+        "path": str(LATENCY_LOG_PATH),
+    }
+
+
 @app.get("/api/status")
 def status() -> dict:
+    from llm_service import ollama_runtime_status
+
     return {
         "camera": camera.status(),
         "faces": faces.stats(),
         "tts": tts.status(),
+        "llm": ollama_runtime_status(
+            model=os.environ.get("OLLAMA_MODEL"),
+            api_url=os.environ.get("OLLAMA_URL"),
+        ),
         "alarms": get_alarm_service().status(),
         "latest_results": latest_results,
     }
@@ -437,23 +469,71 @@ async def _delayed_esp_servo_360(delay_seconds: float) -> None:
 
 
 LATENCY_LOG_PATH = BASE_DIR / "data" / "latency_log.json"
+_LATENCY_LOG_LOCK = threading.Lock()
+
+
+def _load_latency_records() -> list[dict]:
+    if not LATENCY_LOG_PATH.exists():
+        return []
+    try:
+        with open(LATENCY_LOG_PATH, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        if isinstance(loaded, list):
+            return [item for item in loaded if isinstance(item, dict)]
+        logger.warning("latency_log.json was not a JSON array; starting a new log.")
+        return []
+    except json.JSONDecodeError as exc:
+        backup = LATENCY_LOG_PATH.with_name(
+            f"latency_log.corrupt.{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
+        )
+        try:
+            LATENCY_LOG_PATH.rename(backup)
+        except OSError:
+            pass
+        logger.error(
+            "latency_log.json was corrupt (%s); backed up to %s",
+            exc,
+            backup.name,
+        )
+        return []
 
 
 def _append_latency_record(record: dict) -> None:
-    """Append one per-query latency record to data/latency_log.json (JSON array)."""
-    try:
-        records: list = []
-        if LATENCY_LOG_PATH.exists():
-            with open(LATENCY_LOG_PATH, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, list):
-                records = loaded
-        records.append(record)
-        LATENCY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(LATENCY_LOG_PATH, "w", encoding="utf-8") as f:
-            json.dump(records, f, indent=2)
-    except Exception:
-        logger.exception("Failed to write latency log")
+    """Append one record to data/latency_log.json (thread-safe, atomic write)."""
+    with _LATENCY_LOG_LOCK:
+        tmp_path = LATENCY_LOG_PATH.with_suffix(".json.tmp")
+        try:
+            records = _load_latency_records()
+            records.append(record)
+            LATENCY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(records, f, indent=2)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, LATENCY_LOG_PATH)
+        except Exception:
+            logger.exception("Failed to write latency log")
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _latency_log_record(**fields: object) -> dict:
+    return {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        **fields,
+    }
+
+
+def _ws_client_label(websocket: WebSocket) -> str:
+    client = websocket.client
+    if client is None:
+        return "unknown"
+    host = getattr(client, "host", None) or "unknown"
+    port = getattr(client, "port", None)
+    return f"{host}:{port}" if port is not None else str(host)
 
 
 async def _voice_ws_pipeline(websocket: WebSocket) -> None:
@@ -467,13 +547,43 @@ async def _voice_ws_pipeline(websocket: WebSocket) -> None:
     )
 
     session_viewer: str | None = None
+    session_queries = 0
+    session_started = time.perf_counter()
+    client_label = _ws_client_label(websocket)
+    await run_in_threadpool(
+        _append_latency_record,
+        _latency_log_record(event="ws_open", client=client_label),
+    )
 
     try:
         while True:
             try:
-                wav_in = await websocket.receive_bytes()
+                message = await websocket.receive()
             except WebSocketDisconnect:
                 break
+            if message.get("type") == "websocket.disconnect":
+                break
+            if message.get("text") is not None:
+                await run_in_threadpool(
+                    _append_latency_record,
+                    _latency_log_record(
+                        event="ws_text_frame",
+                        client=client_label,
+                        text=str(message["text"])[:200],
+                    ),
+                )
+                continue
+            wav_in = message.get("bytes")
+            if wav_in is None:
+                await run_in_threadpool(
+                    _append_latency_record,
+                    _latency_log_record(
+                        event="ws_empty_frame",
+                        client=client_label,
+                        error="WebSocket frame had no audio bytes.",
+                    ),
+                )
+                continue
 
             wav_out: bytes | None = None
             reply_meta = VoiceReplyMeta()
@@ -505,15 +615,22 @@ async def _voice_ws_pipeline(websocket: WebSocket) -> None:
                 pipeline_error = str(exc)[:200]
                 err_note = str(exc)[:512]
                 try:
-                    from llm_service import brief_spoken_message
+                    from llm_service import (
+                        OLLAMA_UNAVAILABLE_REPLY,
+                        brief_spoken_message,
+                        is_ollama_error,
+                    )
                     from wav_resample import ESP_PCM_SAMPLE_RATE_HZ, resample_wav_bytes_to_mono_16bit
 
-                    def _recover_wav() -> bytes:
-                        txt = brief_spoken_message(
-                            err_note,
-                            model=os.environ.get("OLLAMA_MODEL"),
-                            api_url=os.environ.get("OLLAMA_URL"),
-                        )
+                    def _recover_wav(pipeline_exc: BaseException = exc) -> bytes:
+                        if is_ollama_error(pipeline_exc):
+                            txt = OLLAMA_UNAVAILABLE_REPLY
+                        else:
+                            txt = brief_spoken_message(
+                                err_note,
+                                model=os.environ.get("OLLAMA_MODEL"),
+                                api_url=os.environ.get("OLLAMA_URL"),
+                            )
                         raw, _ = synthesize_sapi_wav_bytes(txt)
                         return resample_wav_bytes_to_mono_16bit(raw, ESP_PCM_SAMPLE_RATE_HZ)
 
@@ -528,14 +645,18 @@ async def _voice_ws_pipeline(websocket: WebSocket) -> None:
             # Server total = WAV received -> reply WAV ready (incl. viewer
             # lookup and error recovery). Device-side VAD/Wi-Fi time is not
             # visible here; audio_in/out sizes help estimate transfer cost.
-            record = {
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-                **reply_meta.timings,
-                "server_total_seconds": round(time.perf_counter() - t_query_start, 3),
-            }
+            timings = dict(reply_meta.timings)
+            timings.setdefault("audio_in_bytes", len(wav_in))
+            record = _latency_log_record(
+                event="voice_query",
+                client=client_label,
+                server_total_seconds=round(time.perf_counter() - t_query_start, 3),
+                **timings,
+            )
             if pipeline_error is not None:
                 record["error"] = pipeline_error
             await run_in_threadpool(_append_latency_record, record)
+            session_queries += 1
 
             await run_in_threadpool(tts.notify_voice_interaction, active_viewer)
 
@@ -545,6 +666,14 @@ async def _voice_ws_pipeline(websocket: WebSocket) -> None:
                 )
                 await websocket.send_bytes(wav_out)
             except WebSocketDisconnect:
+                await run_in_threadpool(
+                    _append_latency_record,
+                    _latency_log_record(
+                        event="ws_disconnect_during_send",
+                        client=client_label,
+                        heard=reply_meta.timings.get("heard", "")[:200],
+                    ),
+                )
                 break
 
             if reply_meta.trigger_servo_360:
@@ -552,6 +681,25 @@ async def _voice_ws_pipeline(websocket: WebSocket) -> None:
                     _delayed_esp_servo_360(SERVO_360_TRIGGER_DELAY_SECONDS)
                 )
     finally:
+        if session_queries == 0:
+            await run_in_threadpool(
+                _append_latency_record,
+                _latency_log_record(
+                    event="ws_closed_without_audio",
+                    client=client_label,
+                    session_seconds=round(time.perf_counter() - session_started, 3),
+                ),
+            )
+        else:
+            await run_in_threadpool(
+                _append_latency_record,
+                _latency_log_record(
+                    event="ws_closed",
+                    client=client_label,
+                    session_queries=session_queries,
+                    session_seconds=round(time.perf_counter() - session_started, 3),
+                ),
+            )
         try:
             await websocket.close()
         except Exception:
@@ -590,8 +738,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--ollama-url",
-        default=os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/api/generate"),
-        help="Ollama generate API URL",
+        default=os.environ.get("OLLAMA_URL", "auto"),
+        help="Ollama generate API URL (default: auto — prefer GPU on :11435)",
     )
     parser.add_argument(
         "--ollama-model",
@@ -613,7 +761,13 @@ def main() -> None:
     parser.add_argument(
         "--elevenlabs-api-key",
         default=os.environ.get("ELEVENLABS_API_KEY", ""),
-        help="ElevenLabs API key for cloud STT (or set ELEVENLABS_API_KEY env var)",
+        help="ElevenLabs API key for cloud STT/TTS (or set ELEVENLABS_API_KEY env var)",
+    )
+    parser.add_argument(
+        "--tts-provider",
+        default=os.environ.get("TTS_PROVIDER", ""),
+        choices=["", "elevenlabs", "sapi", "local"],
+        help="TTS engine: elevenlabs (cloud, default when API key set), sapi (Windows), or local (espeak-ng)",
     )
     parser.add_argument(
         "--face-greeting-interval",
@@ -660,13 +814,21 @@ def main() -> None:
     if args.alarm_wav.strip():
         os.environ["ALARM_WAV_PATH"] = args.alarm_wav.strip()
 
-    os.environ["OLLAMA_URL"] = args.ollama_url.strip()
+    from llm_service import resolve_ollama_api_url, try_start_gpu_ollama
+
+    try_start_gpu_ollama()
+    ollama_url = args.ollama_url.strip()
+    if not ollama_url or ollama_url.lower() in {"auto", "detect"}:
+        ollama_url = resolve_ollama_api_url(model=args.ollama_model.strip())
+    os.environ["OLLAMA_URL"] = ollama_url
     os.environ["OLLAMA_MODEL"] = args.ollama_model.strip()
     os.environ["WHISPER_MODEL"] = args.whisper_model.strip()
     if args.stt_provider.strip():
         os.environ["STT_PROVIDER"] = args.stt_provider.strip().lower()
     if args.elevenlabs_api_key.strip():
         os.environ["ELEVENLABS_API_KEY"] = args.elevenlabs_api_key.strip()
+    if args.tts_provider.strip():
+        os.environ["TTS_PROVIDER"] = args.tts_provider.strip().lower()
 
     if args.face_threshold is not None:
         os.environ["FACE_RECOGNITION_THRESHOLD"] = str(args.face_threshold)
@@ -678,7 +840,7 @@ def main() -> None:
     tts.face_greeting_interval_seconds = max(1.0, float(args.face_greeting_interval))
 
     tts.configure_llm(
-        ollama_url=args.ollama_url.strip(),
+        ollama_url=ollama_url,
         ollama_model=args.ollama_model.strip(),
     )
 

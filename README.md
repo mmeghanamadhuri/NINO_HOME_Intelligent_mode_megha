@@ -12,8 +12,8 @@ NiNO is a smart-home demo for the ESP32-P4 Function EV Board that uses vision, v
 ## Features
 
 - ESP32-P4 firmware with UVC camera support, HTTP streaming, WAV playback, voice wake capture, touch handling, **medical alarm auto-listen**, and Dynamixel servo control.
-- Python FastAPI server for face UI, **ElevenLabs/Whisper STT**, Ollama LLM prompts, **alarm scheduler**, and TTS delivery to the board.
-- **Per-query latency log** (`server/data/latency_log.json`): STT engine + STT/LLM/TTS/total seconds for every voice query.
+- Python FastAPI server for face UI, **ElevenLabs/Whisper STT**, **GPU-accelerated Ollama** LLM prompts, **alarm scheduler**, and cross-platform TTS delivery to the board.
+- **Per-query latency log** (`server/data/latency_log.json`): STT/LLM/TTS timings, WebSocket events, and reply path — view recent entries at `GET /api/latency-log`.
 - **Voice & NLP alarms**: set/list/cancel reminders by voice (“remind me to go to school at 8 AM”); regex parsing with **Ollama fallback** for natural phrasing; persists to `server/data/alarms.json`.
 - **Medical (P0) reminders**: medication labels get priority, spoken TTS on the ESP, **yes/no auto-listen** (no wake word), repeat every 3 min until confirmed; **reschedule or cancel** follow-up with mic re-open.
 - **Alarm web UI**: view pending and awaiting-ack alarms; **Yes** / **No** / **Delete** per row at `http://localhost:8000`.
@@ -23,7 +23,7 @@ NiNO is a smart-home demo for the ESP32-P4 Function EV Board that uses vision, v
 - **Voice servo 360** (“make a 360”, “spin 360”) — fixed TTS confirmation, then `POST /servo/360` on the board (no LLM for this command).
 - Single shared speaker path on the ESP to serialize touch, greetings, alarms, and voice replies.
 - **NINO eye displays**: two mirrored 1.27" SSD1351 OLEDs (128×96) on one SPI bus render flicker-free eye animations; expressions are driven by firmware events and testable from the serial console (`eye <idle|listening|thinking>`).
-- Recommended Windows server support for default SAPI text-to-speech.
+- **Cross-platform server**: runs on **Windows** and **Linux** (including NVIDIA DGX / Ubuntu). TTS auto-selects by platform (see [Text-to-speech](#text-to-speech-tts) below).
 
 ## Recent changes
 
@@ -51,7 +51,9 @@ Summary of enhancements made in this integration branch:
 
 - **ElevenLabs Scribe STT** (cloud, default `scribe_v1`): used automatically when an API key is set via `ELEVENLABS_API_KEY`, `--elevenlabs-api-key`, or `elevenlabs_api_key` in `server/server_config.json` (precedence: CLI > env > config file); typically ~1–2 s vs 6–30 s for local Whisper on CPU. Falls back to Whisper automatically if the API call fails, so the assistant keeps working offline.
 - **Whisper** STT via `faster-whisper` (default model **`small`**; override with `--whisper-model`) — local fallback or forced with `--stt-provider whisper`.
-- **Latency logging**: every voice query appends a record to `server/data/latency_log.json` (heard text, reply path, STT engine, `stt_seconds`, `reply_seconds`, `tts_seconds`, totals).
+- **Latency logging**: thread-safe append to `server/data/latency_log.json` for voice queries and WebSocket lifecycle events (`ws_open`, `voice_query`, `ws_closed`, …). Fields include heard text, reply path, STT engine, `stt_seconds`, `reply_seconds`, `tts_seconds`, and totals. Browse via `GET /api/latency-log?limit=50`.
+- **Cross-platform TTS**: ElevenLabs cloud (when API key + credits), **Windows SAPI** (PowerShell + female voice), or **Linux espeak-ng** fallback (`en+f3` soft female British). Same `tts_service.py` on both OSes — see [Text-to-speech](#text-to-speech-tts).
+- **GPU Ollama on Linux**: server auto-prefers `http://127.0.0.1:11435` (user-local CUDA Ollama) over CPU-only snap on `:11434`; warms the model on startup. Install/start via `server/scripts/`.
 - **Identity questions** (“who am I?”, “what’s my name?”, …): Ollama reply grounded in live camera recognition (recognized name / unknown / no face).
 - **Random personalization**: ~18% of general voice replies include the viewer’s name (`VOICE_PERSONALIZE_PROB` env override). Vision greetings always use the name.
 - **Servo 360 voice command**: phrases like “make a 360”, “do a 360”, “spin 360” → fixed TTS (*“OK, doing the spin now.”*) → delayed `POST http://<ESP_IP>/servo/360`. Does **not** use Ollama.
@@ -101,9 +103,15 @@ Summary of enhancements made in this integration branch:
 ### Server
 
 - Python 3.10+
-- Windows recommended for SAPI TTS
-- Ollama installed and running locally (voice replies + alarm NLP fallback)
+- **Windows** or **Linux** (Ubuntu / NVIDIA DGX tested)
+- Ollama for voice replies + alarm NLP fallback
+  - **Linux + NVIDIA GPU**: user-local GPU Ollama on port **11435** (see [Ollama on Linux (GPU)](#ollama-on-linux-gpu))
+  - **Windows / CPU**: standard Ollama on port **11434**
 - `opencv-contrib-python`
+- **TTS** (one of):
+  - ElevenLabs API key (cloud, best quality on any OS)
+  - Windows: built-in **SAPI** voices (no extra install)
+  - Linux: **espeak-ng** library (used automatically as local fallback; `pyttsx3` on Linux is espeak under the hood)
 
 ## Hardware
 
@@ -174,6 +182,8 @@ On Windows, ensure `IDF_PATH` is set and the ESP-IDF environment is initialized 
 
 From the `server/` directory:
 
+**Windows (PowerShell):**
+
 ```powershell
 cd server
 python -m venv .venv
@@ -181,9 +191,22 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+**Linux (bash):**
+
+```bash
+cd server
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Optional: copy settings into `server/server_config.json` (`camera_source`, `esp_play_wav_url`, `elevenlabs_api_key`). CLI flags override the file.
+
 ### Run the server
 
-Replace `<ESP_IP>` with the ESP board address:
+Replace `<ESP_IP>` with the ESP board address.
+
+**Windows:**
 
 ```powershell
 python app.py --host 0.0.0.0 --port 8000 `
@@ -192,15 +215,33 @@ python app.py --host 0.0.0.0 --port 8000 `
   --whisper-model small
 ```
 
-Face matching uses a cosine-similarity threshold (default **0.36**); tune with `FACE_MATCH_THRESHOLD` if needed (higher = stricter). Legacy LBPH-style `--face-threshold` values above 1 are ignored.
+**Linux (DGX / Ubuntu):**
 
-For fast cloud STT, set an ElevenLabs API key (with the **Speech to Text** permission) before starting the server — it is picked up automatically:
+```bash
+# Start GPU Ollama first (once per boot, if not already running)
+bash scripts/start_ollama_gpu.sh
 
-```powershell
-setx ELEVENLABS_API_KEY "sk_your_key_here"   # then open a new terminal
+python app.py --host 0.0.0.0 --port 8000 \
+  --camera-source http://<ESP_IP>/stream \
+  --esp-play-wav-url http://<ESP_IP>/play_wav \
+  --whisper-model small
 ```
 
-or pass `--elevenlabs-api-key sk_...` on the command line. Force a specific engine with `--stt-provider elevenlabs` or `--stt-provider whisper`.
+The server auto-detects GPU Ollama on `127.0.0.1:11435` (`--ollama-url auto` is the default). Check runtime at `GET /api/status` → `llm`.
+
+Face matching uses a cosine-similarity threshold (default **0.36**); tune with `FACE_MATCH_THRESHOLD` if needed (higher = stricter). Legacy LBPH-style `--face-threshold` values above 1 are ignored.
+
+For fast cloud STT/TTS, set an ElevenLabs API key (STT needs the **Speech to Text** permission; TTS needs **Text to Speech** + credits) — picked up from `server_config.json`, env, or CLI:
+
+```powershell
+setx ELEVENLABS_API_KEY "sk_your_key_here"   # Windows — open a new terminal
+```
+
+```bash
+export ELEVENLABS_API_KEY="sk_your_key_here"   # Linux
+```
+
+or pass `--elevenlabs-api-key sk_...`. Force engines with `--stt-provider elevenlabs|whisper` and `--tts-provider elevenlabs|sapi|local`.
 
 To use a local webcam instead of the ESP stream:
 
@@ -209,6 +250,46 @@ python app.py --camera-source auto
 ```
 
 Open the UI at `http://localhost:8000`.
+
+### Ollama on Linux (GPU)
+
+On DGX / Ubuntu, the default **snap** Ollama on port **11434** is often CPU-only. This project installs a **user-local CUDA build** on port **11435**:
+
+```bash
+# One-time install (~/.local/ollama-gpu)
+bash server/scripts/install_ollama_gpu_user.sh
+
+# Start before the Python server (or let app.py try auto-start)
+bash server/scripts/start_ollama_gpu.sh
+```
+
+The server resolves `--ollama-url auto` to `:11435` when the GPU endpoint responds, falls back to `:11434` otherwise, and warms the model in a background thread on startup. Override with `--ollama-url http://127.0.0.1:11434/api/generate` to force CPU.
+
+### Text-to-speech (TTS)
+
+TTS is selected automatically unless you set `--tts-provider` or `TTS_PROVIDER`:
+
+| Provider | Platform | When used | Voice |
+|----------|----------|-------------|-------|
+| `elevenlabs` | Any | Default when `ELEVENLABS_API_KEY` is set | Cloud voice (`ELEVENLABS_TTS_VOICE_ID`, default soft female) |
+| `sapi` | **Windows** | Auto when no ElevenLabs key; or `--tts-provider sapi` | Microsoft SAPI female (Zira, Hazel, …) via PowerShell |
+| `local` | **Linux** | Auto when no ElevenLabs key; ElevenLabs failure fallback | espeak-ng `en+f3` (soft British female) |
+
+**Fallback chain:** ElevenLabs → Windows SAPI on Windows, espeak on Linux.
+
+**Note:** `pyttsx3` on Linux always uses espeak-ng — it cannot use Windows SAPI voices. For Windows-quality speech on Linux, use ElevenLabs (or top up API credits when quota is exhausted).
+
+**Linux local voice tuning:**
+
+```bash
+export LOCAL_TTS_VOICE=en+f4    # alternate espeak female variant
+export LOCAL_TTS_RATE=120       # words per minute (default ~123)
+export TTS_PROVIDER=local       # skip ElevenLabs even if key is set
+```
+
+**Windows:** use `--tts-provider sapi` to force SAPI; do not use `TTS_PROVIDER=local` on Windows unless you intend espeak.
+
+Check active TTS at `GET /api/status` → `tts`.
 
 ## Typical workflow
 
@@ -276,7 +357,7 @@ Example voice commands after wake:
 | “List my alarms” | Hear pending alarms |
 | “Cancel all alarms” / “Delete my alarms” | Remove every pending alarm |
 | “Cancel alarm at 4 AM” / “Delete my coffee reminder” | Remove one matching alarm |
-| General questions | STT (ElevenLabs/Whisper) → Ollama → TTS (name used ~18% of the time) |
+| General questions | STT (ElevenLabs/Whisper) → Ollama (GPU on Linux when available) → TTS (name used ~18% of the time) |
 
 Serial CLI servo test (U2D2 ready):
 
@@ -297,6 +378,8 @@ Serial CLI servo test (U2D2 ready):
 ### Server endpoints
 
 - `GET /` — web UI
+- `GET /api/status` — camera, TTS provider, Ollama URL/model, face stats
+- `GET /api/latency-log?limit=50` — recent voice latency / WebSocket events
 - `GET /video_feed` — annotated MJPEG stream
 - `POST /api/camera` — change camera source
 - `POST /api/register` — register face data
@@ -314,8 +397,16 @@ Serial CLI servo test (U2D2 ready):
 | `ESP_PLAY_WAV_URL` | CLI / config | Face TTS + derives `/servo/360` host for voice spin |
 | `ESP_MAX_PLAY_WAV_BYTES` | `389120` | Server-side cap (ESP `/play_wav` hard limit is 384 KiB) |
 | `STT_PROVIDER` | auto | `elevenlabs` or `whisper` (`--stt-provider`); defaults to ElevenLabs when an API key is set |
-| `ELEVENLABS_API_KEY` | — | ElevenLabs API key for cloud STT (`--elevenlabs-api-key`); needs the **Speech to Text** permission |
+| `TTS_PROVIDER` | auto | `elevenlabs`, `sapi` (Windows), or `local` (Linux espeak); `--tts-provider` |
+| `ELEVENLABS_API_KEY` | — | ElevenLabs API key for cloud STT/TTS (`--elevenlabs-api-key`); STT needs **Speech to Text** permission |
 | `ELEVENLABS_STT_MODEL` | `scribe_v1` | ElevenLabs Scribe model id |
+| `ELEVENLABS_TTS_VOICE_ID` | `f1K8uOKtx0TAmtXBiLqx` | ElevenLabs voice id |
+| `ELEVENLABS_TTS_SPEED` | `0.86` | ElevenLabs speech speed |
+| `ELEVENLABS_TTS_STABILITY` | `30%` | ElevenLabs stability |
+| `ELEVENLABS_TTS_SIMILARITY` | `0%` | ElevenLabs similarity boost |
+| `ELEVENLABS_TTS_STYLE` | `20%` | ElevenLabs style |
+| `LOCAL_TTS_VOICE` | `en+f3` | Linux espeak voice (female British) |
+| `LOCAL_TTS_RATE` | `~123` | Linux espeak words per minute |
 | `WHISPER_MODEL` | `small` | faster-whisper model (`--whisper-model`); local fallback engine |
 | `VOICE_PERSONALIZE_PROB` | `0.18` | Fraction of voice replies that use viewer name |
 | `SERVO_360_TRIGGER_DELAY_SECONDS` | `2.0` | Delay after 360 confirmation TTS before POST spin |
@@ -328,7 +419,11 @@ Serial CLI servo test (U2D2 ready):
 | `ALARM_TICK_SECONDS` | `1.0` | Scheduler poll interval for due alarms |
 | `ALARM_MEDICAL_REPEAT_MINUTES` | `3` | Re-fire medical alarms until user confirms |
 | `ALARM_NLP_FALLBACK` | `1` | Use Ollama JSON when regex fails (`0` to disable) |
+| `OLLAMA_URL` | `auto` | Ollama generate URL; `auto` prefers GPU `:11435` on Linux |
 | `OLLAMA_MODEL` | `qwen2.5:1.5b` | LLM for voice + alarm NLP fallback |
+| `OLLAMA_GPU_URL` | `http://127.0.0.1:11435/api/generate` | GPU Ollama endpoint (Linux) |
+| `OLLAMA_KEEP_ALIVE` | `-1` | Keep model loaded in VRAM |
+| `OLLAMA_NUM_GPU` | `-1` | Layers on GPU (`-1` = all) |
 
 ## Repository layout
 
@@ -382,6 +477,11 @@ server/
   data/face_embeddings.json
   requirements.txt
   server_config.json
+  scripts/
+    install_ollama_gpu_user.sh
+    start_ollama_gpu.sh
+    stop_ollama_gpu.sh
+    setup_ollama_gpu.sh
   templates/
   static/
   data/
@@ -399,7 +499,7 @@ managed_components/
 - `POST /play_wav` and `POST /servo/360` have no authentication — use only on a trusted LAN.
 - Eye displays initialize first in `app_main`, so the idle face shows during the rest of boot; if OLED init fails the firmware logs a warning and runs without eyes.
 - Both OLEDs mirror the same eye by default; the driver supports per-eye drawing (`ssd1351_target()`) for future asymmetric expressions.
-- Windows is the recommended platform for the default speech synthesis path.
+- **Windows** uses SAPI for local TTS; **Linux** uses espeak-ng for local TTS. ElevenLabs works on both when configured.
 - Face data lives in `server/data/faces/` (JPEG crops) and `server/data/face_embeddings.json` (small JSON) — the old LBPH `face_model.yml` is no longer generated and can be deleted.
 - If you store `elevenlabs_api_key` in `server/server_config.json`, keep that file out of public commits — it contains a secret.
 
@@ -411,6 +511,10 @@ managed_components/
 - If voice does not connect, verify the PC IP is reachable from the ESP (`voice connect <PC_IP> 8000`) and the server is running.
 - If the log shows **`ElevenLabs STT failed ... missing_permissions`**, your API key was created without the **Speech to Text** scope — edit the key in the ElevenLabs dashboard (or create one with full access), update `ELEVENLABS_API_KEY`, and restart the server in a new terminal.
 - If STT is slow (6–30 s `stt_seconds` in `server/data/latency_log.json`), the server is using local Whisper — check that `ELEVENLABS_API_KEY` is set and the log line reads `stt(elevenlabs)=...`.
+- If LLM is slow on Linux (tens of seconds in `reply_seconds`), check `GET /api/status` → `llm.url`. CPU-only snap on `:11434` is much slower than GPU Ollama on `:11435` — run `bash server/scripts/start_ollama_gpu.sh` and restart the server.
+- If you hear a **robotic male voice** on Linux, ElevenLabs likely failed (quota/API error) and the server fell back to espeak — check server logs for `ElevenLabs TTS failed`. Fix API credits or set `TTS_PROVIDER=local` and tune `LOCAL_TTS_VOICE=en+f3`.
+- If TTS fails on Linux with `could not initialize espeak-ng`, install the library: `sudo apt install espeak-ng` (pyttsx3 loads `libespeak-ng.so.1`).
+- On **Windows**, use default SAPI (`--tts-provider sapi` or no key). Avoid `TTS_PROVIDER=local` unless you have espeak installed.
 - If **medical alarm ack** works for yes/no but not after *reschedule or cancel?*, flash latest firmware (WebSocket `prompt_medical_ack`) and restart the server.
 - If alarm fire logs **`WAV too large for ESP`**, restart server (16 kHz + shorter repeat TTS); medical alarms use TTS only, no beep.
 - If alarm time voice fails with *“Please use a 12-hour time”*, restart server (NLP normalizes `20:36 PM` / `8.36pm` style output).

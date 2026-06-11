@@ -12,5 +12,47 @@
     "ack_state": "none",
     "last_fired_at": "",
     "next_repeat_at": ""
+  },
+  {
+    "id": "b127f9f00bdb",
+    "fire_at": "2026-06-13T02:00:00",
+    "label": "",
+    "person_name": "Chakri",
+    "created_at": "2026-06-12T02:47:55",
+    "fired": false,
+    "priority": 1,
+    "category": "general",
+    "requires_ack": false,
+    "ack_state": "none",
+    "last_fired_at": "",
+    "next_repeat_at": ""
+  },
+  {
+    "id": "516e45c1f84f",
+    "fire_at": "2026-06-12T04:00:00",
+    "label": "",
+    "person_name": "Uday",
+    "created_at": "2026-06-12T03:45:24",
+    "fired": true,
+    "priority": 1,
+    "category": "general",
+    "requires_ack": false,
+    "ack_state": "none",
+    "last_fired_at": "",
+    "next_repeat_at": ""
+  },
+  {
+    "id": "69f0cb9b83ea",
+    "fire_at": "2026-06-12T05:00:00",
+    "label": "take medicines",
+    "person_name": "Chakri",
+    "created_at": "2026-06-12T03:53:54",
+    "fired": false,
+    "priority": 0,
+    "category": "medical",
+    "requires_ack": true,
+    "ack_state": "none",
+    "last_fired_at": "",
+    "next_repeat_at": ""
   }
 ]
