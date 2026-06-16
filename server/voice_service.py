@@ -65,6 +65,17 @@ _SERVO_360_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     )
 )
 
+_VOLUME_SET_PATTERN = re.compile(
+    r"\b(?:set|change|make|keep)?\s*(?:the\s*)?volume(?:\s*(?:to|at))?\s*"
+    r"(max(?:imum)?|min(?:imum)?|\d{1,3})\b",
+    re.IGNORECASE,
+)
+_VOLUME_STEP_PATTERN = re.compile(
+    r"\b(?:volume\s*)?(increase|decrease|raise|lower|up|down)\b"
+    r"(?:\s*(?:by|to)\s*(\d{1,3}))?",
+    re.IGNORECASE,
+)
+
 # Seconds after TTS is sent before POST /servo/360 (lets confirmation play first).
 SERVO_360_TRIGGER_DELAY_SECONDS = float(os.environ.get("SERVO_360_TRIGGER_DELAY_SECONDS", "2.0"))
 
@@ -179,6 +190,16 @@ def esp_servo_360_url() -> str | None:
     return f"{parsed.scheme}://{parsed.netloc}/servo/360"
 
 
+def esp_speaker_volume_url() -> str | None:
+    play_url = os.environ.get("ESP_PLAY_WAV_URL", "").strip()
+    if not play_url:
+        return None
+    parsed = urlparse(play_url)
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}/speaker/volume"
+
+
 def trigger_esp_servo_360() -> tuple[bool, str | None]:
     """POST /servo/360 on the ESP. Returns (ok, error_code)."""
     url = esp_servo_360_url()
@@ -200,6 +221,43 @@ def trigger_esp_servo_360() -> tuple[bool, str | None]:
         return False, "request_failed"
 
 
+def get_esp_speaker_volume() -> tuple[int | None, str | None]:
+    url = esp_speaker_volume_url()
+    if not url:
+        return None, "no_esp_url"
+    try:
+        resp = requests.get(url, timeout=8)
+        if resp.status_code != 200:
+            return None, f"http_{resp.status_code}"
+        payload = resp.json()
+        vol = int(payload.get("volume_percent", -1))
+        if 0 <= vol <= 100:
+            return vol, None
+        return None, "bad_response"
+    except Exception as exc:
+        logger.warning("ESP speaker volume read failed: %s", exc)
+        return None, "request_failed"
+
+
+def set_esp_speaker_volume(percent: int) -> tuple[int | None, str | None]:
+    url = esp_speaker_volume_url()
+    if not url:
+        return None, "no_esp_url"
+    pct = max(0, min(100, int(percent)))
+    try:
+        resp = requests.post(url, params={"value": str(pct)}, timeout=8)
+        if resp.status_code != 200:
+            return None, f"http_{resp.status_code}"
+        payload = resp.json()
+        applied = int(payload.get("volume_percent", pct))
+        if 0 <= applied <= 100:
+            return applied, None
+        return None, "bad_response"
+    except Exception as exc:
+        logger.warning("ESP speaker volume set failed: %s", exc)
+        return None, "request_failed"
+
+
 def reply_for_servo_360_command(*, error: str | None = None) -> str:
     """Fixed spoken reply for servo 360 voice commands — no LLM."""
     if error == "no_esp_url":
@@ -214,6 +272,89 @@ def reply_for_servo_360_command(*, error: str | None = None) -> str:
     if error == "request_failed":
         return "I tried to start the spin but the robot did not respond."
     return "OK, doing the spin now."
+
+
+def parse_volume_command(user_text: str) -> tuple[str, int | None, int | None] | None:
+    """
+    Returns:
+      ("set", target_percent, None)
+      ("delta", delta_percent, explicit_target_or_none)
+    """
+    text = user_text.strip().lower()
+    if not text:
+        return None
+
+    set_match = _VOLUME_SET_PATTERN.search(text)
+    if set_match:
+        raw = set_match.group(1).lower()
+        if raw.startswith("max"):
+            return ("set", 100, None)
+        if raw.startswith("min"):
+            return ("set", 0, None)
+        try:
+            value = int(raw)
+            if 0 <= value <= 100:
+                return ("set", value, None)
+        except ValueError:
+            return None
+        return None
+
+    step_match = _VOLUME_STEP_PATTERN.search(text)
+    if not step_match:
+        return None
+
+    action = step_match.group(1).lower()
+    amount_raw = step_match.group(2)
+    if action in {"increase", "raise", "up"}:
+        sign = 1
+    else:
+        sign = -1
+    if amount_raw is None:
+        return ("delta", sign * 10, None)
+
+    try:
+        amount = int(amount_raw)
+    except ValueError:
+        return None
+    if amount < 0:
+        return None
+    if amount <= 100 and (" to " in text or text.endswith(f"to {amount_raw}")):
+        return ("delta", sign * 10, amount)
+    return ("delta", sign * amount, None)
+
+
+def apply_volume_command(user_text: str) -> tuple[bool, str]:
+    parsed = parse_volume_command(user_text)
+    if parsed is None:
+        return False, ""
+
+    mode, value, explicit_target = parsed
+    if mode == "set":
+        applied, err = set_esp_speaker_volume(value or 0)
+        if err:
+            if err == "no_esp_url":
+                return True, "I cannot reach the robot speaker right now."
+            return True, "I could not change the volume on the robot."
+        return True, f"Okay, speaker volume set to {applied} percent."
+
+    if explicit_target is not None:
+        applied, err = set_esp_speaker_volume(explicit_target)
+        if err:
+            if err == "no_esp_url":
+                return True, "I cannot reach the robot speaker right now."
+            return True, "I could not change the volume on the robot."
+        return True, f"Okay, speaker volume set to {applied} percent."
+
+    current, err = get_esp_speaker_volume()
+    if err or current is None:
+        if err == "no_esp_url":
+            return True, "I cannot reach the robot speaker right now."
+        return True, "I could not read the current speaker volume."
+    target = max(0, min(100, current + (value or 0)))
+    applied, err = set_esp_speaker_volume(target)
+    if err:
+        return True, "I could not change the volume on the robot."
+    return True, f"Okay, speaker volume set to {applied} percent."
 
 
 def _ensure_whisper() -> Any:
@@ -337,6 +478,46 @@ def process_voice_wav(
 
     user_text, stt_engine = transcribe_wav(wav_bytes)
     t_stt = time.perf_counter()
+    reply_path = "llm"
+
+    handled_volume, volume_reply = apply_volume_command(user_text)
+    if handled_volume:
+        reply_path = "volume"
+        logger.info("Voice volume command | heard: %s", user_text[:120])
+        reply = volume_reply
+        t_reply = time.perf_counter()
+        wav, _voice = synthesize_sapi_wav_bytes(reply)
+        wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
+        t_tts = time.perf_counter()
+
+        audio_in_seconds = max(0, len(wav_bytes) - 44) / (16000 * 2)
+        audio_out_seconds = max(0, len(wav_out) - 44) / (VOICE_ASSIST_PLAYBACK_HZ * 2)
+        meta.timings = {
+            "heard": user_text[:200],
+            "reply_text": reply[:200],
+            "reply_path": reply_path,
+            "audio_in_seconds": round(audio_in_seconds, 2),
+            "audio_in_bytes": len(wav_bytes),
+            "audio_out_seconds": round(audio_out_seconds, 2),
+            "audio_out_bytes": len(wav_out),
+            "stt_engine": stt_engine,
+            "stt_seconds": round(t_stt - t_start, 3),
+            "reply_seconds": round(t_reply - t_stt, 3),
+            "tts_seconds": round(t_tts - t_reply, 3),
+            "process_total_seconds": round(t_tts - t_start, 3),
+        }
+        logger.info(
+            "Latency | stt(%s)=%.2fs reply(%s)=%.2fs tts=%.2fs total=%.2fs | in=%.1fs out=%.1fs audio",
+            stt_engine,
+            meta.timings["stt_seconds"],
+            reply_path,
+            meta.timings["reply_seconds"],
+            meta.timings["tts_seconds"],
+            meta.timings["process_total_seconds"],
+            audio_in_seconds,
+            audio_out_seconds,
+        )
+        return wav_out, meta
 
     from alarm_voice import handle_alarm_voice
 
@@ -346,7 +527,6 @@ def process_voice_wav(
         camera_identity_name=camera_identity_name,
         camera_identity_state=camera_identity_state,
     )
-    reply_path = "llm"
     if alarm_result.handled:
         reply_path = "alarm"
         logger.info("Voice alarm command | heard: %s", user_text[:120])

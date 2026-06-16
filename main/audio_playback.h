@@ -37,3 +37,9 @@ esp_err_t nino_audio_play_pcm16_mono(const int16_t *samples, size_t sample_count
 /** Serialize access to the shared ES8311 / I2S path (playback vs microphone). */
 void nino_audio_bus_lock(void);
 void nino_audio_bus_unlock(void);
+
+/** Set speaker output volume percent (0-100). */
+esp_err_t nino_audio_set_volume_percent(int volume_percent);
+
+/** Current speaker output volume percent (0-100). */
+int nino_audio_get_volume_percent(void);

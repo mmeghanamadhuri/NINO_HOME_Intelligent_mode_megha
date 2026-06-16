@@ -22,6 +22,7 @@ static const char *TAG = "nino_audio";
 static SemaphoreHandle_t s_mutex;
 static esp_codec_dev_handle_t s_spk;
 static bool s_ready;
+static int s_volume_percent = 80;
 
 /** Let I2S/codec finish samples already queued (avoids truncated two-tone beeps). */
 static void wait_pcm_pipeline_done(uint32_t sample_rate_hz, size_t pcm_bytes,
@@ -147,13 +148,38 @@ esp_err_t nino_audio_init(void) {
       return ESP_FAIL;
     }
 
-    esp_codec_dev_set_out_vol(s_spk, 100);
+    esp_codec_dev_set_out_vol(s_spk, s_volume_percent);
     s_ready = true;
-    ESP_LOGI(TAG, "Speaker ready (ES8311)");
+    ESP_LOGI(TAG, "Speaker ready (ES8311), volume=%d%%", s_volume_percent);
   }
   xSemaphoreGive(s_mutex);
   return ESP_OK;
 }
+
+esp_err_t nino_audio_set_volume_percent(int volume_percent) {
+  if (volume_percent < 0 || volume_percent > 100) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  if (s_mutex == NULL) {
+    esp_err_t err = nino_audio_init();
+    if (err != ESP_OK) {
+      return err;
+    }
+  }
+
+  xSemaphoreTake(s_mutex, portMAX_DELAY);
+  s_volume_percent = volume_percent;
+  if (s_spk != NULL) {
+    (void)esp_codec_dev_set_out_vol(s_spk, s_volume_percent);
+  }
+  xSemaphoreGive(s_mutex);
+
+  ESP_LOGI(TAG, "Speaker volume set to %d%%", s_volume_percent);
+  return ESP_OK;
+}
+
+int nino_audio_get_volume_percent(void) { return s_volume_percent; }
 
 esp_err_t nino_audio_play_pcm16_mono(const int16_t *samples, size_t sample_count,
                                      uint32_t sample_rate_hz) {

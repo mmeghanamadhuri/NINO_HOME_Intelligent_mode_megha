@@ -478,6 +478,7 @@ static void wifi_cli_register(void) {
 
 static void voice_cli_register(void);
 static void servo_cli_register(void);
+static void speaker_cli_register(void);
 
 static int cmd_eye(int argc, char **argv) {
   if (argc >= 2 && nino_eye_apply_command(argv[1])) {
@@ -508,6 +509,7 @@ static void console_init(void) {
   wifi_cli_register();
   voice_cli_register();
   servo_cli_register();
+  speaker_cli_register();
   eye_cli_register();
 
   const esp_console_cmd_t cpu_dump_cmd = {
@@ -1089,6 +1091,84 @@ static esp_err_t play_wav_handler(httpd_req_t *req) {
                          HTTPD_RESP_USE_STRLEN);
 }
 
+static bool parse_volume_percent_value(const char *text, int *out) {
+  if (text == NULL || out == NULL || *text == '\0') {
+    return false;
+  }
+  char *end = NULL;
+  long value = strtol(text, &end, 10);
+  if (end == text || *end != '\0' || value < 0 || value > 100) {
+    return false;
+  }
+  *out = (int)value;
+  return true;
+}
+
+static esp_err_t speaker_volume_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+  if (req->method == HTTP_GET) {
+    char body[96];
+    int n = snprintf(body, sizeof(body), "{\"ok\":true,\"volume_percent\":%d}",
+                     nino_audio_get_volume_percent());
+    if (n <= 0 || n >= (int)sizeof(body)) {
+      return httpd_resp_send_500(req);
+    }
+    return httpd_resp_send(req, body, n);
+  }
+
+  if (req->method != HTTP_POST) {
+    httpd_resp_set_status(req, "405 Method Not Allowed");
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"GET or POST only\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+
+  if (req->content_len > 0) {
+    char discard[64];
+    int remaining = req->content_len;
+    while (remaining > 0) {
+      int chunk = remaining > (int)sizeof(discard) ? (int)sizeof(discard) : remaining;
+      int r = httpd_req_recv(req, discard, chunk);
+      if (r <= 0) {
+        break;
+      }
+      remaining -= r;
+    }
+  }
+
+  char query[64] = {0};
+  char value_str[16] = {0};
+  int volume_percent = -1;
+  bool ok = false;
+  if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+    if (httpd_query_key_value(query, "value", value_str, sizeof(value_str)) == ESP_OK) {
+      ok = parse_volume_percent_value(value_str, &volume_percent);
+    }
+  }
+  if (!ok) {
+    httpd_resp_set_status(req, "400 Bad Request");
+    return httpd_resp_send(
+        req,
+        "{\"ok\":false,\"error\":\"missing_or_invalid_value\",\"hint\":\"use ?value=0..100\"}",
+        HTTPD_RESP_USE_STRLEN);
+  }
+
+  esp_err_t err = nino_audio_set_volume_percent(volume_percent);
+  if (err != ESP_OK) {
+    return httpd_resp_send_500(req);
+  }
+
+  ESP_LOGI(TAG, "Voice/HTTP: speaker volume %d%%", volume_percent);
+  char body[96];
+  int n = snprintf(body, sizeof(body), "{\"ok\":true,\"volume_percent\":%d}",
+                   nino_audio_get_volume_percent());
+  if (n <= 0 || n >= (int)sizeof(body)) {
+    return httpd_resp_send_500(req);
+  }
+  return httpd_resp_send(req, body, n);
+}
+
 static esp_err_t servo_360_handler(httpd_req_t *req) {
   if (req->method != HTTP_POST) {
     httpd_resp_set_status(req, "405 Method Not Allowed");
@@ -1441,6 +1521,39 @@ static void servo_cli_register(void) {
   ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
 }
 
+static int cmd_speaker(int argc, char **argv) {
+  if (argc >= 2 && strcmp(argv[1], "volume") == 0) {
+    if (argc >= 3) {
+      int volume = -1;
+      if (!parse_volume_percent_value(argv[2], &volume)) {
+        printf("Usage: speaker volume [0-100]\n");
+        return 1;
+      }
+      esp_err_t err = nino_audio_set_volume_percent(volume);
+      if (err != ESP_OK) {
+        printf("Failed to set volume: %s\n", esp_err_to_name(err));
+        return 1;
+      }
+    }
+    printf("speaker volume: %d%%\n", nino_audio_get_volume_percent());
+    return 0;
+  }
+
+  printf("Usage: speaker volume [0-100]\n");
+  return 0;
+}
+
+static void speaker_cli_register(void) {
+  const esp_console_cmd_t cmd = {
+      .command = "speaker",
+      .help = "speaker volume [0-100]",
+      .hint = NULL,
+      .func = &cmd_speaker,
+      .argtable = NULL,
+  };
+  ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+}
+
 static void start_http_server(void) {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = HTTP_SERVER_PORT;
@@ -1482,6 +1595,18 @@ static void start_http_server(void) {
       .handler = servo_360_handler,
       .user_ctx = NULL,
   };
+  const httpd_uri_t speaker_volume_get_uri = {
+      .uri = "/speaker/volume",
+      .method = HTTP_GET,
+      .handler = speaker_volume_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t speaker_volume_post_uri = {
+      .uri = "/speaker/volume",
+      .method = HTTP_POST,
+      .handler = speaker_volume_handler,
+      .user_ctx = NULL,
+  };
   const httpd_uri_t wifi_prov_config_uri = {
       .uri = "/api/wifi/config",
       .method = HTTP_POST,
@@ -1506,6 +1631,10 @@ static void start_http_server(void) {
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &snapshot_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &play_wav_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &servo_360_uri));
+  ESP_ERROR_CHECK(
+      httpd_register_uri_handler(s_http_server, &speaker_volume_get_uri));
+  ESP_ERROR_CHECK(
+      httpd_register_uri_handler(s_http_server, &speaker_volume_post_uri));
   ESP_ERROR_CHECK(
       httpd_register_uri_handler(s_http_server, &wifi_prov_config_uri));
   ESP_ERROR_CHECK(
