@@ -66,15 +66,28 @@ _SERVO_360_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
 )
 
 _VOLUME_SET_PATTERN = re.compile(
-    r"\b(?:set|change|make|keep)?\s*(?:the\s*)?volume(?:\s*(?:to|at))?\s*"
-    r"(max(?:imum)?|min(?:imum)?|\d{1,3})\b",
+    r"\b(?:set|change|make|keep|increase|decrease|raise|lower|turn)\b.*\bvolume\b"
+    r".*?\b(?:to|at)\s+([a-z0-9\s-]+)(?:\s*percent)?\b",
     re.IGNORECASE,
 )
 _VOLUME_STEP_PATTERN = re.compile(
-    r"\b(?:volume\s*)?(increase|decrease|raise|lower|up|down)\b"
-    r"(?:\s*(?:by|to)\s*(\d{1,3}))?",
+    r"\b(increase|decrease|raise|lower|up|down)\b(?:\s+volume)?"
+    r"(?:\s+by\s+([a-z0-9\s-]+?)(?:\s*percent)?)?\b",
     re.IGNORECASE,
 )
+_NUMBER_WORDS: dict[str, int] = {
+    "zero": 0,
+    "ten": 10,
+    "twenty": 20,
+    "thirty": 30,
+    "forty": 40,
+    "fifty": 50,
+    "sixty": 60,
+    "seventy": 70,
+    "eighty": 80,
+    "ninety": 90,
+    "hundred": 100,
+}
 
 # Seconds after TTS is sent before POST /servo/360 (lets confirmation play first).
 SERVO_360_TRIGGER_DELAY_SECONDS = float(os.environ.get("SERVO_360_TRIGGER_DELAY_SECONDS", "2.0"))
@@ -274,11 +287,34 @@ def reply_for_servo_360_command(*, error: str | None = None) -> str:
     return "OK, doing the spin now."
 
 
-def parse_volume_command(user_text: str) -> tuple[str, int | None, int | None] | None:
+def _parse_volume_value_phrase(raw: str) -> int | None:
+    text = raw.strip().lower().replace("-", " ")
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\bpercent\b", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return None
+    if text in {"max", "maximum", "full"}:
+        return 100
+    if text in {"min", "minimum", "mute"}:
+        return 0
+    if text.isdigit():
+        value = int(text)
+        return value if 0 <= value <= 100 else None
+    if text in _NUMBER_WORDS:
+        return _NUMBER_WORDS[text]
+    if text in {"one hundred", "a hundred"}:
+        return 100
+    if "hundred" in text:
+        return 100
+    return None
+
+
+def parse_volume_command(user_text: str) -> tuple[str, int | None] | None:
     """
     Returns:
-      ("set", target_percent, None)
-      ("delta", delta_percent, explicit_target_or_none)
+      ("set", target_percent)
+      ("delta", delta_percent)
     """
     text = user_text.strip().lower()
     if not text:
@@ -286,17 +322,9 @@ def parse_volume_command(user_text: str) -> tuple[str, int | None, int | None] |
 
     set_match = _VOLUME_SET_PATTERN.search(text)
     if set_match:
-        raw = set_match.group(1).lower()
-        if raw.startswith("max"):
-            return ("set", 100, None)
-        if raw.startswith("min"):
-            return ("set", 0, None)
-        try:
-            value = int(raw)
-            if 0 <= value <= 100:
-                return ("set", value, None)
-        except ValueError:
-            return None
+        value = _parse_volume_value_phrase(set_match.group(1))
+        if value is not None:
+            return ("set", value)
         return None
 
     step_match = _VOLUME_STEP_PATTERN.search(text)
@@ -304,23 +332,17 @@ def parse_volume_command(user_text: str) -> tuple[str, int | None, int | None] |
         return None
 
     action = step_match.group(1).lower()
-    amount_raw = step_match.group(2)
+    amount_raw = step_match.group(2) or ""
     if action in {"increase", "raise", "up"}:
         sign = 1
     else:
         sign = -1
-    if amount_raw is None:
-        return ("delta", sign * 10, None)
-
-    try:
-        amount = int(amount_raw)
-    except ValueError:
-        return None
-    if amount < 0:
-        return None
-    if amount <= 100 and (" to " in text or text.endswith(f"to {amount_raw}")):
-        return ("delta", sign * 10, amount)
-    return ("delta", sign * amount, None)
+    if not amount_raw.strip():
+        return ("delta", sign * 10)
+    amount = _parse_volume_value_phrase(amount_raw)
+    if amount is None:
+        return ("delta", sign * 10)
+    return ("delta", sign * amount)
 
 
 def apply_volume_command(user_text: str) -> tuple[bool, str]:
@@ -328,17 +350,9 @@ def apply_volume_command(user_text: str) -> tuple[bool, str]:
     if parsed is None:
         return False, ""
 
-    mode, value, explicit_target = parsed
+    mode, value = parsed
     if mode == "set":
         applied, err = set_esp_speaker_volume(value or 0)
-        if err:
-            if err == "no_esp_url":
-                return True, "I cannot reach the robot speaker right now."
-            return True, "I could not change the volume on the robot."
-        return True, f"Okay, speaker volume set to {applied} percent."
-
-    if explicit_target is not None:
-        applied, err = set_esp_speaker_volume(explicit_target)
         if err:
             if err == "no_esp_url":
                 return True, "I cannot reach the robot speaker right now."
