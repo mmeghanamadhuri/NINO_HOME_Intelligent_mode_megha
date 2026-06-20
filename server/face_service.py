@@ -111,6 +111,7 @@ class FaceService:
         self.secondary_face_area_ratio = float(
             os.environ.get("FACE_SECONDARY_AREA_RATIO", "0.40")
         )
+        self.max_detections = max(1, int(os.environ.get("FACE_MAX_DETECTIONS", "1")))
         self.session_primary_hold_seconds = float(
             os.environ.get("FACE_SESSION_PRIMARY_HOLD_SECONDS", "90")
         )
@@ -157,6 +158,7 @@ class FaceService:
             "confirm_frames": self.confirm_frames,
             "engine": "sface" if self._sface is not None else "unavailable",
             "detector": "yunet" if self._yunet_enabled else "haar",
+            "max_detections": self.max_detections,
             "session_primary_hold_seconds": self.session_primary_hold_seconds,
             "secondary_face_area_ratio": self.secondary_face_area_ratio,
         }
@@ -182,7 +184,18 @@ class FaceService:
         if not detections:
             detections = [(box, None) for box in self._detect_haar(frame)]
 
-        return self._filter_detections(detections, (h, w))
+        filtered = self._filter_detections(detections, (h, w))
+        if len(filtered) <= self.max_detections:
+            return filtered
+
+        def _det_rank(item: tuple[tuple[int, int, int, int], np.ndarray | None]) -> float:
+            (_x, _y, bw, bh), row = item
+            area = float(max(1, bw * bh))
+            score = float(row[14]) if row is not None and len(row) > 14 else 1.0
+            return area * score
+
+        filtered.sort(key=_det_rank, reverse=True)
+        return filtered[: self.max_detections]
 
     def _detect_yunet(
         self, frame: np.ndarray
@@ -551,6 +564,9 @@ class FaceService:
             )
 
         self._stabilize_primary_face(results)
+        for result in results:
+            if not result.get("stabilized", False):
+                result["recognized"] = False
 
         primary_name = self.primary_viewer(results)
         if primary_name:
