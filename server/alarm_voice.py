@@ -268,9 +268,79 @@ def _split_label_and_time_phrase(tail: str) -> tuple[str, str] | None:
     return label, time_phrase
 
 
+def _extract_time_phrase_from_text(user_text: str) -> str:
+    """Pull a time phrase from mixed alarm/reminder utterances."""
+    phrase = _extract_time_phrase(user_text)
+    if phrase:
+        split = _split_label_and_time_phrase(phrase)
+        if split:
+            return split[1]
+        if parse_alarm_datetime(phrase).fire_at is not None:
+            return phrase
+
+    tail = _extract_reminder_tail(user_text)
+    if tail:
+        split = _split_label_and_time_phrase(tail)
+        if split:
+            return split[1]
+
+    for pattern in _SET_ALARM_PATTERNS:
+        match = pattern.search(user_text)
+        if match:
+            tail = match.group(1).strip()
+            split = _split_label_and_time_phrase(tail)
+            if split:
+                return split[1]
+            at_match = _AT_TIME_SUFFIX.search(tail)
+            if at_match:
+                return at_match.group(1).strip()
+
+    at_match = _AT_TIME_SUFFIX.search(user_text)
+    if at_match:
+        return at_match.group(1).strip()
+    return ""
+
+
+def _extract_medical_label(user_text: str) -> str:
+    tail = _extract_reminder_tail(user_text)
+    if tail:
+        split = _split_label_and_time_phrase(tail)
+        if split:
+            return _clean_reminder_label(split[0])
+    for pattern in _SET_ALARM_PATTERNS:
+        match = pattern.search(user_text)
+        if match:
+            split = _split_label_and_time_phrase(match.group(1).strip())
+            if split:
+                return _clean_reminder_label(split[0])
+    return "take your medication"
+
+
+def normalize_label_for_user(label: str) -> str:
+    """Rewrite a user-spoken task so the bot addresses them (my → your, me → you)."""
+    text = label.strip()
+    if not text:
+        return text
+    replacements: tuple[tuple[re.Pattern[str], str], ...] = (
+        (re.compile(r"\bmyself\b", re.IGNORECASE), "yourself"),
+        (re.compile(r"\bmine\b", re.IGNORECASE), "yours"),
+        (re.compile(r"\bmy\b", re.IGNORECASE), "your"),
+        (re.compile(r"\bme\b", re.IGNORECASE), "you"),
+        (re.compile(r"\bI'm\b", re.IGNORECASE), "you're"),
+        (re.compile(r"\bI've\b", re.IGNORECASE), "you've"),
+        (re.compile(r"\bI'll\b", re.IGNORECASE), "you'll"),
+        (re.compile(r"\bI\b"), "you"),
+    )
+    for pattern, replacement in replacements:
+        text = pattern.sub(replacement, text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _clean_reminder_label(label: str) -> str:
     cleaned = label.strip().rstrip(".")
+    cleaned = re.sub(r"^to\s+", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = normalize_label_for_user(cleaned)
     return cleaned[:120]
 
 
@@ -505,11 +575,14 @@ def _handle_set_medical_alarm(user_text: str, *, person_name: str = "") -> Alarm
     phrase = ""
     for pattern in _MEDICAL_SET_PATTERNS:
         match = pattern.search(user_text)
-        if match:
+        if not match:
+            continue
+        if match.lastindex and match.lastindex >= 1:
             phrase = (match.group(1) or "").strip()
-            break
+        break
+
     if not phrase:
-        phrase = _extract_time_phrase(user_text) or ""
+        phrase = _extract_time_phrase_from_text(user_text)
     if not phrase:
         return AlarmVoiceResult(handled=False)
 
@@ -517,8 +590,13 @@ def _handle_set_medical_alarm(user_text: str, *, person_name: str = "") -> Alarm
     if parsed.error or parsed.fire_at is None:
         return AlarmVoiceResult(handled=False)
 
-    label = "take medication"
-    logger.info("Voice medical alarm | person=%r phrase=%r", person_name or "(none)", phrase)
+    label = _extract_medical_label(user_text)
+    logger.info(
+        "Voice medical alarm | person=%r label=%r phrase=%r",
+        person_name or "(none)",
+        label,
+        phrase,
+    )
     return _save_alarm(
         parsed.fire_at,
         parsed,
@@ -580,6 +658,7 @@ def _handle_delete_one_alarm(user_text: str) -> AlarmVoiceResult:
     when = _spoken_alarm_time(removed)
     label = (removed.label or "").strip()
     if label:
+        label = normalize_label_for_user(label)
         return AlarmVoiceResult(
             handled=True,
             reply=f"OK, I deleted your {label} reminder for {when}.",
@@ -651,6 +730,7 @@ def _describe_alarm(alarm: Alarm) -> str:
     name_bit = f"{name}: " if name else ""
     label = (alarm.label or "").strip()
     if label:
+        label = normalize_label_for_user(label)
         return f"{name_bit}{kind} {day_word}at {when}, {label}"
     return f"{name_bit}{kind} {day_word}at {when}".strip()
 

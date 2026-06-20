@@ -1,0 +1,10 @@
+#!/bin/sh
+'''exec' "/home/sirena_dgx-1/Desktop/P4 server /ESP-P4-UK-Demo/server/.venv/bin/python3" "$0" "$@"
+' '''
+# -*- coding: utf-8 -*-
+import re
+import sys
+from huggingface_hub.cli.deprecated_cli import main
+if __name__ == '__main__':
+    sys.argv[0] = re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])
+    sys.exit(main())

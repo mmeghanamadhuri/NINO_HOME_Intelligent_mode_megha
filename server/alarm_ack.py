@@ -14,7 +14,7 @@ from alarm_medical import (
     wants_reschedule,
 )
 from alarm_service import get_alarm_service
-from alarm_voice import AlarmVoiceResult, parse_alarm_datetime
+from alarm_voice import AlarmVoiceResult, normalize_label_for_user, parse_alarm_datetime
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,7 @@ def handle_alarm_ack_voice(user_text: str) -> AlarmVoiceResult:
 
     if is_positive_ack(text):
         if service.confirm_ack(target.id):
-            label = (target.label or "medication").strip()
+            label = normalize_label_for_user((target.label or "medication").strip())
             return AlarmVoiceResult(
                 handled=True,
                 reply=f"Thank you. I've noted that you completed your {label} reminder.",
@@ -51,7 +51,7 @@ def handle_alarm_ack_voice(user_text: str) -> AlarmVoiceResult:
 
     if is_negative_ack(text):
         if service.decline_ack(target.id):
-            label = (target.label or "medication").strip()
+            label = normalize_label_for_user((target.label or "medication").strip())
             return AlarmVoiceResult(
                 handled=True,
                 reply=(
@@ -87,7 +87,7 @@ def _handle_reschedule_follow_up(user_text: str, alarm_id: str) -> AlarmVoiceRes
         updated = service.reschedule_alarm(alarm_id, parsed.fire_at)
         if updated:
             when = updated.spoken_time()
-            label = (updated.label or "medication").strip()
+            label = normalize_label_for_user((updated.label or "medication").strip())
             return AlarmVoiceResult(
                 handled=True,
                 reply=f"OK, I rescheduled your {label} reminder for {when}.",

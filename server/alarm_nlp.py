@@ -107,7 +107,7 @@ def _extract_via_ollama(user_text: str) -> dict[str, Any] | None:
         '"ampm":"AM|PM|empty",'
         '"day":"today|tomorrow|empty"}\n\n'
         "Rules:\n"
-        "- set_reminder: user wants a labeled reminder (label = verb phrase, e.g. take medicines, go to school)\n"
+        "- set_reminder: user wants a labeled reminder (label = verb phrase using your/me for the user, e.g. take your medicines, go to your school)\n"
         "- set_alarm: only a clock time, no task\n"
         "- set_reminder with medicine/medication/pills in label = priority medical (requires yes/no ack)\n"
         "- cancel / list: user wants to clear or hear pending alarms\n"

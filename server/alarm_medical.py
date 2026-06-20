@@ -77,7 +77,8 @@ _MEDICAL_SET_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p, re.IGNORECASE)
     for p in (
         r"\b(?:medication|medicine|meds?)\s+reminder\s+(?:at|for)\s+(.+)",
-        r"\bremind\s+me\s+to\s+(?:take|use)\s+(?:my\s+)?(?:meds?|medicine|medication|pills?)\b",
+        r"\bremind\s+me\s+to\s+(?:take|use)\s+(?:my\s+)?(?:meds?|medicines?|medication|pills?)(?:\s+at\s+(.+))?",
+        r"\b(?:set|create|make)\s+(?:an?\s+)?(?:alarm|reminder)\s+.+?\b(?:take|use)\s+(?:my\s+)?(?:meds?|medicines?|medication|pills?)\b",
     )
 )
 

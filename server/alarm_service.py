@@ -89,7 +89,9 @@ class Alarm:
             suffix = ack_prompt_suffix() if self.requires_ack else ""
 
         if self.label:
-            label = self.label.strip()
+            from alarm_voice import normalize_label_for_user
+
+            label = normalize_label_for_user(self.label.strip())
             if self.is_medical():
                 core = (
                     f"{name}, medication at {when}: {label}."
