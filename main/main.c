@@ -31,6 +31,8 @@
 #include "audio_playback.h"
 #include "audio_capture.h"
 #include "audio_queue.h"
+#include "face_detect.hpp"
+#include "face_tracker.h"
 #include "nino_eye.h"
 #include "ssd1351.h"
 #include "servo_dxl.h"
@@ -83,6 +85,15 @@ static bool s_sta_connected = false;
 #define UVC_FRAME_SIZE_BYTES (92 * 1024)
 #define UVC_FRAME_TIMEOUT_LOG_INTERVAL_MS 15000
 #define UVC_OPEN_TIMEOUT_MS 5000
+#define FACE_TRACK_TASK_STACK_SIZE (12 * 1024)
+#define FACE_TRACK_TASK_PRIORITY 5
+#define FACE_TRACK_NOTIFY_WAIT_MS 40
+// Sample face detection more slowly than the raw stream so tracking does not
+// compete too hard with UVC transport.
+#define FACE_TRACK_INFERENCE_INTERVAL_MS 250
+// Keep chasing the last valid face through brief UVC stalls instead of
+// dropping the head immediately when one or two frames are missed.
+#define FACE_TRACK_REUSE_LAST_FACE_MS 8000
 
 #define HTTP_STREAM_BOUNDARY "frame"
 #define HTTP_SERVER_PORT 80
@@ -117,6 +128,7 @@ typedef struct {
 static const char *TAG = "usb_camera";
 
 static TaskHandle_t s_stream_task_handle;
+static TaskHandle_t s_face_track_task_handle;
 static QueueHandle_t s_frame_queue;
 static volatile bool s_device_connected;
 static volatile bool s_stream_task_created;
@@ -479,6 +491,8 @@ static void wifi_cli_register(void) {
 static void voice_cli_register(void);
 static void servo_cli_register(void);
 static void speaker_cli_register(void);
+static void track_cli_register(void);
+static void hstop_cli_register(void);
 
 static int cmd_eye(int argc, char **argv) {
   if (argc >= 2 && nino_eye_apply_command(argv[1])) {
@@ -511,6 +525,8 @@ static void console_init(void) {
   servo_cli_register();
   speaker_cli_register();
   eye_cli_register();
+  track_cli_register();
+  hstop_cli_register();
 
   const esp_console_cmd_t cpu_dump_cmd = {
       .command = "cpu_dump",
@@ -612,6 +628,10 @@ static void latest_frame_store(const uvc_host_frame_t *frame) {
   s_latest_frame.ready = true;
 
   xSemaphoreGive(s_frame_mutex);
+
+  if (s_face_track_task_handle != NULL) {
+    xTaskNotifyGive(s_face_track_task_handle);
+  }
 }
 
 static bool latest_frame_copy(uint8_t *dst, size_t dst_capacity,
@@ -633,6 +653,79 @@ static bool latest_frame_copy(uint8_t *dst, size_t dst_capacity,
 
   xSemaphoreGive(s_frame_mutex);
   return ok;
+}
+
+static void face_track_task(void *arg) {
+  (void)arg;
+
+  uint8_t *jpeg_buf = heap_caps_malloc(UVC_FRAME_SIZE_BYTES,
+                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (jpeg_buf == NULL) {
+    ESP_LOGE(TAG, "Face tracking buffer allocation failed");
+    s_face_track_task_handle = NULL;
+    vTaskDelete(NULL);
+    return;
+  }
+
+  esp_err_t detector_err = nino_face_detect_init();
+  if (detector_err != ESP_OK) {
+    ESP_LOGE(TAG, "Face detector init failed: %s",
+             esp_err_to_name(detector_err));
+    nino_face_tracker_set_detector_ready(false);
+  } else {
+    nino_face_tracker_set_detector_ready(true);
+  }
+
+  nino_face_detect_result_t last_face = {};
+  bool have_last_face = false;
+  uint32_t last_processed_sequence = 0;
+  int64_t last_inference_us = 0;
+  int64_t last_face_seen_us = 0;
+
+  while (true) {
+    (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(FACE_TRACK_NOTIFY_WAIT_MS));
+
+    const int64_t now_us = esp_timer_get_time();
+
+    if (!nino_face_tracker_is_enabled() || !nino_face_detect_is_ready()) {
+      continue;
+    }
+
+    if (last_inference_us != 0 &&
+        (now_us - last_inference_us) <
+            (int64_t)FACE_TRACK_INFERENCE_INTERVAL_MS * 1000LL) {
+      continue;
+    }
+
+    size_t frame_len = 0;
+    uint32_t frame_sequence = 0;
+    bool have_frame = latest_frame_copy(jpeg_buf, UVC_FRAME_SIZE_BYTES, &frame_len,
+                                        &frame_sequence);
+
+    if (have_frame && frame_sequence != last_processed_sequence) {
+      nino_face_detect_result_t face = {};
+      if (nino_face_detect_process(jpeg_buf, frame_len, &face) == ESP_OK) {
+        last_processed_sequence = frame_sequence;
+        last_inference_us = now_us;
+        if (face.found) {
+          last_face = face;
+          have_last_face = true;
+          last_face_seen_us = now_us;
+        }
+        nino_face_tracker_update(face.found, face.cx, face.cy, face.frame_w,
+                                 face.frame_h, frame_sequence);
+      }
+      continue;
+    }
+
+    if (have_last_face &&
+        (now_us - last_face_seen_us) <= (int64_t)FACE_TRACK_REUSE_LAST_FACE_MS * 1000LL) {
+      nino_face_tracker_update(last_face.found, last_face.cx, last_face.cy,
+                               last_face.frame_w, last_face.frame_h,
+                               last_processed_sequence);
+      last_inference_us = now_us;
+    }
+  }
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
@@ -1521,6 +1614,125 @@ static void servo_cli_register(void) {
   ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
 }
 
+static int cmd_track(int argc, char **argv) {
+  if (argc < 2) {
+    printf("Usage: track on | off | status | hon\n");
+    return 0;
+  }
+
+  if (strcmp(argv[1], "on") == 0) {
+    if (!nino_face_detect_is_ready()) {
+      printf("Face detector not ready yet\n");
+      return 1;
+    }
+    nino_face_tracker_set_enabled(true);
+    printf("Pan tracking ON (servo ID 2)\n");
+    return 0;
+  }
+
+  if (strcmp(argv[1], "off") == 0) {
+    nino_face_tracker_set_enabled(false);
+    printf("Pan tracking OFF\n");
+    return 0;
+  }
+
+  if (strcmp(argv[1], "status") == 0) {
+    nino_face_tracker_status_t status = {};
+    nino_face_tracker_get_status(&status);
+    printf("track: %s\n", status.enabled ? "ON" : "OFF");
+    printf("detector: %s\n", status.detector_ready ? "ready" : "not ready");
+    printf("pan goal: %d\n", status.pan_goal);
+    printf("last frame seq: %lu\n", (unsigned long)status.last_frame_sequence);
+    printf("face: %s\n", status.face_found ? "found" : "not found");
+    if (status.face_found && status.last_frame_w > 0) {
+      printf("face cx/frame_w: %d/%d\n", status.last_face_cx, status.last_frame_w);
+    }
+    if (status.paused_for_motion || status.paused_for_spin ||
+        status.paused_for_servo) {
+      printf("paused:");
+      if (status.paused_for_motion) {
+        printf(" audio-motion");
+      }
+      if (status.paused_for_spin) {
+        printf(" spin360-or-hon");
+      }
+      if (status.paused_for_servo) {
+        printf(" servo-not-ready");
+      }
+      printf("\n");
+    } else {
+      printf("paused: no\n");
+    }
+    return 0;
+  }
+
+  if (strcmp(argv[1], "hon") == 0) {
+    esp_err_t err = nino_servo_dxl_track_hon();
+    if (err == ESP_ERR_INVALID_STATE) {
+      if (!nino_servo_dxl_is_ready()) {
+        printf("Servos not ready — connect U2D2 on J18 hub and wait for joint mode\n");
+      } else if (nino_servo_dxl_spin_is_active()) {
+        printf("Cannot run track hon while 360 spin is active\n");
+      } else if (nino_servo_dxl_track_hon_is_active()) {
+        printf("track hon already running\n");
+      } else {
+        printf("track hon unavailable: servo motion busy\n");
+      }
+      return 1;
+    }
+    if (err != ESP_OK) {
+      printf("track hon failed: %s\n", esp_err_to_name(err));
+      return 1;
+    }
+    printf("track hon started (looping ID2: 512 -> 212 -> 512 -> 800 -> 512)\n");
+    printf("Use 'hstop' to stop and return to neutral\n");
+    return 0;
+  }
+
+  printf("Usage: track on | off | status | hon\n");
+  return 0;
+}
+
+static void track_cli_register(void) {
+  const esp_console_cmd_t cmd = {
+      .command = "track",
+      .help = "track on | off | status | hon  (pan-only face tracking on servo ID 2)",
+      .hint = NULL,
+      .func = &cmd_track,
+      .argtable = NULL,
+  };
+  ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+}
+
+static int cmd_hstop(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+
+  esp_err_t err = nino_servo_dxl_track_hon_stop();
+  if (err == ESP_ERR_INVALID_STATE) {
+    printf("track hon is not running\n");
+    return 1;
+  }
+  if (err != ESP_OK) {
+    printf("hstop failed: %s\n", esp_err_to_name(err));
+    return 1;
+  }
+
+  printf("hstop accepted: stopping track hon, waiting 2s, then moving ID2 to neutral 512\n");
+  return 0;
+}
+
+static void hstop_cli_register(void) {
+  const esp_console_cmd_t cmd = {
+      .command = "hstop",
+      .help = "Stop track hon loop, wait 2 seconds, then return ID2 to neutral (512)",
+      .hint = NULL,
+      .func = &cmd_hstop,
+      .argtable = NULL,
+  };
+  ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+}
+
 static int cmd_speaker(int argc, char **argv) {
   if (argc >= 2 && strcmp(argv[1], "volume") == 0) {
     if (argc >= 3) {
@@ -1937,6 +2149,7 @@ void app_main(void) {
   assert(s_frame_mutex != NULL);
   s_frame_queue = xQueueCreate(UVC_FRAME_QUEUE_LEN, sizeof(uvc_host_frame_t *));
   assert(s_frame_queue != NULL);
+  nino_face_tracker_init();
 
   wifi_init_all();
 
@@ -1973,6 +2186,14 @@ void app_main(void) {
 
   if (nino_servo_dxl_start() != ESP_OK) {
     ESP_LOGW(TAG, "Dynamixel servo task not started (connect U2D2 on J18 USB hub)");
+  }
+
+  BaseType_t track_ok = xTaskCreatePinnedToCore(
+      face_track_task, "face_track", FACE_TRACK_TASK_STACK_SIZE, NULL,
+      FACE_TRACK_TASK_PRIORITY, &s_face_track_task_handle, APP_CORE_NET);
+  if (track_ok != pdPASS) {
+    s_face_track_task_handle = NULL;
+    ESP_LOGW(TAG, "Face tracking task not started");
   }
 
   ESP_LOGI(TAG, "Installing UVC host driver");

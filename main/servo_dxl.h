@@ -33,3 +33,19 @@ esp_err_t nino_servo_dxl_spin_360(void);
 
 /** True while the 360 spin task is running (pose/neutral writes are ignored then). */
 bool nino_servo_dxl_spin_is_active(void);
+
+/**
+ * ID2 "track hon" sweep: 512→212→512→800→512.
+ * Runs continuously in a background task until stopped; returns ESP_ERR_INVALID_STATE
+ * if motion is busy or bus not ready.
+ */
+esp_err_t nino_servo_dxl_track_hon(void);
+
+/** True while the track-hon task is running. */
+bool nino_servo_dxl_track_hon_is_active(void);
+
+/**
+ * Request stop for running track-hon motion. The task exits, waits 2 seconds,
+ * then sends ID2 to neutral (512).
+ */
+esp_err_t nino_servo_dxl_track_hon_stop(void);
