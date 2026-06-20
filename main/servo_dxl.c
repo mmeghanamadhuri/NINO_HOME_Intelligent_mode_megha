@@ -14,6 +14,7 @@
 #include "usb/usb_host.h"
 
 #include "servo_dxl.h"
+#include "servo_motion.h"
 
 #define USB_CLIENT_TASK_STACK_SIZE          8192
 #define USB_TASK_PRIORITY                   18
@@ -90,6 +91,9 @@
 #define DXL_MOVE_SEGMENT_TIMEOUT_MS           60000
 #define DXL_SPIN360_TASK_STACK                4096
 #define DXL_SPIN360_TASK_PRIO                 4
+#define DXL_TRACK_HON_TASK_STACK              4096
+#define DXL_TRACK_HON_TASK_PRIO               4
+#define DXL_TRACK_HON_HOLD_MS                 500
 
 typedef enum {
     DXL_SYNC_IDLE = 0,
@@ -183,6 +187,8 @@ static dxl_sync_request_t s_sync = {0};
 static SemaphoreHandle_t s_sync_mutex;
 static SemaphoreHandle_t s_read_done_sem;
 static TaskHandle_t s_spin360_task;
+static TaskHandle_t s_track_hon_task;
+static volatile bool s_track_hon_stop_requested;
 
 static void usb_client_task(void *arg);
 
@@ -215,7 +221,9 @@ static int servo_index_for_id(uint8_t id);
 static esp_err_t dynamixel_read_word_blocking(uint8_t id, uint8_t addr, uint16_t *out, TickType_t timeout);
 static esp_err_t dynamixel_ping_blocking(uint8_t id, TickType_t timeout);
 static bool dynamixel_wait_servo_at(uint8_t id, int target, TickType_t timeout_ms);
+static bool track_hon_wait_target_or_stop(uint8_t id, int target, TickType_t timeout_ms);
 static void spin360_task(void *arg);
+static void track_hon_task(void *arg);
 static bool usb_is_obvious_non_u2d2(uint16_t vid, uint16_t pid);
 static bool usb_is_u2d2_candidate(uint16_t vid, uint16_t pid);
 
@@ -293,12 +301,17 @@ bool nino_servo_dxl_spin_is_active(void)
     return s_spin360_task != NULL;
 }
 
+bool nino_servo_dxl_track_hon_is_active(void)
+{
+    return s_track_hon_task != NULL;
+}
+
 void nino_servo_dxl_go_neutral(void)
 {
     /* Audio-playback cleanup and head-motion stop call this; while a 360 spin
      * is running it must not yank ID2 back to center mid-rotation (the spin
      * ends at neutral anyway). */
-    if (nino_servo_dxl_spin_is_active()) {
+    if (nino_servo_dxl_spin_is_active() || nino_servo_dxl_track_hon_is_active()) {
         return;
     }
     dynamixel_queue_goal_all(DXL_CENTER_POSITION);
@@ -307,7 +320,7 @@ void nino_servo_dxl_go_neutral(void)
 void nino_servo_dxl_set_pan_tilt(int pan_goal, int tilt_goal)
 {
     /* Head-motion poses must not override the spin waypoints. */
-    if (nino_servo_dxl_spin_is_active()) {
+    if (nino_servo_dxl_spin_is_active() || nino_servo_dxl_track_hon_is_active()) {
         return;
     }
     if (s_goal_mutex != NULL) {
@@ -360,7 +373,7 @@ esp_err_t nino_servo_dxl_get_present_position(uint8_t id, int *position)
 
 esp_err_t nino_servo_dxl_spin_360(void)
 {
-    if (s_spin360_task != NULL) {
+    if (s_spin360_task != NULL || s_track_hon_task != NULL) {
         return ESP_ERR_INVALID_STATE;
     }
     if (!nino_servo_dxl_is_ready()) {
@@ -374,6 +387,38 @@ esp_err_t nino_servo_dxl_spin_360(void)
         return ESP_ERR_NO_MEM;
     }
 
+    return ESP_OK;
+}
+
+esp_err_t nino_servo_dxl_track_hon(void)
+{
+    if (s_track_hon_task != NULL || s_spin360_task != NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!nino_servo_dxl_is_ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Freeze any current LRUD/NOD motion while track-hon path is active. */
+    nino_servo_motion_stop();
+    s_track_hon_stop_requested = false;
+
+    BaseType_t ok = xTaskCreate(track_hon_task, "servo_hon", DXL_TRACK_HON_TASK_STACK, NULL,
+                                DXL_TRACK_HON_TASK_PRIO, &s_track_hon_task);
+    if (ok != pdPASS) {
+        s_track_hon_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t nino_servo_dxl_track_hon_stop(void)
+{
+    if (s_track_hon_task == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_track_hon_stop_requested = true;
     return ESP_OK;
 }
 
@@ -401,6 +446,26 @@ static bool dynamixel_wait_servo_at(uint8_t id, int target, TickType_t timeout_m
     const TickType_t start = xTaskGetTickCount();
 
     while ((xTaskGetTickCount() - start) < timeout_ms) {
+        int pos = 0;
+        if (nino_servo_dxl_get_present_position(id, &pos) == ESP_OK) {
+            if (position_delta(pos, target) <= DXL_POSITION_TOLERANCE) {
+                return true;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(80));
+    }
+
+    return false;
+}
+
+static bool track_hon_wait_target_or_stop(uint8_t id, int target, TickType_t timeout_ms)
+{
+    const TickType_t start = xTaskGetTickCount();
+
+    while ((xTaskGetTickCount() - start) < timeout_ms) {
+        if (s_track_hon_stop_requested) {
+            return false;
+        }
         int pos = 0;
         if (nino_servo_dxl_get_present_position(id, &pos) == ESP_OK) {
             if (position_delta(pos, target) <= DXL_POSITION_TOLERANCE) {
@@ -465,6 +530,62 @@ static void spin360_task(void *arg)
 
 done:
     s_spin360_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void track_hon_task(void *arg)
+{
+    (void)arg;
+    const uint8_t servo_id = DXL_SECONDARY_ID;
+    static const int waypoints[] = {512, 212, 512, 800, 512};
+
+    ESP_LOGI(TAG, "ID%u track hon start — path 512->212->512->800->512", servo_id);
+
+    if (!nino_servo_dxl_is_ready()) {
+        ESP_LOGW(TAG, "ID%u track hon aborted — servos not ready", servo_id);
+        goto done;
+    }
+
+    while (!s_track_hon_stop_requested) {
+        for (size_t i = 0; i < sizeof(waypoints) / sizeof(waypoints[0]); i++) {
+            if (s_track_hon_stop_requested) {
+                break;
+            }
+            const int goal = waypoints[i];
+            ESP_LOGI(TAG, "ID%u moving to %d", servo_id, goal);
+            nino_servo_dxl_set_servo_goal(servo_id, goal);
+            if (!track_hon_wait_target_or_stop(servo_id, goal,
+                                               pdMS_TO_TICKS(DXL_MOVE_SEGMENT_TIMEOUT_MS))) {
+                if (s_track_hon_stop_requested) {
+                    break;
+                }
+                ESP_LOGW(TAG, "ID%u timed out reaching %d during track hon", servo_id, goal);
+                goto done;
+            }
+
+            const TickType_t hold_start = xTaskGetTickCount();
+            while (!s_track_hon_stop_requested &&
+                   (xTaskGetTickCount() - hold_start) < pdMS_TO_TICKS(DXL_TRACK_HON_HOLD_MS)) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+            }
+        }
+    }
+
+    if (s_track_hon_stop_requested) {
+        ESP_LOGI(TAG, "ID%u track hon stop requested", servo_id);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        nino_servo_dxl_set_servo_goal(servo_id, DXL_CENTER_POSITION);
+        if (!dynamixel_wait_servo_at(servo_id, DXL_CENTER_POSITION,
+                                     pdMS_TO_TICKS(DXL_MOVE_SEGMENT_TIMEOUT_MS))) {
+            ESP_LOGW(TAG, "ID%u neutral return timeout after hstop", servo_id);
+        }
+        ESP_LOGI(TAG, "ID%u track hon stopped and returned to %d", servo_id,
+                 DXL_CENTER_POSITION);
+    }
+
+done:
+    s_track_hon_stop_requested = false;
+    s_track_hon_task = NULL;
     vTaskDelete(NULL);
 }
 

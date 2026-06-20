@@ -79,6 +79,11 @@ static void motion_task(void *arg) {
 }
 
 void nino_servo_motion_start(nino_servo_motion_mode_t mode) {
+  if (nino_servo_dxl_track_hon_is_active()) {
+    ESP_LOGI(TAG, "Head motion suppressed while track hon is active");
+    return;
+  }
+
   s_motion_mode = mode;
 
   if (s_motion_task != NULL && s_motion_run) {

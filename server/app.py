@@ -160,7 +160,7 @@ def startup() -> None:
         logger.warning("Face samples on disk but model not trained — click Retrain on the web UI")
     else:
         logger.info(
-            "Face recognition ready: %d trained, threshold %.0f (soft %.0f), margin %.0f, "
+            "Face recognition ready: %d trained, threshold %.3f (soft %.3f), margin %.3f, "
             "confirm %d frames, detector=%s — Retrain after changes; add 20+ Chakri samples",
             stats["trained_people"],
             stats["threshold"],

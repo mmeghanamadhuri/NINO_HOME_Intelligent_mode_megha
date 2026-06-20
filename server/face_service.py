@@ -41,10 +41,15 @@ class FaceService:
         self._sface_model_path = data_dir / "models" / SFACE_FILENAME
 
         self._lock = threading.Lock()
+        self._state_lock = threading.Lock()
         # person_id -> (display_name, embeddings ndarray [n_samples, 128])
         self._embeddings: dict[str, tuple[str, np.ndarray]] = {}
         self._session_primary_name: str | None = None
         self._session_primary_at: float = 0.0
+        self._primary_candidate_name: str | None = None
+        self._primary_candidate_streak = 0
+        self._primary_stable_name: str | None = None
+        self._primary_stable_until: float = 0.0
 
         if recognition_threshold is not None and recognition_threshold <= 1.0:
             os.environ["FACE_MATCH_THRESHOLD"] = str(recognition_threshold)
@@ -76,7 +81,7 @@ class FaceService:
     def apply_settings_from_environ(self) -> None:
         """Reload tunables from environment (also used at startup / CLI)."""
         # Cosine similarity acceptance (SFace reference operating point: 0.363).
-        self.match_threshold = float(os.environ.get("FACE_MATCH_THRESHOLD", "0.36"))
+        self.match_threshold = float(os.environ.get("FACE_MATCH_THRESHOLD", "0.42"))
         legacy = os.environ.get("FACE_RECOGNITION_THRESHOLD")
         if legacy:
             try:
@@ -86,9 +91,20 @@ class FaceService:
                 # Values > 1 are legacy LBPH distances — ignored.
             except ValueError:
                 pass
+        self.match_soft_threshold = float(
+            os.environ.get(
+                "FACE_MATCH_SOFT_THRESHOLD",
+                f"{max(0.20, self.match_threshold - 0.03):.3f}",
+            )
+        )
+        self.margin_min = float(os.environ.get("FACE_MATCH_MARGIN_MIN", "0.045"))
+        self.confirm_frames = max(2, int(os.environ.get("FACE_CONFIRM_FRAMES", "3")))
+        self.stable_hold_seconds = float(
+            os.environ.get("FACE_STABLE_HOLD_SECONDS", "1.0")
+        )
 
         self.detect_min_size = int(os.environ.get("FACE_DETECT_MIN_SIZE", "24"))
-        self.yunet_score_threshold = float(os.environ.get("FACE_YUNET_SCORE", "0.38"))
+        self.yunet_score_threshold = float(os.environ.get("FACE_YUNET_SCORE", "0.55"))
         self.min_face_area_ratio = float(os.environ.get("FACE_MIN_AREA_RATIO", "0.0010"))
         self.min_face_aspect = float(os.environ.get("FACE_MIN_ASPECT", "0.68"))
         self.max_face_aspect = float(os.environ.get("FACE_MAX_ASPECT", "1.42"))
@@ -136,6 +152,9 @@ class FaceService:
             "trained_people": trained,
             "embedded_samples": embedded,
             "threshold": self.match_threshold,
+            "soft_threshold": self.match_soft_threshold,
+            "margin_min": self.margin_min,
+            "confirm_frames": self.confirm_frames,
             "engine": "sface" if self._sface is not None else "unavailable",
             "detector": "yunet" if self._yunet_enabled else "haar",
             "session_primary_hold_seconds": self.session_primary_hold_seconds,
@@ -299,19 +318,96 @@ class FaceService:
             return None
         return self._embed(aligned)
 
-    def _match_embedding(self, embedding: np.ndarray) -> tuple[str | None, float]:
-        """Reference logic: best cosine similarity across all stored encodings."""
+    def _match_embedding(self, embedding: np.ndarray) -> tuple[str | None, float, float]:
+        """Returns (best_name, best_score, second_best_score) across all people."""
         best_name: str | None = None
         best_score = -1.0
+        second_best_score = -1.0
         with self._lock:
             for _person_id, (display_name, embs) in self._embeddings.items():
                 if embs.size == 0:
                     continue
                 score = float(np.max(embs @ embedding))
                 if score > best_score:
+                    second_best_score = best_score
                     best_score = score
                     best_name = display_name
-        return best_name, best_score
+                elif score > second_best_score:
+                    second_best_score = score
+        return best_name, best_score, second_best_score
+
+    @staticmethod
+    def _largest_primary_index(results: list[dict[str, Any]]) -> int | None:
+        best_idx: int | None = None
+        best_area = 0
+        for idx, result in enumerate(results):
+            if not result.get("primary", True):
+                continue
+            box = result.get("box") or {}
+            area = int(box.get("w", 0)) * int(box.get("h", 0))
+            if area > best_area:
+                best_area = area
+                best_idx = idx
+        return best_idx
+
+    def _stabilize_primary_face(self, results: list[dict[str, Any]]) -> None:
+        """Require consistent primary recognition before treating it as known."""
+        primary_idx = self._largest_primary_index(results)
+        now = time.time()
+        if primary_idx is None:
+            with self._state_lock:
+                self._primary_candidate_name = None
+                self._primary_candidate_streak = 0
+                if now > self._primary_stable_until:
+                    self._primary_stable_name = None
+            return
+
+        primary = results[primary_idx]
+        candidate_name = str(primary.get("candidate_name") or "").strip()
+        candidate_score = float(primary.get("candidate_score") or 0.0)
+        margin_score = float(primary.get("margin") or 0.0)
+        raw_ok = bool(primary.get("raw_recognized"))
+
+        with self._state_lock:
+            if raw_ok and self._is_known_name(candidate_name):
+                if candidate_name == self._primary_candidate_name:
+                    self._primary_candidate_streak += 1
+                else:
+                    self._primary_candidate_name = candidate_name
+                    self._primary_candidate_streak = 1
+            else:
+                self._primary_candidate_name = None
+                self._primary_candidate_streak = 0
+
+            stabilized = False
+            if (
+                self._primary_candidate_name is not None
+                and self._primary_candidate_streak >= self.confirm_frames
+            ):
+                self._primary_stable_name = self._primary_candidate_name
+                self._primary_stable_until = now + self.stable_hold_seconds
+                stabilized = True
+            elif (
+                self._primary_stable_name
+                and candidate_name == self._primary_stable_name
+                and candidate_score >= self.match_soft_threshold
+                and margin_score >= (self.margin_min * 0.5)
+            ):
+                # Short hysteresis reduces "unknown" flicker while the same face remains.
+                self._primary_stable_until = now + self.stable_hold_seconds
+                stabilized = True
+            elif now > self._primary_stable_until:
+                self._primary_stable_name = None
+
+            if stabilized and self._primary_stable_name:
+                primary["name"] = self._primary_stable_name
+                primary["recognized"] = True
+                primary["stabilized"] = True
+                primary["pending"] = False
+            elif raw_ok:
+                primary["recognized"] = False
+                primary["stabilized"] = False
+                primary["pending"] = True
 
     # ------------------------------------------------------------ registration
 
@@ -410,29 +506,29 @@ class FaceService:
         results: list[dict[str, Any]] = []
 
         sorted_dets = sorted(detections, key=lambda d: d[0][2] * d[0][3], reverse=True)
-        largest_area = (
-            sorted_dets[0][0][2] * sorted_dets[0][0][3] if sorted_dets else 0
-        )
-
         for index, (box, row) in enumerate(sorted_dets):
             x, y, w, h = box
-            face_area = w * h
-            is_primary = index == 0 or (
-                largest_area > 0
-                and face_area >= int(largest_area * self.secondary_face_area_ratio)
-            )
+            is_primary = index == 0
 
             name = "Unknown"
             confidence: float | None = None
             recognized = False
+            best_name: str | None = None
+            best_score = -1.0
+            margin = 0.0
 
             if self._sface is not None:
                 aligned = self._aligned_crop(frame, box, row)
                 embedding = self._embed(aligned) if aligned is not None else None
                 if embedding is not None:
-                    best_name, best_score = self._match_embedding(embedding)
+                    best_name, best_score, second_best = self._match_embedding(embedding)
+                    margin = best_score - max(second_best, -1.0)
                     confidence = round(best_score, 3)
-                    if best_name is not None and best_score >= self.match_threshold:
+                    if (
+                        best_name is not None
+                        and best_score >= self.match_threshold
+                        and margin >= self.margin_min
+                    ):
                         name = best_name
                         recognized = True
             else:
@@ -446,9 +542,15 @@ class FaceService:
                     "confidence": confidence,
                     "stabilized": False,
                     "pending": False,
+                    "candidate_name": best_name if self._sface is not None else None,
+                    "candidate_score": round(best_score, 3) if self._sface is not None else None,
+                    "margin": round(margin, 3) if self._sface is not None else None,
+                    "raw_recognized": recognized,
                     "primary": is_primary,
                 }
             )
+
+        self._stabilize_primary_face(results)
 
         primary_name = self.primary_viewer(results)
         if primary_name:
@@ -467,6 +569,8 @@ class FaceService:
             label = result["name"]
             if result["confidence"] is not None:
                 label = f"{label} ({result['confidence']:.2f})"
+            if result.get("pending"):
+                label = f"{label} [hold]"
 
             cv2.rectangle(output, (x, y), (x + w, y + h), color, 2)
             cv2.putText(
