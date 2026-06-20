@@ -1,24 +1,10 @@
 [
   {
-    "id": "d966ac918ba3",
-    "fire_at": "2026-06-20T19:50:00",
-    "label": "meet your friend",
+    "id": "a8b4e6a90508",
+    "fire_at": "2026-06-20T23:40:00",
+    "label": "",
     "person_name": "Chakri",
-    "created_at": "2026-06-20T19:49:41",
-    "fired": true,
-    "priority": 1,
-    "category": "general",
-    "requires_ack": false,
-    "ack_state": "none",
-    "last_fired_at": "",
-    "next_repeat_at": ""
-  },
-  {
-    "id": "44fd07ba07ce",
-    "fire_at": "2026-06-20T19:55:00",
-    "label": "meet Karthik",
-    "person_name": "Chakri",
-    "created_at": "2026-06-20T19:53:14",
+    "created_at": "2026-06-20T23:38:42",
     "fired": true,
     "priority": 1,
     "category": "general",

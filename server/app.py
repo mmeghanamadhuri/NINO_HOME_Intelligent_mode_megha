@@ -24,6 +24,8 @@ from starlette.requests import Request
 from alarm_service import get_alarm_service
 from camera import CameraStream
 from face_service import FaceService
+from memory_service import configure_from_environ as configure_memory_from_environ
+from memory_service import get_memory_service, normalize_database_url
 from tts_service import TTSService, synthesize_sapi_wav_bytes
 
 logger = logging.getLogger(__name__)
@@ -136,6 +138,8 @@ class AlarmAckRequest(BaseModel):
 @app.on_event("startup")
 def startup() -> None:
     faces.apply_settings_from_environ()
+    configure_memory_from_environ()
+    get_memory_service().startup()
     get_alarm_service().start()
     camera.start()
     import threading
@@ -228,6 +232,7 @@ def status() -> dict:
             api_url=os.environ.get("OLLAMA_URL"),
         ),
         "alarms": get_alarm_service().status(),
+        "memory": get_memory_service().status(),
         "latest_results": latest_results,
     }
 
@@ -802,7 +807,27 @@ def main() -> None:
         default=os.environ.get("ALARM_WAV_PATH", ""),
         help="WAV file POSTed to ESP when an alarm fires (default: ../main/beep.wav)",
     )
+    parser.add_argument(
+        "--database-url",
+        default=os.environ.get("DATABASE_URL", ""),
+        help="PostgreSQL URL for conversation memory (e.g. postgresql://nino:nino@127.0.0.1:5432/nino_memory)",
+    )
     args = parser.parse_args()
+
+    env_db = normalize_database_url(os.environ.get("DATABASE_URL", ""))
+    cli_db = normalize_database_url(args.database_url.strip())
+    if cli_db:
+        os.environ["DATABASE_URL"] = cli_db
+    elif args.database_url.strip() and env_db:
+        logger.warning(
+            "Ignoring invalid --database-url %r; using DATABASE_URL from environment",
+            args.database_url.strip()[:60],
+        )
+        os.environ["DATABASE_URL"] = env_db
+    elif env_db:
+        os.environ["DATABASE_URL"] = env_db
+    elif args.database_url.strip():
+        os.environ["DATABASE_URL"] = args.database_url.strip()
 
     camera_source = args.camera_url or args.camera_source
     os.environ["CAMERA_SOURCE"] = camera_source
@@ -847,6 +872,8 @@ def main() -> None:
     from voice_service import configure_from_environ
 
     configure_from_environ()
+    configure_memory_from_environ()
+    get_memory_service().startup()
     _configure_shutdown_logging()
 
     try:

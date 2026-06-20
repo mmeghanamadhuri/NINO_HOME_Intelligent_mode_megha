@@ -1,304 +1,123 @@
-# NiNO Home — Voice, Vision, Touch, Alarms, Servo & Eyes  (ESP32-P4)
+# NiNO Home — ESP32-P4 Voice, Vision, Memory & Alarms
 
-NiNO is a smart-home demo for the ESP32-P4 Function EV Board that uses vision, voice, alarms, touch, servo motion, and animated OLED eyes together.
+NiNO is a smart-home demo built around the **ESP32-P4 Function EV Board**. The board handles camera streaming, wake-word capture, speaker playback, touch, servo motion, and animated OLED eyes. A **Python FastAPI server** on a PC runs face recognition, speech-to-text, LLM replies, persistent conversation memory, alarms, and TTS — then sends audio back to the board.
 
-- **Vision**: USB UVC camera on the board, face detection/recognition on the PC, personalized greetings played through the ESP speaker.
-- **Voice**: Wake-word capture on the board, ElevenLabs Scribe (cloud) or Whisper (local) speech recognition and Ollama LLM responses on the PC, audio returned to the board. Supports identity questions and servo voice commands.
-- **Alarms**: Voice-set reminders and alarms on the PC; medical (P0) reminders with yes/no ack, auto-repeat, and reschedule/cancel follow-up — spoken TTS fired to the ESP at the scheduled time.
-- **Touch**: QT2120 capacitive touch sensor triggers an embedded warning audio clip with **priority over** server/voice playback.
-- **Servo**: Dynamixel AX servos (IDs 1 & 2) via U2D2 on the J18 USB hub — head motion during TTS, **ID2 full 360° spin** via CLI, HTTP, or voice.
-- **Eyes**: Dual SSD1351 OLED displays animate NINO's eyes — **idle**, **listening**, and **thinking** expressions follow the voice-assistant state automatically (wake word → listening, query sent → thinking, reply received → idle).
+---
+
+## Table of contents
+
+- [Architecture](#architecture)
+- [Features](#features)
+- [Hardware](#hardware)
+- [Requirements](#requirements)
+- [Quick start](#quick-start)
+- [PostgreSQL conversation memory](#postgresql-conversation-memory)
+- [Voice assistant](#voice-assistant)
+- [Face recognition](#face-recognition)
+- [Alarms](#alarms)
+- [Firmware: touch, servo & eyes](#firmware-touch-servo--eyes)
+- [Server setup](#server-setup)
+- [HTTP & WebSocket API](#http--websocket-api)
+- [Environment variables](#environment-variables)
+- [Repository layout](#repository-layout)
+- [Troubleshooting](#troubleshooting)
+- [Related docs](#related-docs)
+
+---
+
+## Architecture
+
+```text
+ESP32-P4 (firmware)                         PC — FastAPI server
+─────────────────────                       ────────────────────
+UVC camera ──► GET /stream ───────────────► CameraStream + YuNet/SFace face ID
+Wake word + mic ──► WS /voice-query ───────► STT → LLM → TTS → WAV reply
+Speaker ◄──── POST /play_wav ◄───────────── greetings, alarms, voice replies
+Servo ◄──── POST /servo/360 ◄────────────── voice-triggered 360° spin
+Touch / eyes ── onboard only
+
+                                            PostgreSQL (optional)
+                                            users, conversations,
+                                            memories, summaries
+```
+
+**Voice query flow**
+
+1. User says **"Hi ESP"** on the board → VAD captures speech → WebSocket to PC.
+2. Server transcribes audio (ElevenLabs Scribe or local Whisper).
+3. Camera resolves who is speaking (face recognition + session hold).
+4. If memory is enabled, recent conversation history is loaded from PostgreSQL.
+5. Request is routed: volume / alarm / servo / identity / recap / general LLM.
+6. Reply is synthesized to 16 kHz WAV and streamed back over the WebSocket.
+7. Exchange is logged to PostgreSQL (when memory is ready) and to `latency_log.json`.
+
+---
 
 ## Features
 
-- ESP32-P4 firmware with UVC camera support, HTTP streaming, WAV playback, voice wake capture, touch handling, **medical alarm auto-listen**, and Dynamixel servo control.
-- Python FastAPI server for face UI, **ElevenLabs/Whisper STT**, **GPU-accelerated Ollama** LLM prompts, **alarm scheduler**, and cross-platform TTS delivery to the board.
-- **Per-query latency log** (`server/data/latency_log.json`): STT/LLM/TTS timings, WebSocket events, and reply path — view recent entries at `GET /api/latency-log`.
-- **Voice & NLP alarms**: set/list/cancel reminders by voice (“remind me to go to school at 8 AM”); regex parsing with **Ollama fallback** for natural phrasing; persists to `server/data/alarms.json`.
-- **Medical (P0) reminders**: medication labels get priority, spoken TTS on the ESP, **yes/no auto-listen** (no wake word), repeat every 3 min until confirmed; **reschedule or cancel** follow-up with mic re-open.
-- **Alarm web UI**: view pending and awaiting-ack alarms; **Yes** / **No** / **Delete** per row at `http://localhost:8000`.
-- **Dual-priority speaker queue** on the ESP: touch warnings preempt server/voice audio and resume playback afterward.
-- **YuNet face detector** + **SFace deep-embedding recognition** (128-D vectors, cosine similarity); vision greetings always personalized; general voice replies personalized ~18% of the time.
-- **Voice identity** (“who am I?”) answered using live camera recognition context via Ollama.
-- **Voice servo 360** (“make a 360”, “spin 360”) — fixed TTS confirmation, then `POST /servo/360` on the board (no LLM for this command).
-- Single shared speaker path on the ESP to serialize touch, greetings, alarms, and voice replies.
-- **NINO eye displays**: two mirrored 1.27" SSD1351 OLEDs (128×96) on one SPI bus render flicker-free eye animations; expressions are driven by firmware events and testable from the serial console (`eye <idle|listening|thinking>`).
-- **Cross-platform server**: runs on **Windows** and **Linux** (including NVIDIA DGX / Ubuntu). TTS auto-selects by platform (see [Text-to-speech](#text-to-speech-tts) below).
+| Area | What NiNO does |
+|------|----------------|
+| **Vision** | YuNet detection + SFace 128-D embeddings; web UI registration; personalized greetings via `/play_wav` |
+| **Voice** | Wake word on ESP; ElevenLabs or Whisper STT; Ollama (Qwen) replies; cross-platform TTS |
+| **Memory** | PostgreSQL per-user conversation log; recap questions answered from stored history |
+| **Alarms** | Voice-set reminders; medical (P0) with yes/no auto-listen; web UI ack/delete |
+| **Servo** | Dynamixel AX head motion during TTS; ID2 full 360° via voice, HTTP, or CLI |
+| **Touch** | QT2120 capacitive sensor — warning audio **preempts** server playback, then resumes |
+| **Eyes** | Dual SSD1351 OLEDs — idle / listening / thinking synced to voice pipeline |
+| **Observability** | `GET /api/status`, `GET /api/latency-log`, thread-safe `server/data/latency_log.json` |
 
-## Recent changes
+---
 
-Summary of enhancements made in this integration branch:
+## Hardware
 
-### Touch-priority audio (firmware)
+| Component | Details |
+|-----------|---------|
+| **Board** | ESP32-P4 Function EV Board (16 MB flash recommended) |
+| **Camera** | USB UVC webcam on J18 host port (640×480 stream) |
+| **Servos** | ROBOTIS Dynamixel AX — ID **1** tilt, ID **2** pan — via **U2D2** on J18 hub |
+| **Touch** | QT2120 on I2C — **SDA GPIO 7**, **SCL GPIO 8**, address `0x1C` |
+| **Eyes** | 2× Waveshare 1.27" SSD1351 OLED (128×96) — CLK 23, DIN 22, DC 21, RST 20, CS 26/27 |
+| **Audio** | ES8311 codec (mic + speaker) |
+| **Network** | ESP and PC on the same LAN |
+| **LLM host** | PC with Ollama (`qwen2.5:1.5b` default) |
 
-- Separate queues: **touch** (8 jobs) and **normal** server/voice (32 jobs).
-- Touch clips (`PDTM.wav`, nod-L/R servo mode) **pause** an in-progress server WAV, play the warning, then **resume** from the saved PCM offset.
-- Fixed mono touch WAV corruption (PCM buffer now owned after decode in `nino_audio_decode_wav()`).
+> U2D2 and the UVC camera share the J18 USB hub. Servo scan may log `ESP_ERR_INVALID_STATE` while the camera is enumerating — normal if U2D2 is unplugged.
 
-### Face recognition (server)
-
-- **Migrated from LBPH to SFace deep embeddings**: each registered sample is encoded once into a 128-D vector (`face_recognition_sface_2021dec.onnx`, auto-download to `server/data/models/`); live faces are matched by **cosine similarity** against the store. No LBPH training, augmentation, or per-person thresholds.
-- **YuNet** detector (auto-download to `server/data/models/`) with Haar fallback.
-- Single tunable acceptance threshold: `FACE_MATCH_THRESHOLD` (cosine, default **0.36**; higher = stricter).
-- Embeddings persist in **`server/data/face_embeddings.json`** — small and portable (no more 100 MB `face_model.yml`).
-- **Register encodes instantly**: new samples are matchable immediately, no retrain needed. **Retrain** on the web UI just re-encodes stored crops (fast — useful after the LBPH → SFace migration, which also runs automatically on first start).
-- **Primary viewer only**: smaller background faces cannot steal a match (closest/largest face wins).
-- **Session memory** (~90 s): faster re-confirm when you walk away and return; stabilizes voice/TTS identity.
-- **Multi-frame “who am I?”** vote (5 frames) instead of a single snapshot.
-- Firmware UVC stream bumped from 480×320 to **640×480** for better detection/recognition range.
-
-### Voice assistant (server + firmware)
-
-- **ElevenLabs Scribe STT** (cloud, default `scribe_v1`): used automatically when an API key is set via `ELEVENLABS_API_KEY`, `--elevenlabs-api-key`, or `elevenlabs_api_key` in `server/server_config.json` (precedence: CLI > env > config file); typically ~1–2 s vs 6–30 s for local Whisper on CPU. Falls back to Whisper automatically if the API call fails, so the assistant keeps working offline.
-- **Whisper** STT via `faster-whisper` (default model **`small`**; override with `--whisper-model`) — local fallback or forced with `--stt-provider whisper`.
-- **Latency logging**: thread-safe append to `server/data/latency_log.json` for voice queries and WebSocket lifecycle events (`ws_open`, `voice_query`, `ws_closed`, …). Fields include heard text, reply path, STT engine, `stt_seconds`, `reply_seconds`, `tts_seconds`, and totals. Browse via `GET /api/latency-log?limit=50`.
-- **Cross-platform TTS**: ElevenLabs cloud (when API key + credits), **Windows SAPI** (PowerShell + female voice), or **Linux espeak-ng** fallback (`en+f3` soft female British). Same `tts_service.py` on both OSes — see [Text-to-speech](#text-to-speech-tts).
-- **GPU Ollama on Linux**: server auto-prefers `http://127.0.0.1:11435` (user-local CUDA Ollama) over CPU-only snap on `:11434`; warms the model on startup. Install/start via `server/scripts/`.
-- **Identity questions** (“who am I?”, “what’s my name?”, …): Ollama reply grounded in live camera recognition (recognized name / unknown / no face).
-- **Random personalization**: ~18% of general voice replies include the viewer’s name (`VOICE_PERSONALIZE_PROB` env override). Vision greetings always use the name.
-- **Servo 360 voice command**: phrases like “make a 360”, “do a 360”, “spin 360” → fixed TTS (*“OK, doing the spin now.”*) → delayed `POST http://<ESP_IP>/servo/360`. Does **not** use Ollama.
-- Voice reply playback uses **L/R/U/D head motion** during WebSocket TTS (same as `/play_wav`). `/servo/360` stops motion before the spin.
-- **Medical alarm follow-up listen**: after you say **no** to a medical reminder, the server asks *reschedule or cancel?* and the board **opens the mic again** automatically (WebSocket `prompt_medical_ack` metadata + firmware re-listen).
-
-### Alarms (server + firmware)
-
-- Regex alarm parsing first; **Ollama NLP fallback** when phrasing is non-standard (`ALARM_NLP_FALLBACK=1`).
-- Normalizes Whisper/Ollama time quirks (e.g. `8.36pm`, `20:36 PM` → valid 12-hour parse).
-- **Medical (P0)** reminders: TTS on ESP with **yes/no auto-listen** (`X-Nino-Prompt-Ack` on `/play_wav`); repeat every 3 min until confirmed.
-- Alarm TTS resampled to **16 kHz** with faster-speech fallback so WAV fits ESP **`/play_wav` limit (384 KiB)**.
-- Medical fires **TTS only** (no beep clip — avoids exceeding size limit). Normal alarms: TTS + beep.
-- Details: **[docs/ALARM.md](docs/ALARM.md)**.
-
-### Dynamixel servo 360 (firmware + server)
-
-- **ID2 (pan)** full rotation: home to **512** if needed, then **512 → 0 → 1023 → 512**.
-- Triggers: serial CLI `360`, **`POST /servo/360`**, voice via server.
-- Present-position read over Dynamixel bus; background `servo_360` task.
-- Details: **[docs/SERVO.md](docs/SERVO.md)**.
-
-### NINO eye displays (firmware)
-
-- **Dual SSD1351 OLED driver** (`main/ssd1351.c`): two 1.27" 128×96 panels share one SPI bus (SPI2, 20 MHz); only CS differs per panel, so both eyes render mirrored by default (`ssd1351_target()` can address one eye).
-- **Eye animation engine** (`main/nino_eye.c`): dedicated FreeRTOS task; state switches are instant and non-blocking from any task via `nino_eye_<emotion>()`.
-- **Expressions integrated so far** (taken from the standalone display project):
-  - **Idle** — neutral black eye on white, slow ~5 s eyelid blink (boot default).
-  - **Listening** — wider/taller eye, snappier ~3 s blink.
-  - **Thinking** — eye slowly rolls around the top (up / up-left / up-right), no blink.
-- **Voice pipeline hooks**: wake word accepted → **listening** (through chime, VAD capture, and upload); WAV sent to server → **thinking**; reply WAV received (or any failure) → **idle**. Eyes can never stick in a state — every error path falls back to idle.
-- **Flicker-free rendering**: the previous shape is "un-drawn" along its own outline instead of erasing rectangles, so the static white background is never re-touched (no full-screen flash on state changes).
-- Serial test command on the existing console: `eye <idle|listening|thinking>`.
-
-### Hardware note
-
-- U2D2 and UVC camera share the **J18 USB hub**. Servo USB scan may log `ESP_ERR_INVALID_STATE` if the camera holds devices — normal when U2D2 is not connected or still enumerating.
+---
 
 ## Requirements
 
 ### Firmware
 
-- ESP-IDF 5.5 or later
-- ESP32-P4 target
-- 16 MB flash recommended
+- ESP-IDF **5.5+**
+- Target: **esp32p4**
 
 ### Server
 
-- Python 3.10+
+- Python **3.10+**
 - **Windows** or **Linux** (Ubuntu / NVIDIA DGX tested)
-- Ollama for voice replies + alarm NLP fallback
-  - **Linux + NVIDIA GPU**: user-local GPU Ollama on port **11435** (see [Ollama on Linux (GPU)](#ollama-on-linux-gpu))
-  - **Windows / CPU**: standard Ollama on port **11434**
-- `opencv-contrib-python`
-- **TTS** (one of):
-  - ElevenLabs API key (cloud, best quality on any OS)
-  - Windows: built-in **SAPI** voices (no extra install)
-  - Linux: **espeak-ng** library (used automatically as local fallback; `pyttsx3` on Linux is espeak under the hood)
+- [Ollama](https://ollama.com) for voice + alarm NLP
+- `opencv-contrib-python`, `fastapi`, `faster-whisper`, `psycopg2-binary` (see `server/requirements.txt`)
+- **PostgreSQL** (optional, for conversation memory)
+- **TTS** — one of: ElevenLabs API key, Windows SAPI, or Linux espeak-ng
 
-## Hardware
+---
 
-- **Board**: ESP32-P4 Function EV Board
-- **Camera**: USB UVC webcam on J18 host port
-- **Servos**: ROBOTIS Dynamixel AX (ID **1** = tilt, ID **2** = pan) via **U2D2** on the same J18 hub
-- **Touch**: QT2120 capacitive sensor on shared **I2C** bus (**SDA GPIO 7**, **SCL GPIO 8**), address `0x1C`
-- **Eyes**: 2× Waveshare 1.27" RGB OLED (SSD1351, 128×96, 4-wire SPI) on the J1 header — shared **CLK GPIO 23**, **DIN GPIO 22**, **DC GPIO 21**, **RST GPIO 20**; per-panel **CS GPIO 26** (left) / **GPIO 27** (right); 3.3 V + GND
-- **Audio**: ES8311 codec for microphone and speaker
-- **Network**: PC and ESP on the same LAN
-- **LLM**: Ollama model such as `qwen2.5:1.5b`
+## Quick start
 
-## Firmware overview
-
-The ESP firmware provides:
-
-- UVC host video capture
-- HTTP endpoints for `/stream`, `/snapshot.jpg`, `/play_wav`, and **`/servo/360`**
-- Wake-word support using ESP-SR WakeNet (“Hi ESP”)
-- VAD-based voice capture and WebSocket transport to the PC
-- **Medical alarm ack**: after `/play_wav` with `X-Nino-Prompt-Ack`, auto-listen for yes/no; WebSocket `prompt_medical_ack` for reschedule/cancel follow-up
-- QT2120 touch sensor warnings with **preemptive playback priority**
-- Dynamixel joint-mode servo control (neutral **512**, position 0–1023)
-- **ID2 full 360° spin** task (`nino_servo_dxl_spin_360`)
-- Dual-queue speaker system with touch interrupt/resume in `main/audio_queue.c`
-- **Animated OLED eyes** synced to the voice assistant (idle / listening / thinking), with a `eye` console command for manual testing
-
-### Key firmware files
-
-- `main/main.c` — UVC, Wi-Fi, HTTP server, voice console, **`360` CLI**, `/servo/360` handler
-- `main/audio_queue.c` — touch-priority dual queues, suspend/resume server WAV
-- `main/audio_playback.c` — ES8311 playback, WAV decode, interruptible partial play
-- `main/audio_capture.c` — microphone capture
-- `main/voice_wake.cpp` — wake word detection
-- `main/voice_assist.c` — VAD, voice session, **medical ack listen** (`nino_voice_assist_prompt_medical_ack`)
-- `main/voice_ws_client.c` — WebSocket client to PC (parses `prompt_medical_ack` metadata)
-- `main/touch_sensor.c` — QT2120 capacitive touch handling
-- `main/bsp_qt2120.c` — QT2120 I2C driver
-- `main/servo_dxl.c` — Dynamixel USB host, read/write, **360 spin**
-- `main/servo_dxl.h` — Dynamixel servo API
-- `main/servo_motion.c` — cyclic head motion during face/touch TTS
-- `main/servo_motion.h` — servo motion helpers
-- `main/nino_eye.c` — eye animation engine (idle/listening/thinking states, blink renderer)
-- `main/ssd1351.c` — dual SSD1351 OLED SPI driver (mirrored eyes, per-panel targeting)
-- `main/PDTM.wav` — embedded touch warning audio
-
-### Servo documentation
-
-See **[docs/SERVO.md](docs/SERVO.md)** for wiring, 360 sequence, voice trigger flow, CLI/HTTP API, and troubleshooting.
-
-### Alarm documentation
-
-See **[docs/ALARM.md](docs/ALARM.md)** for voice commands, medical ack flow, NLP time parsing, scheduler, and troubleshooting.
-
-## Build and flash firmware
+### 1. Build and flash firmware
 
 From the project root in an ESP-IDF shell:
 
-```powershell
+```bash
 idf.py set-target esp32p4
 idf.py build
 idf.py flash monitor
 ```
 
-On Windows, ensure `IDF_PATH` is set and the ESP-IDF environment is initialized first.
+### 2. Connect Wi-Fi
 
-## Server setup
-
-From the `server/` directory:
-
-**Windows (PowerShell):**
-
-```powershell
-cd server
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
-
-**Linux (bash):**
-
-```bash
-cd server
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-Optional: copy settings into `server/server_config.json` (`camera_source`, `esp_play_wav_url`, `elevenlabs_api_key`). CLI flags override the file.
-
-### Run the server
-
-Replace `<ESP_IP>` with the ESP board address.
-
-**Windows:**
-
-```powershell
-python app.py --host 0.0.0.0 --port 8000 `
-  --camera-source http://<ESP_IP>/stream `
-  --esp-play-wav-url http://<ESP_IP>/play_wav `
-  --whisper-model small
-```
-
-**Linux (DGX / Ubuntu):**
-
-```bash
-# Start GPU Ollama first (once per boot, if not already running)
-bash scripts/start_ollama_gpu.sh
-
-python app.py --host 0.0.0.0 --port 8000 \
-  --camera-source http://<ESP_IP>/stream \
-  --esp-play-wav-url http://<ESP_IP>/play_wav \
-  --whisper-model small
-```
-
-The server auto-detects GPU Ollama on `127.0.0.1:11435` (`--ollama-url auto` is the default). Check runtime at `GET /api/status` → `llm`.
-
-Face matching uses a cosine-similarity threshold (default **0.36**); tune with `FACE_MATCH_THRESHOLD` if needed (higher = stricter). Legacy LBPH-style `--face-threshold` values above 1 are ignored.
-
-For fast cloud STT/TTS, set an ElevenLabs API key (STT needs the **Speech to Text** permission; TTS needs **Text to Speech** + credits) — picked up from `server_config.json`, env, or CLI:
-
-```powershell
-setx ELEVENLABS_API_KEY "sk_your_key_here"   # Windows — open a new terminal
-```
-
-```bash
-export ELEVENLABS_API_KEY="sk_your_key_here"   # Linux
-```
-
-or pass `--elevenlabs-api-key sk_...`. Force engines with `--stt-provider elevenlabs|whisper` and `--tts-provider elevenlabs|sapi|local`.
-
-To use a local webcam instead of the ESP stream:
-
-```powershell
-python app.py --camera-source auto
-```
-
-Open the UI at `http://localhost:8000`.
-
-### Ollama on Linux (GPU)
-
-On DGX / Ubuntu, the default **snap** Ollama on port **11434** is often CPU-only. This project installs a **user-local CUDA build** on port **11435**:
-
-```bash
-# One-time install (~/.local/ollama-gpu)
-bash server/scripts/install_ollama_gpu_user.sh
-
-# Start before the Python server (or let app.py try auto-start)
-bash server/scripts/start_ollama_gpu.sh
-```
-
-The server resolves `--ollama-url auto` to `:11435` when the GPU endpoint responds, falls back to `:11434` otherwise, and warms the model in a background thread on startup. Override with `--ollama-url http://127.0.0.1:11434/api/generate` to force CPU.
-
-### Text-to-speech (TTS)
-
-TTS is selected automatically unless you set `--tts-provider` or `TTS_PROVIDER`:
-
-| Provider | Platform | When used | Voice |
-|----------|----------|-------------|-------|
-| `elevenlabs` | Any | Default when `ELEVENLABS_API_KEY` is set | Cloud voice (`ELEVENLABS_TTS_VOICE_ID`, default soft female) |
-| `sapi` | **Windows** | Auto when no ElevenLabs key; or `--tts-provider sapi` | Microsoft SAPI female (Zira, Hazel, …) via PowerShell |
-| `local` | **Linux** | Auto when no ElevenLabs key; ElevenLabs failure fallback | espeak-ng `en+f3` (soft British female) |
-
-**Fallback chain:** ElevenLabs → Windows SAPI on Windows, espeak on Linux.
-
-**Note:** `pyttsx3` on Linux always uses espeak-ng — it cannot use Windows SAPI voices. For Windows-quality speech on Linux, use ElevenLabs (or top up API credits when quota is exhausted).
-
-**Linux local voice tuning:**
-
-```bash
-export LOCAL_TTS_VOICE=en+f4    # alternate espeak female variant
-export LOCAL_TTS_RATE=120       # words per minute (default ~123)
-export TTS_PROVIDER=local       # skip ElevenLabs even if key is set
-```
-
-**Windows:** use `--tts-provider sapi` to force SAPI; do not use `TTS_PROVIDER=local` on Windows unless you intend espeak.
-
-Check active TTS at `GET /api/status` → `tts`.
-
-## Typical workflow
-
-1. Flash the ESP firmware.
-2. Power the board and connect the camera.
-3. Configure Wi-Fi:
-
-   - **Android app (recommended):** BLE GATT to device **PROV_NINO** (service `4facb001-5a2e-4b7c-9e1f-a8d3e6f20401`) — write SSID, password, then command `0x01`. HTTP fallback via soft AP `ESP32_P4_CAM`. See **[docs/WIFI_PROVISION.md](docs/WIFI_PROVISION.md)**.
-   - **Serial console:**
+**Serial console:**
 
 ```text
 wifi mode sta
@@ -306,220 +125,468 @@ wifi connect <SSID> <PASSWORD>
 wifi status
 ```
 
-4. Start the Python server with the ESP camera and `play_wav` URL (required for face TTS, **alarms**, and vision greetings).
-5. Visit `http://localhost:8000` to register faces, **view/manage alarms**, and monitor the system.
-6. On the ESP console, connect voice to the PC:
+Or use BLE provisioning — see [docs/WIFI_PROVISION.md](docs/WIFI_PROVISION.md).
+
+### 3. Set up the Python server
+
+```bash
+cd server
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+**Optional — PostgreSQL memory (recommended):**
+
+```bash
+bash scripts/init_memory_db.sh
+export DATABASE_URL="postgresql://nino:nino@127.0.0.1:5432/nino_memory"
+```
+
+**Linux — start GPU Ollama (once per boot):**
+
+```bash
+bash scripts/start_ollama_gpu.sh
+```
+
+**Run the server** (replace `<ESP_IP>` and `<PC_IP>`):
+
+```bash
+export DATABASE_URL="postgresql://nino:nino@127.0.0.1:5432/nino_memory"   # optional
+export ELEVENLABS_API_KEY="sk_..."                                         # optional
+
+python app.py --host 0.0.0.0 --port 8000 \
+  --camera-source http://<ESP_IP>/stream \
+  --esp-play-wav-url http://<ESP_IP>/play_wav
+```
+
+Open the web UI at **http://localhost:8000** — register faces and manage alarms.
+
+### 4. Connect voice on the ESP console
 
 ```text
 voice connect <PC_IP> 8000
 voice wake on
 ```
 
-7. Say **"Hi ESP"** to trigger the voice assistant (general questions).
+Say **"Hi ESP"**, then ask a question. Eyes animate automatically: **listening** → **thinking** → **idle**.
 
-   The OLED eyes follow along automatically: **listening** (wide eye) from the wake word through your question, **thinking** (eye rolls upward) while the PC transcribes and generates the answer, and back to **idle** as the reply plays. You can also drive them manually from the serial console:
+---
 
-```text
-eye listening
-eye thinking
-eye idle
+## PostgreSQL conversation memory
+
+When `DATABASE_URL` is set, NiNO persists conversation history per recognized user in PostgreSQL.
+
+### Database setup
+
+```bash
+cd server
+bash scripts/init_memory_db.sh
 ```
 
-**Medical alarm ack on the board** (one-time serial setup):
+Creates database `nino_memory`, user `nino`, and applies `scripts/memory_schema.sql`.
 
-```text
-voice connect <PC_LAN_IP> 8000
-voice wake on
+### Schema
+
+| Table | Purpose |
+|-------|---------|
+| `users` | One row per recognized person (`face_id`, `name`, first/last seen) |
+| `conversations` | Every logged Q&A (`user_text`, `assistant_text`, timestamp) |
+| `memories` | Long-term facts (Phase B — requires `MEMORY_EXTRACTION=1`) |
+| `summaries` | Daily rollups (Phase C — requires `MEMORY_SUMMARY_CRON=1`) |
+
+### How it works
+
+1. Face recognition identifies you (e.g. **Chakri** → `face_id: chakri`).
+2. Before each voice reply, the server loads your last **5** conversations (configurable).
+3. After a successful reply, the exchange is queued for insert into `conversations`.
+4. Recap questions (*"What did we just talk about?"*, *"What are we discussing?"*, etc.) build a **deterministic second-person answer** from stored turns — no LLM hallucination, no *"You and Chakri discussed…"* phrasing.
+
+### View records in SQL
+
+```bash
+export DATABASE_URL="postgresql://nino:nino@127.0.0.1:5432/nino_memory"
+psql "$DATABASE_URL"
 ```
 
-After a **medical** reminder plays from the server, the board **automatically listens** for **8 s** for **yes** / **no** — you do **not** need to say “Hi ESP” for that step. Flash firmware that supports `/play_wav` **`X-Nino-Prompt-Ack`** and WebSocket **`prompt_medical_ack`** follow-up listens. You can also ack from the server web UI (**Yes** / **No** buttons).
+```sql
+SELECT * FROM users ORDER BY last_seen DESC;
 
-**Medical flow after “no”:**
-
-1. Board asks *reschedule or cancel?* (spoken by server TTS).
-2. Mic opens again automatically — say **“cancel”** or **“reschedule for 6 PM”** (no wake word).
-3. Repeat listens continue while the alarm is in `reschedule_prompt` state.
-
-Example voice commands after wake:
-
-| Say | Behavior |
-|-----|----------|
-| “Who am I?” / “What’s my name?” | Ollama answer using live face recognition |
-| “Make a 360” / “Spin 360” | Fixed TTS, then ID2 full rotation |
-| “Set an alarm at 4:30 AM today” | Saves alarm; at fire time POSTs TTS + beep to ESP |
-| “Remind me to take medicines at 6 AM” | **P0 medical** — spoken TTS on ESP; yes/no auto-listen; repeats every 3 min (no beep) |
-| “Remind me to take my medicine at 8 AM” | Same as medical — priority over normal alarms at the same time |
-| “Remind me to go to school at 8 AM” | Normal priority — spoken TTS + beep; one-shot |
-| After medical alarm: “yes” / “I took it” | Confirms and clears the reminder (auto-listen on board if `voice connect` is set) |
-| After medical alarm: “no” / “not taken” | Asks to **reschedule** or **cancel**; mic re-opens automatically |
-| Web UI **Yes** / **No** on awaiting row | Same ack without voice |
-| “Reschedule for 6 PM” / “cancel it” | Follow-up after negative ack (mic already listening) |
-| “List my alarms” | Hear pending alarms |
-| “Cancel all alarms” / “Delete my alarms” | Remove every pending alarm |
-| “Cancel alarm at 4 AM” / “Delete my coffee reminder” | Remove one matching alarm |
-| General questions | STT (ElevenLabs/Whisper) → Ollama (GPU on Linux when available) → TTS (name used ~18% of the time) |
-
-Serial CLI servo test (U2D2 ready):
-
-```text
-360
+SELECT u.name, c.timestamp, c.user_text, c.assistant_text
+FROM conversations c
+JOIN users u ON u.id = c.user_id
+ORDER BY c.timestamp DESC
+LIMIT 20;
 ```
 
-## HTTP API
+### Check memory status
 
-### Firmware endpoints
+```bash
+curl -s http://localhost:8000/api/status | python3 -m json.tool
+```
 
-- `GET /` — simple device page and snapshot link
-- `GET /stream` — MJPEG live stream
-- `GET /snapshot.jpg` — one JPEG snapshot
-- `POST /play_wav` — queue WAV audio for playback (optional header `X-Nino-Prompt-Ack: 1` for medical yes/no listen after play)
-- `POST /servo/360` — start ID2 full rotation (512 → 0 → 1023 → 512)
+Look for `"memory": { "ready": true, ... }`.
 
-### Server endpoints
+Voice latency entries include memory fields when enabled:
 
-- `GET /` — web UI
-- `GET /api/status` — camera, TTS provider, Ollama URL/model, face stats
-- `GET /api/latency-log?limit=50` — recent voice latency / WebSocket events
-- `GET /video_feed` — annotated MJPEG stream
-- `POST /api/camera` — change camera source
-- `POST /api/register` — register face data
-- `POST /api/retrain` — retrain face recognition model
-- `GET /api/alarms` — list pending alarms
-- `POST /api/alarms/{id}/ack` — confirm or decline a medical alarm awaiting ack (same as voice yes/no)
-- `DELETE /api/alarms` — delete all pending alarms
-- `DELETE /api/alarms/{id}` — delete one alarm (web UI **Delete** button per row)
-- `WS /voice-query` — voice assistant WebSocket (also `/ws/voice`)
+| Field | Meaning |
+|-------|---------|
+| `memory_store: "queued"` | Conversation saved to PostgreSQL |
+| `memory_store: "recap"` | Recap reply (not stored as a meta-question when filtered) |
+| `memory_store: "user_resolve_failed"` | Could not look up/create user row — not saved |
+| `memory_store: "skipped_fragment"` | Incomplete STT fragment — intentionally not logged |
+| `memory_turns` | Number of recent turns loaded for context |
 
-### Server environment (optional)
+### Enable advanced memory (optional)
+
+```bash
+export MEMORY_EXTRACTION=1      # LLM extracts long-term facts after each turn
+export MEMORY_SUMMARY_CRON=1    # Nightly per-user conversation summaries
+export MEMORY_RECENT_TURNS=5    # Turns injected into LLM context (default 5)
+```
+
+---
+
+## Voice assistant
+
+### Speech-to-text (STT)
+
+| Provider | When used | Typical latency |
+|----------|-----------|-----------------|
+| **ElevenLabs Scribe** | Default when `ELEVENLABS_API_KEY` is set | ~1–2 s |
+| **faster-whisper** | Fallback or `--stt-provider whisper` | 6–30 s on CPU |
+
+Force provider: `--stt-provider elevenlabs|whisper`
+
+### LLM (Ollama)
+
+- Default model: **`qwen2.5:1.5b`**
+- Linux auto-prefers GPU Ollama on **`127.0.0.1:11435`** over CPU snap on `:11434`
+- Override: `--ollama-url`, `--ollama-model`
+
+### Text-to-speech (TTS)
+
+| Provider | Platform | When used |
+|----------|----------|-----------|
+| `elevenlabs` | Any | Default when API key set |
+| `sapi` | Windows | Local fallback |
+| `local` | Linux | espeak-ng `en+f3` fallback |
+
+Check active provider: `GET /api/status` → `tts`.
+
+### Voice routing
+
+After STT, the server picks a reply path:
+
+| Path | Trigger | Behavior |
+|------|---------|----------|
+| `alarm` | Set/list/cancel alarm phrases | Alarm voice handler |
+| `servo_360` | "Make a 360", "spin 360", … | Fixed TTS → `POST /servo/360` |
+| `recap` | "What did we talk about?", "What are we discussing?", … | Deterministic recap from PostgreSQL |
+| `identity_llm` | "Who am I?", "What's my name?", … | Ollama + live camera identity |
+| `llm` | Everything else | Ollama with optional memory context |
+
+**Personalization:** ~18% of general replies include the viewer's name (`VOICE_PERSONALIZE_PROB=0.18`). Vision greetings always use the name.
+
+### Example voice commands
+
+| Say | Result |
+|-----|--------|
+| "Who am I?" | Answer using live face recognition |
+| "What did we just talk about?" | Recap from PostgreSQL (second person) |
+| "Make a 360" | TTS confirmation → servo spin |
+| "Remind me to go to school at 8 AM" | Normal alarm — TTS + beep at fire time |
+| "Remind me to take medicines at 6 AM" | Medical (P0) — TTS only; yes/no auto-listen |
+| "List my alarms" | Hear pending alarms |
+| General questions | STT → Ollama → TTS |
+
+---
+
+## Face recognition
+
+- **Detector:** YuNet (auto-download to `server/data/models/`)
+- **Recognizer:** SFace 128-D embeddings (cosine similarity)
+- **Storage:** `server/data/faces/*.jpg` + `server/data/face_embeddings.json`
+- **Threshold:** `FACE_MATCH_THRESHOLD` (default **0.42** — higher = stricter)
+- **Session hold:** primary viewer remembered ~90 s across brief gaps
+- **Registration:** web UI at `http://localhost:8000` — samples encode instantly (no slow retrain)
+
+Tune if needed:
+
+```bash
+export FACE_MATCH_THRESHOLD=0.38   # looser matching
+export FACE_SESSION_PRIMARY_HOLD_SECONDS=90
+```
+
+---
+
+## Alarms
+
+- Voice parsing via regex + **Ollama NLP fallback** (`ALARM_NLP_FALLBACK=1`)
+- Persists to `server/data/alarms.json`
+- **Normal alarms:** TTS + beep → ESP `/play_wav`
+- **Medical (P0):** TTS only; repeats every 3 min until confirmed; board auto-listens for yes/no
+- Web UI: view, ack, delete at `http://localhost:8000`
+
+Full details: **[docs/ALARM.md](docs/ALARM.md)**
+
+---
+
+## Firmware: touch, servo & eyes
+
+### Touch-priority audio
+
+Touch clips (`PDTM.wav`) **pause** in-progress server WAV, play the warning, then **resume** from the saved offset. Separate queues for touch (8 jobs) and server/voice (32 jobs).
+
+### Servo 360
+
+- **ID2 (pan)** full rotation: 512 → 0 → 1023 → 512
+- Triggers: serial `360`, `POST /servo/360`, voice via server
+
+Details: **[docs/SERVO.md](docs/SERVO.md)**
+
+### OLED eyes
+
+| State | When |
+|-------|------|
+| **Idle** | Boot, after reply finishes |
+| **Listening** | Wake word through end of user speech |
+| **Thinking** | Audio sent to server until reply received |
+
+Serial test: `eye idle` / `eye listening` / `eye thinking`
+
+### Key firmware files
+
+| File | Role |
+|------|------|
+| `main/main.c` | UVC, Wi-Fi, HTTP server, voice console |
+| `main/voice_assist.c` | VAD, medical ack listen |
+| `main/voice_ws_client.c` | WebSocket to PC |
+| `main/audio_queue.c` | Touch-priority dual queues |
+| `main/servo_dxl.c` | Dynamixel + 360 spin |
+| `main/nino_eye.c` | Eye animation engine |
+| `main/ssd1351.c` | Dual OLED SPI driver |
+
+---
+
+## Server setup
+
+### Configuration precedence
+
+1. CLI flags (`python app.py --…`)
+2. Environment variables
+3. `server/server_config.json` (optional — keep API keys out of git)
+
+### Run examples
+
+**ESP camera + speaker:**
+
+```bash
+python app.py \
+  --camera-source http://192.168.0.98/stream \
+  --esp-play-wav-url http://192.168.0.98/play_wav \
+  --database-url "$DATABASE_URL"
+```
+
+**Local webcam instead of ESP stream:**
+
+```bash
+python app.py --camera-source auto
+```
+
+**Force Whisper + CPU Ollama:**
+
+```bash
+python app.py --stt-provider whisper --ollama-url http://127.0.0.1:11434/api/generate
+```
+
+### Ollama on Linux (GPU)
+
+The default snap Ollama on `:11434` is often CPU-only. This project supports a user-local CUDA build on **:11435**:
+
+```bash
+bash server/scripts/install_ollama_gpu_user.sh   # one-time
+bash server/scripts/start_ollama_gpu.sh          # each boot
+bash server/scripts/stop_ollama_gpu.sh
+```
+
+The server resolves `--ollama-url auto` to GPU first, warms the model on startup.
+
+---
+
+## HTTP & WebSocket API
+
+### ESP firmware
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/stream` | MJPEG live stream |
+| GET | `/snapshot.jpg` | Single JPEG frame |
+| POST | `/play_wav` | Queue WAV playback (header `X-Nino-Prompt-Ack: 1` for medical listen) |
+| POST | `/servo/360` | ID2 full rotation |
+
+### Python server
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/` | Web UI (faces, alarms) |
+| GET | `/video_feed` | Annotated MJPEG with face boxes |
+| GET | `/api/status` | Camera, faces, TTS, LLM, alarms, **memory** |
+| GET | `/api/latency-log?limit=50` | Recent voice timing events |
+| GET | `/api/alarms` | List alarms |
+| POST | `/api/alarms/{id}/ack` | Medical yes/no ack |
+| DELETE | `/api/alarms` | Cancel all |
+| DELETE | `/api/alarms/{id}` | Cancel one |
+| POST | `/api/register` | Register face samples |
+| POST | `/api/retrain` | Re-encode stored face crops |
+| POST | `/api/camera` | Change camera source |
+| WS | `/voice-query`, `/ws/voice` | Voice assistant (16 kHz WAV in/out) |
+
+> `POST /play_wav` and `POST /servo/360` on the ESP have no authentication — use on a trusted LAN only.
+
+---
+
+## Environment variables
+
+### Core server
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `ESP_PLAY_WAV_URL` | CLI / config | Face TTS + derives `/servo/360` host for voice spin |
-| `ESP_MAX_PLAY_WAV_BYTES` | `389120` | Server-side cap (ESP `/play_wav` hard limit is 384 KiB) |
-| `STT_PROVIDER` | auto | `elevenlabs` or `whisper` (`--stt-provider`); defaults to ElevenLabs when an API key is set |
-| `TTS_PROVIDER` | auto | `elevenlabs`, `sapi` (Windows), or `local` (Linux espeak); `--tts-provider` |
-| `ELEVENLABS_API_KEY` | — | ElevenLabs API key for cloud STT/TTS (`--elevenlabs-api-key`); STT needs **Speech to Text** permission |
-| `ELEVENLABS_STT_MODEL` | `scribe_v1` | ElevenLabs Scribe model id |
-| `ELEVENLABS_TTS_VOICE_ID` | `f1K8uOKtx0TAmtXBiLqx` | ElevenLabs voice id |
-| `ELEVENLABS_TTS_SPEED` | `0.86` | ElevenLabs speech speed |
-| `ELEVENLABS_TTS_STABILITY` | `30%` | ElevenLabs stability |
-| `ELEVENLABS_TTS_SIMILARITY` | `0%` | ElevenLabs similarity boost |
-| `ELEVENLABS_TTS_STYLE` | `20%` | ElevenLabs style |
-| `LOCAL_TTS_VOICE` | `en+f3` | Linux espeak voice (female British) |
-| `LOCAL_TTS_RATE` | `~123` | Linux espeak words per minute |
-| `WHISPER_MODEL` | `small` | faster-whisper model (`--whisper-model`); local fallback engine |
-| `VOICE_PERSONALIZE_PROB` | `0.18` | Fraction of voice replies that use viewer name |
-| `SERVO_360_TRIGGER_DELAY_SECONDS` | `2.0` | Delay after 360 confirmation TTS before POST spin |
-| `VOICE_VIEWER_TTL_SECONDS` | `900` | How long last recognized face is remembered for voice |
-| `FACE_MATCH_THRESHOLD` | `0.36` | SFace cosine-similarity acceptance (higher = stricter) |
-| `FACE_SESSION_PRIMARY_HOLD_SECONDS` | `90` | Remember primary viewer across brief gaps |
-| `FACE_SECONDARY_AREA_RATIO` | `0.40` | Suppress strict ID on small background faces |
-| `ALARM_WAV_PATH` | `../main/beep.wav` | Beep POSTed after **normal** (non-medical) alarm TTS |
-| `ALARM_TTS_SAMPLE_RATE` | `16000` | Alarm TTS resample rate (keeps WAV under ESP limit) |
-| `ALARM_TICK_SECONDS` | `1.0` | Scheduler poll interval for due alarms |
-| `ALARM_MEDICAL_REPEAT_MINUTES` | `3` | Re-fire medical alarms until user confirms |
-| `ALARM_NLP_FALLBACK` | `1` | Use Ollama JSON when regex fails (`0` to disable) |
-| `OLLAMA_URL` | `auto` | Ollama generate URL; `auto` prefers GPU `:11435` on Linux |
-| `OLLAMA_MODEL` | `qwen2.5:1.5b` | LLM for voice + alarm NLP fallback |
-| `OLLAMA_GPU_URL` | `http://127.0.0.1:11435/api/generate` | GPU Ollama endpoint (Linux) |
-| `OLLAMA_KEEP_ALIVE` | `-1` | Keep model loaded in VRAM |
-| `OLLAMA_NUM_GPU` | `-1` | Layers on GPU (`-1` = all) |
+| `DATABASE_URL` | — | PostgreSQL URL for conversation memory |
+| `ESP_PLAY_WAV_URL` | CLI / config | Face TTS, alarms, greetings; derives servo host |
+| `ESP_MAX_PLAY_WAV_BYTES` | `389120` | Server-side WAV cap (ESP limit 384 KiB) |
+| `OLLAMA_URL` | `auto` | Ollama API; `auto` prefers GPU `:11435` on Linux |
+| `OLLAMA_MODEL` | `qwen2.5:1.5b` | LLM model name |
+| `ELEVENLABS_API_KEY` | — | Cloud STT/TTS |
+| `STT_PROVIDER` | auto | `elevenlabs` or `whisper` |
+| `TTS_PROVIDER` | auto | `elevenlabs`, `sapi`, or `local` |
+| `WHISPER_MODEL` | `small` | faster-whisper model size |
+
+### Memory
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MEMORY_RECENT_TURNS` | `5` | Recent conversations loaded per user |
+| `MEMORY_TOP_MEMORIES` | `10` | Long-term facts injected into prompt |
+| `MEMORY_MIN_IMPORTANCE` | `5` | Minimum importance score for memories |
+| `MEMORY_EXTRACTION` | `0` | Enable LLM memory extraction after each turn |
+| `MEMORY_SUMMARY_CRON` | `0` | Enable nightly per-user summaries |
+
+### Face & voice
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `FACE_MATCH_THRESHOLD` | `0.42` | SFace cosine threshold (higher = stricter) |
+| `FACE_SESSION_PRIMARY_HOLD_SECONDS` | `90` | Remember primary viewer across gaps |
+| `VOICE_PERSONALIZE_PROB` | `0.18` | Fraction of replies using viewer name |
+| `VOICE_VIEWER_TTL_SECONDS` | `900` | Last recognized face TTL for voice |
+
+### Alarms
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `ALARM_NLP_FALLBACK` | `1` | Ollama JSON when regex parse fails |
+| `ALARM_MEDICAL_REPEAT_MINUTES` | `3` | Re-fire medical alarms until ack |
+| `ALARM_WAV_PATH` | `../main/beep.wav` | Beep for normal alarms |
+
+See also [Text-to-speech tuning](#text-to-speech-tts) in the voice section and `docs/ALARM.md` for alarm-specific options.
+
+---
 
 ## Repository layout
 
 ```text
-CMakeLists.txt
-build-idf.bat
-partitions.csv
-sdkconfig.defaults
-sdkconfig.defaults.esp32p4
-sdkconfig.old
-
-main/
-  CMakeLists.txt
-  idf_component.yml
-  main.c
-  audio_capture.c
-  audio_playback.c
-  audio_queue.c
-  bsp_qt2120.c
-  touch_sensor.c
-  voice_assist.c
-  voice_ws_client.c
-  voice_wake.cpp
-  servo_dxl.c
-  servo_motion.c
-  nino_eye.c
-  ssd1351.c
-  PDTM.wav
-
-docs/
-  SERVO.md
-  ALARM.md
-  WIFI_PROVISION.md
-
-server/
-  app.py
-  alarm_service.py
-  alarm_voice.py
-  alarm_nlp.py
-  alarm_ack.py
-  alarm_medical.py
-  esp_playback.py
-  camera.py
-  face_service.py
-  llm_service.py
-  tts_service.py
-  voice_service.py
-  wav_resample.py
-  data/alarms.json
-  data/latency_log.json
-  data/face_embeddings.json
-  requirements.txt
-  server_config.json
-  scripts/
-    install_ollama_gpu_user.sh
-    start_ollama_gpu.sh
-    stop_ollama_gpu.sh
-    setup_ollama_gpu.sh
-  templates/
-  static/
-  data/
-
-managed_components/
-  ...
+├── main/                    ESP-IDF firmware
+│   ├── main.c               UVC, HTTP, Wi-Fi, console
+│   ├── voice_assist.c       VAD + voice sessions
+│   ├── voice_ws_client.c    WebSocket to PC
+│   ├── audio_queue.c        Touch-priority playback
+│   ├── servo_dxl.c          Dynamixel + 360 spin
+│   └── nino_eye.c           OLED eye animations
+├── server/                  Python FastAPI server
+│   ├── app.py               HTTP/WS entry point
+│   ├── voice_service.py     STT → routing → TTS pipeline
+│   ├── llm_service.py       Ollama prompts (voice, recap, identity)
+│   ├── memory_service.py    PostgreSQL memory layer
+│   ├── face_service.py      YuNet + SFace recognition
+│   ├── tts_service.py       TTS + vision greetings
+│   ├── alarm_*.py           Alarm scheduler + voice parsing
+│   ├── scripts/
+│   │   ├── init_memory_db.sh
+│   │   ├── memory_schema.sql
+│   │   ├── start_ollama_gpu.sh
+│   │   └── install_ollama_gpu_user.sh
+│   ├── data/
+│   │   ├── faces/           Registered face crops
+│   │   ├── face_embeddings.json
+│   │   ├── alarms.json
+│   │   └── latency_log.json
+│   └── templates/           Web UI
+├── docs/
+│   ├── ALARM.md
+│   ├── SERVO.md
+│   ├── WIFI_PROVISION.md
+│   └── TEST_QUESTIONS.md
+├── context.md               Target architecture spec
+└── context_main.md          Implemented vs target mapping
 ```
 
-## Notes
-
-- Touch audio **preempts** server/voice playback and resumes afterward; server/voice uses a separate queue from touch.
-- **Alarms** require `--esp-play-wav-url` (or `ESP_PLAY_WAV_URL`); medical alarms need `voice connect` on the board for yes/no and follow-up.
-- Face greeting and alarm TTS from the server use head motion during `/play_wav`.
-- Voice WebSocket `/voice-query` replies also queue with head motion unless interrupted by touch or `/servo/360`.
-- `POST /play_wav` and `POST /servo/360` have no authentication — use only on a trusted LAN.
-- Eye displays initialize first in `app_main`, so the idle face shows during the rest of boot; if OLED init fails the firmware logs a warning and runs without eyes.
-- Both OLEDs mirror the same eye by default; the driver supports per-eye drawing (`ssd1351_target()`) for future asymmetric expressions.
-- **Windows** uses SAPI for local TTS; **Linux** uses espeak-ng for local TTS. ElevenLabs works on both when configured.
-- Face data lives in `server/data/faces/` (JPEG crops) and `server/data/face_embeddings.json` (small JSON) — the old LBPH `face_model.yml` is no longer generated and can be deleted.
-- If you store `elevenlabs_api_key` in `server/server_config.json`, keep that file out of public commits — it contains a secret.
+---
 
 ## Troubleshooting
 
-- If video is missing, verify `http://<ESP_IP>/snapshot.jpg`.
-- If faces are not recognized, register **a handful of varied samples per person** (angles, lighting, distance) and check the server log for `detector=yunet` and the SFace model in `server/data/models/`; lower `FACE_MATCH_THRESHOLD` slightly (e.g. `0.32`) if matches are too strict.
-- If the wrong person is recognized, raise `FACE_MATCH_THRESHOLD` (e.g. `0.42`) and stand closest to the camera (primary face wins).
-- If voice does not connect, verify the PC IP is reachable from the ESP (`voice connect <PC_IP> 8000`) and the server is running.
-- If the log shows **`ElevenLabs STT failed ... missing_permissions`**, your API key was created without the **Speech to Text** scope — edit the key in the ElevenLabs dashboard (or create one with full access), update `ELEVENLABS_API_KEY`, and restart the server in a new terminal.
-- If STT is slow (6–30 s `stt_seconds` in `server/data/latency_log.json`), the server is using local Whisper — check that `ELEVENLABS_API_KEY` is set and the log line reads `stt(elevenlabs)=...`.
-- If LLM is slow on Linux (tens of seconds in `reply_seconds`), check `GET /api/status` → `llm.url`. CPU-only snap on `:11434` is much slower than GPU Ollama on `:11435` — run `bash server/scripts/start_ollama_gpu.sh` and restart the server.
-- If you hear a **robotic male voice** on Linux, ElevenLabs likely failed (quota/API error) and the server fell back to espeak — check server logs for `ElevenLabs TTS failed`. Fix API credits or set `TTS_PROVIDER=local` and tune `LOCAL_TTS_VOICE=en+f3`.
-- If TTS fails on Linux with `could not initialize espeak-ng`, install the library: `sudo apt install espeak-ng` (pyttsx3 loads `libespeak-ng.so.1`).
-- On **Windows**, use default SAPI (`--tts-provider sapi` or no key). Avoid `TTS_PROVIDER=local` unless you have espeak installed.
-- If **medical alarm ack** works for yes/no but not after *reschedule or cancel?*, flash latest firmware (WebSocket `prompt_medical_ack`) and restart the server.
-- If alarm fire logs **`WAV too large for ESP`**, restart server (16 kHz + shorter repeat TTS); medical alarms use TTS only, no beep.
-- If alarm time voice fails with *“Please use a 12-hour time”*, restart server (NLP normalizes `20:36 PM` / `8.36pm` style output).
-- If touch audio fails, check QT2120 init on I2C (GPIO 7/8) and speaker setup in serial logs.
-- If the **eyes stay black**, check the boot log for `SSD1351 ready: 2 panel(s) 128x96`; verify wiring on J1 (CLK 23, DIN 22, DC 21, RST 20, CS 26/27) and that both panels share 3.3 V/GND. If red/blue look swapped, set `SSD1351_SWAP_RB` to `1` in `main/ssd1351.h`.
-- If the eyes show but never change during a voice query, confirm the wake word fires (`Hi ESP detected` in the log) — the listening/thinking expressions are driven by the voice pipeline, and `eye listening` on the console tests the display path alone.
-- If **360 spin** does not run from voice, confirm `--esp-play-wav-url http://<ESP_IP>/play_wav` is set, firmware includes `/servo/360`, and U2D2/servos show ready in logs.
-- USB hub: U2D2 scan errors alongside UVC camera on J18 are common when the Dynamixel adapter is unplugged or still enumerating.
+### Camera & faces
+
+- Verify ESP stream: `http://<ESP_IP>/snapshot.jpg`
+- Register varied samples (angles, lighting); check log for `detector=yunet`
+- Too many false accepts → raise `FACE_MATCH_THRESHOLD` (e.g. `0.45`)
+- Too many rejects → lower it (e.g. `0.38`); stand closest to camera
+
+### Voice
+
+- ESP cannot reach PC → `voice connect <PC_LAN_IP> 8000` and confirm firewall
+- Slow STT (6–30 s) → set `ELEVENLABS_API_KEY` or check key has **Speech to Text** permission
+- Slow LLM → check `GET /api/status` → `llm.url`; start GPU Ollama on Linux
+- Robotic voice on Linux → ElevenLabs failed; check logs or install `espeak-ng`
+
+### Memory
+
+- `"memory": { "ready": false }` → set valid `DATABASE_URL`; run `init_memory_db.sh`
+- `memory_store: "user_resolve_failed"` → DB user lookup failed; check server logs and restart after code updates
+- Recap empty → no prior conversations saved for that user; have a normal chat first
+- Invalid `--database-url` → use `export DATABASE_URL="postgresql://..."` or `--database-url "$DATABASE_URL"` (not `$postgresql://…`)
+
+### Alarms
+
+- Alarms need `--esp-play-wav-url` set
+- Medical ack needs `voice connect` + firmware with `X-Nino-Prompt-Ack`
+- `WAV too large for ESP` → medical uses TTS only; normal alarms use 16 kHz resample
+
+### Hardware
+
+- Touch fails → check QT2120 on I2C GPIO 7/8
+- Eyes black → verify SSD1351 wiring; boot log should show `SSD1351 ready: 2 panel(s)`
+- 360 spin fails → U2D2 connected, `/servo/360` in firmware, `--esp-play-wav-url` set
+
+---
+
+## Related docs
+
+| Document | Contents |
+|----------|----------|
+| [docs/ALARM.md](docs/ALARM.md) | Voice alarm commands, medical flow, scheduler |
+| [docs/SERVO.md](docs/SERVO.md) | Dynamixel wiring, 360 sequence, API |
+| [docs/WIFI_PROVISION.md](docs/WIFI_PROVISION.md) | BLE / soft-AP Wi-Fi setup |
+| [docs/TEST_QUESTIONS.md](docs/TEST_QUESTIONS.md) | Suggested demo questions |
+| [context.md](context.md) | Full target architecture |
+| [context_main.md](context_main.md) | Implemented vs planned features |
+
+---
+
+## Notes
+
+- Touch audio **preempts** server/voice playback and resumes afterward.
+- Face greeting and alarm TTS use head motion during `/play_wav`.
+- Voice WebSocket replies also use head motion unless interrupted by touch or `/servo/360`.
+- Keep `server/server_config.json` and `.env` files with API keys **out of public commits**.
+- Both OLED eyes mirror by default; per-eye drawing is available via `ssd1351_target()` for future expressions.

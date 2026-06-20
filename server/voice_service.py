@@ -23,6 +23,7 @@ from llm_service import (
     answer_voice_query,
     DEFAULT_MODEL,
     DEFAULT_OLLAMA_URL,
+    is_conversation_recap_question,
 )
 from tts_service import synthesize_sapi_wav_bytes
 from wav_resample import resample_wav_bytes_to_mono_16bit
@@ -535,6 +536,19 @@ def process_voice_wav(
 
     from alarm_voice import handle_alarm_voice
 
+    from memory_service import build_spoken_recap, get_memory_service, resolve_memory_display_name
+
+    memory_svc = get_memory_service()
+    memory_name = resolve_memory_display_name(
+        viewer_name,
+        camera_identity_name=camera_identity_name,
+        camera_identity_state=camera_identity_state,
+    )
+    memory_ctx = None
+    if memory_name:
+        memory_ctx = memory_svc.load_context(memory_name)
+    t_memory = time.perf_counter()
+
     alarm_result = handle_alarm_voice(
         user_text,
         viewer_name=viewer_name,
@@ -557,6 +571,21 @@ def process_voice_wav(
         else:
             meta.trigger_servo_360 = True
             reply = reply_for_servo_360_command()
+    elif is_conversation_recap_question(user_text) and memory_name:
+        reply_path = "recap"
+        recent = memory_ctx.recent_history if memory_ctx else []
+        logger.info(
+            "Voice recap query | viewer=%s turns=%s | heard: %s",
+            memory_name,
+            len(recent),
+            user_text[:120],
+        )
+        reply = build_spoken_recap(recent)
+        if not reply:
+            reply = (
+                "We have not chatted about anything yet this session. "
+                "Ask me something and I will remember it."
+            )
     elif is_identity_question(user_text):
         reply_path = "identity_llm"
         logger.info(
@@ -572,6 +601,7 @@ def process_voice_wav(
             model=SETTINGS.ollama_model,
             api_url=SETTINGS.ollama_url,
             max_words=SETTINGS.max_words_reply,
+            memory_context=memory_ctx.prompt_block if memory_ctx else None,
         )
     else:
         effective_viewer = _viewer_for_this_reply(viewer_name)
@@ -595,8 +625,18 @@ def process_voice_wav(
             model=SETTINGS.ollama_model,
             api_url=SETTINGS.ollama_url,
             max_words=SETTINGS.max_words_reply,
+            memory_context=memory_ctx.prompt_block if memory_ctx else None,
         )
     t_reply = time.perf_counter()
+
+    memory_store = "skipped"
+    if reply_path in {"llm", "identity_llm", "recap"}:
+        memory_store = memory_svc.log_conversation_for_viewer(
+            memory_name,
+            user_text,
+            reply,
+            existing=memory_ctx,
+        )
 
     wav, _voice = synthesize_sapi_wav_bytes(reply)
     wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
@@ -615,10 +655,19 @@ def process_voice_wav(
         "audio_out_bytes": len(wav_out),
         "stt_engine": stt_engine,
         "stt_seconds": round(t_stt - t_start, 3),
-        "reply_seconds": round(t_reply - t_stt, 3),
+        "memory_seconds": round(t_memory - t_stt, 3),
+        "reply_seconds": round(t_reply - t_memory, 3),
         "tts_seconds": round(t_tts - t_reply, 3),
         "process_total_seconds": round(t_tts - t_start, 3),
+        "voice_viewer": viewer_name or "",
+        "memory_viewer": memory_name or "",
+        "memory_ready": memory_svc.ready,
+        "memory_store": memory_store,
     }
+    if memory_ctx:
+        meta.timings["memory_turns"] = memory_ctx.recent_turns
+        meta.timings["memory_facts"] = memory_ctx.memory_count
+        meta.timings["memory_user"] = memory_ctx.name
     logger.info(
         "Latency | stt(%s)=%.2fs reply(%s)=%.2fs tts=%.2fs total=%.2fs | in=%.1fs out=%.1fs audio",
         stt_engine,

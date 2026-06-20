@@ -6,3 +6,4 @@ jinja2
 pyttsx3
 requests>=2.32.0
 faster-whisper>=1.1.0
+psycopg2-binary>=2.9.9

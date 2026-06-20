@@ -525,47 +525,140 @@ even when the word "Mars" is not spoken.
 
 # Development Order
 
-Phase 1
+Implementation is split into **seven technical phases** (database design above) rolled out as **four delivery phases (A–D)** on the NiNO Python server. See also [`context_main.md`](context_main.md) for what is already running today.
+
+---
+
+## Delivery phases (NiNO server)
+
+### Phase A — Conversation memory (in progress)
+
+**Goal:** Same-day continuity and recent-thread recall.
 
 ```text
-Create PostgreSQL tables
+PostgreSQL users + conversations tables
+  → resolve user from SFace display name (face_id slug)
+  → load last 5 conversation turns before LLM
+  → inject into Qwen/Ollama prompt
+  → log exchange after reply (non-blocking)
 ```
 
-Phase 2
+**Server modules:** `memory_service.py`, `llm_service.py`, `voice_service.py`, `app.py`
+
+**Latency budget:** +10–40 ms DB read, +200–500 ms LLM prefill → **~+0.3–0.5 s** total on GPU
+
+**Skip logging for:** volume commands, servo 360, alarm regex paths (not conversational)
+
+---
+
+### Phase B — Long-term memory extraction
+
+**Goal:** Remember durable facts across sessions (“favorite planet is Mars”).
 
 ```text
-Store all conversations
+After each logged conversation (background thread, does NOT block TTS):
+  → second Qwen call with extraction prompt
+  → parse JSON [{ "memory", "importance" }]
+  → INSERT INTO memories (importance ≥ 5 only)
+  → load top 10 memories by importance before LLM
 ```
 
-Phase 3
+**Latency budget:** **0 ms user-visible** (async post-reply)
+
+**Importance filter:** store 5–10; ignore 0–4 (weather, battery, etc.)
+
+---
+
+### Phase C — Daily summaries & cross-day greetings
+
+**Goal:** “Welcome back — yesterday we discussed Mars and SpaceX.”
 
 ```text
-Implement memory extraction
+Nightly job (or startup catch-up):
+  → summarize today's conversations per user via Qwen
+  → INSERT INTO summaries
+
+Before LLM + vision greeting_for_face():
+  → load latest summary
+  → inject into prompt
 ```
 
-Phase 4
+**Latency budget:** +50–100 ms DB read; summary text adds ~+100–300 ms LLM prefill
+
+---
+
+### Phase D — Semantic memory (pgvector)
+
+**Goal:** Recall related facts when the user does not repeat keywords.
 
 ```text
-Implement daily summaries
+ALTER TABLE memories ADD COLUMN embedding VECTOR(768);
+  → embed on memory INSERT (background)
+  → at query time: embed user_text → nearest-neighbor retrieval
+  → merge with importance-ranked memories
 ```
 
-Phase 5
+**Latency budget:** +20–80 ms vector search (small corpus); embedding on write only
 
-```text
-Build context retrieval service
-```
+---
 
-Phase 6
+## Technical phases (build order)
 
-```text
-Inject memory into Qwen prompts
-```
+| # | Task | Delivery phase | Status |
+|---|------|----------------|--------|
+| 1 | Create PostgreSQL tables (`users`, `conversations`, `memories`, `summaries`) | A (all tables); B/C use later columns | A: schema |
+| 2 | Store all conversations | A | A: wire |
+| 3 | Implement memory extraction | B | Planned |
+| 4 | Implement daily summaries | C | Planned |
+| 5 | Build context retrieval service | A–C | A: `memory_service.load_context()` |
+| 6 | Inject memory into Qwen prompts | A–C | A: recent turns; B: +memories; C: +summary |
+| 7 | Add pgvector semantic search | D | Planned |
 
-Phase 7
+---
 
-```text
-Add pgvector semantic search
-```
+## Assumed latency (full stack)
+
+Baseline today (GPU Ollama + ElevenLabs STT, from `server/data/latency_log.json`):
+
+| Stage | Typical |
+|-------|---------|
+| STT | ~0.9 s |
+| LLM (short prompt) | ~0.2–0.4 s |
+| TTS | ~1.2 s |
+| **Server total** | **~3 s** |
+
+After all memory phases on GPU:
+
+| Stage | Typical |
+|-------|---------|
+| STT | ~0.9 s (unchanged) |
+| DB context load | ~10–40 ms |
+| LLM (with memory prompt) | ~0.5–1.2 s |
+| TTS | ~1.2 s (unchanged) |
+| Memory extraction | 0 ms visible (background) |
+| **Server total target** | **≤ 4.5 s** |
+
+**Rules to protect latency:**
+
+* Cap context: 5 recent turns, 10 memories, 1 summary
+* Never block reply on extraction, INSERT, or embedding
+* PostgreSQL on same host as FastAPI (not remote)
+* Keep GPU Ollama warm (`OLLAMA_KEEP_ALIVE`)
+
+---
+
+## Environment (memory layer)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `DATABASE_URL` | — | PostgreSQL connection string; memory disabled if unset |
+| `MEMORY_RECENT_TURNS` | `5` | Max conversation pairs loaded into prompt |
+| `MEMORY_TOP_MEMORIES` | `10` | Max memories by importance (Phase B) |
+| `MEMORY_MIN_IMPORTANCE` | `5` | Store/retrieve threshold (Phase B) |
+| `MEMORY_EXTRACTION` | `0` | `1` enables Phase B background extraction |
+| `MEMORY_SUMMARY_CRON` | `0` | `1` enables Phase C daily summary on startup |
+
+Init script: `server/scripts/init_memory_db.sh` + `server/scripts/memory_schema.sql`
 
 ---
 

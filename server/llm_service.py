@@ -362,6 +362,7 @@ def answer_identity_question(
     model: str | None = None,
     api_url: str | None = None,
     max_words: int = 45,
+    memory_context: str | None = None,
 ) -> str:
     """Answer 'who am I?' style questions using live camera recognition context."""
     if recognition_state == "recognized" and registered_name:
@@ -397,9 +398,85 @@ def answer_identity_question(
         "You are NiNO, a concise voice assistant for a smart home with a camera.\n"
         f"{camera_ctx}\n"
         f"{rules}\n"
+        f"{_memory_context_block(memory_context)}"
         f"Rules: one short spoken reply under {max_words} words, plain sentences, "
         "no lists, no markdown, no stage directions, suitable to read aloud.\n"
         f"The user asked: {user_text}"
+    )
+    return ollama_generate(
+        prompt,
+        model=model,
+        api_url=api_url,
+        num_predict=96,
+        timeout_s=VOICE_QUERY_TIMEOUT_S,
+    )
+
+
+def _memory_context_block(memory_context: str | None) -> str:
+    block = (memory_context or "").strip()
+    if not block:
+        return ""
+    return f"{block}\n\n"
+
+
+_CONVERSATION_RECAP_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bwhat (?:did|have) we (?:just )?(?:talk(?:ed|ing)?|discuss(?:ed|ing)?)(?:\s+about)?\b",
+        r"\bwhat we (?:just )?(?:talked|discussed)(?:\s+about)?\b",
+        r"\bwhat were we (?:just )?talking about\b",
+        r"\bwhat (?:are|were) we (?:discussing|talking about)\b",
+        r"\bwhat (?:are|were) you (?:discussing|talking about)\b",
+        r"(?:please\s+)?(?:tell me|say)\s+what (?:you|we) (?:are|were) (?:discussing|talking about)\b",
+        r"(?:repeat|recap|remind me).{0,24}what we (?:just )?(?:talked|discussed)\b",
+        r"tell me what we (?:just )?(?:talked|discussed)\b",
+        r"\bwhat(?:'s| is) our conversation about\b",
+        r"\bwhat(?:'s| is) (?:our|the) (?:discussion|conversation) about\b",
+        r"\bwhat did we (?:just )?talk(?:\s+about)?(?:\s+now)?\b",
+        r"\b(?:so,?\s*)?(?:here\s+)?we just (?:discussed|talked)\b",
+        r"\bwhat did i (?:just )?(?:ask|say|talk about)\b",
+        r"\bwhat (?:have )?i (?:just )?asked(?:\s+earlier|\s+before)?\b",
+        r"(?:please\s+)?(?:tell me|say) what i (?:just )?asked\b",
+        r"\brecap(?:ulate)? (?:our )?(?:chat|conversation|discussion)\b",
+    )
+)
+
+
+def is_conversation_recap_question(user_text: str) -> bool:
+    text = user_text.strip()
+    if not text:
+        return False
+    return any(p.search(text) for p in _CONVERSATION_RECAP_PATTERNS)
+
+
+def answer_conversation_recap(
+    user_text: str,
+    *,
+    viewer_name: str,
+    memory_context: str | None = None,
+    model: str | None = None,
+    api_url: str | None = None,
+    max_words: int = 45,
+) -> str:
+    name = viewer_name.strip()
+    history = (memory_context or "").strip()
+    if not history:
+        return (
+            "We have not chatted about anything yet this session. "
+            "Ask me something and I will remember it."
+        )
+
+    prompt = (
+        "You are NiNO, a concise voice assistant.\n"
+        f"You are speaking directly to {name}.\n"
+        f"{_memory_context_block(history)}"
+        "They want a recap of what you recently discussed.\n"
+        "Rules:\n"
+        f"- Speak in second person only (you/we). Never say \"{name} and ...\" or talk about them in third person.\n"
+        "- Summarize 1–3 concrete topics from the session history in one short spoken reply.\n"
+        "- Ignore incomplete speech-to-text fragments.\n"
+        f"- Under {max_words} words. No lists, no markdown, suitable to read aloud.\n"
+        f"They asked: {user_text}"
     )
     return ollama_generate(
         prompt,
@@ -417,12 +494,13 @@ def answer_voice_query(
     model: str | None = None,
     api_url: str | None = None,
     max_words: int = 40,
+    memory_context: str | None = None,
 ) -> str:
     if viewer_name:
         who = (
-            f"You are speaking to {viewer_name.strip()}, identified by the home camera. "
-            "Use their name once in a brief, natural way (start or end), then answer "
-            "what they asked. Do not repeat the name more than once."
+            f"You are speaking directly to {viewer_name.strip()}, identified by the home camera. "
+            "Use second person (you/we). Use their name at most once, naturally. "
+            "Never refer to them by name in third person."
         )
     else:
         who = (
@@ -430,9 +508,21 @@ def answer_voice_query(
             "Answer the question directly; do not invent or guess a name."
         )
 
+    memory_rules = ""
+    if memory_context:
+        name_hint = viewer_name.strip() if viewer_name else "them"
+        memory_rules = (
+            "Session history is provided below. Use it when relevant. "
+            "If summarizing past chat, speak directly to them in second person "
+            f'(e.g. "You asked about Mars"). Never say "You and {name_hint}" or use their name in third person. '
+            "Ignore incomplete fragment lines.\n"
+        )
+
     prompt = (
         "You are NiNO, a concise voice assistant for a smart home with a camera.\n"
         f"{who}\n"
+        f"{memory_rules}"
+        f"{_memory_context_block(memory_context)}"
         f"Rules: one short spoken reply under {max_words} words, plain sentences, "
         "no lists, no markdown, no stage directions, suitable to read aloud.\n"
         f"The user asked: {user_text}"
