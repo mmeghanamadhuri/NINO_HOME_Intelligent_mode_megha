@@ -532,46 +532,6 @@ See also [Text-to-speech tuning](#text-to-speech-tts) in the voice section and `
 
 ---
 
-## Repository layout
-
-```text
-├── main/                    ESP-IDF firmware
-│   ├── main.c               UVC, HTTP, Wi-Fi, console
-│   ├── voice_assist.c       VAD + voice sessions
-│   ├── voice_ws_client.c    WebSocket to PC
-│   ├── audio_queue.c        Touch-priority playback
-│   ├── servo_dxl.c          Dynamixel + 360 spin
-│   └── nino_eye.c           OLED eye animations
-├── server/                  Python FastAPI server
-│   ├── app.py               HTTP/WS entry point
-│   ├── voice_service.py     STT → routing → TTS pipeline
-│   ├── llm_service.py       Ollama prompts (voice, recap, identity)
-│   ├── memory_service.py    PostgreSQL memory layer
-│   ├── face_service.py      YuNet + SFace recognition
-│   ├── tts_service.py       TTS + vision greetings
-│   ├── alarm_*.py           Alarm scheduler + voice parsing
-│   ├── scripts/
-│   │   ├── init_memory_db.sh
-│   │   ├── memory_schema.sql
-│   │   ├── start_ollama_gpu.sh
-│   │   └── install_ollama_gpu_user.sh
-│   ├── data/
-│   │   ├── faces/           Registered face crops
-│   │   ├── face_embeddings.json
-│   │   ├── alarms.json
-│   │   └── latency_log.json
-│   └── templates/           Web UI
-├── docs/
-│   ├── ALARM.md
-│   ├── SERVO.md
-│   ├── WIFI_PROVISION.md
-│   └── TEST_QUESTIONS.md
-├── context.md               Target architecture spec
-└── context_main.md          Implemented vs target mapping
-```
-
----
-
 ## Troubleshooting
 
 ### Camera & faces
