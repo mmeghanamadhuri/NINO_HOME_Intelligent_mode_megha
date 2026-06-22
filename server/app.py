@@ -447,13 +447,44 @@ def _viewer_for_voice_query() -> str | None:
     return name
 
 
-def _camera_identity_snapshot() -> tuple[str | None, Literal["recognized", "unknown", "no_face"]]:
-    """Live camera identity for 'who am I?' — multi-frame vote on the primary viewer."""
-    name, state = faces.recognize_identity(camera.read)
+def _camera_identity_snapshot(
+    require_live_face: bool = False,
+) -> tuple[str | None, Literal["recognized", "unknown", "no_face"]]:
+    """Live camera identity for voice queries and 'who am I?' prompts."""
+    # Prefer the same live detection stream shown in UI so voice identity follows
+    # what the user sees in the camera overlay.
+    if latest_results:
+        primary = _primary_recognized_viewer(latest_results)
+        if primary:
+            _remember_voice_viewer(primary)
+            return primary, "recognized"
+        if require_live_face:
+            has_primary_face = any(r.get("primary", True) for r in latest_results)
+            if has_primary_face:
+                return None, "unknown"
+
+    # Fresh frame fallback (keeps identity responsive even if latest_results lags).
+    frame = camera.read()
+    if frame is not None:
+        results = faces.recognize(frame)
+        primary = _primary_recognized_viewer(results)
+        if primary:
+            _remember_voice_viewer(primary)
+            return primary, "recognized"
+        if require_live_face and results:
+            return None, "unknown"
+
+    # Multi-frame vote fallback.
+    name, state = faces.recognize_identity(
+        camera.read,
+        allow_session_hint=not require_live_face,
+    )
     if state == "recognized" and name:
         _remember_voice_viewer(name)
         return name, "recognized"
     if state == "no_face":
+        if require_live_face:
+            return None, "no_face"
         recalled = _recall_voice_viewer()
         if recalled:
             return recalled, "recognized"
@@ -551,7 +582,6 @@ async def _voice_ws_pipeline(websocket: WebSocket) -> None:
         process_voice_wav,
     )
 
-    session_viewer: str | None = None
     session_queries = 0
     session_started = time.perf_counter()
     client_label = _ws_client_label(websocket)
@@ -592,19 +622,20 @@ async def _voice_ws_pipeline(websocket: WebSocket) -> None:
 
             wav_out: bytes | None = None
             reply_meta = VoiceReplyMeta()
-            active_viewer: str | None = session_viewer
+            active_viewer: str | None = None
             t_query_start = time.perf_counter()
             pipeline_error: str | None = None
             try:
-                viewer = await run_in_threadpool(_viewer_for_voice_query)
-                if viewer:
-                    session_viewer = viewer
-                    active_viewer = viewer
-                elif session_viewer:
-                    active_viewer = session_viewer
                 identity_name, identity_state = await run_in_threadpool(
-                    _camera_identity_snapshot
+                    _camera_identity_snapshot, True
                 )
+                if identity_state == "recognized" and identity_name:
+                    normalized_identity = str(identity_name).strip()
+                    if normalized_identity and normalized_identity.lower() not in {
+                        "unknown",
+                        "face",
+                    }:
+                        active_viewer = normalized_identity
 
                 def _run_voice() -> tuple[bytes, VoiceReplyMeta]:
                     return process_voice_wav(

@@ -216,7 +216,11 @@ class FaceService:
         for row in faces:
             if len(row) < 15:
                 continue
-            if float(row[14]) < self.yunet_score_threshold:
+            score = float(row[14])
+            if not np.isfinite(score) or score < self.yunet_score_threshold:
+                continue
+            if not np.isfinite(row[:4]).all():
+                # Guard against rare detector glitches producing inf/nan boxes.
                 continue
             x, y, bw, bh = int(row[0]), int(row[1]), int(row[2]), int(row[3])
             if bw <= 0 or bh <= 0:
@@ -643,7 +647,11 @@ class FaceService:
         return best_name
 
     def recognize_identity(
-        self, read_frame: Any, *, samples: int | None = None
+        self,
+        read_frame: Any,
+        *,
+        samples: int | None = None,
+        allow_session_hint: bool = True,
     ) -> tuple[str | None, str]:
         """Multi-frame vote for voice identity ('who am I?'). Returns (name, state)."""
         sample_count = samples if samples is not None else self.identity_sample_frames
@@ -668,9 +676,10 @@ class FaceService:
             time.sleep(self.identity_sample_gap_s)
 
         if not saw_face:
-            hint = self._session_primary_hint()
-            if hint:
-                return hint, "recognized"
+            if allow_session_hint:
+                hint = self._session_primary_hint()
+                if hint:
+                    return hint, "recognized"
             return None, "no_face"
 
         if votes:
@@ -678,9 +687,10 @@ class FaceService:
             if votes[winner] >= max(2, (sample_count + 1) // 2):
                 return winner, "recognized"
 
-        hint = self._session_primary_hint()
-        if hint:
-            return hint, "recognized"
+        if allow_session_hint:
+            hint = self._session_primary_hint()
+            if hint:
+                return hint, "recognized"
 
         return None, "unknown"
 

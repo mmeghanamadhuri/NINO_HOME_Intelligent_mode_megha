@@ -179,7 +179,7 @@ def build_spoken_recap(
 @dataclass
 class MemorySettings:
     database_url: str = ""
-    recent_turns: int = 5
+    recent_turns: int = 10
     top_memories: int = 10
     min_importance: int = 5
     extraction_enabled: bool = False
@@ -193,7 +193,7 @@ _service: MemoryService | None = None
 
 def configure_from_environ() -> None:
     SETTINGS.database_url = normalize_database_url(os.environ.get("DATABASE_URL", ""))
-    SETTINGS.recent_turns = max(1, int(os.environ.get("MEMORY_RECENT_TURNS", "5")))
+    SETTINGS.recent_turns = max(1, int(os.environ.get("MEMORY_RECENT_TURNS", "10")))
     SETTINGS.top_memories = max(1, int(os.environ.get("MEMORY_TOP_MEMORIES", "10")))
     SETTINGS.min_importance = int(os.environ.get("MEMORY_MIN_IMPORTANCE", "5"))
     SETTINGS.extraction_enabled = os.environ.get("MEMORY_EXTRACTION", "0").strip().lower() in {
@@ -497,8 +497,8 @@ class MemoryService:
             lines: list[str] = []
             for user_text, assistant_text in recent:
                 lines.append(
-                    f"- You asked: {truncate_context_text(user_text)} | "
-                    f"I answered: {truncate_context_text(assistant_text)}"
+                    f"- User said: {truncate_context_text(user_text)} | "
+                    f"Assistant replied: {truncate_context_text(assistant_text)}"
                 )
             parts.append(
                 "Recent session history (may contain speech-to-text errors — ignore fragments):\n"
@@ -509,8 +509,8 @@ class MemoryService:
             return ""
 
         parts.append(
-            "If they ask what you just discussed, briefly recap 1–3 topics from the history "
-            'using second person, e.g. "You asked about Mars and the full forms of CPU and GPU." '
+            "If they ask for context, summarize the discussion naturally in one concise spoken reply. "
+            "Do not use repetitive templates such as 'You asked about...'. "
             "Do not say their name as if talking about someone else. "
             "Do not invent topics not in the history."
         )

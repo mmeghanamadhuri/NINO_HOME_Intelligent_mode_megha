@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -269,6 +270,8 @@ def ollama_generate(
     timeout_s: int = 90,
     num_predict: int | None = 96,
     keep_alive: str | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
 ) -> str:
     url = (api_url or os.environ.get("OLLAMA_URL") or DEFAULT_OLLAMA_URL).strip()
     m = (model or os.environ.get("OLLAMA_MODEL") or DEFAULT_MODEL).strip()
@@ -286,6 +289,10 @@ def ollama_generate(
     options: dict[str, Any] = {}
     if num_predict is not None:
         options["num_predict"] = num_predict
+    if temperature is not None:
+        options["temperature"] = float(max(0.0, min(2.0, temperature)))
+    if top_p is not None:
+        options["top_p"] = float(max(0.05, min(1.0, top_p)))
     if os.environ.get("OLLAMA_FORCE_GPU", "1").strip().lower() not in {
         "0",
         "false",
@@ -426,19 +433,31 @@ _CONVERSATION_RECAP_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"\bwhat we (?:just )?(?:talked|discussed)(?:\s+about)?\b",
         r"\bwhat were we (?:just )?talking about\b",
         r"\bwhat (?:are|were) we (?:discussing|talking about)\b",
+        r"\bwhat(?:\s+are|'re)\s+we\s+discussing(?:\s+right\s+now|\s+now)?\b",
         r"\bwhat (?:are|were) you (?:discussing|talking about)\b",
         r"(?:please\s+)?(?:tell me|say)\s+what (?:you|we) (?:are|were) (?:discussing|talking about)\b",
         r"(?:repeat|recap|remind me).{0,24}what we (?:just )?(?:talked|discussed)\b",
         r"tell me what we (?:just )?(?:talked|discussed)\b",
         r"\bwhat(?:'s| is) our conversation about\b",
         r"\bwhat(?:'s| is) (?:our|the) (?:discussion|conversation) about\b",
+        r"\bwhat we are discussing(?:\s+now)?\b",
         r"\bwhat did we (?:just )?talk(?:\s+about)?(?:\s+now)?\b",
         r"\b(?:so,?\s*)?(?:here\s+)?we just (?:discussed|talked)\b",
         r"\bwhat did i (?:just )?(?:ask|say|talk about)\b",
         r"\bwhat (?:have )?i (?:just )?asked(?:\s+earlier|\s+before)?\b",
         r"(?:please\s+)?(?:tell me|say) what i (?:just )?asked\b",
         r"\brecap(?:ulate)? (?:our )?(?:chat|conversation|discussion)\b",
+        r"\b(?:what(?:'s| is)\s+)?(?:the\s+)?context\b",
+        r"\b(?:give|tell|share)\s+me\s+(?:the\s+)?context\b",
+        r"\bcontext\s+so\s+far\b",
     )
+)
+
+_RECAP_STYLE_VARIANTS: tuple[str, ...] = (
+    "Use a warm conversational tone.",
+    "Use a crisp concise tone.",
+    "Use a slightly upbeat tone.",
+    "Use a calm matter-of-fact tone.",
 )
 
 
@@ -452,39 +471,109 @@ def is_conversation_recap_question(user_text: str) -> bool:
 def answer_conversation_recap(
     user_text: str,
     *,
-    viewer_name: str,
+    viewer_name: str | None,
+    recognition_state: str,
     memory_context: str | None = None,
     model: str | None = None,
     api_url: str | None = None,
     max_words: int = 45,
 ) -> str:
-    name = viewer_name.strip()
+    name = (viewer_name or "").strip()
     history = (memory_context or "").strip()
-    if not history:
-        return (
-            "We have not chatted about anything yet this session. "
-            "Ask me something and I will remember it."
+    style_hint = random.choice(_RECAP_STYLE_VARIANTS)
+
+    if recognition_state == "recognized" and name:
+        identity_rules = (
+            f"The live camera currently recognizes the user as {name}.\n"
+            "You may use their name at most once, naturally.\n"
+            f"Use second person only (you/we). Never say \"{name} and ...\" or refer to them in third person.\n"
         )
+    elif recognition_state == "unknown":
+        identity_rules = (
+            "A face is visible, but the user is not recognized in the face database.\n"
+            "Say you cannot pull personal context yet and ask them to register or re-center for recognition.\n"
+            "Do not guess or invent any name.\n"
+        )
+    else:
+        identity_rules = (
+            "No recognized face is currently available for this context request.\n"
+            "Politely say you cannot access personal context right now and ask them to face the camera.\n"
+            "Do not guess or invent any name.\n"
+        )
+
+    history_rules = (
+        "Session history is provided below. Summarize the latest discussion across all provided turns (up to 5).\n"
+        "Ignore incomplete speech-to-text fragments.\n"
+        if history
+        else (
+            "No usable conversation history is available for this user yet.\n"
+            "Say that briefly and ask one short follow-up prompt to continue.\n"
+        )
+    )
 
     prompt = (
         "You are NiNO, a concise voice assistant.\n"
-        f"You are speaking directly to {name}.\n"
+        f"{identity_rules}"
+        "The user asked for context/recap.\n"
+        f"{history_rules}"
         f"{_memory_context_block(history)}"
-        "They want a recap of what you recently discussed.\n"
-        "Rules:\n"
-        f"- Speak in second person only (you/we). Never say \"{name} and ...\" or talk about them in third person.\n"
-        "- Summarize 1–3 concrete topics from the session history in one short spoken reply.\n"
-        "- Ignore incomplete speech-to-text fragments.\n"
-        f"- Under {max_words} words. No lists, no markdown, suitable to read aloud.\n"
-        f"They asked: {user_text}"
+        "Style rules for recap quality:\n"
+        f"- {style_hint}\n"
+        "- Give a compact natural summary in 2-3 short sentences.\n"
+        "- Cover the key points from the provided recent turns (aim for 3-5 points when available), not just one topic.\n"
+        "- Use fresh wording each time; avoid repeating the same sentence structure on every recap.\n"
+        "- Do NOT start with or repeat 'You asked about...'.\n"
+        "- Never use bullet points, numbering, or list formatting.\n"
+        "- Avoid echoing exact lines from history unless necessary.\n"
+        f"Rules: one concise spoken reply under {max_words} words, plain sentences, "
+        "no lists, no markdown, no stage directions, suitable to read aloud.\n"
+        f"The user asked: {user_text}"
     )
-    return ollama_generate(
+    reply = ollama_generate(
         prompt,
         model=model,
         api_url=api_url,
         num_predict=96,
         timeout_s=VOICE_QUERY_TIMEOUT_S,
+        temperature=0.7,
+        top_p=0.92,
     )
+    cleaned = " ".join(reply.strip().split())
+    lower = cleaned.lower()
+    words = [w for w in cleaned.split(" ") if w]
+    needs_rewrite = (
+        lower.startswith("you asked about")
+        or lower.startswith("you just asked")
+        or "\n" in reply
+        or "- " in reply
+        or "*" in reply
+        or len(words) > max_words
+    )
+    if needs_rewrite:
+        rewrite_prompt = (
+            "Rewrite this context recap for voice playback.\n"
+            f"Strict rules: 2-3 short sentences, max {max_words} words, no lists or bullets, "
+            "no markdown, and natural spoken style.\n"
+            "Cover key points from recent turns (aim for 3-5 when available), not just one point.\n"
+            "Use different wording from previous recap responses.\n"
+            "Do not begin with 'You asked about'.\n\n"
+            f"Original recap:\n{cleaned}"
+        )
+        rewritten = ollama_generate(
+            rewrite_prompt,
+            model=model,
+            api_url=api_url,
+            num_predict=96,
+            timeout_s=VOICE_QUERY_TIMEOUT_S,
+            temperature=0.75,
+            top_p=0.95,
+        )
+        rewritten_clean = " ".join(rewritten.strip().split())
+        trimmed = rewritten_clean.split(" ")
+        if len(trimmed) > max_words:
+            rewritten_clean = " ".join(trimmed[:max_words]).rstrip(",;:-") + "."
+        return rewritten_clean
+    return cleaned
 
 
 def answer_voice_query(

@@ -19,6 +19,7 @@ import requests
 logger = logging.getLogger(__name__)
 
 from llm_service import (
+    answer_conversation_recap,
     answer_identity_question,
     answer_voice_query,
     DEFAULT_MODEL,
@@ -119,6 +120,7 @@ class VoiceSettings:
     elevenlabs_stt_model: str = "scribe_v1"
     max_request_bytes: int = 512_000
     max_words_reply: int = 45
+    recap_max_words: int = 55
     personalize_prob: float = DEFAULT_VOICE_PERSONALIZE_PROB
 
 
@@ -166,6 +168,10 @@ def configure_from_environ() -> None:
         os.environ.get("VOICE_PERSONALIZE_PROB", str(DEFAULT_VOICE_PERSONALIZE_PROB))
     )
     SETTINGS.personalize_prob = min(1.0, max(0.0, SETTINGS.personalize_prob))
+    SETTINGS.recap_max_words = max(
+        30,
+        min(80, int(os.environ.get("VOICE_RECAP_MAX_WORDS", "55"))),
+    )
 
 
 def _viewer_for_this_reply(viewer_name: str | None) -> str | None:
@@ -178,6 +184,47 @@ def _viewer_for_this_reply(viewer_name: str | None) -> str | None:
     if random.random() < SETTINGS.personalize_prob:
         return cleaned
     return None
+
+
+def _live_memory_viewer_name(
+    camera_identity_name: str | None,
+    camera_identity_state: CameraIdentityState,
+) -> str | None:
+    """Require a live recognized face before loading per-user memory context."""
+    if camera_identity_state != "recognized":
+        return None
+    if not camera_identity_name:
+        return None
+    cleaned = str(camera_identity_name).strip()
+    if not cleaned or cleaned.lower() in {"unknown", "face"}:
+        return None
+    return cleaned
+
+
+def _recap_context_from_recent_turns(
+    recent_history: list[tuple[str, str]],
+) -> str | None:
+    """Build recap context from latest non-recap turns (up to 5)."""
+    eligible: list[tuple[str, str]] = []
+    for user_text, assistant_text in recent_history:
+        heard = str(user_text or "").strip()
+        replied = str(assistant_text or "").strip()
+        if not heard:
+            continue
+        if is_conversation_recap_question(heard):
+            # Avoid feeding prior recap requests/replies back into recap generation.
+            continue
+        eligible.append((heard, replied))
+
+    lines: list[str] = []
+    latest_first = list(reversed(eligible[-5:]))
+    for idx, (heard, replied) in enumerate(latest_first, start=1):
+        lines.append(
+            f"- Latest turn {idx}: User said: {heard[:180]} | Assistant replied: {replied[:180]}"
+        )
+    if not lines:
+        return None
+    return "Recent turns (ordered newest to oldest, use these for recap):\n" + "\n".join(lines)
 
 
 def is_identity_question(user_text: str) -> bool:
@@ -536,13 +583,12 @@ def process_voice_wav(
 
     from alarm_voice import handle_alarm_voice
 
-    from memory_service import build_spoken_recap, get_memory_service, resolve_memory_display_name
+    from memory_service import get_memory_service
 
     memory_svc = get_memory_service()
-    memory_name = resolve_memory_display_name(
-        viewer_name,
-        camera_identity_name=camera_identity_name,
-        camera_identity_state=camera_identity_state,
+    memory_name = _live_memory_viewer_name(
+        camera_identity_name,
+        camera_identity_state,
     )
     memory_ctx = None
     if memory_name:
@@ -571,20 +617,42 @@ def process_voice_wav(
         else:
             meta.trigger_servo_360 = True
             reply = reply_for_servo_360_command()
-    elif is_conversation_recap_question(user_text) and memory_name:
-        reply_path = "recap"
-        recent = memory_ctx.recent_history if memory_ctx else []
-        logger.info(
-            "Voice recap query | viewer=%s turns=%s | heard: %s",
-            memory_name,
-            len(recent),
-            user_text[:120],
-        )
-        reply = build_spoken_recap(recent)
-        if not reply:
-            reply = (
-                "We have not chatted about anything yet this session. "
-                "Ask me something and I will remember it."
+    elif is_conversation_recap_question(user_text):
+        if not memory_name:
+            reply_path = "recap_blocked_no_face"
+            logger.info(
+                "Voice recap blocked (no live recognized face) | state=%s heard: %s",
+                camera_identity_state,
+                user_text[:120],
+            )
+            reply = answer_conversation_recap(
+                user_text,
+                viewer_name=None,
+                recognition_state=camera_identity_state,
+                model=SETTINGS.ollama_model,
+                api_url=SETTINGS.ollama_url,
+                max_words=SETTINGS.recap_max_words,
+                memory_context=None,
+            )
+        else:
+            reply_path = "recap"
+            logger.info(
+                "Voice recap query | viewer=%s turns=%s | heard: %s",
+                memory_name,
+                memory_ctx.recent_turns if memory_ctx else 0,
+                user_text[:120],
+            )
+            recap_context = _recap_context_from_recent_turns(
+                memory_ctx.recent_history if memory_ctx else []
+            )
+            reply = answer_conversation_recap(
+                user_text,
+                viewer_name=memory_name,
+                recognition_state=camera_identity_state,
+                model=SETTINGS.ollama_model,
+                api_url=SETTINGS.ollama_url,
+                max_words=SETTINGS.recap_max_words,
+                memory_context=recap_context,
             )
     elif is_identity_question(user_text):
         reply_path = "identity_llm"

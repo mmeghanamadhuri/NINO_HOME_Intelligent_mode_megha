@@ -1,23 +1,25 @@
 # NiNO Server — Implemented Architecture vs `context.md`
 
-This document describes **what is running today** on the Python server, how it maps to the target design in [`context.md`](context.md), and what is still missing for the full **Vision + Voice Memory Workflow**.
+This document describes **what is running today** on the Python server, how it maps to the target design in `[context.md](context.md)`, and what is still missing for the full **Vision + Voice Memory Workflow**.
 
 ---
 
 ## Executive summary
 
-| Area | `context.md` target | Current implementation |
-|------|---------------------|------------------------|
-| Face recognition | SFace | **Implemented** — SFace + YuNet on PC |
-| STT | ElevenLabs | **Implemented** — ElevenLabs Scribe + Whisper fallback |
-| LLM | Qwen | **Implemented** — Qwen via **Ollama** (`qwen2.5:1.5b`) |
-| TTS | ElevenLabs | **Partial** — ElevenLabs when keyed; else SAPI (Windows) / espeak (Linux) |
-| Database | PostgreSQL (users, conversations, memories, summaries) | **Not implemented** — JSON files + in-memory session only |
-| Long-term memory | Extract, score, retrieve memories | **Not implemented** |
-| Conversation history | Persist every exchange | **Not implemented** (latency log only) |
-| Daily summaries | Nightly per-user rollup | **Not implemented** |
-| Context injection | Memories + history + summary → Qwen prompt | **Partial** — name only, session-scoped |
-| Device | ESP32-P4 | **Implemented** — voice WS, `/play_wav`, camera stream, servo |
+
+| Area                 | `context.md` target                                    | Current implementation                                                    |
+| -------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------- |
+| Face recognition     | SFace                                                  | **Implemented** — SFace + YuNet on PC                                     |
+| STT                  | ElevenLabs                                             | **Implemented** — ElevenLabs Scribe + Whisper fallback                    |
+| LLM                  | Qwen                                                   | **Implemented** — Qwen via **Ollama** (`qwen2.5:1.5b`)                    |
+| TTS                  | ElevenLabs                                             | **Partial** — ElevenLabs when keyed; else SAPI (Windows) / espeak (Linux) |
+| Database             | PostgreSQL (users, conversations, memories, summaries) | **Not implemented** — JSON files + in-memory session only                 |
+| Long-term memory     | Extract, score, retrieve memories                      | **Not implemented**                                                       |
+| Conversation history | Persist every exchange                                 | **Not implemented** (latency log only)                                    |
+| Daily summaries      | Nightly per-user rollup                                | **Not implemented**                                                       |
+| Context injection    | Memories + history + summary → Qwen prompt             | **Partial** — name only, session-scoped                                   |
+| Device               | ESP32-P4                                               | **Implemented** — voice WS, `/play_wav`, camera stream, servo             |
+
 
 Most of the **real-time pipeline** (camera → face → voice → LLM → TTS → ESP) is up. The **persistent memory layer** from `context.md` has not been built yet.
 
@@ -115,36 +117,44 @@ This path is **session-only**: it knows “return visitor this session” via `_
 
 ### Face recognition — **implemented (with differences)**
 
-| `context.md` | Implemented |
-|--------------|-------------|
-| SFace recognition | `face_service.py` — OpenCV Zoo SFace (`face_recognition_sface_2021dec.onnx`) |
-| `face_id` in PostgreSQL | **person_id** derived from display name; stored in `face_embeddings.json` + JPEG crops under `data/faces/<person_id>/` |
-| User table (`first_seen`, `last_seen`) | **Not persisted** — runtime session fields only (`_session_primary_name`, TTS `_known_seen_once`) |
+
+| `context.md`                           | Implemented                                                                                                            |
+| -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| SFace recognition                      | `face_service.py` — OpenCV Zoo SFace (`face_recognition_sface_2021dec.onnx`)                                           |
+| `face_id` in PostgreSQL                | **person_id** derived from display name; stored in `face_embeddings.json` + JPEG crops under `data/faces/<person_id>/` |
+| User table (`first_seen`, `last_seen`) | **Not persisted** — runtime session fields only (`_session_primary_name`, TTS `_known_seen_once`)                      |
+
 
 Recognition runs on the **PC server**, not on the ESP. The ESP only streams video and plays audio.
 
 ### Speech-to-text — **implemented (with differences)**
 
-| `context.md` | Implemented |
-|--------------|-------------|
-| ElevenLabs STT | `voice_service._transcribe_elevenlabs()` — Scribe `scribe_v1` |
+
+| `context.md`    | Implemented                                                                                                               |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| ElevenLabs STT  | `voice_service._transcribe_elevenlabs()` — Scribe `scribe_v1`                                                             |
 | Single provider | **Dual**: ElevenLabs default when API key present; **Whisper** (`faster-whisper`) as fallback or `--stt-provider whisper` |
+
 
 ### LLM — **implemented (with differences)**
 
-| `context.md` | Implemented |
-|--------------|-------------|
-| Qwen | **Qwen 2.5 1.5B** via Ollama (`OLLAMA_MODEL=qwen2.5:1.5b`) |
-| Direct Qwen API | **Ollama** `/api/generate` — local, GPU-accelerated on DGX (`llm_service.py`) |
-| Memory-enriched prompts | **Not yet** — prompts include viewer name and camera identity only |
+
+| `context.md`            | Implemented                                                                   |
+| ----------------------- | ----------------------------------------------------------------------------- |
+| Qwen                    | **Qwen 2.5 1.5B** via Ollama (`OLLAMA_MODEL=qwen2.5:1.5b`)                    |
+| Direct Qwen API         | **Ollama** `/api/generate` — local, GPU-accelerated on DGX (`llm_service.py`) |
+| Memory-enriched prompts | **Not yet** — prompts include viewer name and camera identity only            |
+
 
 ### Text-to-speech — **partially aligned**
 
-| `context.md` | Implemented |
-|--------------|-------------|
-| ElevenLabs TTS only | ElevenLabs when `ELEVENLABS_API_KEY` set |
-| Stream to ESP32-P4 | WAV bytes over WebSocket (voice) or HTTP POST `/play_wav` (greetings/alarms) |
-| — | **Also**: Windows SAPI, Linux espeak-ng fallback (`tts_service.py`) |
+
+| `context.md`        | Implemented                                                                  |
+| ------------------- | ---------------------------------------------------------------------------- |
+| ElevenLabs TTS only | ElevenLabs when `ELEVENLABS_API_KEY` set                                     |
+| Stream to ESP32-P4  | WAV bytes over WebSocket (voice) or HTTP POST `/play_wav` (greetings/alarms) |
+| —                   | **Also**: Windows SAPI, Linux espeak-ng fallback (`tts_service.py`)          |
+
 
 Voice replies and vision greetings both target **16 kHz mono PCM** for the ESP speaker path.
 
@@ -152,12 +162,14 @@ Voice replies and vision greetings both target **16 kHz mono PCM** for the ESP s
 
 `context.md` defines four PostgreSQL tables. **None exist in the current server.**
 
-| Table | Purpose in `context.md` | Current equivalent |
-|-------|-------------------------|-------------------|
-| `users` | Registered people, face_id, timestamps | `face_embeddings.json` + `data/faces/` (no timestamps, no face_id column) |
-| `conversations` | Every user/assistant exchange | **Missing** — only debug fields in `latency_log.json` (`heard`, `reply_text`) |
-| `memories` | Long-term facts + importance | **Missing** |
-| `summaries` | Daily conversation rollup | **Missing** |
+
+| Table           | Purpose in `context.md`                | Current equivalent                                                            |
+| --------------- | -------------------------------------- | ----------------------------------------------------------------------------- |
+| `users`         | Registered people, face_id, timestamps | `face_embeddings.json` + `data/faces/` (no timestamps, no face_id column)     |
+| `conversations` | Every user/assistant exchange          | **Missing** — only debug fields in `latency_log.json` (`heard`, `reply_text`) |
+| `memories`      | Long-term facts + importance           | **Missing**                                                                   |
+| `summaries`     | Daily conversation rollup              | **Missing**                                                                   |
+
 
 Existing JSON persistence:
 
@@ -187,29 +199,33 @@ There is **no** second LLM call for memory extraction, **no** importance scoring
 
 The live server includes capabilities not described in the memory workflow doc:
 
-| Feature | Module(s) | Notes |
-|---------|-----------|-------|
-| Alarm scheduler | `alarm_service.py`, `alarm_voice.py`, `alarm_nlp.py` | Voice + web UI; medical P0 with yes/no ack |
-| Servo 360 voice command | `voice_service.py` | Fixed TTS → `POST /servo/360` |
-| Speaker volume voice control | `voice_service.py` | ESP `/speaker/volume` |
-| Latency observability | `app.py` | `GET /api/latency-log` |
-| GPU Ollama auto-select | `llm_service.py`, `scripts/start_ollama_gpu.sh` | Port 11435 on Linux |
-| Web UI | `templates/`, `static/` | Face register/retrain, alarm management, live feed |
-| Touch-priority audio | ESP firmware | Not server-side; documented in README |
+
+| Feature                      | Module(s)                                            | Notes                                              |
+| ---------------------------- | ---------------------------------------------------- | -------------------------------------------------- |
+| Alarm scheduler              | `alarm_service.py`, `alarm_voice.py`, `alarm_nlp.py` | Voice + web UI; medical P0 with yes/no ack         |
+| Servo 360 voice command      | `voice_service.py`                                   | Fixed TTS → `POST /servo/360`                      |
+| Speaker volume voice control | `voice_service.py`                                   | ESP `/speaker/volume`                              |
+| Latency observability        | `app.py`                                             | `GET /api/latency-log`                             |
+| GPU Ollama auto-select       | `llm_service.py`, `scripts/start_ollama_gpu.sh`      | Port 11435 on Linux                                |
+| Web UI                       | `templates/`, `static/`                              | Face register/retrain, alarm management, live feed |
+| Touch-priority audio         | ESP firmware                                         | Not server-side; documented in README              |
+
 
 ---
 
 ## Development phases: `context.md` vs status
 
-| Phase | `context.md` | Status |
-|-------|--------------|--------|
-| 1 | Create PostgreSQL tables | **Not started** |
-| 2 | Store all conversations | **Not started** (latency log ≠ conversation store) |
-| 3 | Memory extraction | **Not started** |
-| 4 | Daily summaries | **Not started** |
-| 5 | Context retrieval service | **Not started** |
-| 6 | Inject memory into Qwen prompts | **Partial** — name + session greeting only |
-| 7 | pgvector semantic search | **Not started** |
+
+| Phase | `context.md`                    | Status                                             |
+| ----- | ------------------------------- | -------------------------------------------------- |
+| 1     | Create PostgreSQL tables        | **Not started**                                    |
+| 2     | Store all conversations         | **Not started** (latency log ≠ conversation store) |
+| 3     | Memory extraction               | **Not started**                                    |
+| 4     | Daily summaries                 | **Not started**                                    |
+| 5     | Context retrieval service       | **Not started**                                    |
+| 6     | Inject memory into Qwen prompts | **Partial** — name + session greeting only         |
+| 7     | pgvector semantic search        | **Not started**                                    |
+
 
 ### What *is* done (foundation for memory work)
 
@@ -276,17 +292,19 @@ Add embedding column to `memories`; semantic retrieval when user query does not 
 
 Key files and env vars today:
 
-| Item | Location / default |
-|------|-------------------|
-| Entry point | `server/app.py` |
+
+| Item        | Location / default                                                                      |
+| ----------- | --------------------------------------------------------------------------------------- |
+| Entry point | `server/app.py`                                                                         |
 | Config file | `server/server_config.json` (`camera_source`, `esp_play_wav_url`, `elevenlabs_api_key`) |
-| Face data | `server/data/face_embeddings.json`, `server/data/faces/` |
-| Alarms | `server/data/alarms.json` |
-| Latency | `server/data/latency_log.json` |
-| Ollama | `OLLAMA_URL` (auto → `:11435` GPU), `OLLAMA_MODEL=qwen2.5:1.5b` |
-| STT | `STT_PROVIDER`, `ELEVENLABS_API_KEY`, `WHISPER_MODEL` |
-| TTS | `TTS_PROVIDER`, ElevenLabs voice settings |
-| Voice WS | `/ws/voice`, `/voice-query` |
+| Face data   | `server/data/face_embeddings.json`, `server/data/faces/`                                |
+| Alarms      | `server/data/alarms.json`                                                               |
+| Latency     | `server/data/latency_log.json`                                                          |
+| Ollama      | `OLLAMA_URL` (auto → `:11435` GPU), `OLLAMA_MODEL=qwen2.5:1.5b`                         |
+| STT         | `STT_PROVIDER`, `ELEVENLABS_API_KEY`, `WHISPER_MODEL`                                   |
+| TTS         | `TTS_PROVIDER`, ElevenLabs voice settings                                               |
+| Voice WS    | `/ws/voice`, `/voice-query`                                                             |
+
 
 Full runbook: see [README.md](README.md).
 
@@ -321,4 +339,4 @@ The NiNO server **already implements** the real-time vision + voice stack descri
 
 The **memory workflow** — PostgreSQL, conversation history, long-term memory extraction, daily summaries, and rich context injection — remains **design-only** in `context.md` and is the main delta to close for a persistent companion experience across days.
 
-Use **`context.md`** as the product spec for memory. Use **`context_main.md`** (this file) as the map of what is live today and what to implement next.
+Use `**context.md`** as the product spec for memory. Use `**context_main.md**` (this file) as the map of what is live today and what to implement next.
