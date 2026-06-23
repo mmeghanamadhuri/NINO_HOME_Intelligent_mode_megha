@@ -6,13 +6,13 @@
     "--query-driver=**",
     "--compile-commands-dir=d:\\Sirena Stuff\\USB_Camera\\build"
   ],
-  "idf.currentSetup": "C:\\Users\\kchak\\esp\\v5.5.2\\esp-idf",
+  "idf.currentSetup": "C:\\esp\\v5.5.2\\esp-idf",
   "idf.openOcdConfigs": [
     "board/esp32p4-builtin.cfg"
   ],
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32p4"
   },
-  "idf.portWin": "COM11",
+  "idf.portWin": "COM5",
   "idf.flashType": "JTAG"
 }

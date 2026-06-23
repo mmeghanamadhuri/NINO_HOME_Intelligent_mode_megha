@@ -111,12 +111,12 @@ static bool s_mdns_started = false;
 #define HTTP_SERVER_PORT 80
 #define HTTP_STREAM_POLL_MS 25
 #define MAX_PLAY_WAV_BYTES (384 * 1024)
-#define MDNS_HOSTNAME "espressif"
-#define MDNS_INSTANCE_NAME "espressif"
-#define MDNS_SERVICE_NAME "Espressif Bot"
+#define MDNS_HOSTNAME "NINO - HOME"
+#define MDNS_INSTANCE_NAME "NINO - HOME"
+#define MDNS_SERVICE_NAME "NINO - HOME"
 #define MDNS_SERVICE_TYPE "_nino"
 #define MDNS_SERVICE_PROTO "_tcp"
-#define STATUS_DEVICE_NAME "ESP Assistant"
+#define STATUS_DEVICE_NAME "NINO-HOME"
 #ifndef PROJECT_VER
 #define PROJECT_VER "unknown"
 #endif
@@ -168,6 +168,20 @@ static int64_t s_last_uvc_timeout_log_us;
 extern const uint8_t wifi_wav_start[] asm("_binary_WIFI_wav_start");
 extern const uint8_t wifi_wav_end[] asm("_binary_WIFI_wav_end");
 
+extern const uint8_t hello_home_wav_start[] asm("_binary_Hello_home_wav_start");
+extern const uint8_t hello_home_wav_end[] asm("_binary_Hello_home_wav_end");
+
+extern const uint8_t wifi_unable_wav_start[] asm("_binary_WIFI_UNABLE_wav_start");
+extern const uint8_t wifi_unable_wav_end[] asm("_binary_WIFI_UNABLE_wav_end");
+
+extern const uint8_t go_app_wav_start[] asm("_binary_GO_APP_wav_start");
+extern const uint8_t go_app_wav_end[] asm("_binary_GO_APP_wav_end");
+
+/* Set once WIFI-UNABLE.wav has been played for the current connect attempt so
+ * the prompt is not repeated on every reconnect retry. Reset on success and on
+ * fresh credentials from GATT provisioning. */
+static volatile bool s_wifi_unable_chimed = false;
+
 static bool play_wifi_connected_clip(void) {
   const size_t wav_len = (size_t)(wifi_wav_end - wifi_wav_start);
   if (wav_len < 44) {
@@ -185,6 +199,106 @@ static bool play_wifi_connected_clip(void) {
   ESP_LOGI(TAG, "Queued WIFI.wav (%u bytes) after STA connect",
            (unsigned)wav_len);
   return true;
+}
+
+static bool play_hello_home_clip(void) {
+  const size_t wav_len = (size_t)(hello_home_wav_end - hello_home_wav_start);
+  if (wav_len < 44) {
+    ESP_LOGW(TAG, "Embedded Hello-home.wav missing or too small");
+    return false;
+  }
+
+  esp_err_t err = nino_audio_queue_wav_copy(hello_home_wav_start, wav_len, false,
+                                            NINO_AUDIO_SERVO_PRIORITY_NONE, false);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Failed to queue Hello-home.wav: %s", esp_err_to_name(err));
+    return false;
+  }
+
+  ESP_LOGI(TAG, "Queued Hello-home.wav (%u bytes) after boot",
+           (unsigned)wav_len);
+  return true;
+}
+
+static bool play_wifi_unable_clip(void) {
+  const size_t wav_len = (size_t)(wifi_unable_wav_end - wifi_unable_wav_start);
+  if (wav_len < 44) {
+    ESP_LOGW(TAG, "Embedded WIFI-UNABLE.wav missing or too small");
+    return false;
+  }
+
+  esp_err_t err = nino_audio_queue_wav_copy(wifi_unable_wav_start, wav_len, false,
+                                            NINO_AUDIO_SERVO_PRIORITY_NONE, false);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Failed to queue WIFI-UNABLE.wav: %s", esp_err_to_name(err));
+    return false;
+  }
+
+  ESP_LOGI(TAG, "Queued WIFI-UNABLE.wav (%u bytes): STA connect failed",
+           (unsigned)wav_len);
+  return true;
+}
+
+static bool play_go_app_clip(void) {
+  const size_t wav_len = (size_t)(go_app_wav_end - go_app_wav_start);
+  if (wav_len < 44) {
+    ESP_LOGW(TAG, "Embedded GO-APP.wav missing or too small");
+    return false;
+  }
+
+  esp_err_t err = nino_audio_queue_wav_copy(go_app_wav_start, wav_len, false,
+                                            NINO_AUDIO_SERVO_PRIORITY_NONE, false);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Failed to queue GO-APP.wav: %s", esp_err_to_name(err));
+    return false;
+  }
+
+  ESP_LOGI(TAG, "Queued GO-APP.wav (%u bytes): no saved Wi-Fi network",
+           (unsigned)wav_len);
+  return true;
+}
+
+/* Disconnect reasons that mean "could not join the network" (wrong password,
+ * auth/handshake failure, or SSID not found) rather than a transient drop. */
+static bool wifi_disconnect_is_connect_failure(uint8_t reason) {
+  switch (reason) {
+    case WIFI_REASON_AUTH_EXPIRE:
+    case WIFI_REASON_AUTH_FAIL:
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_NO_AP_FOUND:
+    case WIFI_REASON_ASSOC_FAIL:
+    case WIFI_REASON_CONNECTION_FAIL:
+      return true;
+    default:
+      return false;
+  }
+}
+
+/* Boot greeting:
+ *  - No saved Wi-Fi network in NVS -> prompt the user to use the app (GO-APP).
+ *  - Provisioned and connected -> greet with Hello-home after the WIFI.wav clip.
+ *    Falls back to greeting anyway if Wi-Fi never connects within the timeout,
+ *    unless we already played the "unable to connect" prompt. */
+static void hello_home_task(void *arg) {
+  (void)arg;
+  if (s_sta_ssid[0] == '\0') {
+    play_go_app_clip();
+    vTaskDelete(NULL);
+    return;
+  }
+
+  const int timeout_ms = 60000;
+  int waited_ms = 0;
+  while (waited_ms < timeout_ms && !s_wifi_unable_chimed &&
+         !(s_sta_connected && !s_wifi_connected_chime_pending)) {
+    vTaskDelay(pdMS_TO_TICKS(100));
+    waited_ms += 100;
+  }
+  if (s_sta_connected) {
+    play_hello_home_clip();
+  }
+  vTaskDelete(NULL);
 }
 
 #if NINO_HAS_MDNS
@@ -504,6 +618,9 @@ esp_err_t wifi_config_set_sta_credentials(const char *ssid, const char *pass) {
   } else {
     s_sta_pass[0] = '\0';
   }
+  /* New credentials: allow the "unable to connect" prompt to play again if
+   * this attempt also fails. */
+  s_wifi_unable_chimed = false;
   return ESP_OK;
 }
 
@@ -871,6 +988,13 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         (wifi_event_sta_disconnected_t *)event_data;
     ESP_LOGW(TAG, "STA: Disconnected (reason %d)", ev->reason);
     if (strlen(s_sta_ssid) > 0 &&
+        wifi_disconnect_is_connect_failure(ev->reason) &&
+        !s_wifi_unable_chimed) {
+      if (play_wifi_unable_clip()) {
+        s_wifi_unable_chimed = true;
+      }
+    }
+    if (strlen(s_sta_ssid) > 0 &&
         (s_wifi_mode == WIFI_MODE_STA || s_wifi_mode == WIFI_MODE_APSTA)) {
       xTaskCreatePinnedToCore(sta_reconnect_task, "sta_reconn", 2048, NULL, 5,
                               NULL, APP_CORE_NET);
@@ -880,6 +1004,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
   if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
     ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
     s_sta_connected = true;
+    s_wifi_unable_chimed = false;
     ESP_LOGI(TAG, "STA: Got IP " IPSTR, IP2STR(&event->ip_info.ip));
     mdns_start_service();
     wifi_prov_ble_on_sta_ip_changed(true);
@@ -1323,14 +1448,44 @@ static bool parse_volume_percent_value(const char *text, int *out) {
   return true;
 }
 
+/* Minimal extractor for a numeric JSON field, e.g. {"volume": 42}. Avoids
+ * pulling in a full JSON parser for this single small request body. */
+static bool parse_json_int_field(const char *body, const char *key, int *out) {
+  if (body == NULL || key == NULL || out == NULL) {
+    return false;
+  }
+  char pattern[24];
+  int pn = snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+  if (pn <= 0 || pn >= (int)sizeof(pattern)) {
+    return false;
+  }
+  const char *p = strstr(body, pattern);
+  if (p == NULL) {
+    return false;
+  }
+  p += pn;
+  while (*p == ' ' || *p == '\t' || *p == ':' || *p == '"') {
+    p++;
+  }
+  char *end = NULL;
+  long value = strtol(p, &end, 10);
+  if (end == p || value < 0 || value > 100) {
+    return false;
+  }
+  *out = (int)value;
+  return true;
+}
+
 static esp_err_t speaker_volume_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
   if (req->method == HTTP_GET) {
     char body[96];
-    int n = snprintf(body, sizeof(body), "{\"ok\":true,\"volume_percent\":%d}",
-                     nino_audio_get_volume_percent());
+    int vol = nino_audio_get_volume_percent();
+    int n = snprintf(body, sizeof(body),
+                     "{\"ok\":true,\"volume\":%d,\"volume_percent\":%d}", vol,
+                     vol);
     if (n <= 0 || n >= (int)sizeof(body)) {
       return httpd_resp_send_500(req);
     }
@@ -1343,10 +1498,28 @@ static esp_err_t speaker_volume_handler(httpd_req_t *req) {
                            HTTPD_RESP_USE_STRLEN);
   }
 
+  int volume_percent = -1;
+  bool ok = false;
+
+  /* Preferred: JSON body {"volume": N} (also accept {"volume_percent": N}). */
   if (req->content_len > 0) {
-    char discard[64];
-    int remaining = req->content_len;
+    char body[128] = {0};
+    int to_read = req->content_len < (int)sizeof(body) - 1
+                      ? req->content_len
+                      : (int)sizeof(body) - 1;
+    int received = 0;
+    while (received < to_read) {
+      int r = httpd_req_recv(req, body + received, to_read - received);
+      if (r <= 0) {
+        break;
+      }
+      received += r;
+    }
+    body[received] = '\0';
+    /* Drain any remainder beyond our buffer so the socket stays in sync. */
+    int remaining = req->content_len - received;
     while (remaining > 0) {
+      char discard[64];
       int chunk = remaining > (int)sizeof(discard) ? (int)sizeof(discard) : remaining;
       int r = httpd_req_recv(req, discard, chunk);
       if (r <= 0) {
@@ -1354,22 +1527,26 @@ static esp_err_t speaker_volume_handler(httpd_req_t *req) {
       }
       remaining -= r;
     }
+    ok = parse_json_int_field(body, "volume", &volume_percent) ||
+         parse_json_int_field(body, "volume_percent", &volume_percent);
   }
 
-  char query[64] = {0};
-  char value_str[16] = {0};
-  int volume_percent = -1;
-  bool ok = false;
-  if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-    if (httpd_query_key_value(query, "value", value_str, sizeof(value_str)) == ESP_OK) {
-      ok = parse_volume_percent_value(value_str, &volume_percent);
+  /* Fallback: query string ?value=0..100 (legacy callers). */
+  if (!ok) {
+    char query[64] = {0};
+    char value_str[16] = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+      if (httpd_query_key_value(query, "value", value_str, sizeof(value_str)) == ESP_OK) {
+        ok = parse_volume_percent_value(value_str, &volume_percent);
+      }
     }
   }
+
   if (!ok) {
     httpd_resp_set_status(req, "400 Bad Request");
     return httpd_resp_send(
         req,
-        "{\"ok\":false,\"error\":\"missing_or_invalid_value\",\"hint\":\"use ?value=0..100\"}",
+        "{\"ok\":false,\"error\":\"missing_or_invalid_value\",\"hint\":\"POST {\\\"volume\\\":0..100} or ?value=0..100\"}",
         HTTPD_RESP_USE_STRLEN);
   }
 
@@ -1380,8 +1557,10 @@ static esp_err_t speaker_volume_handler(httpd_req_t *req) {
 
   ESP_LOGI(TAG, "Voice/HTTP: speaker volume %d%%", volume_percent);
   char body[96];
-  int n = snprintf(body, sizeof(body), "{\"ok\":true,\"volume_percent\":%d}",
-                   nino_audio_get_volume_percent());
+  int vol = nino_audio_get_volume_percent();
+  int n = snprintf(body, sizeof(body),
+                   "{\"ok\":true,\"volume\":%d,\"volume_percent\":%d}", vol,
+                   vol);
   if (n <= 0 || n >= (int)sizeof(body)) {
     return httpd_resp_send_500(req);
   }
@@ -2044,6 +2223,18 @@ static void start_http_server(void) {
       .handler = speaker_volume_handler,
       .user_ctx = NULL,
   };
+  const httpd_uri_t volume_get_uri = {
+      .uri = "/volume",
+      .method = HTTP_GET,
+      .handler = speaker_volume_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t volume_post_uri = {
+      .uri = "/volume",
+      .method = HTTP_POST,
+      .handler = speaker_volume_handler,
+      .user_ctx = NULL,
+  };
   const httpd_uri_t status_uri = {
       .uri = "/status",
       .method = HTTP_GET,
@@ -2089,6 +2280,8 @@ static void start_http_server(void) {
       httpd_register_uri_handler(s_http_server, &speaker_volume_get_uri));
   ESP_ERROR_CHECK(
       httpd_register_uri_handler(s_http_server, &speaker_volume_post_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &volume_get_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &volume_post_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &status_uri));
 #if CONFIG_HTTPD_WS_SUPPORT
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &status_ws_uri));
@@ -2403,6 +2596,7 @@ void app_main(void) {
     ESP_LOGW(TAG,
              "Speaker (BSP audio) init failed; POST /play_wav may not work");
   }
+  (void)nino_audio_load_saved_volume();
   ESP_ERROR_CHECK(nino_audio_queue_start());
   if (s_sta_connected && s_wifi_connected_chime_pending) {
     if (play_wifi_connected_clip()) {
@@ -2473,4 +2667,8 @@ void app_main(void) {
   ESP_LOGI(
       TAG,
       "Open / in a browser on your camera's IP address (check 'wifi status')");
+
+  /* Boot sequence complete: greet with Hello-home after the Wi-Fi clip. */
+  xTaskCreatePinnedToCore(hello_home_task, "hello_home", 4096, NULL, 4, NULL,
+                          APP_CORE_NET);
 }

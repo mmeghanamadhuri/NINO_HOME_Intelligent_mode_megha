@@ -38,8 +38,15 @@ esp_err_t nino_audio_play_pcm16_mono(const int16_t *samples, size_t sample_count
 void nino_audio_bus_lock(void);
 void nino_audio_bus_unlock(void);
 
-/** Set speaker output volume percent (0-100). */
+/** Set speaker output volume percent (0-100). Persisted to NVS. */
 esp_err_t nino_audio_set_volume_percent(int volume_percent);
 
 /** Current speaker output volume percent (0-100). */
 int nino_audio_get_volume_percent(void);
+
+/**
+ * Load the speaker volume saved in NVS (set by the app/console) and apply it.
+ * Falls back to the 80% default if nothing has been saved yet. Call once at
+ * boot after nino_audio_init().
+ */
+esp_err_t nino_audio_load_saved_volume(void);

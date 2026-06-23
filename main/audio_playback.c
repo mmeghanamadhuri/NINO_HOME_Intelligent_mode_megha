@@ -16,13 +16,29 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "nvs.h"
 
 static const char *TAG = "nino_audio";
+
+#define NINO_AUDIO_NVS_NS "nino_audio"
+#define NINO_AUDIO_NVS_KEY_VOL "vol"
+#define NINO_AUDIO_DEFAULT_VOLUME 80
 
 static SemaphoreHandle_t s_mutex;
 static esp_codec_dev_handle_t s_spk;
 static bool s_ready;
-static int s_volume_percent = 80;
+static int s_volume_percent = NINO_AUDIO_DEFAULT_VOLUME;
+
+static void audio_persist_volume(int volume_percent) {
+  nvs_handle_t h;
+  if (nvs_open(NINO_AUDIO_NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+    return;
+  }
+  if (nvs_set_i32(h, NINO_AUDIO_NVS_KEY_VOL, (int32_t)volume_percent) == ESP_OK) {
+    nvs_commit(h);
+  }
+  nvs_close(h);
+}
 
 /** Let I2S/codec finish samples already queued (avoids truncated two-tone beeps). */
 static void wait_pcm_pipeline_done(uint32_t sample_rate_hz, size_t pcm_bytes,
@@ -175,11 +191,29 @@ esp_err_t nino_audio_set_volume_percent(int volume_percent) {
   }
   xSemaphoreGive(s_mutex);
 
+  audio_persist_volume(volume_percent);
   ESP_LOGI(TAG, "Speaker volume set to %d%%", s_volume_percent);
   return ESP_OK;
 }
 
 int nino_audio_get_volume_percent(void) { return s_volume_percent; }
+
+esp_err_t nino_audio_load_saved_volume(void) {
+  int volume_percent = NINO_AUDIO_DEFAULT_VOLUME;
+  nvs_handle_t h;
+  if (nvs_open(NINO_AUDIO_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+    int32_t stored = NINO_AUDIO_DEFAULT_VOLUME;
+    if (nvs_get_i32(h, NINO_AUDIO_NVS_KEY_VOL, &stored) == ESP_OK &&
+        stored >= 0 && stored <= 100) {
+      volume_percent = (int)stored;
+      ESP_LOGI(TAG, "Loaded saved speaker volume from NVS: %d%%", volume_percent);
+    } else {
+      ESP_LOGI(TAG, "No saved volume in NVS, using default %d%%", volume_percent);
+    }
+    nvs_close(h);
+  }
+  return nino_audio_set_volume_percent(volume_percent);
+}
 
 esp_err_t nino_audio_play_pcm16_mono(const int16_t *samples, size_t sample_count,
                                      uint32_t sample_rate_hz) {
