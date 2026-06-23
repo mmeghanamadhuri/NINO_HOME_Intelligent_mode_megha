@@ -42,11 +42,13 @@ static suspended_playback_t s_suspended;
 static bool s_has_suspended;
 
 static bool is_touch_job(const audio_play_job_t *job) {
-  return job->servo_mode == NINO_AUDIO_SERVO_NOD_LR;
+  return job->servo_mode == NINO_AUDIO_SERVO_NOD_LR ||
+         job->servo_mode == NINO_AUDIO_SERVO_PRIORITY_NONE;
 }
 
 static void servo_motion_for_mode(nino_audio_servo_mode_t mode, bool start) {
-  if (mode == NINO_AUDIO_SERVO_NONE) {
+  if (mode == NINO_AUDIO_SERVO_NONE ||
+      mode == NINO_AUDIO_SERVO_PRIORITY_NONE) {
     return;
   }
   if (start) {

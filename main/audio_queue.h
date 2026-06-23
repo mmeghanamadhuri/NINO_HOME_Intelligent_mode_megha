@@ -11,6 +11,8 @@ typedef enum {
   NINO_AUDIO_SERVO_FULL = 0,
   NINO_AUDIO_SERVO_NOD_LR = 1,
   NINO_AUDIO_SERVO_NONE = 2,
+  /* High-priority queue with no servo motion; preempts normal clips. */
+  NINO_AUDIO_SERVO_PRIORITY_NONE = 3,
 } nino_audio_servo_mode_t;
 
 /** Start the shared playback worker (touch priority; server/voice pause/resume). */

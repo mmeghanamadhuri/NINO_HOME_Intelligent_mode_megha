@@ -25,4 +25,6 @@ dependencies:
     version: "*"
     rules:
       - if: "target in [esp32p4]"
+  espressif/mdns:
+    version: "*"
   idf: ">=5.5"

@@ -131,6 +131,11 @@ wifi status
 
 Or use BLE provisioning — see [docs/WIFI_PROVISION.md](docs/WIFI_PROVISION.md).
 
+After Wi-Fi is connected, mDNS discovery is available:
+
+- `NINO-HOME.local`
+- service `_nino._tcp` on port `443`
+
 ### 3. Set up the Python server
 
 ```bash
@@ -577,6 +582,8 @@ See also [Text-to-speech tuning](#text-to-speech-tts) in the voice section and `
 | [docs/ALARM.md](docs/ALARM.md)                   | Voice alarm commands, medical flow, scheduler |
 | [docs/SERVO.md](docs/SERVO.md)                   | Dynamixel wiring, 360 sequence, API           |
 | [docs/WIFI_PROVISION.md](docs/WIFI_PROVISION.md) | BLE / soft-AP Wi-Fi setup                     |
+| [docs/MDns.md](docs/MDns.md)                     | Current mDNS behavior and LAN validation      |
+| [docs/MDn-main.md](docs/MDn-main.md)             | mDNS implementation status + pending work     |
 | [docs/TEST_QUESTIONS.md](docs/TEST_QUESTIONS.md) | Suggested demo questions                      |
 | [context.md](context.md)                         | Full target architecture                      |
 | [context_main.md](context_main.md)               | Implemented vs planned features               |

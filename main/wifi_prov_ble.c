@@ -34,7 +34,7 @@ void ble_store_config_init(void);
 
 static const char *TAG = "wifi_prov_ble";
 
-#define PROV_DEVICE_NAME "PROV_NINO"
+#define PROV_DEVICE_NAME WIFI_PROV_BLE_DEVICE_NAME
 #define PROV_CMD_APPLY 0x01
 
 /* 4facb001-5a2e-4b7c-9e1f-a8d3e6f20401 */
@@ -156,12 +156,15 @@ static int write_mbuf_to_buf(struct os_mbuf *om, void *dst, uint16_t max_len,
   return (rc == 0) ? 0 : BLE_ATT_ERR_UNLIKELY;
 }
 
-static void prov_update_status_json(int state) {
+static void prov_update_status_json(int state, const char *msg) {
   char ip[16] = "0.0.0.0";
+  if (msg == NULL) {
+    msg = "unknown";
+  }
   wifi_config_get_sta_ip(ip, sizeof(ip));
   snprintf(s_status_json, sizeof(s_status_json),
-           "{\"state\":%d,\"connected\":%s,\"ip\":\"%s\"}", state,
-           wifi_config_sta_connected() ? "true" : "false", ip);
+           "{\"state\":%d,\"connected\":%s,\"ip\":\"%s\",\"msg\":\"%s\"}", state,
+           wifi_config_sta_connected() ? "true" : "false", ip, msg);
 }
 
 static void prov_notify_status(void) {
@@ -186,13 +189,15 @@ void wifi_prov_ble_on_sta_ip_changed(bool connected) {
       prov_advertise();
     }
   }
-  prov_update_status_json(connected ? 2 : 1);
+  prov_update_status_json(connected ? 2 : 1, connected ? "done" : "connecting");
   prov_notify_status();
 }
 
 static void prov_apply_task(void *arg) {
   (void)arg;
-  prov_update_status_json(1);
+  ESP_LOGI(TAG, "BLE apply received (ssid=%s, pass_len=%u)", s_pending_ssid,
+           (unsigned)strlen(s_pending_pass));
+  prov_update_status_json(1, "applying");
   prov_notify_status();
 
   esp_err_t err = wifi_config_set_sta_credentials(s_pending_ssid, s_pending_pass);
@@ -201,7 +206,8 @@ static void prov_apply_task(void *arg) {
   }
 
   if (err != ESP_OK) {
-    prov_update_status_json(3);
+    ESP_LOGW(TAG, "BLE apply failed before connect: %s", esp_err_to_name(err));
+    prov_update_status_json(3, "failed");
     prov_notify_status();
     vTaskDelete(NULL);
     return;
@@ -210,13 +216,15 @@ static void prov_apply_task(void *arg) {
   for (int i = 0; i < 40; ++i) {
     vTaskDelay(pdMS_TO_TICKS(500));
     if (wifi_config_sta_connected()) {
-      prov_update_status_json(2);
+      ESP_LOGI(TAG, "BLE apply success: STA connected");
+      prov_update_status_json(2, "done");
       prov_notify_status();
       vTaskDelete(NULL);
       return;
     }
   }
-  prov_update_status_json(3);
+  ESP_LOGW(TAG, "BLE apply timeout: STA did not connect in time");
+  prov_update_status_json(3, "timeout");
   prov_notify_status();
   vTaskDelete(NULL);
 }
@@ -246,6 +254,8 @@ static int gatt_prov_access(uint16_t conn_handle, uint16_t attr_handle,
     }
     s_pending_ssid[len] = '\0';
     ESP_LOGI(TAG, "BLE SSID set (%u bytes)", (unsigned)len);
+    prov_update_status_json(0, "ssid_received");
+    prov_notify_status();
     return 0;
   }
 
@@ -259,6 +269,10 @@ static int gatt_prov_access(uint16_t conn_handle, uint16_t attr_handle,
     }
     s_pending_pass[len] = '\0';
     ESP_LOGI(TAG, "BLE password set (%u bytes)", (unsigned)len);
+    if (s_pending_ssid[0] != '\0') {
+      prov_update_status_json(0, "creds_received");
+      prov_notify_status();
+    }
     return 0;
   }
 
@@ -276,13 +290,17 @@ static int gatt_prov_access(uint16_t conn_handle, uint16_t attr_handle,
     if (s_pending_ssid[0] == '\0') {
       return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     }
+    ESP_LOGI(TAG, "BLE apply command accepted");
+    prov_update_status_json(1, "apply_accepted");
+    prov_notify_status();
     xTaskCreate(prov_apply_task, "ble_prov", 4096, NULL, 5, NULL);
     return 0;
   }
 
   if (ble_uuid_cmp(uuid, &s_chr_status_uuid.u) == 0 &&
       ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
-    prov_update_status_json(wifi_config_sta_connected() ? 2 : 0);
+    prov_update_status_json(wifi_config_sta_connected() ? 2 : 0,
+                            wifi_config_sta_connected() ? "done" : "idle");
     int rc = os_mbuf_append(ctxt->om, s_status_json, strlen(s_status_json));
     return (rc == 0) ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
   }
@@ -371,7 +389,7 @@ static void on_sync(void) {
   }
 
   ble_svc_gap_device_name_set(PROV_DEVICE_NAME);
-  prov_update_status_json(0);
+  prov_update_status_json(0, "idle");
   prov_advertise();
   ESP_LOGI(TAG, "BLE provisioning GATT ready (%s)", PROV_DEVICE_NAME);
 }
@@ -405,7 +423,7 @@ esp_err_t wifi_prov_ble_start(void) {
 
   s_pending_ssid[0] = '\0';
   s_pending_pass[0] = '\0';
-  prov_update_status_json(0);
+  prov_update_status_json(0, "idle");
 
   (void)hosted_bt_setup_with_retry();
 

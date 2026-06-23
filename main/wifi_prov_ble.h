@@ -12,4 +12,4 @@ void wifi_prov_ble_on_sta_ip_changed(bool connected);
 
 /** 128-bit service UUID for Android scanner (same as firmware GATT service). */
 #define WIFI_PROV_BLE_SVC_UUID "4facb001-5a2e-4b7c-9e1f-a8d3e6f20401"
-#define WIFI_PROV_BLE_DEVICE_NAME "PROV_NINO"
+#define WIFI_PROV_BLE_DEVICE_NAME "NINO - HOME"

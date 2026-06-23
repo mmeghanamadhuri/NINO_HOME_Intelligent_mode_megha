@@ -2,26 +2,79 @@
 
 The ESP32-P4 advertises a BLE GATT service for Wi‑Fi setup. Credentials are saved to NVS and the board reconnects on every boot. A soft AP and HTTP API remain available as a fallback.
 
+## Implementation progress tracker
+
+Last updated: 2026-06-23 (BLE + mDNS sync)
+
+Current status: **BLE credential write -> apply -> NVS save -> STA connected path validated on hardware**.
+
+### Checklist (track here)
+
+- [x] BLE provisioning service implemented in firmware (`main/wifi_prov_ble.c`)
+- [x] UUIDs/device name defined and exported (`NINO - HOME`, `4fac...0401`)
+- [x] GATT chars implemented (SSID/PASS/CMD/STATUS)
+- [x] `wifi_prov_ble_start()` integrated in boot (`main/main.c`)
+- [x] Wi-Fi event to BLE status notify bridge integrated
+- [x] NVS persistence + STA reconnect flow integrated
+- [x] HTTP fallback (`/api/wifi/config`, `/api/wifi/status`) integrated
+- [x] Build defaults include NimBLE + ESP-Hosted BT (`sdkconfig.defaults.esp32p4`)
+- [ ] Device run shows healthy BLE startup logs:
+  - `C6 BLE controller ready`
+  - `NimBLE host started`
+  - `BLE provisioning GATT ready (NINO - HOME)`
+- [x] End-to-end BLE phone test passed (scan -> connect -> write creds -> apply -> connected status/ip)
+- [ ] Optional: add minimal app/test client for repeatable BLE provisioning QA
+
+### Latest validation (structured)
+
+Validated from terminal logs (`terminals/5.txt`, run around t=500s):
+
+
+| Stage                       | Evidence                                                                             | Verdict              |
+| --------------------------- | ------------------------------------------------------------------------------------ | -------------------- |
+| BLE credentials received    | `BLE password set (12 bytes)`                                                        | Pass                 |
+| Apply command received      | `BLE apply command accepted`                                                         | Pass                 |
+| Parsed credential integrity | `BLE apply received (ssid=GOSPAZE Premium Connect, pass_len=12)`                     | Pass (not corrupted) |
+| NVS persistence path        | `Saved Wi-Fi credentials to NVS (mode=3, ssid=GOSPAZE Premium Connect, pass_len=12)` | Pass                 |
+| STA connect                 | `STA: Connected to AP`                                                               | Pass                 |
+| STA IP acquired             | `STA: Got IP 192.168.0.89`                                                           | Pass                 |
+| BLE flow completion         | `BLE apply success: STA connected`                                                   | Pass                 |
+
+
+Credential quality verdict:
+
+- SSID string is preserved end-to-end (BLE apply log == NVS save log).
+- Password is represented by stable length (`12`) at BLE receive and NVS commit points.
+- No signs of truncation/encoding corruption in this run.
+
+### Remaining gap
+
+- Capture startup-signature logs (`C6 BLE controller ready`, `NimBLE host started`, `BLE provisioning GATT ready`) in one boot transcript for complete bring-up evidence.
+
 ## BLE discovery
 
-| Field | Value |
-|-------|--------|
-| Advertised name | `PROV_NINO` |
-| Service UUID | `4facb001-5a2e-4b7c-9e1f-a8d3e6f20401` |
-| Soft AP (optional) | `ESP32_P4_CAM` / `12345678` |
 
-Scan for **PROV_NINO** or filter by the service UUID above.
+| Field              | Value                                  |
+| ------------------ | -------------------------------------- |
+| Advertised name    | `NINO - HOME`                          |
+| Service UUID       | `4facb001-5a2e-4b7c-9e1f-a8d3e6f20401` |
+| Soft AP (optional) | `ESP32_P4_CAM` / `12345678`            |
+
+
+Scan for **NINO - HOME** or filter by the service UUID above.
 
 ## GATT layout
 
 All characteristics belong to service `4facb001-5a2e-4b7c-9e1f-a8d3e6f20401`.
 
-| Characteristic UUID | Properties | Max length | Description |
-|---------------------|------------|------------|-------------|
-| `...0201` `4facb001-5a2e-4b7c-9e1f-a8d3e6f20402` | Write | 32 | Home Wi‑Fi SSID (UTF-8) |
-| `...0301` `4facb001-5a2e-4b7c-9e1f-a8d3e6f20403` | Write | 64 | Home Wi‑Fi password (UTF-8, may be empty) |
-| `...0401` `4facb001-5a2e-4b7c-9e1f-a8d3e6f20404` | Write | 1 | Command: `0x01` = apply and connect |
-| `...0501` `4facb001-5a2e-4b7c-9e1f-a8d3e6f20405` | Read, Notify | 96 | JSON status (see below) |
+
+| Characteristic UUID                              | Properties   | Max length | Description                               |
+| ------------------------------------------------ | ------------ | ---------- | ----------------------------------------- |
+| `...0201` `4facb001-5a2e-4b7c-9e1f-a8d3e6f20402` | Write        | 32         | Home Wi‑Fi SSID (UTF-8)                   |
+| `...0301` `4facb001-5a2e-4b7c-9e1f-a8d3e6f20403` | Write        | 64         | Home Wi‑Fi password (UTF-8, may be empty) |
+| `...0401` `4facb001-5a2e-4b7c-9e1f-a8d3e6f20404` | Write        | 1          | Command: `0x01` = apply and connect       |
+| `...0501` `4facb001-5a2e-4b7c-9e1f-a8d3e6f20405` | Read, Notify | 96         | JSON status (see below)                   |
+
 
 Full UUIDs:
 
@@ -32,25 +85,38 @@ Full UUIDs:
 
 ### Android provisioning sequence (GATT)
 
-1. Scan and connect to `PROV_NINO` (no pairing required).
+1. Scan and connect to `NINO - HOME` (no pairing required).
 2. Discover service `4facb001-5a2e-4b7c-9e1f-a8d3e6f20401`.
 3. Enable notifications on the status characteristic (`...0501`).
 4. Write SSID to `...0201`.
 5. Write password to `...0301` (zero-length write for open networks).
 6. Write `0x01` to command characteristic `...0401`.
 7. Wait for status notify/read:
-   - `state` **1** = connecting
-   - `state` **2** = connected (`connected` true, `ip` set)
-   - `state` **3** = failed
+  - `msg` **creds_received** = firmware has credentials
+  - `msg` **done** = apply completed and STA connected
+  - `state` **1** = connecting
+  - `state` **2** = connected (`connected` true, `ip` set)
+  - `state` **3** = failed
 8. Move the phone to the same home Wi‑Fi; the robot is reachable at `http://<ip>/`.
 
 Example status JSON:
 
 ```json
-{"state":2,"connected":true,"ip":"192.168.1.42"}
+{"state":2,"connected":true,"ip":"192.168.1.42","msg":"done"}
 ```
 
 `state` values: `0` idle, `1` connecting, `2` connected, `3` failed.
+
+`msg` values (milestones for app UX):
+
+- `idle` - no active BLE apply flow yet
+- `ssid_received` - SSID characteristic was written
+- `creds_received` - credentials are present on firmware side
+- `apply_accepted` - command `0x01` accepted
+- `applying` - Wi-Fi connect attempt started
+- `done` - credentials applied and station connected
+- `failed` - apply/connect failed before connect
+- `timeout` - connect did not complete in time
 
 ### Kotlin / Android BLE hints
 
@@ -63,11 +129,13 @@ Example status JSON:
 
 Namespace `wifi_cfg`:
 
-| Key | Content |
-|-----|---------|
-| `mode` | `2` = STA after BLE/HTTP provision |
-| `sta_ssid` | Router SSID |
-| `sta_pass` | Router password |
+
+| Key        | Content                            |
+| ---------- | ---------------------------------- |
+| `mode`     | `2` = STA after BLE/HTTP provision |
+| `sta_ssid` | Router SSID                        |
+| `sta_pass` | Router password                    |
+
 
 On reboot the firmware loads these keys and calls `esp_wifi_connect()` automatically.
 
@@ -78,9 +146,25 @@ If BLE is unavailable, join `ESP32_P4_CAM` and use:
 - `POST http://192.168.4.1/api/wifi/config` — body `{"ssid":"...","password":"..."}`
 - `GET http://192.168.4.1/api/wifi/status` — poll until `sta_connected` is true
 
+## mDNS discovery after provisioning
+
+After STA receives IP, firmware now starts mDNS advertisement automatically.
+
+- Hostname: `espressif.local` (mDNS label: `espressif`)
+- Service: `_nino._tcp`
+- Port: `80`
+
+Use this for zero-config LAN access after BLE provisioning:
+
+- `http://espressif.lan/status` (if LAN DNS has `espressif.lan`) or `http://espressif.local/status` (mDNS)
+
 ## Build requirements (ESP32-P4)
 
 `sdkconfig.defaults.esp32p4` enables NimBLE host + ESP-Hosted VHCI to the on-board ESP32-C6.
+
+mDNS is provided by Component Manager dependency:
+
+- `main/idf_component.yml` -> `espressif/mdns`
 
 **After pulling BLE changes you must regenerate sdkconfig**, or the build fails looking for `host/ble_gap.h`:
 
@@ -104,6 +188,31 @@ wifi connect <SSID> [password]
 wifi status
 ```
 
+### Expected BLE provisioning logs
+
+When the mobile app writes credentials and sends apply (`0x01`), monitor should show logs similar to:
+
+```text
+I (...) wifi_prov_ble: BLE SSID set (.. bytes)
+I (...) wifi_prov_ble: BLE password set (.. bytes)
+I (...) wifi_prov_ble: BLE apply command accepted
+I (...) wifi_prov_ble: BLE apply received (ssid=<your-ssid>, pass_len=<n>)
+I (...) main: Saved Wi-Fi credentials to NVS (mode=2, ssid=<your-ssid>, pass_len=<n>)
+```
+
+If connection completes:
+
+```text
+I (...) wifi_prov_ble: BLE apply success: STA connected
+```
+
+If it fails before connect or times out:
+
+```text
+W (...) wifi_prov_ble: BLE apply failed before connect: <err>
+W (...) wifi_prov_ble: BLE apply timeout: STA did not connect in time
+```
+
 ## Reset Wi‑Fi
 
 Erase NVS namespace `wifi_cfg`, or `idf.py erase-flash`, or `wifi mode ap` then provision again.
@@ -124,7 +233,7 @@ idf.py build
 idf.py flash monitor
 ```
 
-A healthy boot should reach `app_main` logs and eventually `BLE provisioning GATT ready (PROV_NINO)` or `NimBLE host started`.
+A healthy boot should reach `app_main` logs and eventually `BLE provisioning GATT ready (NINO - HOME)` or `NimBLE host started`.
 
 ## BLE: `bt_controller_init failed` / co-processor version `0.0.0`
 

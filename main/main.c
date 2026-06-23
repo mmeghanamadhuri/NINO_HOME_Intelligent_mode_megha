@@ -28,6 +28,16 @@
 #include "usb/usb_host.h"
 #include "usb/uvc_host.h"
 
+#if __has_include("mdns.h")
+#include "mdns.h"
+#define NINO_HAS_MDNS 1
+#elif __has_include("mdns/include/mdns.h")
+#include "mdns/include/mdns.h"
+#define NINO_HAS_MDNS 1
+#else
+#define NINO_HAS_MDNS 0
+#endif
+
 #include "audio_playback.h"
 #include "audio_capture.h"
 #include "audio_queue.h"
@@ -67,6 +77,8 @@ static char s_sta_pass[WIFI_CONFIG_STA_PASS_MAX] = "";
 
 static wifi_mode_t s_wifi_mode = WIFI_MODE_AP;
 static bool s_sta_connected = false;
+static bool s_wifi_connected_chime_pending = false;
+static bool s_mdns_started = false;
 
 #define USB_LIB_TASK_STACK_SIZE 4096
 #define USB_LIB_TASK_PRIORITY 20
@@ -99,6 +111,15 @@ static bool s_sta_connected = false;
 #define HTTP_SERVER_PORT 80
 #define HTTP_STREAM_POLL_MS 25
 #define MAX_PLAY_WAV_BYTES (384 * 1024)
+#define MDNS_HOSTNAME "espressif"
+#define MDNS_INSTANCE_NAME "espressif"
+#define MDNS_SERVICE_NAME "Espressif Bot"
+#define MDNS_SERVICE_TYPE "_nino"
+#define MDNS_SERVICE_PROTO "_tcp"
+#define STATUS_DEVICE_NAME "ESP Assistant"
+#ifndef PROJECT_VER
+#define PROJECT_VER "unknown"
+#endif
 
 #if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
 #define APP_CORE_NET 0
@@ -143,6 +164,100 @@ static esp_console_repl_t *s_repl;
 static char s_voice_ws_url[160];
 static bool s_voice_wake_started;
 static int64_t s_last_uvc_timeout_log_us;
+
+extern const uint8_t wifi_wav_start[] asm("_binary_WIFI_wav_start");
+extern const uint8_t wifi_wav_end[] asm("_binary_WIFI_wav_end");
+
+static bool play_wifi_connected_clip(void) {
+  const size_t wav_len = (size_t)(wifi_wav_end - wifi_wav_start);
+  if (wav_len < 44) {
+    ESP_LOGW(TAG, "Embedded WIFI.wav missing or too small");
+    return false;
+  }
+
+  esp_err_t err = nino_audio_queue_wav_copy(wifi_wav_start, wav_len, false,
+                                            NINO_AUDIO_SERVO_PRIORITY_NONE, false);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Failed to queue WIFI.wav: %s", esp_err_to_name(err));
+    return false;
+  }
+
+  ESP_LOGI(TAG, "Queued WIFI.wav (%u bytes) after STA connect",
+           (unsigned)wav_len);
+  return true;
+}
+
+#if NINO_HAS_MDNS
+static void mdns_stop_service(void) {
+  if (!s_mdns_started) {
+    return;
+  }
+  mdns_free();
+  s_mdns_started = false;
+  ESP_LOGI(TAG, "mDNS stopped");
+}
+
+static void mdns_start_service(void) {
+  if (s_mdns_started) {
+    return;
+  }
+
+  esp_err_t err = mdns_init();
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "mDNS init failed: %s", esp_err_to_name(err));
+    return;
+  }
+
+  err = mdns_hostname_set(MDNS_HOSTNAME);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "mDNS hostname set failed: %s", esp_err_to_name(err));
+    mdns_free();
+    return;
+  }
+
+  err = mdns_instance_name_set(MDNS_INSTANCE_NAME);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "mDNS instance set failed: %s", esp_err_to_name(err));
+    mdns_free();
+    return;
+  }
+
+  err = mdns_service_add(MDNS_SERVICE_NAME, MDNS_SERVICE_TYPE, MDNS_SERVICE_PROTO,
+                         HTTP_SERVER_PORT, NULL, 0);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "mDNS service add failed: %s", esp_err_to_name(err));
+    mdns_free();
+    return;
+  }
+
+  mdns_txt_item_t txt[] = {
+      {"device", "nino"},
+      {"ble_name", WIFI_PROV_BLE_DEVICE_NAME},
+      {"transport", "http"},
+  };
+  err = mdns_service_txt_set(MDNS_SERVICE_TYPE, MDNS_SERVICE_PROTO, txt,
+                             sizeof(txt) / sizeof(txt[0]));
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "mDNS TXT set failed: %s", esp_err_to_name(err));
+    mdns_free();
+    return;
+  }
+
+  s_mdns_started = true;
+  ESP_LOGI(TAG, "mDNS ready: %s.local service %s.%s port %d", MDNS_HOSTNAME,
+           MDNS_SERVICE_TYPE, MDNS_SERVICE_PROTO, HTTP_SERVER_PORT);
+}
+#else
+static void mdns_stop_service(void) {}
+
+static void mdns_start_service(void) {
+  static bool s_logged_missing_mdns;
+  if (!s_logged_missing_mdns) {
+    s_logged_missing_mdns = true;
+    ESP_LOGW(TAG, "mDNS headers not available in current build environment");
+  }
+}
+#endif
 
 static void voice_wake_start_once(void) {
   if (s_voice_wake_started) {
@@ -343,7 +458,8 @@ static void wifi_save_to_nvs(wifi_mode_t mode) {
   nvs_set_str(h, NVS_KEY_STA_PASS, s_sta_pass);
   nvs_commit(h);
   nvs_close(h);
-  ESP_LOGI(TAG, "Saved mode %d to NVS", (int)mode);
+  ESP_LOGI(TAG, "Saved Wi-Fi credentials to NVS (mode=%d, ssid=%s, pass_len=%u)",
+           (int)mode, s_sta_ssid, (unsigned)strlen(s_sta_pass));
 }
 
 esp_err_t wifi_config_sta_connect(wifi_mode_t mode_to_save) {
@@ -748,7 +864,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 
   if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
     s_sta_connected = false;
+    s_wifi_connected_chime_pending = true;
     wifi_prov_ble_on_sta_ip_changed(false);
+    mdns_stop_service();
     wifi_event_sta_disconnected_t *ev =
         (wifi_event_sta_disconnected_t *)event_data;
     ESP_LOGW(TAG, "STA: Disconnected (reason %d)", ev->reason);
@@ -763,7 +881,13 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
     s_sta_connected = true;
     ESP_LOGI(TAG, "STA: Got IP " IPSTR, IP2STR(&event->ip_info.ip));
+    mdns_start_service();
     wifi_prov_ble_on_sta_ip_changed(true);
+    if (s_wifi_connected_chime_pending) {
+      if (play_wifi_connected_clip()) {
+        s_wifi_connected_chime_pending = false;
+      }
+    }
   }
 }
 
@@ -849,6 +973,8 @@ static void wifi_init_all(void) {
 
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+  s_wifi_connected_chime_pending = true;
 
   ESP_ERROR_CHECK(esp_event_handler_instance_register(
       WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
@@ -1360,6 +1486,20 @@ static bool json_copy_quoted_value(const char *start, char *out, size_t out_sz) 
   return true;
 }
 
+static int app_status_json(char *buf, size_t buf_sz) {
+  char sta_ip[16] = "0.0.0.0";
+  wifi_config_get_sta_ip(sta_ip, sizeof(sta_ip));
+  const char *fw_version = PROJECT_VER;
+
+  return snprintf(
+      buf, buf_sz,
+      "{\"ok\":true,\"device_name\":\"%s\",\"wifi_ssid\":\"%s\","
+      "\"volume\":%d,\"firmware\":\"%s\",\"sta_connected\":%s,"
+      "\"ip\":\"%s\",\"mdns_host\":\"%s.local\"}",
+      STATUS_DEVICE_NAME, s_sta_ssid, nino_audio_get_volume_percent(), fw_version,
+      s_sta_connected ? "true" : "false", sta_ip, MDNS_HOSTNAME);
+}
+
 int wifi_config_status_json(char *buf, size_t buf_sz) {
   wifi_mode_t mode;
   if (esp_wifi_get_mode(&mode) != ESP_OK) {
@@ -1382,6 +1522,91 @@ int wifi_config_status_json(char *buf, size_t buf_sz) {
       mode_str, s_sta_connected ? "true" : "false", s_sta_ssid, ap_ip, sta_ip,
       wifi_config_is_provisioned() ? "true" : "false");
 }
+
+static esp_err_t status_handler(httpd_req_t *req) {
+  if (req->method != HTTP_GET) {
+    httpd_resp_set_status(req, "405 Method Not Allowed");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"GET only\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+
+  char body[320];
+  int n = app_status_json(body, sizeof(body));
+  if (n < 0 || n >= (int)sizeof(body)) {
+    return httpd_resp_send_500(req);
+  }
+
+  httpd_resp_set_type(req, "application/json");
+  wifi_http_set_cors(req);
+  return httpd_resp_send(req, body, n);
+}
+
+#if CONFIG_HTTPD_WS_SUPPORT
+static esp_err_t status_ws_send(httpd_req_t *req) {
+  char body[320];
+  int n = app_status_json(body, sizeof(body));
+  if (n < 0 || n >= (int)sizeof(body)) {
+    return ESP_FAIL;
+  }
+  httpd_ws_frame_t out = {
+      .type = HTTPD_WS_TYPE_TEXT,
+      .payload = (uint8_t *)body,
+      .len = (size_t)n,
+  };
+  return httpd_ws_send_frame(req, &out);
+}
+
+static esp_err_t status_ws_handler(httpd_req_t *req) {
+  if (req->method == HTTP_GET) {
+    return ESP_OK; // websocket handshake
+  }
+
+  httpd_ws_frame_t in = {};
+  in.type = HTTPD_WS_TYPE_TEXT;
+  esp_err_t err = httpd_ws_recv_frame(req, &in, 0);
+  if (err != ESP_OK) {
+    return err;
+  }
+
+  char *payload = NULL;
+  if (in.len > 0) {
+    payload = calloc(1, in.len + 1);
+    if (payload == NULL) {
+      return ESP_ERR_NO_MEM;
+    }
+    in.payload = (uint8_t *)payload;
+    err = httpd_ws_recv_frame(req, &in, in.len);
+    if (err != ESP_OK) {
+      free(payload);
+      return err;
+    }
+  }
+
+  bool send_status = true;
+  if (payload != NULL && in.type == HTTPD_WS_TYPE_TEXT) {
+    if (strcmp(payload, "status") != 0 && strcmp(payload, "get_status") != 0 &&
+        strcmp(payload, "ping") != 0) {
+      send_status = false;
+    }
+  }
+
+  if (!send_status) {
+    const char *msg = "{\"ok\":false,\"error\":\"send 'status'\"}";
+    httpd_ws_frame_t out = {
+        .type = HTTPD_WS_TYPE_TEXT,
+        .payload = (uint8_t *)msg,
+        .len = strlen(msg),
+    };
+    err = httpd_ws_send_frame(req, &out);
+  } else {
+    err = status_ws_send(req);
+  }
+
+  free(payload);
+  return err;
+}
+#endif
 
 static esp_err_t wifi_prov_status_handler(httpd_req_t *req) {
   if (req->method != HTTP_GET) {
@@ -1819,6 +2044,23 @@ static void start_http_server(void) {
       .handler = speaker_volume_handler,
       .user_ctx = NULL,
   };
+  const httpd_uri_t status_uri = {
+      .uri = "/status",
+      .method = HTTP_GET,
+      .handler = status_handler,
+      .user_ctx = NULL,
+  };
+#if CONFIG_HTTPD_WS_SUPPORT
+  const httpd_uri_t status_ws_uri = {
+      .uri = "/ws/status",
+      .method = HTTP_GET,
+      .handler = status_ws_handler,
+      .user_ctx = NULL,
+      .is_websocket = true,
+      .handle_ws_control_frames = false,
+      .supported_subprotocol = NULL,
+  };
+#endif
   const httpd_uri_t wifi_prov_config_uri = {
       .uri = "/api/wifi/config",
       .method = HTTP_POST,
@@ -1847,6 +2089,10 @@ static void start_http_server(void) {
       httpd_register_uri_handler(s_http_server, &speaker_volume_get_uri));
   ESP_ERROR_CHECK(
       httpd_register_uri_handler(s_http_server, &speaker_volume_post_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &status_uri));
+#if CONFIG_HTTPD_WS_SUPPORT
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &status_ws_uri));
+#endif
   ESP_ERROR_CHECK(
       httpd_register_uri_handler(s_http_server, &wifi_prov_config_uri));
   ESP_ERROR_CHECK(
@@ -2158,6 +2404,11 @@ void app_main(void) {
              "Speaker (BSP audio) init failed; POST /play_wav may not work");
   }
   ESP_ERROR_CHECK(nino_audio_queue_start());
+  if (s_sta_connected && s_wifi_connected_chime_pending) {
+    if (play_wifi_connected_clip()) {
+      s_wifi_connected_chime_pending = false;
+    }
+  }
   if (nino_touch_sensor_start() != ESP_OK) {
     ESP_LOGW(TAG, "QT2120 touch sensor task not started");
   }
@@ -2169,6 +2420,7 @@ void app_main(void) {
 
   console_init();
   start_http_server();
+  /* HTTP-only mode for now: keep status/websocket on port 80. */
 
   ESP_LOGI(TAG, "Installing USB host stack");
   const usb_host_config_t usb_host_config = {
