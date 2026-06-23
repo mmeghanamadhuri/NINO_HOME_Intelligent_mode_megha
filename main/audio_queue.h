@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "nino_eye.h"
 
 /** How servos move while a queued WAV plays on the speaker. */
 typedef enum {
@@ -21,10 +22,12 @@ esp_err_t nino_audio_queue_start(void);
 /**
  * Enqueue WAV for speaker playback. Takes ownership of @p wav (freed after play).
  * Blocks until the job is queued — no drop when the speaker is busy.
+ * @p eye_state is shown while this clip plays and reverts to idle when it ends;
+ * pass NINO_EYE_STATE_COUNT to leave the eyes untouched.
  */
 esp_err_t nino_audio_queue_wav(uint8_t *wav, size_t len, bool play_done_chime,
                                nino_audio_servo_mode_t servo_mode,
-                               bool prompt_ack_after);
+                               bool prompt_ack_after, nino_eye_state_t eye_state);
 
 /**
  * Copy @p wav into heap, then enqueue (for embedded flash clips e.g. touch warning).
@@ -34,6 +37,8 @@ esp_err_t nino_audio_queue_wav_copy(const uint8_t *wav, size_t len, bool play_do
                                     nino_audio_servo_mode_t servo_mode,
                                     bool prompt_ack_after);
 
-/** Voice assistant: queue server reply WAV; optional done chime after. */
+/** Voice assistant: queue server reply WAV; optional done chime after.
+ *  @p eye_state is the expression to show during playback (idle afterwards);
+ *  pass NINO_EYE_STATE_COUNT for no expression. */
 void nino_main_queue_audio_wav(uint8_t *pcm_wav, size_t len, bool play_done_chime,
-                               bool prompt_ack_after);
+                               bool prompt_ack_after, nino_eye_state_t eye_state);

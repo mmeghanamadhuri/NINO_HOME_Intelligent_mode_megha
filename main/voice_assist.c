@@ -405,7 +405,9 @@ static esp_err_t run_ws_and_queue(int max_seconds, bool *prompt_after_out) {
   uint8_t *resp = NULL;
   size_t resp_len = 0;
   bool prompt_after = false;
-  e = nino_voice_ws_exchange(uri, cap, cap_len, &resp, &resp_len, 300000, &prompt_after);
+  char eye_expr[16] = {0};
+  e = nino_voice_ws_exchange(uri, cap, cap_len, &resp, &resp_len, 300000, &prompt_after,
+                             eye_expr, sizeof(eye_expr));
   nino_audio_capture_free(cap);
 
   if (e != ESP_OK || resp == NULL || resp_len == 0) {
@@ -414,7 +416,13 @@ static esp_err_t run_ws_and_queue(int max_seconds, bool *prompt_after_out) {
     return (e != ESP_OK) ? e : ESP_ERR_NOT_FOUND;
   }
 
-  nino_main_queue_audio_wav(resp, resp_len, true, prompt_after);
+  /* Map the server's eye_expression tag to a state (NINO_EYE_STATE_COUNT when
+   * absent/unknown -> the reply plays on idle). */
+  nino_eye_state_t eye_state = nino_eye_state_from_name(eye_expr);
+  if (eye_state < NINO_EYE_STATE_COUNT) {
+    ESP_LOGI(TAG, "Reply eye_expression=%s -> state %d", eye_expr, (int)eye_state);
+  }
+  nino_main_queue_audio_wav(resp, resp_len, true, prompt_after, eye_state);
   if (prompt_after_out != NULL) {
     *prompt_after_out = prompt_after;
   }

@@ -9,6 +9,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "nino_eye.h"
 #include "servo_dxl.h"
 #include "servo_motion.h"
 #include "voice_assist.h"
@@ -26,6 +27,7 @@ typedef struct {
   bool play_done_chime;
   nino_audio_servo_mode_t servo_mode;
   bool prompt_ack_after;
+  nino_eye_state_t eye_state; /* expression while playing; NINO_EYE_STATE_COUNT = none */
 } audio_play_job_t;
 
 typedef struct {
@@ -99,14 +101,25 @@ static bool play_touch_job(audio_play_job_t *job) {
 }
 
 static bool play_normal_job(audio_play_job_t *job) {
+  /* Expression (if any) is already showing from the moment the tag arrived; keep
+   * it for the whole reply and revert to idle when the clip ends. */
+  const bool has_expr = (job->eye_state < NINO_EYE_STATE_COUNT);
+
   nino_decoded_wav_t decoded = {};
   if (nino_audio_decode_wav(job->data, job->len, &decoded) != ESP_OK) {
     ESP_LOGW(TAG, "WAV decode failed");
     free(job->data);
+    if (has_expr) {
+      nino_eye_idle();
+    }
     return true;
   }
   free(job->data);
   job->data = NULL;
+
+  if (has_expr) {
+    nino_eye_set_state(job->eye_state);
+  }
 
   size_t offset = 0;
   const bool completed =
@@ -122,6 +135,11 @@ static bool play_normal_job(audio_play_job_t *job) {
     ESP_LOGI(TAG, "Server WAV paused at %u/%u bytes for touch",
              (unsigned)offset, (unsigned)decoded.num_bytes);
     return false;
+  }
+
+  /* TTS finished: back to idle (server contract). */
+  if (has_expr) {
+    nino_eye_idle();
   }
 
   if (job->play_done_chime) {
@@ -254,7 +272,7 @@ esp_err_t nino_audio_queue_start(void) {
 
 esp_err_t nino_audio_queue_wav(uint8_t *wav, size_t len, bool play_done_chime,
                                nino_audio_servo_mode_t servo_mode,
-                               bool prompt_ack_after) {
+                               bool prompt_ack_after, nino_eye_state_t eye_state) {
   if (wav == NULL || len == 0) {
     free(wav);
     return ESP_ERR_INVALID_ARG;
@@ -266,6 +284,7 @@ esp_err_t nino_audio_queue_wav(uint8_t *wav, size_t len, bool play_done_chime,
       .play_done_chime = play_done_chime,
       .servo_mode = servo_mode,
       .prompt_ack_after = prompt_ack_after,
+      .eye_state = eye_state,
   };
 
   if (is_touch_job(&job)) {
@@ -291,14 +310,15 @@ esp_err_t nino_audio_queue_wav_copy(const uint8_t *wav, size_t len, bool play_do
     return ESP_ERR_NO_MEM;
   }
   memcpy(copy, wav, len);
-  return nino_audio_queue_wav(copy, len, play_done_chime, servo_mode, prompt_ack_after);
+  return nino_audio_queue_wav(copy, len, play_done_chime, servo_mode, prompt_ack_after,
+                              NINO_EYE_STATE_COUNT);
 }
 
 void nino_main_queue_audio_wav(uint8_t *pcm_wav, size_t len, bool play_done_chime,
-                               bool prompt_ack_after) {
+                               bool prompt_ack_after, nino_eye_state_t eye_state) {
   /* Same L/R/U/D as POST /play_wav; motion stops when clip ends (/servo/360 stops it too). */
   esp_err_t err = nino_audio_queue_wav(pcm_wav, len, play_done_chime,
-                                       NINO_AUDIO_SERVO_FULL, prompt_ack_after);
+                                       NINO_AUDIO_SERVO_FULL, prompt_ack_after, eye_state);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "voice: queue WAV failed: %s", esp_err_to_name(err));
   }

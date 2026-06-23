@@ -15,6 +15,8 @@ static const char *TAG = "nino_vws";
 /* Long TTS replies at 16 kHz mono: ~4 min max; must exceed largest WS binary frame reassembly. */
 #define MAX_VOICE_WAV (4 * 1024 * 1024)
 
+#define EYE_EXPR_MAX 16
+
 typedef struct {
   SemaphoreHandle_t done;
   esp_websocket_client_handle_t client;
@@ -24,6 +26,7 @@ typedef struct {
   bool complete;
   bool error;
   bool prompt_medical_ack;
+  char eye_expr[EYE_EXPR_MAX];
 } vws_ctx_t;
 
 static bool chunk_contains(const char *hay, size_t hay_len, const char *needle) {
@@ -39,9 +42,52 @@ static bool chunk_contains(const char *hay, size_t hay_len, const char *needle) 
   return false;
 }
 
+/*
+ * Pull the quoted string value of "eye_expression" out of the JSON metadata,
+ * matching the server format e.g. {"prompt_medical_ack": false, "eye_expression": "sad"}.
+ * Tolerant of spaces around ':' and the key being anywhere in the object.
+ */
+static void parse_eye_expression(vws_ctx_t *ctx, const char *text, size_t len) {
+  static const char key[] = "\"eye_expression\"";
+  const size_t key_len = sizeof(key) - 1;
+  if (len < key_len) {
+    return;
+  }
+  size_t i = 0;
+  for (; i + key_len <= len; ++i) {
+    if (memcmp(text + i, key, key_len) == 0) {
+      break;
+    }
+  }
+  if (i + key_len > len) {
+    return;
+  }
+  size_t p = i + key_len;
+  /* Skip whitespace and the ':' separator. */
+  while (p < len && (text[p] == ' ' || text[p] == '\t' || text[p] == ':')) {
+    p++;
+  }
+  if (p >= len || text[p] != '"') {
+    return;
+  }
+  p++;
+  size_t out = 0;
+  while (p < len && text[p] != '"' && out < sizeof(ctx->eye_expr) - 1) {
+    ctx->eye_expr[out++] = text[p++];
+  }
+  ctx->eye_expr[out] = '\0';
+}
+
 static void parse_metadata_text(vws_ctx_t *ctx, const char *text, size_t len) {
   if (ctx == NULL || text == NULL || len == 0) {
     return;
+  }
+  parse_eye_expression(ctx, text, len);
+  /* Show the expression the instant the tag arrives (the reply WAV is still
+   * downloading); it then holds through playback and the audio queue reverts to
+   * idle once the reply finishes. */
+  if (ctx->eye_expr[0] != '\0') {
+    nino_eye_apply_expression(ctx->eye_expr);
   }
   if (!chunk_contains(text, len, "prompt_medical_ack")) {
     return;
@@ -132,7 +178,8 @@ static void on_event(void *handler_args, esp_event_base_t base, int32_t event_id
 esp_err_t nino_voice_ws_exchange(const char *ws_uri, const uint8_t *wav_in,
                                    size_t wav_in_len, uint8_t **wav_out,
                                    size_t *wav_out_len, int timeout_ms,
-                                   bool *prompt_medical_ack_out) {
+                                   bool *prompt_medical_ack_out,
+                                   char *eye_expr_out, size_t eye_expr_cap) {
   if (ws_uri == NULL || wav_in == NULL || wav_out == NULL || wav_out_len == NULL ||
       wav_in_len == 0) {
     return ESP_ERR_INVALID_ARG;
@@ -142,6 +189,9 @@ esp_err_t nino_voice_ws_exchange(const char *ws_uri, const uint8_t *wav_in,
   if (prompt_medical_ack_out != NULL) {
     *prompt_medical_ack_out = false;
   }
+  if (eye_expr_out != NULL && eye_expr_cap > 0) {
+    eye_expr_out[0] = '\0';
+  }
 
   vws_ctx_t ctx = {.done = xSemaphoreCreateBinary(),
                    .client = NULL,
@@ -150,7 +200,8 @@ esp_err_t nino_voice_ws_exchange(const char *ws_uri, const uint8_t *wav_in,
                    .cap = 0,
                    .complete = false,
                    .error = false,
-                   .prompt_medical_ack = false};
+                   .prompt_medical_ack = false,
+                   .eye_expr = {0}};
   if (ctx.done == NULL) {
     return ESP_ERR_NO_MEM;
   }
@@ -211,14 +262,14 @@ esp_err_t nino_voice_ws_exchange(const char *ws_uri, const uint8_t *wav_in,
   }
 
 cleanup:
-  /* Reply WAV received (or connect/send/wait failed): back to idle. Also
-   * guarantees the eyes never stick in listening/thinking. */
-  nino_eye_idle();
   esp_websocket_client_stop(ctx.client);
   esp_websocket_client_destroy(ctx.client);
   vSemaphoreDelete(ctx.done);
 
   if (ctx.error || ctx.len == 0 || ctx.buf == NULL) {
+    /* Failed/empty: nothing will play to revert the eyes, so clear any emotion
+     * (or stuck listening/thinking) back to idle now. */
+    nino_eye_idle();
     if (ctx.len > 0 && ctx.buf != NULL) {
       ESP_LOGW(TAG, "WS done but error=%d len=%u (reply dropped)", (int)ctx.error, (unsigned)ctx.len);
     }
@@ -226,10 +277,21 @@ cleanup:
     return ctx.error ? ESP_FAIL : ESP_ERR_NOT_FOUND;
   }
 
+  /* Success: if the server sent an expression it is already showing and must
+   * persist until the reply finishes (the audio queue reverts to idle then).
+   * With no tag, drop the thinking face to idle for this reply. */
+  if (ctx.eye_expr[0] == '\0') {
+    nino_eye_idle();
+  }
+
   *wav_out = ctx.buf;
   *wav_out_len = ctx.len;
   if (prompt_medical_ack_out != NULL) {
     *prompt_medical_ack_out = ctx.prompt_medical_ack;
+  }
+  if (eye_expr_out != NULL && eye_expr_cap > 0) {
+    strncpy(eye_expr_out, ctx.eye_expr, eye_expr_cap - 1);
+    eye_expr_out[eye_expr_cap - 1] = '\0';
   }
   return ESP_OK;
 }

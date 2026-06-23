@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "nino_eye.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -12,7 +13,7 @@ extern "C" {
 
 /** Queues WAV on the shared speaker FIFO (see audio_queue.c). */
 void nino_main_queue_audio_wav(uint8_t *pcm_wav, size_t len, bool play_done_chime,
-                               bool prompt_ack_after);
+                               bool prompt_ack_after, nino_eye_state_t eye_state);
 
 /** Copy current WebSocket URL (e.g. after `voice connect`). */
 void nino_voice_assist_set_ws_uri(const char *uri);

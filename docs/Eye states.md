@@ -18,13 +18,13 @@ This document describes the **9 eye states** driven by the NINO eye animation en
 
 ## Emotion States
 
-Excluding the functional states (idle, thinking, listening), there are **6 emotion states**:
+Excluding the functional states (idle, thinking, listening), there are emotion states:
 
 1. happy
 2. tired
-3. curious
+3. curiousśś
 4. sad
-5. surprised
+5. surprisedśś
 6. recalling
 
 ## Overview

@@ -732,7 +732,8 @@ static int cmd_eye(int argc, char **argv) {
     printf("eye -> state %d\n", (int)nino_eye_get_state());
     return 0;
   }
-  printf("Usage: eye <idle|listening|thinking>   (current state: %d)\n",
+  printf("Usage: eye <idle|happy|tired|thinking|curious|sad|surprised|listening|recalling>"
+         "   (current state: %d)\n",
          (int)nino_eye_get_state());
   return 0;
 }
@@ -740,7 +741,7 @@ static int cmd_eye(int argc, char **argv) {
 static void eye_cli_register(void) {
   const esp_console_cmd_t eye_cmd = {
       .command = "eye",
-      .help = "Set NINO eye state: eye <idle|listening|thinking>",
+      .help = "Set NINO eye state: eye <idle|happy|tired|thinking|curious|sad|surprised|listening|recalling>",
       .hint = NULL,
       .func = &cmd_eye,
       .argtable = NULL,
@@ -1421,8 +1422,8 @@ static esp_err_t play_wav_handler(httpd_req_t *req) {
     prompt_ack = (ack_hdr[0] == '1');
   }
 
-  if (nino_audio_queue_wav(buf, total, false, NINO_AUDIO_SERVO_FULL, prompt_ack) !=
-      ESP_OK) {
+  if (nino_audio_queue_wav(buf, total, false, NINO_AUDIO_SERVO_FULL, prompt_ack,
+                           NINO_EYE_STATE_COUNT) != ESP_OK) {
     httpd_resp_set_status(req, "503 Service Unavailable");
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, "{\"ok\":false,\"error\":\"audio queue down\"}",
