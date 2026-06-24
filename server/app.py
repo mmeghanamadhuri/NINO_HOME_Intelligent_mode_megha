@@ -23,6 +23,7 @@ from starlette.requests import Request
 
 from alarm_service import get_alarm_service
 from camera import CameraStream
+from eye_expression import normalize_eye_expression
 from face_service import FaceService
 from memory_service import configure_from_environ as configure_memory_from_environ
 from memory_service import get_memory_service, normalize_database_url
@@ -697,9 +698,18 @@ async def _voice_ws_pipeline(websocket: WebSocket) -> None:
             await run_in_threadpool(tts.notify_voice_interaction, active_viewer)
 
             try:
-                await websocket.send_json(
-                    {"prompt_medical_ack": reply_meta.prompt_medical_ack}
-                )
+                ws_meta: dict[str, object] = {
+                    "prompt_medical_ack": reply_meta.prompt_medical_ack,
+                }
+                eye_tag = normalize_eye_expression(reply_meta.eye_expression)
+                if eye_tag:
+                    ws_meta["eye_expression"] = eye_tag
+                    logger.info(
+                        "WS send eye_expression=%s client=%s",
+                        eye_tag,
+                        client_label,
+                    )
+                await websocket.send_json(ws_meta)
                 await websocket.send_bytes(wav_out)
             except WebSocketDisconnect:
                 await run_in_threadpool(

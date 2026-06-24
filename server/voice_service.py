@@ -26,6 +26,7 @@ from llm_service import (
     DEFAULT_OLLAMA_URL,
     is_conversation_recap_question,
 )
+from eye_expression import infer_eye_expression_for_response
 from tts_service import synthesize_sapi_wav_bytes
 from wav_resample import resample_wav_bytes_to_mono_16bit
 
@@ -99,6 +100,7 @@ SERVO_360_TRIGGER_DELAY_SECONDS = float(os.environ.get("SERVO_360_TRIGGER_DELAY_
 class VoiceReplyMeta:
     trigger_servo_360: bool = False
     prompt_medical_ack: bool = False
+    eye_expression: str | None = None
     # Per-stage latency info for this query (stt/reply/tts seconds, heard text,
     # reply path, audio sizes). Filled by process_voice_wav; logged by app.py.
     timings: dict[str, Any] = field(default_factory=dict)
@@ -706,6 +708,12 @@ def process_voice_wav(
             existing=memory_ctx,
         )
 
+    meta.eye_expression = infer_eye_expression_for_response(
+        reply,
+        user_text=user_text,
+        reply_path=reply_path,
+    )
+
     wav, _voice = synthesize_sapi_wav_bytes(reply)
     wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
     t_tts = time.perf_counter()
@@ -736,8 +744,10 @@ def process_voice_wav(
         meta.timings["memory_turns"] = memory_ctx.recent_turns
         meta.timings["memory_facts"] = memory_ctx.memory_count
         meta.timings["memory_user"] = memory_ctx.name
+    if meta.eye_expression:
+        meta.timings["eye_expression"] = meta.eye_expression
     logger.info(
-        "Latency | stt(%s)=%.2fs reply(%s)=%.2fs tts=%.2fs total=%.2fs | in=%.1fs out=%.1fs audio",
+        "Latency | stt(%s)=%.2fs reply(%s)=%.2fs tts=%.2fs total=%.2fs | in=%.1fs out=%.1fs%s",
         stt_engine,
         meta.timings["stt_seconds"],
         reply_path,
@@ -746,5 +756,6 @@ def process_voice_wav(
         meta.timings["process_total_seconds"],
         audio_in_seconds,
         audio_out_seconds,
+        f" | eye={meta.eye_expression}" if meta.eye_expression else "",
     )
     return wav_out, meta
