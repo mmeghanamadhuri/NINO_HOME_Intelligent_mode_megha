@@ -57,7 +57,9 @@ def looks_alarm_related(user_text: str) -> bool:
     return any(p.search(text) for p in _ALARM_HINT_PATTERNS)
 
 
-def try_nlp_alarm(user_text: str, *, person_name: str = "") -> AlarmVoiceResult:
+def try_nlp_alarm(
+    user_text: str, *, person_name: str = "", user_id: int | None = None
+) -> AlarmVoiceResult:
     """Call Ollama for structured intent; validate with parse_alarm_datetime before save."""
     if not nlp_fallback_enabled():
         return AlarmVoiceResult(handled=False)
@@ -65,7 +67,7 @@ def try_nlp_alarm(user_text: str, *, person_name: str = "") -> AlarmVoiceResult:
     from alarm_voice import is_list_alarm_command
 
     if is_list_alarm_command(user_text):
-        return _handle_list_alarms()
+        return _handle_list_alarms(user_id=user_id)
 
     try:
         payload = _extract_via_ollama(user_text)
@@ -83,13 +85,15 @@ def try_nlp_alarm(user_text: str, *, person_name: str = "") -> AlarmVoiceResult:
         return AlarmVoiceResult(handled=False)
 
     if intent == "cancel":
-        return _handle_cancel_alarms()
+        return _handle_cancel_alarms(user_id=user_id)
 
     if intent == "list":
-        return _handle_list_alarms()
+        return _handle_list_alarms(user_id=user_id)
 
     if intent in {"set_alarm", "set_reminder", "reminder", "alarm"}:
-        return _apply_set_intent(payload, user_text, person_name=person_name)
+        return _apply_set_intent(
+            payload, user_text, person_name=person_name, user_id=user_id
+        )
 
     return AlarmVoiceResult(handled=False)
 
@@ -143,7 +147,11 @@ def _parse_json_object(raw: str) -> dict[str, Any] | None:
 
 
 def _apply_set_intent(
-    payload: dict[str, Any], user_text: str, *, person_name: str = ""
+    payload: dict[str, Any],
+    user_text: str,
+    *,
+    person_name: str = "",
+    user_id: int | None = None,
 ) -> AlarmVoiceResult:
     label = str(payload.get("label", "") or "").strip()
     time_phrase = _payload_to_time_phrase(payload)
@@ -178,6 +186,7 @@ def _apply_set_intent(
         parsed,
         label=label,
         person_name=person_name,
+        user_id=user_id,
         source_text=user_text,
     )
 

@@ -151,17 +151,18 @@ def is_reminder_command(user_text: str) -> bool:
 
 
 def _resolve_person_name(
-    viewer_name: str | None = None,
+    *,
+    person_name: str = "",
     camera_identity_name: str | None = None,
     camera_identity_state: str = "no_face",
 ) -> str:
-    """Best name from live face recognition, then voice session viewer."""
-    if camera_identity_state == "recognized" and camera_identity_name:
-        name = str(camera_identity_name).strip()
+    """Name for alarm speech — only from live face recognition, never session fallback."""
+    if person_name:
+        name = str(person_name).strip()
         if name and name.lower() not in {"unknown", "face"}:
             return name[:64]
-    if viewer_name:
-        name = str(viewer_name).strip()
+    if camera_identity_state == "recognized" and camera_identity_name:
+        name = str(camera_identity_name).strip()
         if name and name.lower() not in {"unknown", "face"}:
             return name[:64]
     return ""
@@ -170,7 +171,8 @@ def _resolve_person_name(
 def handle_alarm_voice(
     user_text: str,
     *,
-    viewer_name: str | None = None,
+    user_id: int | None = None,
+    person_name: str = "",
     camera_identity_name: str | None = None,
     camera_identity_state: str = "no_face",
 ) -> AlarmVoiceResult:
@@ -178,8 +180,10 @@ def handle_alarm_voice(
     if not text:
         return AlarmVoiceResult(handled=False)
 
-    person_name = _resolve_person_name(
-        viewer_name, camera_identity_name, camera_identity_state
+    resolved_name = _resolve_person_name(
+        person_name=person_name,
+        camera_identity_name=camera_identity_name,
+        camera_identity_state=camera_identity_state,
     )
 
     from alarm_ack import handle_alarm_ack_voice
@@ -189,37 +193,43 @@ def handle_alarm_voice(
         return ack_result
 
     if is_delete_one_alarm_command(text):
-        result = _handle_delete_one_alarm(text)
+        result = _handle_delete_one_alarm(text, user_id=user_id)
         if result.handled:
             return result
     if is_cancel_all_alarm_command(text):
-        return _handle_cancel_alarms()
+        return _handle_cancel_alarms(user_id=user_id)
     if is_list_alarm_command(text):
         logger.info("Voice list alarms (regex) | heard: %s", text[:120])
-        return _handle_list_alarms()
+        return _handle_list_alarms(user_id=user_id)
 
     regex_set_attempted = False
 
     if is_medical_set_command(text):
         regex_set_attempted = True
-        result = _handle_set_medical_alarm(text, person_name=person_name)
+        result = _handle_set_medical_alarm(
+            text, person_name=resolved_name, user_id=user_id
+        )
         if result.handled:
             return result
     if is_reminder_command(text):
         regex_set_attempted = True
-        result = _handle_set_reminder(text, person_name=person_name)
+        result = _handle_set_reminder(
+            text, person_name=resolved_name, user_id=user_id
+        )
         if result.handled:
             return result
     elif is_set_alarm_command(text):
         regex_set_attempted = True
-        result = _handle_set_alarm(text, person_name=person_name)
+        result = _handle_set_alarm(text, person_name=resolved_name, user_id=user_id)
         if result.handled:
             return result
 
     from alarm_nlp import looks_alarm_related, nlp_fallback_enabled, try_nlp_alarm
 
     if nlp_fallback_enabled() and (regex_set_attempted or looks_alarm_related(text)):
-        nlp_result = try_nlp_alarm(text, person_name=person_name)
+        nlp_result = try_nlp_alarm(
+            text, person_name=resolved_name, user_id=user_id
+        )
         if nlp_result.handled:
             logger.info("Alarm handled via Ollama NLP fallback | heard: %s", text[:120])
             return nlp_result
@@ -227,7 +237,7 @@ def handle_alarm_voice(
     # List phrasing + "alarm" but regex missed — still list, don't send to general chat
     if is_list_alarm_command(text) or _looks_like_list_after_nlp(text):
         logger.info("Voice list alarms (loose match) | heard: %s", text[:120])
-        return _handle_list_alarms()
+        return _handle_list_alarms(user_id=user_id)
 
     if regex_set_attempted:
         return AlarmVoiceResult(
@@ -486,6 +496,7 @@ def _save_alarm(
     *,
     label: str = "",
     person_name: str = "",
+    user_id: int | None = None,
     source_text: str = "",
     force_medical: bool = False,
 ) -> AlarmVoiceResult:
@@ -495,6 +506,7 @@ def _save_alarm(
         fire_at,
         label=label,
         person_name=person_name,
+        user_id=user_id,
         source_text=source_text or label,
         force_medical=force_medical,
     )
@@ -539,7 +551,9 @@ def _day_note_for(fire_at: datetime) -> str:
     return ""
 
 
-def _handle_set_reminder(user_text: str, *, person_name: str = "") -> AlarmVoiceResult:
+def _handle_set_reminder(
+    user_text: str, *, person_name: str = "", user_id: int | None = None
+) -> AlarmVoiceResult:
     tail = _extract_reminder_tail(user_text)
     if not tail:
         return AlarmVoiceResult(handled=False)
@@ -565,11 +579,14 @@ def _handle_set_reminder(user_text: str, *, person_name: str = "") -> AlarmVoice
         parsed,
         label=label,
         person_name=person_name,
+        user_id=user_id,
         source_text=user_text,
     )
 
 
-def _handle_set_medical_alarm(user_text: str, *, person_name: str = "") -> AlarmVoiceResult:
+def _handle_set_medical_alarm(
+    user_text: str, *, person_name: str = "", user_id: int | None = None
+) -> AlarmVoiceResult:
     from alarm_medical import _MEDICAL_SET_PATTERNS
 
     phrase = ""
@@ -602,12 +619,15 @@ def _handle_set_medical_alarm(user_text: str, *, person_name: str = "") -> Alarm
         parsed,
         label=label,
         person_name=person_name,
+        user_id=user_id,
         source_text=user_text,
         force_medical=True,
     )
 
 
-def _handle_set_alarm(user_text: str, *, person_name: str = "") -> AlarmVoiceResult:
+def _handle_set_alarm(
+    user_text: str, *, person_name: str = "", user_id: int | None = None
+) -> AlarmVoiceResult:
     phrase = _extract_time_phrase(user_text)
     if not phrase:
         return AlarmVoiceResult(handled=False)
@@ -617,7 +637,9 @@ def _handle_set_alarm(user_text: str, *, person_name: str = "") -> AlarmVoiceRes
         return AlarmVoiceResult(handled=False)
 
     logger.info("Voice alarm (regex) | person=%r time_phrase=%r", person_name or "(none)", phrase)
-    return _save_alarm(parsed.fire_at, parsed, person_name=person_name, source_text=user_text)
+    return _save_alarm(
+        parsed.fire_at, parsed, person_name=person_name, user_id=user_id, source_text=user_text
+    )
 
 
 def _extract_delete_target(user_text: str) -> str | None:
@@ -631,7 +653,9 @@ def _extract_delete_target(user_text: str) -> str | None:
     return None
 
 
-def _handle_delete_one_alarm(user_text: str) -> AlarmVoiceResult:
+def _handle_delete_one_alarm(
+    user_text: str, *, user_id: int | None = None
+) -> AlarmVoiceResult:
     target = _extract_delete_target(user_text)
     if not target:
         return AlarmVoiceResult(handled=False)
@@ -643,6 +667,7 @@ def _handle_delete_one_alarm(user_text: str) -> AlarmVoiceResult:
     removed = get_alarm_service().remove_pending_matching(
         fire_at=fire_at,
         label_hint=label_hint,
+        user_id=user_id,
     )
     if removed is None:
         if fire_at is not None:
@@ -666,9 +691,9 @@ def _handle_delete_one_alarm(user_text: str) -> AlarmVoiceResult:
     return AlarmVoiceResult(handled=True, reply=f"OK, I deleted your alarm for {when}.")
 
 
-def _handle_cancel_alarms() -> AlarmVoiceResult:
+def _handle_cancel_alarms(*, user_id: int | None = None) -> AlarmVoiceResult:
     service = get_alarm_service()
-    count = service.cancel_all()
+    count = service.cancel_all(user_id=user_id)
     if count == 0:
         return AlarmVoiceResult(handled=True, reply="You have no alarms set.")
     if count == 1:
@@ -676,10 +701,12 @@ def _handle_cancel_alarms() -> AlarmVoiceResult:
     return AlarmVoiceResult(handled=True, reply=f"OK, I deleted {count} alarms.")
 
 
-def _handle_list_alarms() -> AlarmVoiceResult:
+def _handle_list_alarms(*, user_id: int | None = None) -> AlarmVoiceResult:
     service = get_alarm_service()
-    pending = sorted(service.list_pending(), key=lambda a: (a.priority, a.fire_at))
-    awaiting = service.list_awaiting_ack()
+    pending = sorted(
+        service.list_pending(user_id=user_id), key=lambda a: (a.priority, a.fire_at)
+    )
+    awaiting = service.list_awaiting_ack(user_id=user_id)
     logger.info(
         "Voice list alarms | pending=%d awaiting_ack=%d",
         len(pending),

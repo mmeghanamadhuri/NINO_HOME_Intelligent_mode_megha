@@ -103,6 +103,16 @@ def try_start_gpu_ollama() -> None:
     subprocess.run(["bash", script], check=False, timeout=120)
 
 
+def _normalize_ollama_generate_url(url: str) -> str:
+    """Ensure POST target is .../api/generate (not the server root)."""
+    raw = url.strip().rstrip("/")
+    if not raw:
+        return DEFAULT_OLLAMA_URL
+    if raw.endswith("/api/generate") or raw.endswith("/api/chat"):
+        return raw
+    return f"{raw}/api/generate"
+
+
 def _ollama_base_url(api_url: str | None = None) -> str:
     raw = (api_url or os.environ.get("OLLAMA_URL") or DEFAULT_OLLAMA_URL).strip()
     if raw.endswith("/api/generate"):
@@ -273,7 +283,9 @@ def ollama_generate(
     temperature: float | None = None,
     top_p: float | None = None,
 ) -> str:
-    url = (api_url or os.environ.get("OLLAMA_URL") or DEFAULT_OLLAMA_URL).strip()
+    url = _normalize_ollama_generate_url(
+        (api_url or os.environ.get("OLLAMA_URL") or DEFAULT_OLLAMA_URL).strip()
+    )
     m = (model or os.environ.get("OLLAMA_MODEL") or DEFAULT_MODEL).strip()
     alive = (
         keep_alive
@@ -407,7 +419,8 @@ def answer_identity_question(
         f"{rules}\n"
         f"{_memory_context_block(memory_context)}"
         f"Rules: one short spoken reply under {max_words} words, plain sentences, "
-        "no lists, no markdown, no stage directions, suitable to read aloud.\n"
+        "no lists, no markdown, no stage directions, suitable to read aloud. "
+        "Use fresh casual wording; do not sound like a fixed template.\n"
         f"The user asked: {user_text}"
     )
     return ollama_generate(
@@ -416,6 +429,8 @@ def answer_identity_question(
         api_url=api_url,
         num_predict=96,
         timeout_s=VOICE_QUERY_TIMEOUT_S,
+        temperature=_voice_reply_temperature(),
+        top_p=_voice_reply_top_p(),
     )
 
 
@@ -450,6 +465,9 @@ _CONVERSATION_RECAP_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"\b(?:what(?:'s| is)\s+)?(?:the\s+)?context\b",
         r"\b(?:give|tell|share)\s+me\s+(?:the\s+)?context\b",
         r"\bcontext\s+so\s+far\b",
+        r"\bwhatever we (?:are |'re )?(?:discussing|talking about)\b",
+        r"(?:please\s+)?(?:describe|explain|summarize|summarise)(?:\s+me)?\s+(?:whatever|what)\s+we (?:are |'re )?(?:discussing|talking about)\b",
+        r"(?:please\s+)?(?:describe|explain|summarize|summarise).{0,32}(?:discussing|talking about)(?:\s+right\s+now|\s+now|\s+today)?\b",
     )
 )
 
@@ -459,6 +477,53 @@ _RECAP_STYLE_VARIANTS: tuple[str, ...] = (
     "Use a slightly upbeat tone.",
     "Use a calm matter-of-fact tone.",
 )
+
+_VOICE_STYLE_VARIANTS: tuple[str, ...] = _RECAP_STYLE_VARIANTS + (
+    "Use a friendly relaxed tone, like chatting at home.",
+    "Use a lightly playful tone.",
+    "Use a thoughtful helpful tone.",
+)
+
+
+def _voice_reply_temperature() -> float:
+    raw = os.environ.get("VOICE_REPLY_TEMPERATURE", "0.72").strip()
+    try:
+        return float(max(0.0, min(1.2, float(raw))))
+    except ValueError:
+        return 0.72
+
+
+def _voice_reply_top_p() -> float:
+    raw = os.environ.get("VOICE_REPLY_TOP_P", "0.92").strip()
+    try:
+        return float(max(0.05, min(1.0, float(raw))))
+    except ValueError:
+        return 0.92
+
+
+def _anti_repetition_block(recent_assistant_replies: list[str] | None) -> str:
+    if not recent_assistant_replies:
+        return ""
+    snippets: list[str] = []
+    seen: set[str] = set()
+    for text in reversed(recent_assistant_replies):
+        cleaned = " ".join(str(text or "").strip().split())
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        snippets.append(cleaned)
+        if len(snippets) >= 4:
+            break
+    if not snippets:
+        return ""
+    quoted = "; ".join(f'"{s[:120]}"' for s in reversed(snippets))
+    return (
+        "Do NOT reuse these exact prior replies — same facts, new wording and tone:\n"
+        f"{quoted}\n"
+    )
 
 
 def is_conversation_recap_question(user_text: str) -> bool:
@@ -584,6 +649,7 @@ def answer_voice_query(
     api_url: str | None = None,
     max_words: int = 40,
     memory_context: str | None = None,
+    recent_assistant_replies: list[str] | None = None,
 ) -> str:
     if viewer_name:
         who = (
@@ -597,14 +663,16 @@ def answer_voice_query(
             "Answer the question directly; do not invent or guess a name."
         )
 
+    style_hint = random.choice(_VOICE_STYLE_VARIANTS)
     memory_rules = ""
     if memory_context:
         name_hint = viewer_name.strip() if viewer_name else "them"
         memory_rules = (
-            "Session history is provided below. Use it when relevant. "
-            "If summarizing past chat, speak directly to them in second person "
-            f'(e.g. "You asked about Mars"). Never say "You and {name_hint}" or use their name in third person. '
+            "Known facts and recent user lines are below. Use them when relevant. "
+            "Speak directly to them in second person. "
+            f'Never say "You and {name_hint}" or use their name in third person. '
             "Ignore incomplete fragment lines.\n"
+            f"{_anti_repetition_block(recent_assistant_replies)}"
         )
 
     prompt = (
@@ -612,6 +680,10 @@ def answer_voice_query(
         f"{who}\n"
         f"{memory_rules}"
         f"{_memory_context_block(memory_context)}"
+        "Style rules:\n"
+        f"- {style_hint}\n"
+        "- Sound natural and casual, not scripted or robotic.\n"
+        "- If the topic came up before, vary wording and tone — do not repeat the same sentence.\n"
         f"Rules: one short spoken reply under {max_words} words, plain sentences, "
         "no lists, no markdown, no stage directions, suitable to read aloud.\n"
         f"The user asked: {user_text}"
@@ -622,4 +694,6 @@ def answer_voice_query(
         api_url=api_url,
         num_predict=96,
         timeout_s=VOICE_QUERY_TIMEOUT_S,
+        temperature=_voice_reply_temperature(),
+        top_p=_voice_reply_top_p(),
     )

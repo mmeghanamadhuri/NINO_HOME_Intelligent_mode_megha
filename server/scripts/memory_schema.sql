@@ -42,3 +42,26 @@ CREATE TABLE IF NOT EXISTS summaries (
 
 CREATE INDEX IF NOT EXISTS idx_summaries_user_date
     ON summaries (user_id, summary_date DESC);
+
+CREATE TABLE IF NOT EXISTS alarms (
+    id VARCHAR(12) PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    fire_at TIMESTAMP NOT NULL,
+    label VARCHAR(120) DEFAULT '',
+    person_name VARCHAR(64) DEFAULT '',
+    created_at TIMESTAMP DEFAULT NOW(),
+    fired BOOLEAN DEFAULT FALSE,
+    priority INTEGER DEFAULT 1,
+    category VARCHAR(32) DEFAULT 'general',
+    requires_ack BOOLEAN DEFAULT FALSE,
+    ack_state VARCHAR(32) DEFAULT 'none',
+    last_fired_at TIMESTAMP,
+    next_repeat_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_alarms_user_fire
+    ON alarms (user_id, fire_at);
+
+CREATE INDEX IF NOT EXISTS idx_alarms_pending
+    ON alarms (fire_at)
+    WHERE fired = FALSE OR ack_state NOT IN ('none', '', 'confirmed');

@@ -196,12 +196,17 @@ def configure_from_environ() -> None:
     SETTINGS.recent_turns = max(1, int(os.environ.get("MEMORY_RECENT_TURNS", "10")))
     SETTINGS.top_memories = max(1, int(os.environ.get("MEMORY_TOP_MEMORIES", "10")))
     SETTINGS.min_importance = int(os.environ.get("MEMORY_MIN_IMPORTANCE", "5"))
-    SETTINGS.extraction_enabled = os.environ.get("MEMORY_EXTRACTION", "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    raw_extraction = os.environ.get("MEMORY_EXTRACTION")
+    if raw_extraction is None and SETTINGS.database_url:
+        # Phase B on by default when PostgreSQL memory is configured.
+        SETTINGS.extraction_enabled = True
+    else:
+        SETTINGS.extraction_enabled = (raw_extraction or "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
     SETTINGS.summary_cron_enabled = os.environ.get("MEMORY_SUMMARY_CRON", "0").strip().lower() in {
         "1",
         "true",
@@ -245,6 +250,12 @@ class MemoryService:
             self._ensure_schema()
             self._ready = True
             logger.info("Memory layer ready (PostgreSQL)")
+            if SETTINGS.extraction_enabled:
+                logger.info(
+                    "Memory Phase B enabled — long-term extraction after each logged turn "
+                    "(importance >= %s)",
+                    SETTINGS.min_importance,
+                )
             if SETTINGS.summary_cron_enabled:
                 threading.Thread(
                     target=self._run_summary_catchup_safe,
@@ -257,16 +268,29 @@ class MemoryService:
             logger.warning("Memory layer unavailable: %s", exc)
 
     def status(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "enabled": self.enabled,
             "ready": self._ready,
             "database_url_set": bool(SETTINGS.database_url),
             "recent_turns": SETTINGS.recent_turns,
             "top_memories": SETTINGS.top_memories,
+            "min_importance": SETTINGS.min_importance,
             "extraction_enabled": SETTINGS.extraction_enabled,
             "summary_cron_enabled": SETTINGS.summary_cron_enabled,
             "last_error": self._last_error,
         }
+        if self._ready:
+            try:
+                out["table_counts"] = self._fetch_table_counts()
+            except Exception as exc:
+                out["table_counts_error"] = str(exc)
+        return out
+
+    def table_stats(self) -> dict[str, Any]:
+        """Row counts per memory table (for /api/memory/stats)."""
+        if not self._ready:
+            return {"ready": False, "last_error": self._last_error}
+        return {"ready": True, "table_counts": self._fetch_table_counts()}
 
     def load_context(self, display_name: str | None) -> LoadedMemoryContext | None:
         if not self._ready or not display_name:
@@ -363,6 +387,11 @@ class MemoryService:
         if not is_loggable_user_text(user_text):
             logger.info("Skipping STT fragment from memory log: %s", user_text[:80])
             return "skipped_fragment"
+        from llm_service import is_conversation_recap_question
+
+        if is_conversation_recap_question(user_text):
+            logger.info("Skipping context/recap query from memory log: %s", user_text[:80])
+            return "skipped_recap"
         ctx = existing or self.ensure_user(display_name)
         if not ctx:
             return "user_resolve_failed"
@@ -387,9 +416,49 @@ class MemoryService:
 
     # ------------------------------------------------------------------ internals
 
+    def _fetch_table_counts(self) -> dict[str, int]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                counts: dict[str, int] = {}
+                for table in ("users", "conversations", "memories", "summaries", "alarms"):
+                    cur.execute(f"SELECT COUNT(*) FROM {table}")
+                    row = cur.fetchone()
+                    counts[table] = int(row[0]) if row else 0
+        return counts
+
+    def _memory_already_stored(self, conn, user_id: int, memory_text: str) -> bool:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1 FROM memories
+                WHERE user_id = %s AND LOWER(TRIM(memory_text)) = LOWER(TRIM(%s))
+                LIMIT 1
+                """,
+                (user_id, memory_text),
+            )
+            return cur.fetchone() is not None
+
+    @staticmethod
+    def _build_extraction_prompt(
+        user_text: str, assistant_text: str, *, min_importance: int
+    ) -> str:
+        return (
+            "Extract durable personal facts worth remembering across future conversations.\n"
+            "STORE: preferences, hobbies, job, relationships, allergies, location, "
+            "stable interests, important personal details.\n"
+            "SKIP: greetings, thanks, transient moods, weather, generic small talk, "
+            "one-off questions with no personal fact.\n"
+            "Return JSON only: a list of objects with keys memory (string) and "
+            f"importance (integer 0-10). Only include importance >= {min_importance}.\n"
+            "Write each memory as a short third-person fact (e.g. \"Favorite planet is Mars\").\n\n"
+            f"User:\n{user_text.strip()}\n\n"
+            f"Assistant:\n{assistant_text.strip()}\n"
+        )
+
     def _connect(self):
         assert psycopg2 is not None
         return psycopg2.connect(SETTINGS.database_url)
+
 
     def _ensure_schema(self) -> None:
         if self._schema_checked:
@@ -495,24 +564,27 @@ class MemoryService:
 
         if recent:
             lines: list[str] = []
-            for user_text, assistant_text in recent:
-                lines.append(
-                    f"- User said: {truncate_context_text(user_text)} | "
-                    f"Assistant replied: {truncate_context_text(assistant_text)}"
+            for user_text, _assistant_text in recent:
+                cleaned_user = truncate_context_text(user_text)
+                if cleaned_user:
+                    lines.append(f"- User said: {cleaned_user}")
+            if lines:
+                parts.append(
+                    "Recent things they asked or said (speech-to-text may have errors):\n"
+                    + "\n".join(lines)
                 )
-            parts.append(
-                "Recent session history (may contain speech-to-text errors — ignore fragments):\n"
-                + "\n".join(lines)
-            )
 
         if len(parts) == 1:
             return ""
 
         parts.append(
-            "If they ask for context, summarize the discussion naturally in one concise spoken reply. "
+            "Use known facts and recent user lines for context. "
+            "Answer in fresh, casual spoken wording every time — never copy a previous reply verbatim. "
+            "If they ask the same thing again, change tone and phrasing while keeping the same facts. "
+            "When several related facts exist (e.g. tea and coffee), combine them naturally. "
             "Do not use repetitive templates such as 'You asked about...'. "
             "Do not say their name as if talking about someone else. "
-            "Do not invent topics not in the history."
+            "Do not invent topics not supported by the facts."
         )
         return "\n\n".join(parts)
 
@@ -542,12 +614,10 @@ class MemoryService:
         try:
             from llm_service import DEFAULT_MODEL, DEFAULT_OLLAMA_URL, ollama_generate
 
-            prompt = (
-                "Extract useful long-term memories from this conversation.\n"
-                "Return JSON only: a list of objects with keys memory (string) and "
-                f"importance (integer 0-10). Only include importance >= {SETTINGS.min_importance}.\n\n"
-                f"User:\n{user_text.strip()}\n\n"
-                f"Assistant:\n{assistant_text.strip()}\n"
+            prompt = self._build_extraction_prompt(
+                user_text,
+                assistant_text,
+                min_importance=SETTINGS.min_importance,
             )
             raw = ollama_generate(
                 prompt,
@@ -555,16 +625,26 @@ class MemoryService:
                 api_url=os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL),
                 num_predict=256,
                 timeout_s=45,
+                temperature=0.2,
             )
             items = _parse_memory_json(raw)
             if not items:
+                logger.info("Memory extraction: no items parsed for user_id=%s", user_id)
                 return
+            inserted = 0
             with self._connect() as conn:
                 with conn.cursor() as cur:
                     for item in items:
                         imp = int(item.get("importance", 0))
                         text = str(item.get("memory", "")).strip()
                         if not text or imp < SETTINGS.min_importance:
+                            continue
+                        if self._memory_already_stored(conn, user_id, text):
+                            logger.debug(
+                                "Skipping duplicate memory for user_id=%s: %s",
+                                user_id,
+                                text[:80],
+                            )
                             continue
                         cur.execute(
                             """
@@ -573,8 +653,21 @@ class MemoryService:
                             """,
                             (user_id, text, imp),
                         )
+                        inserted += 1
                 conn.commit()
-            logger.info("Extracted %d memories for user_id=%s", len(items), user_id)
+            if inserted:
+                logger.info(
+                    "Memory Phase B stored %d fact(s) for user_id=%s (parsed %d)",
+                    inserted,
+                    user_id,
+                    len(items),
+                )
+            else:
+                logger.info(
+                    "Memory Phase B: nothing stored for user_id=%s (parsed %d, below threshold or duplicate)",
+                    user_id,
+                    len(items),
+                )
         except Exception as exc:
             logger.warning("Memory extraction failed: %s", exc)
 
@@ -664,6 +757,27 @@ def _parse_memory_json(raw: str) -> list[dict[str, Any]]:
     if not isinstance(data, list):
         return []
     return [item for item in data if isinstance(item, dict)]
+
+
+def resolve_alarm_user(
+    camera_identity_name: str | None,
+    camera_identity_state: str = "no_face",
+) -> tuple[int | None, str]:
+    """Return (user_id, person_name) for an alarm — user row only when face is recognized."""
+    if camera_identity_state != "recognized":
+        return None, ""
+    if not camera_identity_name:
+        return None, ""
+    cleaned = str(camera_identity_name).strip()
+    if not cleaned or cleaned.lower() in {"unknown", "face"}:
+        return None, ""
+    svc = get_memory_service()
+    if not svc.ready:
+        return None, cleaned[:64]
+    ctx = svc.ensure_user(cleaned)
+    if not ctx:
+        return None, cleaned[:64]
+    return ctx.user_id, cleaned[:64]
 
 
 def get_memory_service() -> MemoryService:

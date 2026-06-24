@@ -32,6 +32,17 @@ from tts_service import TTSService, synthesize_sapi_wav_bytes
 logger = logging.getLogger(__name__)
 
 
+def _load_env_file() -> None:
+    try:
+        from dotenv import load_dotenv
+
+        env_path = Path(__file__).resolve().parent / ".env"
+        if env_path.is_file():
+            load_dotenv(env_path)
+    except ImportError:
+        pass
+
+
 class _GracefulShutdownFilter(logging.Filter):
     """Suppress expected Ctrl+C / CancelledError tracebacks during uvicorn shutdown."""
 
@@ -138,6 +149,7 @@ class AlarmAckRequest(BaseModel):
 
 @app.on_event("startup")
 def startup() -> None:
+    _load_env_file()
     faces.apply_settings_from_environ()
     configure_memory_from_environ()
     get_memory_service().startup()
@@ -236,6 +248,12 @@ def status() -> dict:
         "memory": get_memory_service().status(),
         "latest_results": latest_results,
     }
+
+
+@app.get("/api/memory/stats")
+def memory_stats() -> dict:
+    """PostgreSQL row counts — useful when validating Phase A/B/C."""
+    return {"ok": True, **get_memory_service().table_stats()}
 
 
 @app.get("/api/alarms")
@@ -853,7 +871,30 @@ def main() -> None:
         default=os.environ.get("DATABASE_URL", ""),
         help="PostgreSQL URL for conversation memory (e.g. postgresql://nino:nino@127.0.0.1:5432/nino_memory)",
     )
+    parser.add_argument(
+        "--memory-extraction",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Phase B: extract long-term facts after each logged turn "
+        "(default: on when DATABASE_URL is set)",
+    )
+    parser.add_argument(
+        "--memory-min-importance",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Min importance 0-10 for storing memories (default 5)",
+    )
+    parser.add_argument(
+        "--memory-top-memories",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Max long-term facts loaded before each reply (default 10)",
+    )
     args = parser.parse_args()
+
+    _load_env_file()
 
     env_db = normalize_database_url(os.environ.get("DATABASE_URL", ""))
     cli_db = normalize_database_url(args.database_url.strip())
@@ -869,6 +910,16 @@ def main() -> None:
         os.environ["DATABASE_URL"] = env_db
     elif args.database_url.strip():
         os.environ["DATABASE_URL"] = args.database_url.strip()
+
+    resolved_db = normalize_database_url(os.environ.get("DATABASE_URL", ""))
+    if args.memory_extraction is not None:
+        os.environ["MEMORY_EXTRACTION"] = "1" if args.memory_extraction else "0"
+    elif resolved_db and "MEMORY_EXTRACTION" not in os.environ:
+        os.environ["MEMORY_EXTRACTION"] = "1"
+    if args.memory_min_importance is not None:
+        os.environ["MEMORY_MIN_IMPORTANCE"] = str(max(0, min(10, args.memory_min_importance)))
+    if args.memory_top_memories is not None:
+        os.environ["MEMORY_TOP_MEMORIES"] = str(max(1, args.memory_top_memories))
 
     camera_source = args.camera_url or args.camera_source
     os.environ["CAMERA_SOURCE"] = camera_source

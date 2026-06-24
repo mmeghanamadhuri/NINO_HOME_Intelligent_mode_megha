@@ -188,6 +188,14 @@ def _viewer_for_this_reply(viewer_name: str | None) -> str | None:
     return None
 
 
+def _recent_assistant_replies(
+    recent_history: list[tuple[str, str]] | None,
+) -> list[str]:
+    if not recent_history:
+        return []
+    return [str(assistant_text or "").strip() for _user, assistant_text in recent_history]
+
+
 def _live_memory_viewer_name(
     camera_identity_name: str | None,
     camera_identity_state: CameraIdentityState,
@@ -585,7 +593,7 @@ def process_voice_wav(
 
     from alarm_voice import handle_alarm_voice
 
-    from memory_service import get_memory_service
+    from memory_service import get_memory_service, resolve_alarm_user
 
     memory_svc = get_memory_service()
     memory_name = _live_memory_viewer_name(
@@ -595,11 +603,16 @@ def process_voice_wav(
     memory_ctx = None
     if memory_name:
         memory_ctx = memory_svc.load_context(memory_name)
+    alarm_user_id, alarm_person_name = resolve_alarm_user(
+        camera_identity_name,
+        camera_identity_state,
+    )
     t_memory = time.perf_counter()
 
     alarm_result = handle_alarm_voice(
         user_text,
-        viewer_name=viewer_name,
+        user_id=alarm_user_id,
+        person_name=alarm_person_name,
         camera_identity_name=camera_identity_name,
         camera_identity_state=camera_identity_state,
     )
@@ -696,11 +709,14 @@ def process_voice_wav(
             api_url=SETTINGS.ollama_url,
             max_words=SETTINGS.max_words_reply,
             memory_context=memory_ctx.prompt_block if memory_ctx else None,
+            recent_assistant_replies=_recent_assistant_replies(
+                memory_ctx.recent_history if memory_ctx else None
+            ),
         )
     t_reply = time.perf_counter()
 
     memory_store = "skipped"
-    if reply_path in {"llm", "identity_llm", "recap"}:
+    if reply_path in {"llm", "identity_llm"}:
         memory_store = memory_svc.log_conversation_for_viewer(
             memory_name,
             user_text,

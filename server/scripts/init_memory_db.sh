@@ -40,3 +40,4 @@ psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 -f "${SCHEMA}"
 
 echo ">>> Done. Add to your environment:"
 echo "export DATABASE_URL=\"${DATABASE_URL}\""
+echo "export MEMORY_EXTRACTION=1   # Phase B — on by default when DATABASE_URL is set"

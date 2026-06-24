@@ -1,16 +1,1 @@
-[
-  {
-    "id": "a8b4e6a90508",
-    "fire_at": "2026-06-20T23:40:00",
-    "label": "",
-    "person_name": "Chakri",
-    "created_at": "2026-06-20T23:38:42",
-    "fired": true,
-    "priority": 1,
-    "category": "general",
-    "requires_ack": false,
-    "ack_state": "none",
-    "last_fired_at": "",
-    "next_repeat_at": ""
-  }
-]
+[]
