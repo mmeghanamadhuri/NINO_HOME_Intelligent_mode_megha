@@ -10,6 +10,13 @@ esp_err_t wifi_prov_ble_start(void);
 /** Call when STA gets or loses IP (updates status characteristic notify). */
 void wifi_prov_ble_on_sta_ip_changed(bool connected);
 
+/** Returns the current BLE advertised device name. */
+const char *wifi_prov_ble_device_name(void);
+
+/** Updates the BLE advertised device name (applies immediately when possible). */
+void wifi_prov_ble_set_device_name(const char *name);
+
 /** 128-bit service UUID for Android scanner (same as firmware GATT service). */
 #define WIFI_PROV_BLE_SVC_UUID "4facb001-5a2e-4b7c-9e1f-a8d3e6f20401"
-#define WIFI_PROV_BLE_DEVICE_NAME "NINO - HOME"
+#define WIFI_PROV_BLE_DEVICE_NAME_DEFAULT "NINO - HOME"
+#define WIFI_PROV_BLE_DEVICE_NAME_MAX 32

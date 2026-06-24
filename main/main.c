@@ -62,6 +62,7 @@
 #define NVS_KEY_MODE "mode"
 #define NVS_KEY_STA_SSID "sta_ssid"
 #define NVS_KEY_STA_PASS "sta_pass"
+#define NVS_KEY_DEVICE_NAME "dev_name"
 
 #define MULTICAST_ADDR "239.255.255.250"
 #define BROADCAST_ADDR "255.255.255.255"
@@ -111,12 +112,9 @@ static bool s_mdns_started = false;
 #define HTTP_SERVER_PORT 80
 #define HTTP_STREAM_POLL_MS 25
 #define MAX_PLAY_WAV_BYTES (384 * 1024)
-#define MDNS_HOSTNAME "NINO - HOME"
-#define MDNS_INSTANCE_NAME "NINO - HOME"
-#define MDNS_SERVICE_NAME "NINO - HOME"
+#define DEVICE_NAME_DEFAULT WIFI_PROV_BLE_DEVICE_NAME_DEFAULT
 #define MDNS_SERVICE_TYPE "_nino"
 #define MDNS_SERVICE_PROTO "_tcp"
-#define STATUS_DEVICE_NAME "NINO-HOME"
 #ifndef PROJECT_VER
 #define PROJECT_VER "unknown"
 #endif
@@ -164,6 +162,8 @@ static esp_console_repl_t *s_repl;
 static char s_voice_ws_url[160];
 static bool s_voice_wake_started;
 static int64_t s_last_uvc_timeout_log_us;
+static char s_device_name[WIFI_PROV_BLE_DEVICE_NAME_MAX + 1] =
+    DEVICE_NAME_DEFAULT;
 
 extern const uint8_t wifi_wav_start[] asm("_binary_WIFI_wav_start");
 extern const uint8_t wifi_wav_end[] asm("_binary_WIFI_wav_end");
@@ -322,21 +322,21 @@ static void mdns_start_service(void) {
     return;
   }
 
-  err = mdns_hostname_set(MDNS_HOSTNAME);
+  err = mdns_hostname_set(s_device_name);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "mDNS hostname set failed: %s", esp_err_to_name(err));
     mdns_free();
     return;
   }
 
-  err = mdns_instance_name_set(MDNS_INSTANCE_NAME);
+  err = mdns_instance_name_set(s_device_name);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "mDNS instance set failed: %s", esp_err_to_name(err));
     mdns_free();
     return;
   }
 
-  err = mdns_service_add(MDNS_SERVICE_NAME, MDNS_SERVICE_TYPE, MDNS_SERVICE_PROTO,
+  err = mdns_service_add(s_device_name, MDNS_SERVICE_TYPE, MDNS_SERVICE_PROTO,
                          HTTP_SERVER_PORT, NULL, 0);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "mDNS service add failed: %s", esp_err_to_name(err));
@@ -346,7 +346,7 @@ static void mdns_start_service(void) {
 
   mdns_txt_item_t txt[] = {
       {"device", "nino"},
-      {"ble_name", WIFI_PROV_BLE_DEVICE_NAME},
+      {"ble_name", s_device_name},
       {"transport", "http"},
   };
   err = mdns_service_txt_set(MDNS_SERVICE_TYPE, MDNS_SERVICE_PROTO, txt,
@@ -358,7 +358,7 @@ static void mdns_start_service(void) {
   }
 
   s_mdns_started = true;
-  ESP_LOGI(TAG, "mDNS ready: %s.local service %s.%s port %d", MDNS_HOSTNAME,
+  ESP_LOGI(TAG, "mDNS ready: %s.local service %s.%s port %d", s_device_name,
            MDNS_SERVICE_TYPE, MDNS_SERVICE_PROTO, HTTP_SERVER_PORT);
 }
 #else
@@ -409,6 +409,35 @@ static void copy_cstr_field(uint8_t *dst, size_t dst_size, const char *src) {
   size_t len = strnlen(src, dst_size - 1);
   memcpy(dst, src, len);
   dst[len] = '\0';
+}
+
+static void copy_device_name(char *dst, size_t dst_size, const char *src) {
+  if (dst == NULL || dst_size == 0) {
+    return;
+  }
+  if (src == NULL || src[0] == '\0') {
+    src = DEVICE_NAME_DEFAULT;
+  }
+  size_t len = strnlen(src, dst_size - 1);
+  memcpy(dst, src, len);
+  dst[len] = '\0';
+}
+
+static bool is_valid_device_name(const char *name) {
+  if (name == NULL || name[0] == '\0') {
+    return false;
+  }
+  size_t len = strnlen(name, WIFI_PROV_BLE_DEVICE_NAME_MAX + 1);
+  if (len == 0 || len > WIFI_PROV_BLE_DEVICE_NAME_MAX) {
+    return false;
+  }
+  for (size_t i = 0; i < len; ++i) {
+    char c = name[i];
+    if ((unsigned char)c < 32U || c == '"' || c == '\\') {
+      return false;
+    }
+  }
+  return true;
 }
 
 static void sta_reconnect_task(void *arg) {
@@ -570,6 +599,7 @@ static void wifi_save_to_nvs(wifi_mode_t mode) {
   nvs_set_u8(h, NVS_KEY_MODE, m);
   nvs_set_str(h, NVS_KEY_STA_SSID, s_sta_ssid);
   nvs_set_str(h, NVS_KEY_STA_PASS, s_sta_pass);
+  nvs_set_str(h, NVS_KEY_DEVICE_NAME, s_device_name);
   nvs_commit(h);
   nvs_close(h);
   ESP_LOGI(TAG, "Saved Wi-Fi credentials to NVS (mode=%d, ssid=%s, pass_len=%u)",
@@ -1019,8 +1049,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 
 static wifi_mode_t wifi_load_from_nvs(void) {
   nvs_handle_t h;
-  if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK)
+  if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+    copy_device_name(s_device_name, sizeof(s_device_name), DEVICE_NAME_DEFAULT);
+    wifi_prov_ble_set_device_name(s_device_name);
     return WIFI_MODE_AP;
+  }
   uint8_t m = WIFI_MODE_AP;
   esp_err_t err = nvs_get_u8(h, NVS_KEY_MODE, &m);
   if (err == ESP_OK && m >= WIFI_MODE_STA && m <= WIFI_MODE_APSTA) {
@@ -1034,7 +1067,13 @@ static wifi_mode_t wifi_load_from_nvs(void) {
   if (nvs_get_str(h, NVS_KEY_STA_PASS, s_sta_pass, &len) != ESP_OK) {
     s_sta_pass[0] = '\0';
   }
+  len = sizeof(s_device_name);
+  if (nvs_get_str(h, NVS_KEY_DEVICE_NAME, s_device_name, &len) != ESP_OK ||
+      !is_valid_device_name(s_device_name)) {
+    copy_device_name(s_device_name, sizeof(s_device_name), DEVICE_NAME_DEFAULT);
+  }
   nvs_close(h);
+  wifi_prov_ble_set_device_name(s_device_name);
   if (s_sta_ssid[0] == '\0' && s_wifi_mode != WIFI_MODE_AP) {
     s_wifi_mode = WIFI_MODE_AP;
   }
@@ -1199,7 +1238,7 @@ static void multicast_discovery_task(void *arg) {
           snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-          const char *device_name = WIFI_CONFIG_AP_SSID;
+          const char *device_name = s_device_name;
           char response[DISCOVERY_BUF];
           int rlen;
 
@@ -1676,8 +1715,8 @@ static int app_status_json(char *buf, size_t buf_sz) {
       "{\"ok\":true,\"device_name\":\"%s\",\"wifi_ssid\":\"%s\","
       "\"volume\":%d,\"firmware\":\"%s\",\"sta_connected\":%s,"
       "\"ip\":\"%s\",\"mdns_host\":\"%s.local\"}",
-      STATUS_DEVICE_NAME, s_sta_ssid, nino_audio_get_volume_percent(), fw_version,
-      s_sta_connected ? "true" : "false", sta_ip, MDNS_HOSTNAME);
+      s_device_name, s_sta_ssid, nino_audio_get_volume_percent(), fw_version,
+      s_sta_connected ? "true" : "false", sta_ip, s_device_name);
 }
 
 int wifi_config_status_json(char *buf, size_t buf_sz) {
@@ -1698,7 +1737,7 @@ int wifi_config_status_json(char *buf, size_t buf_sz) {
       "\"ble_service\":\"%s\",\"mode\":\"%s\",\"sta_connected\":%s,"
       "\"sta_ssid\":\"%s\",\"ap_ip\":\"%s\",\"sta_ip\":\"%s\","
       "\"provisioned\":%s}",
-      WIFI_CONFIG_AP_SSID, WIFI_PROV_BLE_DEVICE_NAME, WIFI_PROV_BLE_SVC_UUID,
+      WIFI_CONFIG_AP_SSID, wifi_prov_ble_device_name(), WIFI_PROV_BLE_SVC_UUID,
       mode_str, s_sta_connected ? "true" : "false", s_sta_ssid, ap_ip, sta_ip,
       wifi_config_is_provisioned() ? "true" : "false");
 }
@@ -1879,6 +1918,106 @@ static esp_err_t wifi_prov_config_handler(httpd_req_t *req) {
   }
   return httpd_resp_send(req, "{\"ok\":true,\"status\":\"connecting\"}",
                          HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t save_device_name_to_nvs(void) {
+  nvs_handle_t h;
+  esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+  if (err != ESP_OK) {
+    return err;
+  }
+  err = nvs_set_str(h, NVS_KEY_DEVICE_NAME, s_device_name);
+  if (err == ESP_OK) {
+    err = nvs_commit(h);
+  }
+  nvs_close(h);
+  return err;
+}
+
+static esp_err_t device_name_handler(httpd_req_t *req) {
+  if (req->method == HTTP_OPTIONS) {
+    httpd_resp_set_status(req, "204 No Content");
+    wifi_http_set_cors(req);
+    return httpd_resp_send(req, NULL, 0);
+  }
+
+  httpd_resp_set_type(req, "application/json");
+  wifi_http_set_cors(req);
+
+  if (req->method == HTTP_GET) {
+    char body[96];
+    int n = snprintf(body, sizeof(body), "{\"ok\":true,\"device_name\":\"%s\"}",
+                     s_device_name);
+    if (n <= 0 || n >= (int)sizeof(body)) {
+      return httpd_resp_send_500(req);
+    }
+    return httpd_resp_send(req, body, n);
+  }
+
+  if (req->method != HTTP_POST) {
+    httpd_resp_set_status(req, "405 Method Not Allowed");
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"GET or POST only\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+
+  if (req->content_len <= 0 || req->content_len >= WIFI_PROV_JSON_MAX) {
+    httpd_resp_set_status(req, "400 Bad Request");
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"bad_body\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+
+  char *body = malloc((size_t)req->content_len + 1);
+  if (body == NULL) {
+    return httpd_resp_send_500(req);
+  }
+  int received = 0;
+  while (received < req->content_len) {
+    int r = httpd_req_recv(req, body + received, req->content_len - received);
+    if (r <= 0) {
+      free(body);
+      httpd_resp_set_status(req, "400 Bad Request");
+      return httpd_resp_send(req, "{\"ok\":false,\"error\":\"recv\"}",
+                             HTTPD_RESP_USE_STRLEN);
+    }
+    received += r;
+  }
+  body[received] = '\0';
+
+  char next_name[WIFI_PROV_BLE_DEVICE_NAME_MAX + 1];
+  const char *name_start = json_value_start(body, "device_name");
+  bool copied =
+      json_copy_quoted_value(name_start, next_name, sizeof(next_name));
+  free(body);
+
+  if (!copied || !is_valid_device_name(next_name)) {
+    httpd_resp_set_status(req, "400 Bad Request");
+    return httpd_resp_send(req,
+                           "{\"ok\":false,\"error\":\"invalid_device_name\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+
+  copy_device_name(s_device_name, sizeof(s_device_name), next_name);
+  wifi_prov_ble_set_device_name(s_device_name);
+  if (s_mdns_started) {
+    mdns_stop_service();
+    mdns_start_service();
+  }
+
+  esp_err_t err = save_device_name_to_nvs();
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Failed to save device name to NVS: %s", esp_err_to_name(err));
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"nvs_save_failed\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+
+  char out[112];
+  int n = snprintf(out, sizeof(out), "{\"ok\":true,\"device_name\":\"%s\"}",
+                   s_device_name);
+  if (n <= 0 || n >= (int)sizeof(out)) {
+    return httpd_resp_send_500(req);
+  }
+  return httpd_resp_send(req, out, n);
 }
 
 static void load_voice_ws_from_nvs(void) {
@@ -2271,6 +2410,24 @@ static void start_http_server(void) {
       .handler = wifi_prov_status_handler,
       .user_ctx = NULL,
   };
+  const httpd_uri_t device_name_get_uri = {
+      .uri = "/device/name",
+      .method = HTTP_GET,
+      .handler = device_name_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t device_name_post_uri = {
+      .uri = "/device/name",
+      .method = HTTP_POST,
+      .handler = device_name_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t device_name_opts_uri = {
+      .uri = "/device/name",
+      .method = HTTP_OPTIONS,
+      .handler = device_name_handler,
+      .user_ctx = NULL,
+  };
 
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &index_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &stream_uri));
@@ -2293,6 +2450,12 @@ static void start_http_server(void) {
       httpd_register_uri_handler(s_http_server, &wifi_prov_config_opts_uri));
   ESP_ERROR_CHECK(
       httpd_register_uri_handler(s_http_server, &wifi_prov_status_uri));
+  ESP_ERROR_CHECK(
+      httpd_register_uri_handler(s_http_server, &device_name_get_uri));
+  ESP_ERROR_CHECK(
+      httpd_register_uri_handler(s_http_server, &device_name_post_uri));
+  ESP_ERROR_CHECK(
+      httpd_register_uri_handler(s_http_server, &device_name_opts_uri));
 }
 
 static void usb_lib_task(void *arg) {

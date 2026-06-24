@@ -34,7 +34,6 @@ void ble_store_config_init(void);
 
 static const char *TAG = "wifi_prov_ble";
 
-#define PROV_DEVICE_NAME WIFI_PROV_BLE_DEVICE_NAME
 #define PROV_CMD_APPLY 0x01
 
 /* 4facb001-5a2e-4b7c-9e1f-a8d3e6f20401 */
@@ -72,8 +71,19 @@ static uint8_t s_own_addr_type;
 static bool s_ble_started;
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static bool s_bt_ctrl_ready;
+static char s_prov_device_name[WIFI_PROV_BLE_DEVICE_NAME_MAX + 1] =
+    WIFI_PROV_BLE_DEVICE_NAME_DEFAULT;
 
 static void prov_advertise(void);
+
+static void set_prov_device_name(const char *name) {
+  if (name == NULL || name[0] == '\0') {
+    name = WIFI_PROV_BLE_DEVICE_NAME_DEFAULT;
+  }
+  size_t len = strnlen(name, WIFI_PROV_BLE_DEVICE_NAME_MAX);
+  memcpy(s_prov_device_name, name, len);
+  s_prov_device_name[len] = '\0';
+}
 
 static esp_err_t hosted_bt_setup_with_retry(void) {
   if (s_bt_ctrl_ready) {
@@ -191,6 +201,19 @@ void wifi_prov_ble_on_sta_ip_changed(bool connected) {
   }
   prov_update_status_json(connected ? 2 : 1, connected ? "done" : "connecting");
   prov_notify_status();
+}
+
+const char *wifi_prov_ble_device_name(void) { return s_prov_device_name; }
+
+void wifi_prov_ble_set_device_name(const char *name) {
+  set_prov_device_name(name);
+  if (!s_ble_started) {
+    return;
+  }
+  ble_svc_gap_device_name_set(s_prov_device_name);
+  if (s_bt_ctrl_ready) {
+    prov_advertise();
+  }
 }
 
 static void prov_apply_task(void *arg) {
@@ -346,8 +369,8 @@ static void prov_advertise(void) {
   /* 31-byte ADV limit: keep name in ADV, 128-bit UUID in scan response (rc=4 EINVAL if combined). */
   memset(&adv_fields, 0, sizeof(adv_fields));
   adv_fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-  adv_fields.name = (uint8_t *)PROV_DEVICE_NAME;
-  adv_fields.name_len = strlen(PROV_DEVICE_NAME);
+  adv_fields.name = (uint8_t *)s_prov_device_name;
+  adv_fields.name_len = strlen(s_prov_device_name);
   adv_fields.name_is_complete = 1;
 
   rc = ble_gap_adv_set_fields(&adv_fields);
@@ -388,10 +411,10 @@ static void on_sync(void) {
     return;
   }
 
-  ble_svc_gap_device_name_set(PROV_DEVICE_NAME);
+  ble_svc_gap_device_name_set(s_prov_device_name);
   prov_update_status_json(0, "idle");
   prov_advertise();
-  ESP_LOGI(TAG, "BLE provisioning GATT ready (%s)", PROV_DEVICE_NAME);
+  ESP_LOGI(TAG, "BLE provisioning GATT ready (%s)", s_prov_device_name);
 }
 
 static void on_reset(int reason) {
@@ -455,6 +478,9 @@ esp_err_t wifi_prov_ble_start(void) {
 
 #else /* !CONFIG_BT_NIMBLE_ENABLED || !CONFIG_ESP_HOSTED_ENABLE_BT_NIMBLE */
 
+static char s_prov_device_name[WIFI_PROV_BLE_DEVICE_NAME_MAX + 1] =
+    WIFI_PROV_BLE_DEVICE_NAME_DEFAULT;
+
 esp_err_t wifi_prov_ble_start(void) {
   ESP_LOGW("wifi_prov_ble",
            "BLE provisioning off — enable BT + NimBLE + ESP-Hosted BT in "
@@ -465,6 +491,17 @@ esp_err_t wifi_prov_ble_start(void) {
 
 void wifi_prov_ble_on_sta_ip_changed(bool connected) {
   (void)connected;
+}
+
+const char *wifi_prov_ble_device_name(void) { return s_prov_device_name; }
+
+void wifi_prov_ble_set_device_name(const char *name) {
+  if (name == NULL || name[0] == '\0') {
+    name = WIFI_PROV_BLE_DEVICE_NAME_DEFAULT;
+  }
+  size_t len = strnlen(name, WIFI_PROV_BLE_DEVICE_NAME_MAX);
+  memcpy(s_prov_device_name, name, len);
+  s_prov_device_name[len] = '\0';
 }
 
 #endif
