@@ -79,6 +79,20 @@ _MEDICAL_SET_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"\b(?:medication|medicine|meds?)\s+reminder\s+(?:at|for)\s+(.+)",
         r"\bremind\s+me\s+to\s+(?:take|use)\s+(?:my\s+)?(?:meds?|medicines?|medication|pills?)(?:\s+at\s+(.+))?",
         r"\b(?:set|create|make)\s+(?:an?\s+)?(?:alarm|reminder)\s+.+?\b(?:take|use)\s+(?:my\s+)?(?:meds?|medicines?|medication|pills?)\b",
+        # Whisper often drops "re-" or hears "find" instead of "remind".
+        r"\b(?:find|mind)\s+me\s+to\s+(?:take|use)\s+(?:my\s+)?(?:meds?|medicines?|medication|pills?)",
+        r"\b(?:take|use)\s+(?:my\s+)?(?:meds?|medicines?|medication|pills?)\s+at\s+(.+)",
+        r"^(?:me\s+)?to\s+(?:take|use)\s+(?:my\s+)?(?:meds?|medicines?|medication|pills?)\b",
+    )
+)
+
+_MEDICINE_REMINDER_HINT_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\b(?:find|mind)\s+me\s+to\s+.*\b(?:meds?|medicines?|medication|pills?)\b",
+        r"\bme\s+to\s+take\s+(?:my\s+)?(?:meds?|medicines?|medication|pills?)\b",
+        r"^to\s+take\s+(?:my\s+)?(?:meds?|medicines?|medication|pills?)\b",
+        r"\b(?:take|use)\s+(?:my\s+)?(?:meds?|medicines?|medication|pills?)\s+at\b",
     )
 )
 
@@ -92,6 +106,16 @@ def is_medical_set_command(user_text: str) -> bool:
     if not text:
         return False
     return any(p.search(text) for p in _MEDICAL_SET_PATTERNS)
+
+
+def looks_like_medicine_reminder_set(user_text: str) -> bool:
+    """Catch garbled Whisper transcripts for medication reminders."""
+    text = user_text.strip()
+    if not text:
+        return False
+    if is_medical_set_command(text):
+        return True
+    return any(p.search(text) for p in _MEDICINE_REMINDER_HINT_PATTERNS)
 
 
 def classify_alarm_text(*parts: str) -> tuple[int, str, bool]:

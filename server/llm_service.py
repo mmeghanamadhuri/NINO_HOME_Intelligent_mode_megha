@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
 import re
 import shutil
 import subprocess
+from dataclasses import dataclass, field
 from typing import Any
 
 import requests
@@ -468,6 +470,19 @@ _CONVERSATION_RECAP_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"\bwhatever we (?:are |'re )?(?:discussing|talking about)\b",
         r"(?:please\s+)?(?:describe|explain|summarize|summarise)(?:\s+me)?\s+(?:whatever|what)\s+we (?:are |'re )?(?:discussing|talking about)\b",
         r"(?:please\s+)?(?:describe|explain|summarize|summarise).{0,32}(?:discussing|talking about)(?:\s+right\s+now|\s+now|\s+today)?\b",
+        r"\brecap\b.{0,48}\b(?:talking|discussing)\b",
+        r"\bwhat we are (?:talking|discussing)\b",
+        r"\bwe(?:'re| are) discussing(?:\s+right\s+now|\s+now)?\b",
+        r"\bcontext of what we\b",
+        r"\bin this view.{0,40}recap\b",
+        r"^what we are discussing[.!?…]*\s*$",
+        r"\bplease give me the context\b",
+        r"\bwe(?:'re| are) (?:talking|discussing) about\b",
+        r"\bso we(?:'re| are)? (?:talking|discussing) about\b",
+        r"\baren't we (?:talking|discussing)(?:\s+about)?\b",
+        r"\bare we (?:talking|discussing) about\b",
+        r"\bhope.{0,24}(?:we(?:'re| are)|that we).{0,24}(?:talking|discussing) about\b",
+        r"\b(?:isn't|is not) (?:that|this) what we(?:'re| are) (?:talking|discussing) about\b",
     )
 )
 
@@ -533,18 +548,127 @@ def is_conversation_recap_question(user_text: str) -> bool:
     return any(p.search(text) for p in _CONVERSATION_RECAP_PATTERNS)
 
 
+_TOPIC_FOCUSED_RECAP_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bhope.{0,30}(?:talking|discussing) about\b",
+        r"\baren't we (?:talking|discussing) about\b",
+        r"\bare we (?:talking|discussing) about\b",
+        r"\bso,?\s*we(?:'re| are)?\s+(?:talking|discussing) about\b",
+        r"\bisn't that what we(?:'re| are) (?:talking|discussing) about\b",
+        r"\b(?:today|yesterday|earlier|just now)\b.{0,24}(?:talking|discussing) about\b",
+        r"\bwe(?:'re| are)\s+(?:talking|discussing) about\b",
+    )
+)
+
+_TALKING_ABOUT_TOPIC = re.compile(
+    r"(?:talking|discussing)\s+about\s+(?:something\s+(?:called\s+)?)?",
+    re.IGNORECASE,
+)
+
+_TOPIC_EXTRACT = re.compile(
+    r"(?:talking|discussing) about\s+(?:something\s+(?:called\s+)?)?"
+    r"(.+?)(?:\s+right|\s+correct)?\s*\?",
+    re.IGNORECASE,
+)
+
+_BRIEF_OR_EXPLAIN_REQUEST = re.compile(
+    r"\b(?:brief(?:\s+out)?|explain|tell me about|describe|walk me through)\b",
+    re.IGNORECASE,
+)
+
+
+def is_topic_focused_recap(user_text: str) -> bool:
+    """User assumes a specific topic was already being discussed."""
+    text = user_text.strip()
+    if not text:
+        return False
+    if any(p.search(text) for p in _TOPIC_FOCUSED_RECAP_PATTERNS):
+        return True
+    return bool(_TALKING_ABOUT_TOPIC.search(text) and extract_recap_focus_topic(text))
+
+
+def is_assumed_prior_topic_question(user_text: str) -> bool:
+    """Same as topic-focused recap — alias for voice routing."""
+    return is_topic_focused_recap(user_text)
+
+
+def user_requests_topic_brief(user_text: str) -> bool:
+    return bool(_BRIEF_OR_EXPLAIN_REQUEST.search(user_text.strip()))
+
+
+def normalize_recap_focus_topic(raw: str) -> str:
+    topic = raw.strip().rstrip(".!?…,")
+    topic = re.sub(r"^(?:something\s+)?(?:called\s+)?", "", topic, flags=re.IGNORECASE)
+    topic = re.split(r"[?.!,;]", topic, maxsplit=1)[0].strip()
+    topic = re.sub(r"\s+(?:right|correct)$", "", topic, flags=re.IGNORECASE)
+    return topic
+
+
+def extract_recap_focus_topic(user_text: str) -> str | None:
+    """Pull the subject from 'we are talking about trigonometry right?'."""
+    text = user_text.strip()
+    match = _TOPIC_EXTRACT.search(text)
+    if match:
+        topic = normalize_recap_focus_topic(match.group(1))
+        if len(topic) >= 3:
+            return topic
+    fallback = _TALKING_ABOUT_TOPIC.search(text)
+    if fallback:
+        after = text[fallback.end() :]
+        chunk = re.split(r"[?.!,;]", after, maxsplit=1)[0]
+        topic = normalize_recap_focus_topic(chunk)
+        if len(topic) >= 3:
+            return topic
+    return None
+
+
+def recap_turn_matches_topic(
+    topic: str, user_text: str, assistant_text: str
+) -> bool:
+    topic_clean = normalize_recap_focus_topic(topic).lower()
+    if not topic_clean:
+        return False
+    blob = f"{user_text} {assistant_text}".lower()
+    if topic_clean in blob:
+        return True
+    tokens = [w for w in re.findall(r"[a-z0-9]+", topic_clean) if len(w) >= 4]
+    if len(tokens) >= 2:
+        return all(token in blob for token in tokens)
+    if tokens:
+        return tokens[0] in blob
+    short_tokens = [w for w in re.findall(r"[a-z0-9]+", topic_clean) if len(w) >= 3]
+    return bool(short_tokens) and all(t in blob for t in short_tokens)
+
+
+def recap_topic_not_found_reply(
+    topic: str,
+    *,
+    person_name: str = "",
+) -> str:
+    """Deterministic reply — never hallucinate a briefing without DB context."""
+    prefix = f"{person_name}, " if person_name else ""
+    return (
+        f"{prefix}I don't have {topic} in our conversation history yet. "
+        "Shall we discuss it now?"
+    )
+
+
 def answer_conversation_recap(
     user_text: str,
     *,
     viewer_name: str | None,
     recognition_state: str,
     memory_context: str | None = None,
+    focus_topic: str | None = None,
     model: str | None = None,
     api_url: str | None = None,
     max_words: int = 45,
 ) -> str:
     name = (viewer_name or "").strip()
     history = (memory_context or "").strip()
+    if focus_topic and not history:
+        return recap_topic_not_found_reply(focus_topic, person_name=name)
     style_hint = random.choice(_RECAP_STYLE_VARIANTS)
 
     if recognition_state == "recognized" and name:
@@ -568,11 +692,33 @@ def answer_conversation_recap(
 
     history_rules = (
         "Session history is provided below. Summarize the latest discussion across all provided turns (up to 5).\n"
+        "If the user is checking whether you are discussing a specific topic (e.g. 'aren't we talking about X?'), "
+        "answer yes or no based ONLY on the session history, then briefly say what you were discussing.\n"
         "Ignore incomplete speech-to-text fragments.\n"
-        if history
+        if history and not focus_topic
         else (
-            "No usable conversation history is available for this user yet.\n"
-            "Say that briefly and ask one short follow-up prompt to continue.\n"
+            f"The user is asking specifically about '{focus_topic}'.\n"
+            "Use ONLY the session turns below that mention this topic.\n"
+            "Do NOT mention birthdays, food, drinks, sports, or any unrelated subject.\n"
+            "If the turns support it, confirm briefly and explain only what was said about this topic.\n"
+            "Never bring in other topics from earlier chats.\n"
+            if history and focus_topic
+            else (
+                "No usable conversation history is available for this user yet.\n"
+                "Say that briefly and ask one short follow-up prompt to continue.\n"
+            )
+        )
+    )
+
+    style_rules = (
+        f"- {style_hint}\n"
+        "- Give a compact natural summary in 1-2 short sentences.\n"
+        "- Stay on the asked topic only; do not drift to unrelated stored facts.\n"
+        if focus_topic
+        else (
+            f"- {style_hint}\n"
+            "- Give a compact natural summary in 2-3 short sentences.\n"
+            "- Cover the key points from the provided recent turns (aim for 3-5 points when available), not just one topic.\n"
         )
     )
 
@@ -583,9 +729,7 @@ def answer_conversation_recap(
         f"{history_rules}"
         f"{_memory_context_block(history)}"
         "Style rules for recap quality:\n"
-        f"- {style_hint}\n"
-        "- Give a compact natural summary in 2-3 short sentences.\n"
-        "- Cover the key points from the provided recent turns (aim for 3-5 points when available), not just one topic.\n"
+        f"{style_rules}"
         "- Use fresh wording each time; avoid repeating the same sentence structure on every recap.\n"
         "- Do NOT start with or repeat 'You asked about...'.\n"
         "- Never use bullet points, numbering, or list formatting.\n"
@@ -668,9 +812,11 @@ def answer_voice_query(
     if memory_context:
         name_hint = viewer_name.strip() if viewer_name else "them"
         memory_rules = (
-            "Known facts and recent user lines are below. Use them when relevant. "
+            "Known facts and recent user lines are below. Use ONLY facts relevant to "
+            "the user's current question. "
             "Speak directly to them in second person. "
             f'Never say "You and {name_hint}" or use their name in third person. '
+            "Do not mention birthdays, hobbies, or jokes unless the user asked about them. "
             "Ignore incomplete fragment lines.\n"
             f"{_anti_repetition_block(recent_assistant_replies)}"
         )
@@ -684,6 +830,7 @@ def answer_voice_query(
         f"- {style_hint}\n"
         "- Sound natural and casual, not scripted or robotic.\n"
         "- If the topic came up before, vary wording and tone — do not repeat the same sentence.\n"
+        "- Answer ONLY what the user asked; do not bring up unrelated stored facts.\n"
         f"Rules: one short spoken reply under {max_words} words, plain sentences, "
         "no lists, no markdown, no stage directions, suitable to read aloud.\n"
         f"The user asked: {user_text}"
@@ -696,4 +843,183 @@ def answer_voice_query(
         timeout_s=VOICE_QUERY_TIMEOUT_S,
         temperature=_voice_reply_temperature(),
         top_p=_voice_reply_top_p(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# LLM-driven memory: recall vs store vs chat
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MemoryTurnDecision:
+    action: str  # chat | recall | store
+    recall_keys: list[str] = field(default_factory=list)
+    store: list[dict[str, Any]] = field(default_factory=list)
+
+
+_MEMORY_SLOT_CATALOG = """
+birthdate, anniversary, nickname,
+favorite_food, favorite_drink, favorite_sport, favorite_color, favorite_movie,
+favorite_music, favorite_game, favorite_book, favorite_show,
+hobbies, job_title, employer, education, skills,
+allergies, dietary_restrictions, health_conditions,
+location, hometown, nationality, languages,
+family, spouse, children, pets,
+relationship_status, religion, goals, aspirations,
+dislikes, preferences
+"""
+
+
+def _parse_memory_turn_json(raw: str) -> MemoryTurnDecision:
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            return MemoryTurnDecision(action="chat")
+        try:
+            data = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return MemoryTurnDecision(action="chat")
+    if not isinstance(data, dict):
+        return MemoryTurnDecision(action="chat")
+    action = str(data.get("action", "chat")).strip().lower()
+    if action not in {"chat", "recall", "store"}:
+        action = "chat"
+    recall_keys = [
+        str(k).strip()
+        for k in (data.get("recall_keys") or [])
+        if str(k).strip()
+    ]
+    store_raw = data.get("store") or data.get("memories") or []
+    store: list[dict[str, Any]] = []
+    if isinstance(store_raw, list):
+        store = [item for item in store_raw if isinstance(item, dict)]
+    return MemoryTurnDecision(action=action, recall_keys=recall_keys, store=store)
+
+
+def analyze_memory_turn(
+    user_text: str,
+    *,
+    person_name: str | None = None,
+    known_memory_keys: list[str] | None = None,
+    model: str | None = None,
+    api_url: str | None = None,
+) -> MemoryTurnDecision:
+    """LLM decides whether the user is recalling, sharing, or just chatting."""
+    who = (
+        f"The speaker is {person_name.strip()}."
+        if person_name and person_name.strip()
+        else "The speaker is an identified user."
+    )
+    keys_hint = ""
+    if known_memory_keys:
+        keys_hint = (
+            "Memory keys already stored for this user: "
+            + ", ".join(known_memory_keys[:20])
+            + ".\n"
+        )
+    prompt = (
+        "You classify voice input for a personal memory system.\n"
+        f"{who}\n"
+        f"{keys_hint}"
+        "Decide ONE action:\n"
+        "- recall: user asks to retrieve **personal** saved facts about themselves "
+        "(birthday, favorites, likes/dislikes, job, family, pets, allergies, etc.)\n"
+        "- store: user explicitly shares durable personal facts worth remembering "
+        "(preferences, dates, relationships, location, health, goals, etc.)\n"
+        "- chat: general Q&A, jokes, trivia, commands, greetings, fragments, "
+        "conversation topic checks ('are we talking about X?'), recap/context requests, "
+        "or nothing durable to save\n\n"
+        "NOT recall: 'are we discussing CEOs', 'what are we talking about', "
+        "'hope we are talking about X' — those are conversation context, action=chat.\n"
+        "STORE rules: only facts the USER stated; skip jokes, questions, "
+        "transient mood, weather, things only an assistant would say.\n"
+        "Preference corrections count as store (e.g. 'favorite food is biryani not lemon rice').\n"
+        "For each store item, memory must be a complete short fact sentence grounded in "
+        "what the user said (not just one word).\n"
+        "RECALL rules: pick snake_case keys to look up. Use catalog keys when possible.\n"
+        f"Key catalog:{_MEMORY_SLOT_CATALOG}\n"
+        "Return JSON only:\n"
+        '{"action":"chat|recall|store","recall_keys":[],"store":'
+        '[{"key":"favorite_food","memory":"Favorite food is biryani, not lemon rice","importance":8}]}\n\n'
+        f"User said:\n{user_text.strip()}\n"
+    )
+    raw = ollama_generate(
+        prompt,
+        model=model,
+        api_url=api_url,
+        num_predict=200,
+        timeout_s=VOICE_QUERY_TIMEOUT_S,
+        temperature=0.1,
+    )
+    return _parse_memory_turn_json(raw)
+
+
+def answer_memory_store_ack(
+    user_text: str,
+    stored_facts: list[str],
+    *,
+    person_name: str | None = None,
+    model: str | None = None,
+    api_url: str | None = None,
+    max_words: int = 28,
+) -> str:
+    """Short spoken acknowledgment after the LLM chose to store facts."""
+    facts = "; ".join(stored_facts[:3])
+    who = f"Address them as {person_name.strip()}. " if person_name else ""
+    prompt = (
+        "You are NiNO, a friendly voice assistant.\n"
+        f"{who}"
+        f"The user said: {user_text.strip()}\n"
+        f"You saved these personal facts: {facts}\n"
+        f"Give ONE short spoken acknowledgment under {max_words} words. "
+        "Confirm what you will remember. No lists, no markdown.\n"
+    )
+    return ollama_generate(
+        prompt,
+        model=model,
+        api_url=api_url,
+        num_predict=64,
+        timeout_s=VOICE_QUERY_TIMEOUT_S,
+        temperature=0.5,
+    )
+
+
+def answer_memory_recall_reply(
+    user_text: str,
+    recalled_facts: list[str],
+    *,
+    person_name: str | None = None,
+    model: str | None = None,
+    api_url: str | None = None,
+    max_words: int = 35,
+) -> str:
+    """Speak a recall answer from DB facts (LLM phrases it naturally)."""
+    if not recalled_facts:
+        prefix = f"{person_name}, " if person_name else ""
+        return f"{prefix}I don't have that saved yet."
+    facts = "; ".join(recalled_facts)
+    who = f"Speaking to {person_name.strip()}. " if person_name else ""
+    prompt = (
+        "You are NiNO, a friendly voice assistant.\n"
+        f"{who}"
+        f"The user asked: {user_text.strip()}\n"
+        f"Known facts from memory database: {facts}\n"
+        f"Answer using ONLY those facts. Under {max_words} words. "
+        "Second person. No markdown. If facts do not answer the question, "
+        "say you do not have that saved yet.\n"
+    )
+    return ollama_generate(
+        prompt,
+        model=model,
+        api_url=api_url,
+        num_predict=80,
+        timeout_s=VOICE_QUERY_TIMEOUT_S,
+        temperature=0.35,
     )

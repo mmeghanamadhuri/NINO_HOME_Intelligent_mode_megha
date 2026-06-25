@@ -73,6 +73,8 @@ _STT_FRAGMENT_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"^(?:what )?we (?:just )?(?:talked|discussed) about[\s-]*$",
         r"^(?:about|and|so|here)[\s-]*$",
         r"^tell me about[\s-]*$",
+        r"^\.\.\.\s*",
+        r"^\*+\s*$",
     )
 )
 
@@ -97,12 +99,15 @@ def filter_recent_turns(
     recent: list[tuple[str, str]],
 ) -> list[tuple[str, str]]:
     """Remove STT fragments from session history shown to the LLM."""
-    cleaned: list[tuple[str, str]] = []
-    for user_text, assistant_text in recent:
-        if is_stt_fragment(user_text):
-            continue
-        cleaned.append((user_text.strip(), assistant_text.strip()))
-    return cleaned
+    from memory_filters import filter_recent_turns_for_prompt
+
+    return filter_recent_turns_for_prompt(
+        [
+            (user_text, assistant_text)
+            for user_text, assistant_text in recent
+            if not is_stt_fragment(user_text)
+        ]
+    )
 
 
 def truncate_context_text(text: str, limit: int = 160) -> str:
@@ -292,7 +297,9 @@ class MemoryService:
             return {"ready": False, "last_error": self._last_error}
         return {"ready": True, "table_counts": self._fetch_table_counts()}
 
-    def load_context(self, display_name: str | None) -> LoadedMemoryContext | None:
+    def load_context(
+        self, display_name: str | None, *, query_text: str = ""
+    ) -> LoadedMemoryContext | None:
         if not self._ready or not display_name:
             return None
         face_id = slug_face_id(display_name)
@@ -308,6 +315,9 @@ class MemoryService:
                 )
                 summary = self._fetch_latest_summary(conn, user_id)
             recent = filter_recent_turns(recent)
+            from memory_filters import filter_memories_for_query
+
+            memories = filter_memories_for_query(memories, query_text)
             block = self._format_prompt_block(
                 name=display_name.strip(),
                 recent=recent,
@@ -351,17 +361,438 @@ class MemoryService:
             self._last_error = str(exc)
             return None
 
+    def get_memory_text_by_key(self, user_id: int, memory_key: str) -> str | None:
+        if not self._ready or not memory_key:
+            return None
+        from memory_filters import memory_key_lookup_candidates
+
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    for key in memory_key_lookup_candidates(memory_key):
+                        cur.execute(
+                            """
+                            SELECT memory_text FROM memories
+                            WHERE user_id = %s AND memory_key = %s
+                            ORDER BY updated_at DESC NULLS LAST, created_at DESC
+                            LIMIT 1
+                            """,
+                            (user_id, key),
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            return str(row[0]).strip()
+            return None
+        except Exception as exc:
+            logger.warning("get_memory_text_by_key failed: %s", exc)
+            return None
+
+    def list_preference_memories(
+        self, user_id: int, *, dislikes: bool = False
+    ) -> list[str]:
+        if not self._ready:
+            return []
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    if dislikes:
+                        cur.execute(
+                            """
+                            SELECT memory_text FROM memories
+                            WHERE user_id = %s
+                              AND (
+                                memory_key LIKE 'dislike%%'
+                                OR memory_text ILIKE '%%dislike%%'
+                                OR memory_text ILIKE '%%don''t like%%'
+                                OR memory_text ILIKE '%%hate%%'
+                              )
+                            ORDER BY updated_at DESC NULLS LAST, created_at DESC
+                            """,
+                            (user_id,),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT memory_text FROM memories
+                            WHERE user_id = %s
+                              AND (
+                                memory_key LIKE 'favorite_%%'
+                                OR memory_key LIKE 'likes_%%'
+                              )
+                            ORDER BY updated_at DESC NULLS LAST, created_at DESC
+                            """,
+                            (user_id,),
+                        )
+                    rows = cur.fetchall()
+            return [str(row[0]).strip() for row in rows if row and row[0]]
+        except Exception as exc:
+            logger.warning("list_preference_memories failed: %s", exc)
+            return []
+
+    def answer_memory_recall(
+        self,
+        user_id: int,
+        user_text: str,
+        *,
+        person_name: str = "",
+    ) -> str | None:
+        """Answer from the memories table — not from conversation history."""
+        from memory_filters import (
+            RECALL_ALL_PREFERENCES,
+            RECALL_DISLIKES,
+            format_memories_list_for_recall,
+            format_memory_for_recall,
+            infer_recall_memory_key,
+        )
+
+        key = infer_recall_memory_key(user_text)
+        if not key:
+            return None
+        name = (person_name or "").strip()
+
+        if key == RECALL_ALL_PREFERENCES:
+            stored_list = self.list_preference_memories(user_id, dislikes=False)
+            answer = format_memories_list_for_recall(stored_list, dislikes=False)
+        elif key == RECALL_DISLIKES:
+            stored_list = self.list_preference_memories(user_id, dislikes=True)
+            answer = format_memories_list_for_recall(stored_list, dislikes=True)
+        else:
+            stored = self.get_memory_text_by_key(user_id, key)
+            if not stored:
+                prefix = f"{name}, " if name else ""
+                return f"{prefix}I don't have that saved yet."
+            answer = format_memory_for_recall(stored)
+
+        if name and answer and not answer.lower().startswith(name.lower()):
+            return f"{name}, {answer[0].lower()}{answer[1:]}" if answer else answer
+        return answer
+
+    def upsert_preference_from_utterance(
+        self,
+        user_id: int,
+        user_text: str,
+        *,
+        person_name: str = "",
+    ) -> str | None:
+        """Immediately store a spoken preference update (before async extraction)."""
+        from memory_filters import (
+            normalize_memory_key,
+            parse_birthdate_update,
+            parse_like_dislike_update,
+            parse_preference_update,
+            preference_update_memory_key,
+        )
+
+        birthdate = parse_birthdate_update(user_text)
+        if birthdate:
+            memory_key = "birthdate"
+            memory_text = f"My birthday is on {birthdate}"
+        else:
+            parsed = parse_preference_update(user_text)
+            if parsed:
+                topic, value = parsed
+                memory_key = preference_update_memory_key(topic)
+                memory_text = f"{value} is my favorite {topic}"
+            else:
+                like_dislike = parse_like_dislike_update(user_text)
+                if not like_dislike:
+                    return None
+                kind, subject = like_dislike
+                slug = normalize_memory_key(subject)[:48]
+                if kind == "dislike":
+                    memory_key = f"dislike_{slug}"
+                    memory_text = f"I dislike {subject}"
+                else:
+                    memory_key = f"likes_{slug}"
+                    memory_text = f"I like {subject}"
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    self._upsert_memory(cur, user_id, memory_text, 7, memory_key)
+                conn.commit()
+            logger.info(
+                "Preference synced user_id=%s key=%s text=%r",
+                user_id,
+                memory_key,
+                memory_text[:80],
+            )
+            return memory_key
+        except Exception as exc:
+            logger.warning("upsert_preference_from_utterance failed: %s", exc)
+            return None
+
+    def list_memory_keys_for_user(self, user_id: int) -> list[str]:
+        if not self._ready:
+            return []
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT DISTINCT memory_key FROM memories
+                        WHERE user_id = %s AND memory_key IS NOT NULL
+                        ORDER BY memory_key
+                        """,
+                        (user_id,),
+                    )
+                    rows = cur.fetchall()
+            return [str(row[0]).strip() for row in rows if row and row[0]]
+        except Exception as exc:
+            logger.warning("list_memory_keys_for_user failed: %s", exc)
+            return []
+
+    def fetch_memories_for_keys(self, user_id: int, keys: list[str]) -> list[str]:
+        from memory_filters import canonical_preference_key, memory_key_lookup_candidates
+
+        if not self._ready:
+            return []
+        found: list[str] = []
+        seen: set[str] = set()
+        lookup_keys = keys or []
+        if not lookup_keys:
+            try:
+                with self._connect() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT memory_text FROM memories
+                            WHERE user_id = %s
+                            ORDER BY importance DESC, updated_at DESC NULLS LAST
+                            LIMIT 5
+                            """,
+                            (user_id,),
+                        )
+                        rows = cur.fetchall()
+                return [str(r[0]).strip() for r in rows if r and r[0]]
+            except Exception as exc:
+                logger.warning("fetch_memories_for_keys fallback failed: %s", exc)
+                return []
+
+        for raw_key in lookup_keys:
+            key = raw_key.strip()
+            if not key:
+                continue
+            if not key.startswith("favorite_") and key not in {
+                "birthdate",
+                "hobbies",
+                "job_title",
+                "allergies",
+                "location",
+                "dislikes",
+            }:
+                key = canonical_preference_key(key)
+            for candidate in memory_key_lookup_candidates(key):
+                text = self.get_memory_text_by_key(user_id, candidate)
+                if text and text.lower() not in seen:
+                    seen.add(text.lower())
+                    found.append(text)
+        return found
+
+    def store_llm_memory_items(
+        self,
+        user_id: int,
+        items: list[dict[str, Any]],
+        *,
+        user_text: str,
+        assistant_text: str = "",
+    ) -> list[str]:
+        from memory_filters import (
+            enrich_llm_memory_text,
+            infer_memory_key,
+            is_valid_llm_memory_item,
+        )
+
+        if not self._ready or not items:
+            return []
+        stored: list[str] = []
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    for item in items:
+                        raw_text = str(item.get("memory", "")).strip()
+                        imp = int(item.get("importance", 7))
+                        explicit_key = str(item.get("key", "") or "").strip()
+                        if not raw_text or imp < SETTINGS.min_importance:
+                            logger.info(
+                                "LLM store skip (importance/text) user_id=%s text=%r",
+                                user_id,
+                                raw_text[:60],
+                            )
+                            continue
+                        memory_key = infer_memory_key(raw_text, explicit_key)
+                        text = enrich_llm_memory_text(raw_text, memory_key, user_text)
+                        if not is_valid_llm_memory_item(
+                            text, user_text=user_text, memory_key=memory_key
+                        ):
+                            logger.info(
+                                "LLM store rejected user_id=%s key=%s text=%r",
+                                user_id,
+                                memory_key,
+                                text[:80],
+                            )
+                            continue
+                        self._upsert_memory(cur, user_id, text, imp, memory_key)
+                        stored.append(text)
+                conn.commit()
+            if stored:
+                logger.info(
+                    "LLM memory store user_id=%s count=%d keys from %d items",
+                    user_id,
+                    len(stored),
+                    len(items),
+                )
+            elif items:
+                logger.warning(
+                    "LLM memory store: all %d item(s) rejected for user_id=%s heard=%s",
+                    len(items),
+                    user_id,
+                    user_text[:80],
+                )
+        except Exception as exc:
+            logger.warning("store_llm_memory_items failed: %s", exc)
+        return stored
+
+    def extract_and_store_sync(
+        self,
+        user_id: int,
+        user_text: str,
+        *,
+        assistant_text: str = "",
+        model: str | None = None,
+        api_url: str | None = None,
+    ) -> list[str]:
+        """Fallback: dedicated LLM extraction when classify/store parsing failed."""
+        from llm_service import DEFAULT_MODEL, DEFAULT_OLLAMA_URL, ollama_generate
+        from memory_filters import infer_memory_key, is_valid_llm_memory_item, enrich_llm_memory_text
+
+        prompt = self._build_extraction_prompt(
+            user_text,
+            min_importance=SETTINGS.min_importance,
+        )
+        try:
+            raw = ollama_generate(
+                prompt,
+                model=model or os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL),
+                api_url=api_url or os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL),
+                num_predict=256,
+                timeout_s=45,
+                temperature=0.2,
+            )
+            items = _parse_memory_json(raw)
+            if not items:
+                return []
+            normalized: list[dict[str, Any]] = []
+            for item in items:
+                key = str(item.get("key", "") or "").strip()
+                mem = str(item.get("memory", item.get("text", ""))).strip()
+                if not mem:
+                    continue
+                memory_key = infer_memory_key(mem, key)
+                mem = enrich_llm_memory_text(mem, memory_key, user_text)
+                if is_valid_llm_memory_item(mem, user_text=user_text, memory_key=memory_key):
+                    normalized.append(
+                        {
+                            "key": memory_key,
+                            "memory": mem,
+                            "importance": int(item.get("importance", 7)),
+                        }
+                    )
+            return self.store_llm_memory_items(
+                user_id,
+                normalized,
+                user_text=user_text,
+                assistant_text=assistant_text,
+            )
+        except Exception as exc:
+            logger.warning("extract_and_store_sync failed: %s", exc)
+            return []
+
+    def handle_llm_memory_turn(
+        self,
+        user_id: int,
+        user_text: str,
+        *,
+        person_name: str = "",
+        model: str | None = None,
+        api_url: str | None = None,
+    ) -> tuple[str, str] | None:
+        """LLM classifies recall vs store vs chat; reads/writes PostgreSQL."""
+        from llm_service import (
+            DEFAULT_MODEL,
+            DEFAULT_OLLAMA_URL,
+            analyze_memory_turn,
+            answer_memory_recall_reply,
+            answer_memory_store_ack,
+            is_conversation_recap_question,
+        )
+
+        if is_conversation_recap_question(user_text):
+            return None
+
+        known_keys = self.list_memory_keys_for_user(user_id)
+        decision = analyze_memory_turn(
+            user_text,
+            person_name=person_name,
+            known_memory_keys=known_keys,
+            model=model or os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL),
+            api_url=api_url or os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL),
+        )
+        logger.info(
+            "LLM memory decision user_id=%s action=%s recall_keys=%s store_items=%d heard=%s",
+            user_id,
+            decision.action,
+            decision.recall_keys,
+            len(decision.store),
+            user_text[:80],
+        )
+        if decision.action == "recall":
+            facts = self.fetch_memories_for_keys(user_id, decision.recall_keys)
+            reply = answer_memory_recall_reply(
+                user_text,
+                facts,
+                person_name=person_name,
+                model=model,
+                api_url=api_url,
+            )
+            return "memory_llm_recall", reply
+
+        if decision.action == "store":
+            stored = self.store_llm_memory_items(
+                user_id, decision.store, user_text=user_text
+            )
+            if not stored:
+                stored = self.extract_and_store_sync(
+                    user_id,
+                    user_text,
+                    model=model,
+                    api_url=api_url,
+                )
+            if not stored:
+                return None
+            reply = answer_memory_store_ack(
+                user_text,
+                stored,
+                person_name=person_name,
+                model=model,
+                api_url=api_url,
+            )
+            return "memory_llm_store", reply
+
+        return None
+
     def log_conversation_background(
         self,
         user_id: int,
         user_text: str,
         assistant_text: str,
+        *,
+        reply_path: str = "llm",
     ) -> None:
         if not self._ready:
             return
         threading.Thread(
             target=self._log_conversation_safe,
-            args=(user_id, user_text, assistant_text),
+            args=(user_id, user_text, assistant_text, reply_path),
             daemon=True,
             name="memory-log-conversation",
         ).start()
@@ -378,24 +809,25 @@ class MemoryService:
         assistant_text: str,
         *,
         existing: LoadedMemoryContext | None = None,
+        reply_path: str = "llm",
     ) -> str:
         """Log exchange; returns skip reason or 'queued'."""
         if not display_name:
             return "no_viewer"
         if not self._ready:
             return "db_not_ready"
-        if not is_loggable_user_text(user_text):
-            logger.info("Skipping STT fragment from memory log: %s", user_text[:80])
-            return "skipped_fragment"
-        from llm_service import is_conversation_recap_question
+        from memory_filters import conversation_log_skip_reason
 
-        if is_conversation_recap_question(user_text):
-            logger.info("Skipping context/recap query from memory log: %s", user_text[:80])
-            return "skipped_recap"
+        skip = conversation_log_skip_reason(user_text, reply_path=reply_path)
+        if skip:
+            logger.info("Skipping conversation log (%s): %s", skip, user_text[:80])
+            return skip
         ctx = existing or self.ensure_user(display_name)
         if not ctx:
             return "user_resolve_failed"
-        self.log_conversation_background(ctx.user_id, user_text, assistant_text)
+        self.log_conversation_background(
+            ctx.user_id, user_text, assistant_text, reply_path=reply_path
+        )
         return "queued"
 
     def after_conversation_logged(
@@ -403,9 +835,29 @@ class MemoryService:
         user_id: int,
         user_text: str,
         assistant_text: str,
+        *,
+        reply_path: str = "llm",
     ) -> None:
-        """Phase B hook — run after conversation INSERT."""
+        """Phase B hook — run after conversation INSERT (backup if sync LLM did not store)."""
         if not self._ready or not SETTINGS.extraction_enabled:
+            return
+        if reply_path in {
+            "memory_llm_store",
+            "memory_llm_recall",
+            "memory_recall",
+            "memory_update",
+            "stt_rejected",
+        }:
+            return
+        from memory_filters import should_extract_memories
+
+        if not should_extract_memories(user_text, reply_path=reply_path):
+            logger.info(
+                "Memory extraction skipped for user_id=%s reply_path=%s heard=%s",
+                user_id,
+                reply_path,
+                user_text[:80],
+            )
             return
         threading.Thread(
             target=self._extract_memories_safe,
@@ -439,20 +891,24 @@ class MemoryService:
             return cur.fetchone() is not None
 
     @staticmethod
-    def _build_extraction_prompt(
-        user_text: str, assistant_text: str, *, min_importance: int
-    ) -> str:
+    def _build_extraction_prompt(user_text: str, *, min_importance: int) -> str:
         return (
-            "Extract durable personal facts worth remembering across future conversations.\n"
-            "STORE: preferences, hobbies, job, relationships, allergies, location, "
-            "stable interests, important personal details.\n"
-            "SKIP: greetings, thanks, transient moods, weather, generic small talk, "
-            "one-off questions with no personal fact.\n"
-            "Return JSON only: a list of objects with keys memory (string) and "
-            f"importance (integer 0-10). Only include importance >= {min_importance}.\n"
-            "Write each memory as a short third-person fact (e.g. \"Favorite planet is Mars\").\n\n"
-            f"User:\n{user_text.strip()}\n\n"
-            f"Assistant:\n{assistant_text.strip()}\n"
+            "Extract durable personal facts the USER stated about themselves.\n"
+            "STORE only if the USER explicitly shared durable personal facts.\n"
+            "Categories: preferences, likes/dislikes, hobbies, job, relationships, "
+            "allergies, location, birthdate, anniversaries, family, pets, health, "
+            "education, goals, nationality, languages, nickname, favorites "
+            "(food, drink, sport, color, movie, music, game, book, show).\n"
+            "SKIP: jokes, sarcasm, assistant summaries, trivia questions, greetings, "
+            "thanks, transient moods, weather, meta-advice, things only the assistant said.\n"
+            "Return JSON only: a list of objects with keys key (snake_case slot name), "
+            "memory (short third-person fact), and importance (integer 0-10).\n"
+            f"Only include importance >= {min_importance}.\n"
+            "Use keys like birthdate, favorite_drink, favorite_sport, favorite_food, "
+            "job_title, hobbies, allergies, location, education, pets, family, "
+            "dislikes, goals, nickname, anniversary.\n"
+            "If nothing durable was stated by the user, return [].\n\n"
+            f"User said:\n{user_text.strip()}\n"
         )
 
     def _connect(self):
@@ -476,6 +932,89 @@ class MemoryService:
                     raise FileNotFoundError(f"Schema not found: {schema_path}")
             conn.commit()
         self._schema_checked = True
+        self._purge_junk_memories()
+
+    def _purge_junk_memories(self) -> None:
+        """Remove known bad rows (jokes, fragments, meta lines)."""
+        from memory_filters import infer_memory_key, is_junk_memory_text
+
+        junk_ids: list[int] = []
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id, memory_text FROM memories")
+                    rows = cur.fetchall()
+                    junk_ids = [int(r[0]) for r in rows if is_junk_memory_text(str(r[1]))]
+                    if junk_ids:
+                        cur.execute("DELETE FROM memories WHERE id = ANY(%s)", (junk_ids,))
+                    cur.execute(
+                        """
+                        DELETE FROM memories
+                        WHERE memory_text ILIKE '%don''t believe everything%'
+                           OR memory_text ILIKE '%not born on june%'
+                           OR memory_text ILIKE '%just a joke%'
+                           OR memory_text ILIKE 'currently working on projects%'
+                           OR memory_text ILIKE '%[insert%'
+                           OR memory_text ILIKE '%insert actual date%'
+                           OR memory_text ILIKE '%are my hobbies%'
+                           OR memory_text ILIKE '%preferred beverage%'
+                           OR memory_text ILIKE '%reading and playing video games%'
+                           OR memory_text ILIKE '%enjoy playing board games%'
+                        """
+                    )
+                    cur.execute(
+                        """
+                        SELECT id, user_id, memory_text, importance
+                        FROM memories
+                        WHERE memory_key IS NULL
+                        ORDER BY importance DESC, id DESC
+                        """
+                    )
+                    for row_id, user_id, text, importance in cur.fetchall():
+                        key = infer_memory_key(str(text))
+                        cur.execute(
+                            """
+                            SELECT id, importance FROM memories
+                            WHERE user_id = %s AND memory_key = %s AND id <> %s
+                            LIMIT 1
+                            """,
+                            (user_id, key, int(row_id)),
+                        )
+                        existing = cur.fetchone()
+                        if existing:
+                            keep_new = int(importance) >= int(existing[1])
+                            if keep_new:
+                                cur.execute(
+                                    "DELETE FROM memories WHERE id = %s",
+                                    (int(existing[0]),),
+                                )
+                                cur.execute(
+                                    """
+                                    UPDATE memories
+                                    SET memory_key = %s, updated_at = NOW()
+                                    WHERE id = %s
+                                    """,
+                                    (key, int(row_id)),
+                                )
+                            else:
+                                cur.execute(
+                                    "DELETE FROM memories WHERE id = %s",
+                                    (int(row_id),),
+                                )
+                        else:
+                            cur.execute(
+                                """
+                                UPDATE memories
+                                SET memory_key = %s, updated_at = NOW()
+                                WHERE id = %s
+                                """,
+                                (key, int(row_id)),
+                            )
+                conn.commit()
+            if junk_ids:
+                logger.info("Memory hygiene removed %d junk row(s)", len(junk_ids))
+        except Exception as exc:
+            logger.warning("Memory hygiene skipped: %s", exc)
 
     def _get_or_create_user(self, conn, face_id: str, name: str) -> int:
         with conn.cursor() as cur:
@@ -578,18 +1117,26 @@ class MemoryService:
             return ""
 
         parts.append(
-            "Use known facts and recent user lines for context. "
+            "Known facts about them are authoritative — if recent lines disagree, "
+            "trust the known facts (especially for preferences and personal details). "
+            "Use known facts and recent user lines only when they directly answer the "
+            "current question. "
             "Answer in fresh, casual spoken wording every time — never copy a previous reply verbatim. "
             "If they ask the same thing again, change tone and phrasing while keeping the same facts. "
             "When several related facts exist (e.g. tea and coffee), combine them naturally. "
             "Do not use repetitive templates such as 'You asked about...'. "
             "Do not say their name as if talking about someone else. "
-            "Do not invent topics not supported by the facts."
+            "Do not invent topics not supported by the facts. "
+            "Do not mention unrelated stored facts (birthdays, hobbies, jokes) unless the user asked about them."
         )
         return "\n\n".join(parts)
 
     def _log_conversation_safe(
-        self, user_id: int, user_text: str, assistant_text: str
+        self,
+        user_id: int,
+        user_text: str,
+        assistant_text: str,
+        reply_path: str = "llm",
     ) -> None:
         try:
             with self._connect() as conn:
@@ -602,10 +1149,27 @@ class MemoryService:
                         (user_id, user_text.strip(), assistant_text.strip()),
                     )
                 conn.commit()
-            self.after_conversation_logged(user_id, user_text, assistant_text)
+            self.after_conversation_logged(
+                user_id, user_text, assistant_text, reply_path=reply_path
+            )
         except Exception as exc:
             logger.warning("Conversation log failed: %s", exc)
             self._last_error = str(exc)
+
+    def _upsert_memory(
+        self, cur, user_id: int, memory_text: str, importance: int, memory_key: str
+    ) -> None:
+        cur.execute(
+            "DELETE FROM memories WHERE user_id = %s AND memory_key = %s",
+            (user_id, memory_key),
+        )
+        cur.execute(
+            """
+            INSERT INTO memories (user_id, memory_key, memory_text, importance, updated_at)
+            VALUES (%s, %s, %s, %s, NOW())
+            """,
+            (user_id, memory_key, memory_text, importance),
+        )
 
     def _extract_memories_safe(
         self, user_id: int, user_text: str, assistant_text: str
@@ -613,10 +1177,13 @@ class MemoryService:
         """Phase B — background memory extraction via Ollama."""
         try:
             from llm_service import DEFAULT_MODEL, DEFAULT_OLLAMA_URL, ollama_generate
+            from memory_filters import (
+                infer_memory_key,
+                is_valid_memory_text,
+            )
 
             prompt = self._build_extraction_prompt(
                 user_text,
-                assistant_text,
                 min_importance=SETTINGS.min_importance,
             )
             raw = ollama_generate(
@@ -637,22 +1204,15 @@ class MemoryService:
                     for item in items:
                         imp = int(item.get("importance", 0))
                         text = str(item.get("memory", "")).strip()
+                        explicit_key = str(item.get("key", "") or "").strip()
                         if not text or imp < SETTINGS.min_importance:
                             continue
-                        if self._memory_already_stored(conn, user_id, text):
-                            logger.debug(
-                                "Skipping duplicate memory for user_id=%s: %s",
-                                user_id,
-                                text[:80],
-                            )
+                        if not is_valid_memory_text(
+                            text, user_text=user_text, assistant_text=assistant_text
+                        ):
                             continue
-                        cur.execute(
-                            """
-                            INSERT INTO memories (user_id, memory_text, importance)
-                            VALUES (%s, %s, %s)
-                            """,
-                            (user_id, text, imp),
-                        )
+                        memory_key = infer_memory_key(text, explicit_key)
+                        self._upsert_memory(cur, user_id, text, imp, memory_key)
                         inserted += 1
                 conn.commit()
             if inserted:

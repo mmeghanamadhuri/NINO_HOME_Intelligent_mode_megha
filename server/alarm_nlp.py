@@ -26,6 +26,7 @@ _ALARM_HINT_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     for p in (
         r"\bremind(?:er)?\b",
         r"\bremaind\b",
+        r"\b(?:find|mind)\s+me\s+to\b",
         r"\balarm\b",
         r"\breminders?\b",
         r"\bwake\s+me\b",
@@ -35,6 +36,7 @@ _ALARM_HINT_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"\bnotify\s+me\b",
         r"\balert\s+me\b",
         r"\bin\s+\d+\s+minutes?\b",
+        r"\b(?:take|use)\s+(?:my\s+)?(?:meds?|medicines?|medication|pills?)\s+at\b",
     )
 )
 

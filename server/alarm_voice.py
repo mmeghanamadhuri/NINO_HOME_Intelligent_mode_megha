@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from alarm_medical import is_medical_set_command
+from alarm_medical import is_medical_set_command, looks_like_medicine_reminder_set
 from alarm_service import Alarm, get_alarm_service
 from alarm_time import system_now
 
@@ -62,6 +62,9 @@ _REMINDER_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     for p in (
         r"\bremind(?:er)?\s+me\s+to\s+(.+)",
         r"\bremaind\s+me\s+to\s+(.+)",  # common speech/Whisper typo
+        r"\b(?:find|mind)\s+me\s+to\s+(.+)",  # Whisper: "remind" -> "find"
+        r"\bme\s+to\s+((?:take|use)\s+(?:my\s+)?(?:meds?|medicines?|medication|pills?).+)",
+        r"^to\s+((?:take|use)\s+(?:my\s+)?(?:meds?|medicines?|medication|pills?).+)",
         r"\bset\s+(?:a\s+)?reminder\s+to\s+(.+)",
         r"\b(?:create|make)\s+(?:a\s+)?reminder\s+to\s+(.+)",
     )
@@ -226,7 +229,11 @@ def handle_alarm_voice(
 
     from alarm_nlp import looks_alarm_related, nlp_fallback_enabled, try_nlp_alarm
 
-    if nlp_fallback_enabled() and (regex_set_attempted or looks_alarm_related(text)):
+    if nlp_fallback_enabled() and (
+        regex_set_attempted
+        or looks_alarm_related(text)
+        or looks_like_medicine_reminder_set(text)
+    ):
         nlp_result = try_nlp_alarm(
             text, person_name=resolved_name, user_id=user_id
         )
@@ -238,6 +245,13 @@ def handle_alarm_voice(
     if is_list_alarm_command(text) or _looks_like_list_after_nlp(text):
         logger.info("Voice list alarms (loose match) | heard: %s", text[:120])
         return _handle_list_alarms(user_id=user_id)
+
+    from memory_filters import is_alarm_followup_question
+
+    if is_alarm_followup_question(text):
+        followup = _handle_alarm_followup(text, person_name=resolved_name, user_id=user_id)
+        if followup.handled:
+            return followup
 
     if regex_set_attempted:
         return AlarmVoiceResult(
@@ -312,6 +326,13 @@ def _extract_time_phrase_from_text(user_text: str) -> str:
 
 
 def _extract_medical_label(user_text: str) -> str:
+    direct = re.search(
+        r"\b((?:take|use)\s+(?:my\s+)?(?:meds?|medicines?|medication|pills?))\s+at\b",
+        user_text,
+        re.IGNORECASE,
+    )
+    if direct:
+        return _clean_reminder_label(direct.group(1))
     tail = _extract_reminder_tail(user_text)
     if tail:
         split = _split_label_and_time_phrase(tail)
@@ -651,6 +672,58 @@ def _extract_delete_target(user_text: str) -> str | None:
             if target:
                 return target
     return None
+
+
+def _handle_alarm_followup(
+    user_text: str,
+    *,
+    person_name: str = "",
+    user_id: int | None = None,
+) -> AlarmVoiceResult:
+    """Explain pending medicine/alarms when user asks why a reminder was set."""
+    service = get_alarm_service()
+    pending = sorted(
+        service.list_pending(user_id=user_id), key=lambda a: (a.priority, a.fire_at)
+    )
+    medical = [a for a in pending if a.is_medical()]
+    targets = medical or pending
+    name = (person_name or "").strip()
+    prefix = f"{name}, " if name else ""
+
+    if not targets:
+        return AlarmVoiceResult(
+            handled=True,
+            reply=f"{prefix}you do not have any pending medicine or alarm reminders right now.",
+        )
+
+    nearest = targets[0]
+    when = nearest.spoken_time()
+    label = (nearest.label or "").strip()
+    if label:
+        label = normalize_label_for_user(label)
+        if nearest.is_medical():
+            return AlarmVoiceResult(
+                handled=True,
+                reply=(
+                    f"{prefix}yes — you have a medication reminder set for {when}"
+                    f"{_day_note_for(nearest.fire_datetime())}: {label}."
+                ),
+            )
+        return AlarmVoiceResult(
+            handled=True,
+            reply=(
+                f"{prefix}you have a reminder set for {when}"
+                f"{_day_note_for(nearest.fire_datetime())}: {label}."
+            ),
+        )
+
+    return AlarmVoiceResult(
+        handled=True,
+        reply=(
+            f"{prefix}you have an alarm set for {when}"
+            f"{_day_note_for(nearest.fire_datetime())}."
+        ),
+    )
 
 
 def _handle_delete_one_alarm(

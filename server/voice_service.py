@@ -24,8 +24,12 @@ from llm_service import (
     answer_voice_query,
     DEFAULT_MODEL,
     DEFAULT_OLLAMA_URL,
+    extract_recap_focus_topic,
+    is_assumed_prior_topic_question,
     is_conversation_recap_question,
+    recap_topic_not_found_reply,
 )
+from memory_filters import is_likely_tts_echo, is_unintelligible_stt
 from eye_expression import infer_eye_expression_for_response
 from tts_service import synthesize_sapi_wav_bytes
 from wav_resample import resample_wav_bytes_to_mono_16bit
@@ -41,12 +45,14 @@ _IDENTITY_QUESTION_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"\bwho am i\b",
         r"\bwhat(?:'s| is) my name\b",
         r"\bdo you know me\b",
+        r"\bdo you know my name\b",
         r"\bdo you know who i am\b",
         r"\bwho is this\b",
         r"\bidentify me\b",
         r"\brecogni[sz]e me\b",
         r"\bwhat do you call me\b",
         r"\bwhat(?:'s| is) my identity\b",
+        r"^my name[.!?…]*\s*$",
     )
 )
 
@@ -74,8 +80,9 @@ _VOLUME_SET_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _VOLUME_STEP_PATTERN = re.compile(
-    r"\b(increase|decrease|raise|lower|up|down)\b(?:\s+volume)?"
-    r"(?:\s+by\s+([a-z0-9\s-]+?)(?:\s*percent)?)?\b",
+    r"\b(increase|decrease|raise|lower)\s+(?:the\s+)?(?:speaker\s+)?volume\b"
+    r"(?:\s+by\s+([a-z0-9\s-]+?)(?:\s*percent)?)?\b"
+    r"|\bvolume\s+(up|down)\b(?:\s+by\s+([a-z0-9\s-]+?)(?:\s*percent)?)?\b",
     re.IGNORECASE,
 )
 _NUMBER_WORDS: dict[str, int] = {
@@ -213,8 +220,12 @@ def _live_memory_viewer_name(
 
 def _recap_context_from_recent_turns(
     recent_history: list[tuple[str, str]],
+    *,
+    focus_topic: str | None = None,
 ) -> str | None:
     """Build recap context from latest non-recap turns (up to 5)."""
+    from llm_service import recap_turn_matches_topic
+
     eligible: list[tuple[str, str]] = []
     for user_text, assistant_text in recent_history:
         heard = str(user_text or "").strip()
@@ -222,9 +233,13 @@ def _recap_context_from_recent_turns(
         if not heard:
             continue
         if is_conversation_recap_question(heard):
-            # Avoid feeding prior recap requests/replies back into recap generation.
+            continue
+        if focus_topic and not recap_turn_matches_topic(focus_topic, heard, replied):
             continue
         eligible.append((heard, replied))
+
+    if focus_topic and not eligible:
+        return None
 
     lines: list[str] = []
     latest_first = list(reversed(eligible[-5:]))
@@ -234,7 +249,12 @@ def _recap_context_from_recent_turns(
         )
     if not lines:
         return None
-    return "Recent turns (ordered newest to oldest, use these for recap):\n" + "\n".join(lines)
+    header = (
+        f"Recent turns about '{focus_topic}' (newest to oldest):\n"
+        if focus_topic
+        else "Recent turns (ordered newest to oldest, use these for recap):\n"
+    )
+    return header + "\n".join(lines)
 
 
 def is_identity_question(user_text: str) -> bool:
@@ -375,7 +395,7 @@ def parse_volume_command(user_text: str) -> tuple[str, int | None] | None:
       ("delta", delta_percent)
     """
     text = user_text.strip().lower()
-    if not text:
+    if not text or "volume" not in text:
         return None
 
     set_match = _VOLUME_SET_PATTERN.search(text)
@@ -389,12 +409,15 @@ def parse_volume_command(user_text: str) -> tuple[str, int | None] | None:
     if not step_match:
         return None
 
-    action = step_match.group(1).lower()
-    amount_raw = step_match.group(2) or ""
-    if action in {"increase", "raise", "up"}:
-        sign = 1
+    if step_match.group(1):
+        action = step_match.group(1).lower()
+        amount_raw = step_match.group(2) or ""
+        sign = 1 if action in {"increase", "raise"} else -1
     else:
-        sign = -1
+        direction = (step_match.group(3) or "").lower()
+        amount_raw = step_match.group(4) or ""
+        sign = 1 if direction == "up" else -1
+
     if not amount_raw.strip():
         return ("delta", sign * 10)
     amount = _parse_volume_value_phrase(amount_raw)
@@ -591,6 +614,32 @@ def process_voice_wav(
         )
         return wav_out, meta
 
+    if is_likely_tts_echo(user_text) or is_unintelligible_stt(user_text):
+        reply_path = "stt_rejected"
+        logger.info("Voice STT rejected (echo/garbled) | heard: %s", user_text[:120])
+        reply = "Sorry, I didn't catch that. Could you say that again?"
+        t_reply = time.perf_counter()
+        wav, _voice = synthesize_sapi_wav_bytes(reply)
+        wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
+        t_tts = time.perf_counter()
+        audio_in_seconds = max(0, len(wav_bytes) - 44) / (16000 * 2)
+        audio_out_seconds = max(0, len(wav_out) - 44) / (VOICE_ASSIST_PLAYBACK_HZ * 2)
+        meta.timings = {
+            "heard": user_text[:200],
+            "reply_text": reply[:200],
+            "reply_path": reply_path,
+            "audio_in_seconds": round(audio_in_seconds, 2),
+            "audio_in_bytes": len(wav_bytes),
+            "audio_out_seconds": round(audio_out_seconds, 2),
+            "audio_out_bytes": len(wav_out),
+            "stt_engine": stt_engine,
+            "stt_seconds": round(t_stt - t_start, 3),
+            "reply_seconds": round(t_reply - t_stt, 3),
+            "tts_seconds": round(t_tts - t_reply, 3),
+            "process_total_seconds": round(t_tts - t_start, 3),
+        }
+        return wav_out, meta
+
     from alarm_voice import handle_alarm_voice
 
     from memory_service import get_memory_service, resolve_alarm_user
@@ -602,7 +651,7 @@ def process_voice_wav(
     )
     memory_ctx = None
     if memory_name:
-        memory_ctx = memory_svc.load_context(memory_name)
+        memory_ctx = memory_svc.load_context(memory_name, query_text=user_text)
     alarm_user_id, alarm_person_name = resolve_alarm_user(
         camera_identity_name,
         camera_identity_state,
@@ -632,7 +681,7 @@ def process_voice_wav(
         else:
             meta.trigger_servo_360 = True
             reply = reply_for_servo_360_command()
-    elif is_conversation_recap_question(user_text):
+    if reply_path == "llm" and is_conversation_recap_question(user_text):
         if not memory_name:
             reply_path = "recap_blocked_no_face"
             logger.info(
@@ -650,26 +699,79 @@ def process_voice_wav(
                 memory_context=None,
             )
         else:
-            reply_path = "recap"
+            focus_topic = extract_recap_focus_topic(user_text)
+            assumed_prior_topic = is_assumed_prior_topic_question(user_text)
+            recap_context = _recap_context_from_recent_turns(
+                memory_ctx.recent_history if memory_ctx else [],
+                focus_topic=focus_topic if assumed_prior_topic else None,
+            )
+            if assumed_prior_topic:
+                if not focus_topic or recap_context is None:
+                    reply_path = "recap_not_found"
+                    logger.info(
+                        "Voice recap topic not in history | viewer=%s topic=%s heard: %s",
+                        memory_name,
+                        focus_topic or "(unknown)",
+                        user_text[:120],
+                    )
+                    reply = recap_topic_not_found_reply(
+                        focus_topic or "that topic",
+                        person_name=memory_name,
+                    )
+                else:
+                    reply_path = "recap"
+                    logger.info(
+                        "Voice recap topic confirmed | viewer=%s topic=%s heard: %s",
+                        memory_name,
+                        focus_topic,
+                        user_text[:120],
+                    )
+                    reply = answer_conversation_recap(
+                        user_text,
+                        viewer_name=memory_name,
+                        recognition_state=camera_identity_state,
+                        model=SETTINGS.ollama_model,
+                        api_url=SETTINGS.ollama_url,
+                        max_words=SETTINGS.recap_max_words,
+                        memory_context=recap_context,
+                        focus_topic=focus_topic,
+                    )
+            else:
+                reply_path = "recap"
+                logger.info(
+                    "Voice recap query | viewer=%s turns=%s topic=%s | heard: %s",
+                    memory_name,
+                    memory_ctx.recent_turns if memory_ctx else 0,
+                    focus_topic or "(general)",
+                    user_text[:120],
+                )
+                reply = answer_conversation_recap(
+                    user_text,
+                    viewer_name=memory_name,
+                    recognition_state=camera_identity_state,
+                    model=SETTINGS.ollama_model,
+                    api_url=SETTINGS.ollama_url,
+                    max_words=SETTINGS.recap_max_words,
+                    memory_context=recap_context,
+                    focus_topic=focus_topic,
+                )
+    elif reply_path == "llm" and memory_name and memory_ctx and memory_svc.ready:
+        llm_memory = memory_svc.handle_llm_memory_turn(
+            memory_ctx.user_id,
+            user_text,
+            person_name=memory_name,
+            model=SETTINGS.ollama_model,
+            api_url=SETTINGS.ollama_url,
+        )
+        if llm_memory:
+            reply_path, reply = llm_memory
             logger.info(
-                "Voice recap query | viewer=%s turns=%s | heard: %s",
+                "Voice LLM memory | path=%s viewer=%s heard: %s",
+                reply_path,
                 memory_name,
-                memory_ctx.recent_turns if memory_ctx else 0,
                 user_text[:120],
             )
-            recap_context = _recap_context_from_recent_turns(
-                memory_ctx.recent_history if memory_ctx else []
-            )
-            reply = answer_conversation_recap(
-                user_text,
-                viewer_name=memory_name,
-                recognition_state=camera_identity_state,
-                model=SETTINGS.ollama_model,
-                api_url=SETTINGS.ollama_url,
-                max_words=SETTINGS.recap_max_words,
-                memory_context=recap_context,
-            )
-    elif is_identity_question(user_text):
+    if reply_path == "llm" and is_identity_question(user_text):
         reply_path = "identity_llm"
         logger.info(
             "Voice identity query | state=%s name=%s | heard: %s",
@@ -686,7 +788,7 @@ def process_voice_wav(
             max_words=SETTINGS.max_words_reply,
             memory_context=memory_ctx.prompt_block if memory_ctx else None,
         )
-    else:
+    elif reply_path == "llm":
         effective_viewer = _viewer_for_this_reply(viewer_name)
         if effective_viewer:
             logger.info(
@@ -716,12 +818,13 @@ def process_voice_wav(
     t_reply = time.perf_counter()
 
     memory_store = "skipped"
-    if reply_path in {"llm", "identity_llm"}:
+    if reply_path in {"llm", "identity_llm", "memory_llm_store"}:
         memory_store = memory_svc.log_conversation_for_viewer(
             memory_name,
             user_text,
             reply,
             existing=memory_ctx,
+            reply_path=reply_path,
         )
 
     meta.eye_expression = infer_eye_expression_for_response(

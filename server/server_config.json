@@ -1,5 +1,0 @@
-{
-  "camera_source": "http://192.168.0.85/stream",
-  "esp_play_wav_url": "http://192.168.0.85/play_wav",
-  "elevenlabs_api_key": "sk_c2dcc2c3b463c4b75a0de7e9786c36e82bb9c87fff774007"
-}

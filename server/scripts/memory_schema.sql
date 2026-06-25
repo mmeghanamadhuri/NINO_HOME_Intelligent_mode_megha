@@ -32,6 +32,13 @@ CREATE TABLE IF NOT EXISTS memories (
 CREATE INDEX IF NOT EXISTS idx_memories_user_importance
     ON memories (user_id, importance DESC, created_at DESC);
 
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS memory_key VARCHAR(64);
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_user_key
+    ON memories (user_id, memory_key)
+    WHERE memory_key IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS summaries (
     id BIGSERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
