@@ -4,79 +4,89 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>NiNO Camera Face Server</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=2" />
   </head>
   <body>
-    <main class="page">
-      <section class="hero">
-        <div>
-          <p class="eyebrow">Server-side face detection and recognition</p>
-          <h1>NiNO Camera Face Server</h1>
-          <p>
-            Pulls a local USB camera or ESP32-P4 stream, detects faces on the
-            server, recognizes registered people, and sends robot responses back.
-          </p>
-        </div>
+    <header class="site-header">
+      <div class="site-header-inner">
+        <h1>NiNO Camera Face Server</h1>
         <div class="status-pill" id="connectionStatus">Starting...</div>
-      </section>
+      </div>
+    </header>
 
-      <section class="grid">
-        <div class="card stream-card">
-          <div class="card-header">
-            <h2>Live Feed</h2>
-            <a href="/snapshot.jpg" target="_blank" rel="noreferrer">Open snapshot</a>
-          </div>
+    <main class="page">
+      <p class="intro">
+        Server-side face detection and recognition. Pulls a local USB camera or
+        ESP32-P4 stream, recognizes registered people, and sends robot responses
+        back.
+      </p>
+
+      <section class="card stream-card">
+        <div class="card-header">
+          <h2>Live Feed</h2>
+          <a href="/snapshot.jpg" target="_blank" rel="noreferrer">Open snapshot</a>
+        </div>
+        <div class="stream-frame">
           <img id="stream" src="/video_feed" alt="Annotated camera stream" />
         </div>
+      </section>
 
-        <aside class="panel">
-          <div class="card">
-            <h2>Camera Input</h2>
+      <section class="controls-grid">
+        <div class="card">
+          <h2>Camera Input</h2>
+          <div class="field">
             <label for="cameraSource">Camera source</label>
             <input id="cameraSource" value="{{ camera_source }}" />
-            <button id="startCamera">Start / Restart Stream</button>
-            <p class="hint">
-              Use <code>auto</code> for a local webcam, or
-              <code>http://&lt;P4-IP&gt;/stream</code> for the ESP32-P4. You only need
-              this page (<code>localhost:8000</code>) for video and face recognition; you
-              do not need the board&rsquo;s web page open at the same time.
-            </p>
           </div>
+          <button id="startCamera" type="button">Start / Restart Stream</button>
+          <p class="hint">
+            Use <code>auto</code> for a local webcam, or
+            <code>http://&lt;P4-IP&gt;/stream</code> for the ESP32-P4. You only need
+            this page (<code>localhost:8000</code>) for video and face recognition.
+          </p>
+        </div>
 
-          <div class="card">
-            <h2>Register Person</h2>
+        <div class="card">
+          <h2>Register Person</h2>
+          <div class="field">
             <label for="personName">Name</label>
             <input id="personName" placeholder="Example: Sirena" />
+          </div>
+          <div class="field">
             <label for="sampleCount">Samples</label>
             <input id="sampleCount" type="number" min="1" max="80" value="15" />
-            <button id="registerPerson">Capture Samples and Train</button>
-            <button class="secondary" id="retrain">Retrain Existing Samples</button>
-            <p class="hint">Keep one face centered while registering.</p>
           </div>
+          <button id="registerPerson" type="button">Capture Samples and Train</button>
+          <button class="secondary" id="retrain" type="button">Retrain Existing Samples</button>
+          <p class="hint">Keep one face centered while registering.</p>
+        </div>
 
-          <div class="card">
-            <h2>Alarms &amp; Reminders</h2>
-            <ul id="alarmList" class="alarm-list"></ul>
-            <button class="secondary" id="clearAllAlarms" type="button">
-              Delete all pending
-            </button>
-            <p class="hint">
-              <strong>Board ack (recommended):</strong> on ESP serial once:
-              <code>voice connect &lt;PC_IP&gt; 8000</code> then <code>voice wake on</code>.
-              After a medical alarm plays, the board listens for <strong>5 seconds</strong> — say
-              <strong>yes</strong> or <strong>no</strong> (no &ldquo;Hi ESP&rdquo; needed).
-              Or use <strong>Yes</strong> / <strong>No</strong> here. Flash firmware after updates.
-            </p>
-          </div>
+        <div class="card card-wide">
+          <h2>Alarms &amp; Reminders</h2>
+          <ul id="alarmList" class="alarm-list"></ul>
+          <button class="secondary" id="clearAllAlarms" type="button">
+            Delete all pending
+          </button>
+          <p class="hint">
+            <strong>Board ack:</strong> on ESP serial:
+            <code>voice connect &lt;PC_IP&gt; 8000</code> then
+            <code>voice wake on</code>. After a medical alarm, the board listens
+            for <strong>5 seconds</strong> — say <strong>yes</strong> or
+            <strong>no</strong>. Or use <strong>Yes</strong> /
+            <strong>No</strong> below.
+          </p>
+        </div>
+      </section>
 
-          <div class="card">
-            <h2>Recognition Status</h2>
-            <pre id="statusBox">Loading...</pre>
-          </div>
-        </aside>
+      <section class="card status-card">
+        <div class="card-header">
+          <h2>System Status</h2>
+          <span class="status-label">Live JSON</span>
+        </div>
+        <pre id="statusBox">Loading...</pre>
       </section>
     </main>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=2"></script>
   </body>
 </html>

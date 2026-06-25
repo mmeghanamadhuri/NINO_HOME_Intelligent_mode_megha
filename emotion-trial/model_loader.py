@@ -1,4 +1,4 @@
-from tensorflow.keras.layers import Conv2D, Dense, Dropout, Flatten, MaxPooling2D
+wil from tensorflow.keras.layers import Conv2D, Dense, Dropout, Flatten, MaxPooling2D
 from tensorflow.keras.models import Sequential
 
 

@@ -47,6 +47,9 @@ function renderAlarms(pending, awaiting) {
     const repeat = alarm.next_repeat_at ? ` · repeats ${alarm.next_repeat_at}` : "";
     text.innerHTML = `<strong>${badge}${title}</strong><span>${alarm.spoken_time || alarm.fire_at}${who}${repeat}</span>`;
 
+    const actions = document.createElement("div");
+    actions.className = "alarm-actions";
+
     if (alarm._awaiting) {
       const yes = document.createElement("button");
       yes.type = "button";
@@ -83,12 +86,13 @@ function renderAlarms(pending, awaiting) {
         }
       });
 
-      li.append(yes, no);
+      actions.append(yes, no);
     }
 
     const del = document.createElement("button");
     del.type = "button";
     del.textContent = "Delete";
+    del.className = "delete-btn";
     del.addEventListener("click", async () => {
       del.disabled = true;
       try {
@@ -101,7 +105,8 @@ function renderAlarms(pending, awaiting) {
       }
     });
 
-    li.append(text, del);
+    actions.append(del);
+    li.append(text, actions);
     alarmList.append(li);
   }
 }

@@ -15,11 +15,11 @@ os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
 import cv2
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, StreamingResponse
-from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
+from starlette.staticfiles import StaticFiles as StarletteStaticFiles
 
 from alarm_service import get_alarm_service
 from camera import CameraStream
@@ -118,7 +118,17 @@ if _CONFIG_ELEVENLABS_KEY and not os.environ.get("ELEVENLABS_API_KEY", "").strip
 
 app = FastAPI(title="NiNO Camera Face Server")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
-app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+
+
+class NoCacheStaticFiles(StarletteStaticFiles):
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        return response
+
+
+app.mount("/static", NoCacheStaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 camera = CameraStream(DEFAULT_CAMERA_SOURCE)
 faces = FaceService(BASE_DIR / "data")
@@ -215,11 +225,14 @@ def shutdown() -> None:
 
 @app.get("/")
 def index(request: Request):
-    return templates.TemplateResponse(
+    response = templates.TemplateResponse(
         request,
         "index.html",
         {"camera_source": camera.source},
     )
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    return response
 
 
 @app.post("/api/camera")
