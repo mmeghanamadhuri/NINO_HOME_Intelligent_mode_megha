@@ -186,5 +186,10 @@ retrain.addEventListener("click", async () => {
   }
 });
 
+stream.addEventListener("error", () => {
+  window.setTimeout(refreshStream, 1500);
+});
+
+refreshStream();
 refreshStatus();
 setInterval(refreshStatus, 1500);

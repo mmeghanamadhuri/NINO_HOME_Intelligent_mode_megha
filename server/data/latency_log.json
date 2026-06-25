@@ -15213,5 +15213,169 @@
     "client": "192.168.0.96:53379",
     "session_queries": 1,
     "session_seconds": 4.805
+  },
+  {
+    "timestamp": "2026-06-26T01:26:37",
+    "event": "ws_open",
+    "client": "192.168.0.96:53381"
+  },
+  {
+    "timestamp": "2026-06-26T01:26:39",
+    "event": "voice_query",
+    "client": "192.168.0.96:53381",
+    "server_total_seconds": 1.831,
+    "heard": "Had a good day.",
+    "reply_text": "That's great! \ud83d\ude0a How was your day?",
+    "reply_path": "llm",
+    "audio_in_seconds": 1.38,
+    "audio_in_bytes": 44204,
+    "audio_out_seconds": 5.44,
+    "audio_out_bytes": 174152,
+    "stt_engine": "elevenlabs",
+    "stt_seconds": 1.177,
+    "memory_seconds": 0.003,
+    "reply_seconds": 0.344,
+    "tts_seconds": 0.279,
+    "process_total_seconds": 1.803,
+    "voice_viewer": "",
+    "memory_viewer": "",
+    "memory_ready": true,
+    "memory_store": "no_viewer",
+    "eye_expression": "happy"
+  },
+  {
+    "timestamp": "2026-06-26T01:26:39",
+    "event": "ws_closed",
+    "client": "192.168.0.96:53381",
+    "session_queries": 1,
+    "session_seconds": 2.158
+  },
+  {
+    "timestamp": "2026-06-26T01:28:00",
+    "event": "ws_open",
+    "client": "192.168.0.96:53382"
+  },
+  {
+    "timestamp": "2026-06-26T01:28:06",
+    "event": "voice_query",
+    "client": "192.168.0.96:53382",
+    "server_total_seconds": 6.189,
+    "audio_in_bytes": 32044,
+    "error": "No speech recognized from input audio."
+  },
+  {
+    "timestamp": "2026-06-26T01:28:06",
+    "event": "ws_closed",
+    "client": "192.168.0.96:53382",
+    "session_queries": 1,
+    "session_seconds": 6.369
+  },
+  {
+    "timestamp": "2026-06-26T01:28:16",
+    "event": "ws_open",
+    "client": "192.168.0.96:53383"
+  },
+  {
+    "timestamp": "2026-06-26T01:28:20",
+    "event": "voice_query",
+    "client": "192.168.0.96:53383",
+    "server_total_seconds": 3.314,
+    "heard": "What a great day today.",
+    "reply_text": "Oh really? That's fantastic! Sounds like we've had some nice moments too. How was your day?",
+    "reply_path": "llm",
+    "audio_in_seconds": 1.6,
+    "audio_in_bytes": 51244,
+    "audio_out_seconds": 6.5,
+    "audio_out_bytes": 208094,
+    "stt_engine": "elevenlabs",
+    "stt_seconds": 0.896,
+    "memory_seconds": 0.0,
+    "reply_seconds": 0.421,
+    "tts_seconds": 1.525,
+    "process_total_seconds": 2.842,
+    "voice_viewer": "",
+    "memory_viewer": "",
+    "memory_ready": true,
+    "memory_store": "no_viewer",
+    "eye_expression": "happy"
+  },
+  {
+    "timestamp": "2026-06-26T01:28:20",
+    "event": "ws_closed",
+    "client": "192.168.0.96:53383",
+    "session_queries": 1,
+    "session_seconds": 3.715
+  },
+  {
+    "timestamp": "2026-06-26T01:28:47",
+    "event": "ws_open",
+    "client": "192.168.0.96:53384"
+  },
+  {
+    "timestamp": "2026-06-26T01:28:51",
+    "event": "voice_query",
+    "client": "192.168.0.96:53384",
+    "server_total_seconds": 3.157,
+    "heard": "I had a very bad day.",
+    "reply_text": "It sounds like you're feeling quite low today. How can I help make things better?",
+    "reply_path": "llm",
+    "audio_in_seconds": 1.58,
+    "audio_in_bytes": 50604,
+    "audio_out_seconds": 4.92,
+    "audio_out_bytes": 157568,
+    "stt_engine": "elevenlabs",
+    "stt_seconds": 0.88,
+    "memory_seconds": 0.0,
+    "reply_seconds": 0.451,
+    "tts_seconds": 1.343,
+    "process_total_seconds": 2.675,
+    "voice_viewer": "",
+    "memory_viewer": "",
+    "memory_ready": true,
+    "memory_store": "no_viewer",
+    "eye_expression": "sad"
+  },
+  {
+    "timestamp": "2026-06-26T01:28:51",
+    "event": "ws_closed",
+    "client": "192.168.0.96:53384",
+    "session_queries": 1,
+    "session_seconds": 3.496
+  },
+  {
+    "timestamp": "2026-06-26T01:29:22",
+    "event": "ws_open",
+    "client": "192.168.0.96:53385"
+  },
+  {
+    "timestamp": "2026-06-26T01:29:25",
+    "event": "voice_query",
+    "client": "192.168.0.96:53385",
+    "server_total_seconds": 3.633,
+    "heard": "I am really tired now.",
+    "reply_text": "I see you're feeling quite weary. Is there anything specific you'd like help with? Or would you prefer a friendly chat to ease your mind?",
+    "reply_path": "llm",
+    "audio_in_seconds": 1.82,
+    "audio_in_bytes": 58284,
+    "audio_out_seconds": 8.96,
+    "audio_out_bytes": 286856,
+    "stt_engine": "elevenlabs",
+    "stt_seconds": 0.996,
+    "memory_seconds": 0.0,
+    "reply_seconds": 0.463,
+    "tts_seconds": 1.682,
+    "process_total_seconds": 3.141,
+    "voice_viewer": "",
+    "memory_viewer": "",
+    "memory_ready": true,
+    "memory_store": "no_viewer",
+    "eye_expression": "tired"
+  },
+  {
+    "timestamp": "2026-06-26T01:29:26",
+    "event": "ws_closed",
+    "client": "192.168.0.96:53385",
+    "session_queries": 1,
+    "session_seconds": 4.049
   }
 ]

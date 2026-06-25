@@ -471,8 +471,24 @@ class TTSService:
             self._pending_jobs.clear()
             self._suppress_vision_until = 0.0
 
+    def is_speaking(self) -> bool:
+        """True while any vision TTS job is running or queued."""
+        with self._lock:
+            return self._is_speaking or bool(self._pending_jobs)
+
+    def speak_to_esp(self, text: str, *, eye_expression: str | None = None) -> None:
+        """Synthesize and POST WAV to ESP (vision empathy / greetings)."""
+        from esp_playback import post_wav_to_esp
+
+        wav = self._synthesize_wav_windows_sapi(text)
+        wav = resample_wav_bytes_to_mono_16bit(wav, ESP_PCM_SAMPLE_RATE_HZ)
+        post_wav_to_esp(wav, eye_expression=eye_expression)
+
     def notify_voice_interaction(self, viewer_name: str | None) -> None:
         """After a voice reply: drop stale vision greetings and pause auto-welcome."""
+        from pipeline_priority import notify_voice_interaction as _notify_priority
+
+        _notify_priority()
         with self._lock:
             now = time.time()
             self._suppress_vision_until = now + self._voice_cooldown_seconds
@@ -532,12 +548,20 @@ class TTSService:
             primary_re_entered = primary not in prev_present
             self._present_known_names = current_known
 
-            if now >= self._suppress_vision_until:
+            vision_emotion_on = os.environ.get("VISION_EMOTION_ENABLED", "1").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            if now >= self._suppress_vision_until and not vision_emotion_on:
                 seen_before = primary in self._known_seen_once
                 if not seen_before:
                     self._enqueue_known_greeting_locked(primary, now, welcome_back=False)
                 elif primary_re_entered:
                     self._enqueue_known_greeting_locked(primary, now, welcome_back=True)
+            elif now >= self._suppress_vision_until and vision_emotion_on:
+                self._known_seen_once.add(primary)
 
             self._active_mode = "known"
             self._active_name = primary

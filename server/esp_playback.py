@@ -18,7 +18,13 @@ def esp_play_wav_url() -> str | None:
     return url if url else None
 
 
-def post_wav_to_esp(wav: bytes, *, timeout: float = 60.0, prompt_ack: bool = False) -> None:
+def post_wav_to_esp(
+    wav: bytes,
+    *,
+    timeout: float = 60.0,
+    prompt_ack: bool = False,
+    eye_expression: str | None = None,
+) -> None:
     """Queue raw WAV bytes on the board speaker via POST /play_wav."""
     url = esp_play_wav_url()
     if not url:
@@ -33,6 +39,8 @@ def post_wav_to_esp(wav: bytes, *, timeout: float = 60.0, prompt_ack: bool = Fal
     headers = {"Content-Type": "audio/wav"}
     if prompt_ack:
         headers["X-Nino-Prompt-Ack"] = "1"
+    if eye_expression:
+        headers["X-Nino-Eye-Expression"] = eye_expression.strip().lower()
     req = urllib.request.Request(
         url,
         data=wav,

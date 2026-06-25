@@ -23,11 +23,14 @@ from starlette.requests import Request
 
 from alarm_service import get_alarm_service
 from camera import CameraStream
+from emotion_service import EmotionService
 from eye_expression import normalize_eye_expression
 from face_service import FaceService
 from memory_service import configure_from_environ as configure_memory_from_environ
 from memory_service import get_memory_service, normalize_database_url
+from pipeline_priority import begin_voice_query, end_voice_query
 from tts_service import TTSService, synthesize_sapi_wav_bytes
+from vision_emotion_service import VisionEmotionService
 
 logger = logging.getLogger(__name__)
 
@@ -119,8 +122,14 @@ app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="stat
 
 camera = CameraStream(DEFAULT_CAMERA_SOURCE)
 faces = FaceService(BASE_DIR / "data")
+emotion = EmotionService(BASE_DIR / "data")
 _tts_face_interval = float(os.environ.get("FACE_GREETING_INTERVAL_SECONDS", "600"))
 tts = TTSService(cooldown_seconds=0.0, face_greeting_interval_seconds=_tts_face_interval)
+vision_emotion = VisionEmotionService(
+    emotion,
+    speak_wav=lambda text, eye: tts.speak_to_esp(text, eye_expression=eye),
+    is_speaker_busy=tts.is_speaking,
+)
 latest_results: list[dict] = []
 # Update vision-driven TTS every frame so greetings start as soon as recognition succeeds
 # (throttling here added a noticeable delay before enqueue).
@@ -235,10 +244,14 @@ def latency_log(limit: int = 50) -> dict:
 @app.get("/api/status")
 def status() -> dict:
     from llm_service import ollama_runtime_status
+    from pipeline_priority import status as pipeline_status
 
     return {
         "camera": camera.status(),
         "faces": faces.stats(),
+        "emotion": emotion.stats(),
+        "vision_emotion": vision_emotion.status(),
+        "pipeline_priority": pipeline_status(),
         "tts": tts.status(),
         "llm": ollama_runtime_status(
             model=os.environ.get("OLLAMA_MODEL"),
@@ -364,6 +377,39 @@ def video_feed() -> StreamingResponse:
     )
 
 
+def _draw_emotion_overlay(frame, overlay: dict) -> None:
+    """Live emotion label on MJPEG (debug / demo)."""
+    label = overlay.get("emotion")
+    if not label:
+        return
+    conf = overlay.get("confidence")
+    raw = overlay.get("raw_emotion")
+    accum = overlay.get("accum_s")
+    scores = overlay.get("scores") or {}
+    parts = [str(label)]
+    if conf is not None:
+        parts.append(f"{float(conf):.0%}")
+    if raw and raw != label:
+        parts.append(f"raw={raw}")
+    if accum is not None:
+        parts.append(f"{float(accum):.1f}s")
+    if scores:
+        score_txt = " ".join(f"{k[:1]}:{v:.0%}" for k, v in list(scores.items())[:3])
+        parts.append(score_txt)
+    text = " ".join(parts)
+    h = frame.shape[0]
+    cv2.putText(
+        frame,
+        text,
+        (12, max(24, h - 16)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (180, 80, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+
 def _mjpeg_generator():
     global latest_results
     last_tts_update_at = 0.0
@@ -377,6 +423,13 @@ def _mjpeg_generator():
 
             annotated, results = faces.annotate(frame)
             latest_results = results
+            try:
+                vision_emotion.process_frame(frame, results)
+                overlay = vision_emotion.latest_overlay()
+                if overlay:
+                    _draw_emotion_overlay(annotated, overlay)
+            except Exception:
+                logger.exception("Vision emotion frame failed; continuing MJPEG")
             now = time.time()
             if now - last_tts_update_at >= TTS_UPDATE_INTERVAL_SECONDS:
                 _update_tts_face_state(results)
@@ -644,78 +697,76 @@ async def _voice_ws_pipeline(websocket: WebSocket) -> None:
             active_viewer: str | None = None
             t_query_start = time.perf_counter()
             pipeline_error: str | None = None
+            await run_in_threadpool(begin_voice_query)
             try:
-                identity_name, identity_state = await run_in_threadpool(
-                    _camera_identity_snapshot, True
-                )
-                if identity_state == "recognized" and identity_name:
-                    normalized_identity = str(identity_name).strip()
-                    if normalized_identity and normalized_identity.lower() not in {
-                        "unknown",
-                        "face",
-                    }:
-                        active_viewer = normalized_identity
-
-                def _run_voice() -> tuple[bytes, VoiceReplyMeta]:
-                    return process_voice_wav(
-                        wav_in,
-                        active_viewer,
-                        camera_identity_name=identity_name,
-                        camera_identity_state=identity_state,
-                    )
-
-                wav_out, reply_meta = await run_in_threadpool(_run_voice)
-            except Exception as exc:
-                logger.exception("Voice pipeline failed")
-                pipeline_error = str(exc)[:200]
-                err_note = str(exc)[:512]
                 try:
-                    from llm_service import (
-                        OLLAMA_UNAVAILABLE_REPLY,
-                        brief_spoken_message,
-                        is_ollama_error,
+                    identity_name, identity_state = await run_in_threadpool(
+                        _camera_identity_snapshot, True
                     )
-                    from wav_resample import ESP_PCM_SAMPLE_RATE_HZ, resample_wav_bytes_to_mono_16bit
+                    if identity_state == "recognized" and identity_name:
+                        normalized_identity = str(identity_name).strip()
+                        if normalized_identity and normalized_identity.lower() not in {
+                            "unknown",
+                            "face",
+                        }:
+                            active_viewer = normalized_identity
 
-                    def _recover_wav(pipeline_exc: BaseException = exc) -> bytes:
-                        if is_ollama_error(pipeline_exc):
-                            txt = OLLAMA_UNAVAILABLE_REPLY
-                        else:
-                            txt = brief_spoken_message(
-                                err_note,
-                                model=os.environ.get("OLLAMA_MODEL"),
-                                api_url=os.environ.get("OLLAMA_URL"),
-                            )
-                        raw, _ = synthesize_sapi_wav_bytes(txt)
-                        return resample_wav_bytes_to_mono_16bit(raw, ESP_PCM_SAMPLE_RATE_HZ)
+                    def _run_voice() -> tuple[bytes, VoiceReplyMeta]:
+                        return process_voice_wav(
+                            wav_in,
+                            active_viewer,
+                            camera_identity_name=identity_name,
+                            camera_identity_state=identity_state,
+                        )
 
-                    wav_out = await run_in_threadpool(_recover_wav)
-                except Exception:
-                    logger.exception("Voice pipeline recovery failed")
+                    wav_out, reply_meta = await run_in_threadpool(_run_voice)
+                except Exception as exc:
+                    logger.exception("Voice pipeline failed")
+                    pipeline_error = str(exc)[:200]
+                    err_note = str(exc)[:512]
+                    try:
+                        from llm_service import (
+                            OLLAMA_UNAVAILABLE_REPLY,
+                            brief_spoken_message,
+                            is_ollama_error,
+                        )
+                        from wav_resample import ESP_PCM_SAMPLE_RATE_HZ, resample_wav_bytes_to_mono_16bit
+
+                        def _recover_wav(pipeline_exc: BaseException = exc) -> bytes:
+                            if is_ollama_error(pipeline_exc):
+                                txt = OLLAMA_UNAVAILABLE_REPLY
+                            else:
+                                txt = brief_spoken_message(
+                                    err_note,
+                                    model=os.environ.get("OLLAMA_MODEL"),
+                                    api_url=os.environ.get("OLLAMA_URL"),
+                                )
+                            raw, _ = synthesize_sapi_wav_bytes(txt)
+                            return resample_wav_bytes_to_mono_16bit(raw, ESP_PCM_SAMPLE_RATE_HZ)
+
+                        wav_out = await run_in_threadpool(_recover_wav)
+                    except Exception:
+                        logger.exception("Voice pipeline recovery failed")
+                        wav_out = minimal_voice_reply_wav()
+
+                if not wav_out:
                     wav_out = minimal_voice_reply_wav()
 
-            if not wav_out:
-                wav_out = minimal_voice_reply_wav()
+                timings = dict(reply_meta.timings)
+                timings.setdefault("audio_in_bytes", len(wav_in))
+                record = _latency_log_record(
+                    event="voice_query",
+                    client=client_label,
+                    server_total_seconds=round(time.perf_counter() - t_query_start, 3),
+                    **timings,
+                )
+                if pipeline_error is not None:
+                    record["error"] = pipeline_error
+                await run_in_threadpool(_append_latency_record, record)
+                session_queries += 1
 
-            # Server total = WAV received -> reply WAV ready (incl. viewer
-            # lookup and error recovery). Device-side VAD/Wi-Fi time is not
-            # visible here; audio_in/out sizes help estimate transfer cost.
-            timings = dict(reply_meta.timings)
-            timings.setdefault("audio_in_bytes", len(wav_in))
-            record = _latency_log_record(
-                event="voice_query",
-                client=client_label,
-                server_total_seconds=round(time.perf_counter() - t_query_start, 3),
-                **timings,
-            )
-            if pipeline_error is not None:
-                record["error"] = pipeline_error
-            await run_in_threadpool(_append_latency_record, record)
-            session_queries += 1
+                await run_in_threadpool(tts.notify_voice_interaction, active_viewer)
 
-            await run_in_threadpool(tts.notify_voice_interaction, active_viewer)
-
-            try:
                 ws_meta: dict[str, object] = {
                     "prompt_medical_ack": reply_meta.prompt_medical_ack,
                 }
@@ -729,6 +780,11 @@ async def _voice_ws_pipeline(websocket: WebSocket) -> None:
                     )
                 await websocket.send_json(ws_meta)
                 await websocket.send_bytes(wav_out)
+
+                if reply_meta.trigger_servo_360:
+                    asyncio.create_task(
+                        _delayed_esp_servo_360(SERVO_360_TRIGGER_DELAY_SECONDS)
+                    )
             except WebSocketDisconnect:
                 await run_in_threadpool(
                     _append_latency_record,
@@ -739,11 +795,8 @@ async def _voice_ws_pipeline(websocket: WebSocket) -> None:
                     ),
                 )
                 break
-
-            if reply_meta.trigger_servo_360:
-                asyncio.create_task(
-                    _delayed_esp_servo_360(SERVO_360_TRIGGER_DELAY_SECONDS)
-                )
+            finally:
+                await run_in_threadpool(end_voice_query)
     finally:
         if session_queries == 0:
             await run_in_threadpool(
