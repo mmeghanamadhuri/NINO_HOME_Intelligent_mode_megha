@@ -491,11 +491,12 @@ def format_preference_update_ack(user_text: str, *, person_name: str = "") -> st
 
 
 def format_memories_list_for_recall(memories: list[str], *, dislikes: bool = False) -> str:
+    """Format stored facts for display (used by tests and legacy helpers)."""
     if not memories:
-        return "I don't have that saved yet."
+        return ""
     answers = [format_memory_for_recall(m) for m in memories if m.strip()]
     if not answers:
-        return "I don't have that saved yet."
+        return ""
     if len(answers) == 1:
         return answers[0]
     if dislikes:
@@ -621,7 +622,7 @@ def conversation_log_skip_reason(user_text: str, *, reply_path: str = "llm") -> 
 
     if reply_path in _SKIP_LOG_REPLY_PATHS:
         return f"skipped_{reply_path}"
-    if reply_path != "llm":
+    if reply_path not in {"llm", "recap_answer"}:
         return f"skipped_{reply_path}"
     if is_stt_fragment(user_text):
         return "skipped_fragment"

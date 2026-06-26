@@ -429,43 +429,41 @@ class MemoryService:
             logger.warning("list_preference_memories failed: %s", exc)
             return []
 
+    def _facts_for_recall_key(self, user_id: int, key: str) -> list[str]:
+        """Load memory rows for a recall slot (favorites, dislikes, birthdate, etc.)."""
+        from memory_filters import RECALL_ALL_PREFERENCES, RECALL_DISLIKES
+
+        if key == RECALL_ALL_PREFERENCES:
+            return self.list_preference_memories(user_id, dislikes=False)
+        if key == RECALL_DISLIKES:
+            return self.list_preference_memories(user_id, dislikes=True)
+        stored = self.get_memory_text_by_key(user_id, key)
+        return [stored] if stored else []
+
     def answer_memory_recall(
         self,
         user_id: int,
         user_text: str,
         *,
         person_name: str = "",
+        model: str | None = None,
+        api_url: str | None = None,
     ) -> str | None:
-        """Answer from the memories table — not from conversation history."""
-        from memory_filters import (
-            RECALL_ALL_PREFERENCES,
-            RECALL_DISLIKES,
-            format_memories_list_for_recall,
-            format_memory_for_recall,
-            infer_recall_memory_key,
-        )
+        """Answer from the memories table — LLM phrases the reply from DB facts."""
+        from llm_service import answer_memory_recall_reply
+        from memory_filters import infer_recall_memory_key
 
         key = infer_recall_memory_key(user_text)
         if not key:
             return None
-        name = (person_name or "").strip()
-
-        if key == RECALL_ALL_PREFERENCES:
-            stored_list = self.list_preference_memories(user_id, dislikes=False)
-            answer = format_memories_list_for_recall(stored_list, dislikes=False)
-        elif key == RECALL_DISLIKES:
-            stored_list = self.list_preference_memories(user_id, dislikes=True)
-            answer = format_memories_list_for_recall(stored_list, dislikes=True)
-        else:
-            stored = self.get_memory_text_by_key(user_id, key)
-            if not stored:
-                prefix = f"{name}, " if name else ""
-                return f"{prefix}I don't have that saved yet."
-            answer = format_memory_for_recall(stored)
-
-        if name and answer and not answer.lower().startswith(name.lower()):
-            return f"{name}, {answer[0].lower()}{answer[1:]}" if answer else answer
-        return answer
+        facts = self._facts_for_recall_key(user_id, key)
+        return answer_memory_recall_reply(
+            user_text,
+            facts,
+            person_name=person_name,
+            model=model,
+            api_url=api_url,
+        )
 
     def upsert_preference_from_utterance(
         self,
@@ -716,27 +714,85 @@ class MemoryService:
         model: str | None = None,
         api_url: str | None = None,
     ) -> tuple[str, str] | None:
-        """LLM classifies recall vs store vs chat; reads/writes PostgreSQL."""
+        """Route personal memory: store likes/dislikes first, recall questions from DB, else LLM classify."""
         from llm_service import (
             DEFAULT_MODEL,
             DEFAULT_OLLAMA_URL,
+            MemoryTurnDecision,
             analyze_memory_turn,
             answer_memory_recall_reply,
             answer_memory_store_ack,
             is_conversation_recap_question,
         )
+        from memory_filters import (
+            is_memory_recall_question,
+            is_preference_update_statement,
+            user_shares_personal_fact,
+        )
 
         if is_conversation_recap_question(user_text):
             return None
+
+        resolved_model = model or os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL)
+        resolved_api = api_url or os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL)
+
+        # 1) User is stating a like/dislike/favorite/birthday → write memories table immediately.
+        if is_preference_update_statement(user_text):
+            memory_key = self.upsert_preference_from_utterance(
+                user_id, user_text, person_name=person_name
+            )
+            if memory_key:
+                stored_text = self.get_memory_text_by_key(user_id, memory_key)
+                stored = [stored_text] if stored_text else []
+                reply = answer_memory_store_ack(
+                    user_text,
+                    stored,
+                    person_name=person_name,
+                    model=resolved_model,
+                    api_url=resolved_api,
+                )
+                return "memory_llm_store", reply
+
+        # 2) User is asking about saved preferences → read DB, LLM speaks the answer.
+        if is_memory_recall_question(user_text):
+            recall_reply = self.answer_memory_recall(
+                user_id,
+                user_text,
+                person_name=person_name,
+                model=resolved_model,
+                api_url=resolved_api,
+            )
+            if recall_reply:
+                return "memory_llm_recall", recall_reply
 
         known_keys = self.list_memory_keys_for_user(user_id)
         decision = analyze_memory_turn(
             user_text,
             person_name=person_name,
             known_memory_keys=known_keys,
-            model=model or os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL),
-            api_url=api_url or os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL),
+            model=resolved_model,
+            api_url=resolved_api,
         )
+
+        # Statements misclassified as recall (e.g. "my favorite food is lemon rice") → store.
+        if decision.action == "recall" and (
+            is_preference_update_statement(user_text)
+            or (
+                user_shares_personal_fact(user_text)
+                and not is_memory_recall_question(user_text)
+            )
+        ):
+            logger.info(
+                "Memory override recall→store user_id=%s heard=%s",
+                user_id,
+                user_text[:80],
+            )
+            decision = MemoryTurnDecision(action="store")
+
+        # STT fragments like "favorite" alone — not a real recall question.
+        if decision.action == "recall" and not is_memory_recall_question(user_text):
+            return None
+
         logger.info(
             "LLM memory decision user_id=%s action=%s recall_keys=%s store_items=%d heard=%s",
             user_id,
@@ -751,8 +807,8 @@ class MemoryService:
                 user_text,
                 facts,
                 person_name=person_name,
-                model=model,
-                api_url=api_url,
+                model=resolved_model,
+                api_url=resolved_api,
             )
             return "memory_llm_recall", reply
 
@@ -764,17 +820,25 @@ class MemoryService:
                 stored = self.extract_and_store_sync(
                     user_id,
                     user_text,
-                    model=model,
-                    api_url=api_url,
+                    model=resolved_model,
+                    api_url=resolved_api,
                 )
+            if not stored and is_preference_update_statement(user_text):
+                memory_key = self.upsert_preference_from_utterance(
+                    user_id, user_text, person_name=person_name
+                )
+                if memory_key:
+                    stored_text = self.get_memory_text_by_key(user_id, memory_key)
+                    if stored_text:
+                        stored = [stored_text]
             if not stored:
                 return None
             reply = answer_memory_store_ack(
                 user_text,
                 stored,
                 person_name=person_name,
-                model=model,
-                api_url=api_url,
+                model=resolved_model,
+                api_url=resolved_api,
             )
             return "memory_llm_store", reply
 

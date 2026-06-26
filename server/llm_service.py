@@ -513,6 +513,15 @@ _CONVERSATION_RECAP_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"\bare we (?:talking|discussing) about\b",
         r"\bhope.{0,24}(?:we(?:'re| are)|that we).{0,24}(?:talking|discussing) about\b",
         r"\b(?:isn't|is not) (?:that|this) what we(?:'re| are) (?:talking|discussing) about\b",
+        # Past-time assumed discussion (must not fall through to general LLM)
+        r"\b(?:few|several|couple of)\s+minutes?\s+(?:back|ago)\b.{0,48}(?:discuss|talk|chat|conversation)\b",
+        r"\b(?:a while|some time)\s+ago\b.{0,40}(?:discuss|talk|chat|conversation)\b",
+        r"\b(?:earlier|previously|before)(?:\s+today)?\s+we (?:had|were having)\s+(?:a\s+)?(?:discussion|conversation|chat)\b",
+        r"\bwe (?:had|have had)\s+(?:a\s+)?(?:discussion|conversation|chat)\s+(?:on|about)\b",
+        r"\bwe (?:just |already )?(?:discussed|talked about|chatted about)\b",
+        r"\b(?:today|yesterday|this morning|this afternoon|last night)\b.{0,40}(?:discuss|talk|chat|conversation)\b",
+        r"\bexplain (?:about )?that again\b",
+        r"\b(?:please\s+)?(?:explain|tell me about|brief).{0,24}again\b",
     )
 )
 
@@ -586,13 +595,30 @@ _TOPIC_FOCUSED_RECAP_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"\bare we (?:talking|discussing) about\b",
         r"\bso,?\s*we(?:'re| are)?\s+(?:talking|discussing) about\b",
         r"\bisn't that what we(?:'re| are) (?:talking|discussing) about\b",
-        r"\b(?:today|yesterday|earlier|just now)\b.{0,24}(?:talking|discussing) about\b",
+        r"\b(?:today|yesterday|earlier|just now|this morning|this afternoon|last night)\b.{0,32}(?:talking|discussing|discuss|talk|chat)\b",
         r"\bwe(?:'re| are)\s+(?:talking|discussing) about\b",
+        r"\b(?:few|several|couple of)\s+minutes?\s+(?:back|ago)\b",
+        r"\b(?:a while|some time)\s+ago\b",
+        r"\b(?:earlier|previously|before)(?:\s+today)?\s+we (?:had|were having|discussed|talked)\b",
+        r"\bwe (?:had|have had)\s+(?:a\s+)?(?:discussion|conversation|chat)\s+(?:on|about)\b",
+        r"\bwe (?:just |already )?(?:discussed|talked about|chatted about)\b",
     )
 )
 
 _TALKING_ABOUT_TOPIC = re.compile(
     r"(?:talking|discussing)\s+about\s+(?:something\s+(?:called\s+)?)?",
+    re.IGNORECASE,
+)
+
+_TOPIC_FROM_DISCUSSION_ON = re.compile(
+    r"(?:had|having)\s+(?:a\s+)?(?:discussion|conversation|chat)\s+(?:on|about)\s+(?:the\s+)?"
+    r"(.+?)(?:\s+right|\s+correct)?(?:\s*[?.!,;]|\s+please\b|\s+could\b|\s+would\b|$)",
+    re.IGNORECASE,
+)
+
+_TOPIC_FROM_DISCUSSED = re.compile(
+    r"\b(?:discussed|talked about|chatted about)\s+(?:the\s+)?"
+    r"(.+?)(?:\s+right|\s+correct)?(?:\s*[?.!,;]|\s+please\b|\s+could\b|\s+would\b|$)",
     re.IGNORECASE,
 )
 
@@ -627,27 +653,118 @@ def user_requests_topic_brief(user_text: str) -> bool:
     return bool(_BRIEF_OR_EXPLAIN_REQUEST.search(user_text.strip()))
 
 
+_RECAP_BRIEF_ONLY = re.compile(
+    r"\b(?:brief(?:\s+(?:me|out|that))?|recap(?:ulate)?|context|summarize|summarise|"
+    r"remind me what we|what (?:did|have) we (?:talked|discussed)|what were we (?:talking|discussing))\b",
+    re.IGNORECASE,
+)
+
+
+def is_substantive_recap_follow_up(follow_up: str) -> bool:
+    """True when the tail after recap framing is a real question, not just 'brief me'."""
+    q = follow_up.strip()
+    if len(q) < 8:
+        return False
+    lower = q.lower()
+    if _RECAP_BRIEF_ONLY.search(lower):
+        return False
+    if re.search(
+        r"^(?:please\s+)?(?:could you\s+)?(?:explain|tell me about|describe|brief)\s+(?:about\s+)?that[.!?…]*$",
+        lower,
+    ):
+        return False
+    if re.search(r"\b(?:what|how|which|why|who|when|where)\b", lower):
+        return True
+    if re.search(r"\b(?:explain|describe|list|name|compare|add)\b", lower):
+        return True
+    return len(q) >= 24
+
+
+def extract_recap_follow_up_question(user_text: str) -> str | None:
+    """When recap framing is followed by a real question, return that question part."""
+    text = user_text.strip()
+    if not text or not is_conversation_recap_question(text):
+        return None
+
+    if "?" in text:
+        after_first = text.split("?", 1)[1].strip().lstrip(",").strip()
+        if is_substantive_recap_follow_up(after_first):
+            return after_first
+
+    for pattern in (
+        r"\b(?:right|correct)\??\s*[,]?\s*(?:and\s+)?(?P<rest>.+)$",
+        r"\b(?:right|correct)\s+(?P<rest>.+)$",
+    ):
+        match = re.search(pattern, text, re.IGNORECASE)
+        if not match:
+            continue
+        rest = match.group("rest").strip()
+        sub = re.search(
+            r"\b(?:and\s+)?((?:what|how|which|why|who|when|where)\s+.+)$",
+            rest,
+            re.IGNORECASE,
+        )
+        if sub and is_substantive_recap_follow_up(sub.group(1)):
+            return sub.group(1).strip()
+        if is_substantive_recap_follow_up(rest):
+            return rest
+
+    return None
+
+
+def is_recap_with_follow_up_question(user_text: str) -> bool:
+    return extract_recap_follow_up_question(user_text) is not None
+
+
 def normalize_recap_focus_topic(raw: str) -> str:
     topic = raw.strip().rstrip(".!?…,")
     topic = re.sub(r"^(?:something\s+)?(?:called\s+)?", "", topic, flags=re.IGNORECASE)
+    topic = re.sub(r"^(?:a|an|the)\s+", "", topic, flags=re.IGNORECASE)
     topic = re.split(r"[?.!,;]", topic, maxsplit=1)[0].strip()
     topic = re.sub(r"\s+(?:right|correct)$", "", topic, flags=re.IGNORECASE)
     return topic
 
 
+_TOPIC_TAIL_BOUNDARY = re.compile(
+    r"\s+right(?:\s|$)|"
+    r"\s+correct(?:\s|$)|"
+    r"\s*,\s*|"
+    r"\s+(?:could|can|would)\s+you\b|"
+    r"\s+please\b|"
+    r"\s+and\s+(?:on top of that|also|what|how|could|please)\b|"
+    r"\s+(?:brief|explain|tell me|describe|walk me through)\b",
+    re.IGNORECASE,
+)
+
+
+def _trim_recap_topic_chunk(chunk: str) -> str:
+    """Keep only the subject before 'right', 'could you brief', 'and what…', etc."""
+    text = chunk.strip()
+    match = _TOPIC_TAIL_BOUNDARY.search(text)
+    if match:
+        text = text[: match.start()].strip()
+    return normalize_recap_focus_topic(text)
+
+
 def extract_recap_focus_topic(user_text: str) -> str | None:
-    """Pull the subject from 'we are talking about trigonometry right?'."""
+    """Pull the subject from recap phrasing (talking about X, discussion on X, etc.)."""
     text = user_text.strip()
     match = _TOPIC_EXTRACT.search(text)
     if match:
-        topic = normalize_recap_focus_topic(match.group(1))
+        topic = _trim_recap_topic_chunk(match.group(1))
         if len(topic) >= 3:
             return topic
+    for pattern in (_TOPIC_FROM_DISCUSSION_ON, _TOPIC_FROM_DISCUSSED):
+        match = pattern.search(text)
+        if match:
+            topic = _trim_recap_topic_chunk(match.group(1))
+            if len(topic) >= 3:
+                return topic
     fallback = _TALKING_ABOUT_TOPIC.search(text)
     if fallback:
         after = text[fallback.end() :]
         chunk = re.split(r"[?.!,;]", after, maxsplit=1)[0]
-        topic = normalize_recap_focus_topic(chunk)
+        topic = _trim_recap_topic_chunk(chunk)
         if len(topic) >= 3:
             return topic
     return None
@@ -677,10 +794,63 @@ def recap_topic_not_found_reply(
     person_name: str = "",
 ) -> str:
     """Deterministic reply — never hallucinate a briefing without DB context."""
+    clean = normalize_recap_focus_topic(topic) or topic.strip()
     prefix = f"{person_name}, " if person_name else ""
     return (
-        f"{prefix}I don't have {topic} in our conversation history yet. "
+        f"{prefix}I don't have {clean} in our conversation history yet. "
         "Shall we discuss it now?"
+    )
+
+
+def answer_recap_contextual_question(
+    user_text: str,
+    follow_up_question: str,
+    *,
+    viewer_name: str | None,
+    memory_context: str,
+    focus_topic: str | None = None,
+    model: str | None = None,
+    api_url: str | None = None,
+    max_words: int = 60,
+) -> str:
+    """Answer a new question grounded in recalled session history (not recap-only)."""
+    name = (viewer_name or "").strip()
+    history = memory_context.strip()
+    topic_line = (
+        f"The user assumes you were already discussing '{focus_topic}'.\n"
+        if focus_topic
+        else ""
+    )
+    who = (
+        f"Speaking to {name}. Use second person (you/we). Name at most once.\n"
+        if name
+        else "Use second person (you/we).\n"
+    )
+    prompt = (
+        "You are NiNO, a concise voice assistant.\n"
+        f"{who}"
+        f"{topic_line}"
+        "Session history about this topic (newest turns first):\n"
+        f"{history}\n\n"
+        "The user's full message:\n"
+        f"{user_text.strip()}\n\n"
+        "Their specific question you must answer now:\n"
+        f"{follow_up_question.strip()}\n\n"
+        "Rules:\n"
+        "- Answer the specific question directly — do not only summarize prior chat.\n"
+        "- Ground in session history when it helps; you may add brief factual detail to answer well.\n"
+        "- Do not invent things that were never said in the history.\n"
+        "- If they confirm the topic ('we are talking about X right?'), acknowledge briefly then answer.\n"
+        f"- One spoken reply under {max_words} words. Plain sentences, no lists or markdown.\n"
+    )
+    return ollama_generate(
+        prompt,
+        model=model,
+        api_url=api_url,
+        num_predict=128,
+        timeout_s=VOICE_QUERY_TIMEOUT_S,
+        temperature=0.55,
+        top_p=0.9,
     )
 
 
@@ -971,6 +1141,9 @@ def analyze_memory_turn(
         "STORE rules: only facts the USER stated; skip jokes, questions, "
         "transient mood, weather, things only an assistant would say.\n"
         "Preference corrections count as store (e.g. 'favorite food is biryani not lemon rice').\n"
+        "CRITICAL: 'my favorite food is lemon rice', 'I love hiking', 'I hate mushrooms' "
+        "are STORE (user is telling you), never recall.\n"
+        "RECALL only when the user ASKS a question (what is my..., do you know my...).\n"
         "For each store item, memory must be a complete short fact sentence grounded in "
         "what the user said (not just one word).\n"
         "RECALL rules: pick snake_case keys to look up. Use catalog keys when possible.\n"
@@ -1030,20 +1203,25 @@ def answer_memory_recall_reply(
     api_url: str | None = None,
     max_words: int = 35,
 ) -> str:
-    """Speak a recall answer from DB facts (LLM phrases it naturally)."""
-    if not recalled_facts:
-        prefix = f"{person_name}, " if person_name else ""
-        return f"{prefix}I don't have that saved yet."
-    facts = "; ".join(recalled_facts)
+    """Speak a recall answer from DB facts — always phrased by the LLM."""
     who = f"Speaking to {person_name.strip()}. " if person_name else ""
+    if recalled_facts:
+        facts = "; ".join(recalled_facts)
+        empty_hint = ""
+    else:
+        facts = "(none — nothing saved for this yet)"
+        empty_hint = (
+            "No matching facts exist. Tell them naturally you have not learned that "
+            "about them yet. Do not invent or guess.\n"
+        )
     prompt = (
         "You are NiNO, a friendly voice assistant.\n"
         f"{who}"
         f"The user asked: {user_text.strip()}\n"
         f"Known facts from memory database: {facts}\n"
-        f"Answer using ONLY those facts. Under {max_words} words. "
-        "Second person. No markdown. If facts do not answer the question, "
-        "say you do not have that saved yet.\n"
+        f"{empty_hint}"
+        f"Answer using ONLY those facts when they exist. Under {max_words} words. "
+        "Second person. No markdown.\n"
     )
     return ollama_generate(
         prompt,

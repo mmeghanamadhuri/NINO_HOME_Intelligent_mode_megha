@@ -21,10 +21,12 @@ logger = logging.getLogger(__name__)
 from llm_service import (
     answer_conversation_recap,
     answer_identity_question,
+    answer_recap_contextual_question,
     answer_voice_query,
     DEFAULT_MODEL,
     DEFAULT_OLLAMA_URL,
     extract_recap_focus_topic,
+    extract_recap_follow_up_question,
     is_assumed_prior_topic_question,
     is_conversation_recap_question,
     recap_topic_not_found_reply,
@@ -232,7 +234,9 @@ def _recap_context_from_recent_turns(
         replied = str(assistant_text or "").strip()
         if not heard:
             continue
-        if is_conversation_recap_question(heard):
+        # For topic-focused recap, keep prior recap turns if they still contain
+        # substantive assistant content about that topic (e.g. earlier speaker discussion).
+        if is_conversation_recap_question(heard) and not focus_topic:
             continue
         if focus_topic and not recap_turn_matches_topic(focus_topic, heard, replied):
             continue
@@ -719,11 +723,71 @@ def process_voice_wav(
                         person_name=memory_name,
                     )
                 else:
+                    follow_up = extract_recap_follow_up_question(user_text)
+                    if follow_up:
+                        reply_path = "recap_answer"
+                        logger.info(
+                            "Voice recap + question | viewer=%s topic=%s follow_up=%s heard: %s",
+                            memory_name,
+                            focus_topic,
+                            follow_up[:80],
+                            user_text[:120],
+                        )
+                        reply = answer_recap_contextual_question(
+                            user_text,
+                            follow_up,
+                            viewer_name=memory_name,
+                            memory_context=recap_context,
+                            focus_topic=focus_topic,
+                            model=SETTINGS.ollama_model,
+                            api_url=SETTINGS.ollama_url,
+                            max_words=max(SETTINGS.recap_max_words, SETTINGS.max_words_reply),
+                        )
+                    else:
+                        reply_path = "recap"
+                        logger.info(
+                            "Voice recap topic confirmed | viewer=%s topic=%s heard: %s",
+                            memory_name,
+                            focus_topic,
+                            user_text[:120],
+                        )
+                        reply = answer_conversation_recap(
+                            user_text,
+                            viewer_name=memory_name,
+                            recognition_state=camera_identity_state,
+                            model=SETTINGS.ollama_model,
+                            api_url=SETTINGS.ollama_url,
+                            max_words=SETTINGS.recap_max_words,
+                            memory_context=recap_context,
+                            focus_topic=focus_topic,
+                        )
+            else:
+                follow_up = extract_recap_follow_up_question(user_text)
+                if follow_up and recap_context:
+                    reply_path = "recap_answer"
+                    logger.info(
+                        "Voice recap + question (general) | viewer=%s follow_up=%s heard: %s",
+                        memory_name,
+                        follow_up[:80],
+                        user_text[:120],
+                    )
+                    reply = answer_recap_contextual_question(
+                        user_text,
+                        follow_up,
+                        viewer_name=memory_name,
+                        memory_context=recap_context,
+                        focus_topic=focus_topic,
+                        model=SETTINGS.ollama_model,
+                        api_url=SETTINGS.ollama_url,
+                        max_words=max(SETTINGS.recap_max_words, SETTINGS.max_words_reply),
+                    )
+                else:
                     reply_path = "recap"
                     logger.info(
-                        "Voice recap topic confirmed | viewer=%s topic=%s heard: %s",
+                        "Voice recap query | viewer=%s turns=%s topic=%s | heard: %s",
                         memory_name,
-                        focus_topic,
+                        memory_ctx.recent_turns if memory_ctx else 0,
+                        focus_topic or "(general)",
                         user_text[:120],
                     )
                     reply = answer_conversation_recap(
@@ -736,25 +800,6 @@ def process_voice_wav(
                         memory_context=recap_context,
                         focus_topic=focus_topic,
                     )
-            else:
-                reply_path = "recap"
-                logger.info(
-                    "Voice recap query | viewer=%s turns=%s topic=%s | heard: %s",
-                    memory_name,
-                    memory_ctx.recent_turns if memory_ctx else 0,
-                    focus_topic or "(general)",
-                    user_text[:120],
-                )
-                reply = answer_conversation_recap(
-                    user_text,
-                    viewer_name=memory_name,
-                    recognition_state=camera_identity_state,
-                    model=SETTINGS.ollama_model,
-                    api_url=SETTINGS.ollama_url,
-                    max_words=SETTINGS.recap_max_words,
-                    memory_context=recap_context,
-                    focus_topic=focus_topic,
-                )
     elif reply_path == "llm" and memory_name and memory_ctx and memory_svc.ready:
         llm_memory = memory_svc.handle_llm_memory_turn(
             memory_ctx.user_id,
@@ -818,7 +863,7 @@ def process_voice_wav(
     t_reply = time.perf_counter()
 
     memory_store = "skipped"
-    if reply_path in {"llm", "identity_llm", "memory_llm_store"}:
+    if reply_path in {"llm", "identity_llm", "memory_llm_store", "recap_answer"}:
         memory_store = memory_svc.log_conversation_for_viewer(
             memory_name,
             user_text,

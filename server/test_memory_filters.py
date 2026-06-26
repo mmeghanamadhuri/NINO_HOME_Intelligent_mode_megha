@@ -130,7 +130,7 @@ class MemoryFilterTests(unittest.TestCase):
             ),
             (
                 "So, yesterday we are talking about a race in sea programming right? Could you please brief about that?",
-                "a race in sea programming",
+                "race in sea programming",
             ),
             (
                 "Today we are talking about arrays write and see programming. Could you please brief out that?",
@@ -145,6 +145,112 @@ class MemoryFilterTests(unittest.TestCase):
         reply = recap_topic_not_found_reply("trigonometry", person_name="Chakri")
         self.assertIn("don't have trigonometry", reply.lower())
         self.assertIn("shall we discuss it now", reply.lower())
+
+    def test_past_time_recap_phrases_from_latency_log(self) -> None:
+        from llm_service import (
+            extract_recap_focus_topic,
+            is_assumed_prior_topic_question,
+            is_conversation_recap_question,
+        )
+
+        cases = (
+            (
+                "We are talking about a trigonometry, right?",
+                True,
+                True,
+                "trigonometry",
+            ),
+            (
+                "Today we are talking about speakers and mics right? Could you please explain about that?",
+                True,
+                True,
+                "speakers and mics",
+            ),
+            (
+                "Few minutes back we had a discussion on speakers right? Please explain about that again.",
+                True,
+                True,
+                "speakers",
+            ),
+            (
+                "Earlier today we discussed microcontrollers. Could you brief that again?",
+                True,
+                True,
+                "microcontrollers",
+            ),
+            (
+                "A while ago we had a conversation about sea programming right?",
+                True,
+                True,
+                "sea programming",
+            ),
+        )
+        for text, want_recap, want_topic_focus, expected_topic in cases:
+            with self.subTest(text=text[:55]):
+                self.assertEqual(
+                    is_conversation_recap_question(text),
+                    want_recap,
+                    msg=f"recap detect: {text}",
+                )
+                self.assertEqual(
+                    is_assumed_prior_topic_question(text),
+                    want_topic_focus,
+                    msg=f"topic focus: {text}",
+                )
+                self.assertEqual(
+                    extract_recap_focus_topic(text),
+                    expected_topic,
+                    msg=f"topic extract: {text}",
+                )
+
+    def test_recap_follow_up_question_detection(self) -> None:
+        from llm_service import (
+            extract_recap_follow_up_question,
+            is_recap_with_follow_up_question,
+        )
+
+        compound = (
+            "Hi, we are talking about speakers right? "
+            "And on top of that add, what components are used in that?"
+        )
+        self.assertTrue(is_recap_with_follow_up_question(compound))
+        follow_up = extract_recap_follow_up_question(compound)
+        self.assertIsNotNone(follow_up)
+        assert follow_up is not None
+        self.assertIn("components", follow_up.lower())
+
+        brief_only = (
+            "So, we are talking about trigonometry right? Could you please brief out that?"
+        )
+        self.assertFalse(is_recap_with_follow_up_question(brief_only))
+        self.assertIsNone(extract_recap_follow_up_question(brief_only))
+
+    def test_latency_log_speakers_compound_no_question_mark(self) -> None:
+        from llm_service import (
+            extract_recap_focus_topic,
+            extract_recap_follow_up_question,
+            recap_turn_matches_topic,
+        )
+
+        heard = (
+            "we are talking about speakers right could you please brief about that "
+            "and what components are used in"
+        )
+        self.assertEqual(extract_recap_focus_topic(heard), "speakers")
+        follow_up = extract_recap_follow_up_question(heard)
+        self.assertIsNotNone(follow_up)
+        assert follow_up is not None
+        self.assertIn("components", follow_up.lower())
+
+        prior_user = (
+            "Few minutes back we had a discussion on speakers right? "
+            "Please explain about that again."
+        )
+        prior_reply = (
+            "Of course! A speaker is just like a microphone but usually attached "
+            "to something permanent in the room."
+        )
+        self.assertTrue(recap_turn_matches_topic("speakers", prior_user, prior_reply))
 
     def test_memory_recall_not_logged(self) -> None:
         self.assertEqual(
