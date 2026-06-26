@@ -139,7 +139,9 @@ vision_emotion = VisionEmotionService(
     emotion,
     speak_wav=lambda text, eye: tts.speak_to_esp(text, eye_expression=eye),
     is_speaker_busy=tts.is_speaking,
+    defer_empathy_for=tts.needs_startup_summary_greeting,
 )
+tts.set_on_summary_greeting_spoken(vision_emotion.notify_summary_greeting_spoken)
 latest_results: list[dict] = []
 # Update vision-driven TTS every frame so greetings start as soon as recognition succeeds
 # (throttling here added a noticeable delay before enqueue).
@@ -209,6 +211,10 @@ def startup() -> None:
 
 @app.on_event("shutdown")
 def shutdown() -> None:
+    try:
+        get_memory_service().stop()
+    except BaseException:
+        pass
     try:
         get_alarm_service().stop()
     except BaseException:
@@ -436,6 +442,10 @@ def _mjpeg_generator():
 
             annotated, results = faces.annotate(frame)
             latest_results = results
+            now = time.time()
+            if now - last_tts_update_at >= TTS_UPDATE_INTERVAL_SECONDS:
+                _update_tts_face_state(results)
+                last_tts_update_at = now
             try:
                 vision_emotion.process_frame(frame, results)
                 overlay = vision_emotion.latest_overlay()
@@ -443,10 +453,6 @@ def _mjpeg_generator():
                     _draw_emotion_overlay(annotated, overlay)
             except Exception:
                 logger.exception("Vision emotion frame failed; continuing MJPEG")
-            now = time.time()
-            if now - last_tts_update_at >= TTS_UPDATE_INTERVAL_SECONDS:
-                _update_tts_face_state(results)
-                last_tts_update_at = now
 
             ok, encoded = cv2.imencode(
                 ".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 70]

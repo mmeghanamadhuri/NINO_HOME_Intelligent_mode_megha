@@ -15,7 +15,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -189,6 +189,36 @@ class MemorySettings:
     min_importance: int = 5
     extraction_enabled: bool = False
     summary_cron_enabled: bool = False
+    summary_scheduler_time: str = "00:05"
+
+
+def parse_summary_scheduler_time(raw: str) -> tuple[int, int]:
+    """Parse MEMORY_SUMMARY_CRON_TIME (HH:MM local) for the daily summary job."""
+    text = (raw or "00:05").strip()
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    if not match:
+        raise ValueError(f"Invalid MEMORY_SUMMARY_CRON_TIME: {raw!r} (expected HH:MM)")
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if hour > 23 or minute > 59:
+        raise ValueError(f"Invalid MEMORY_SUMMARY_CRON_TIME: {raw!r}")
+    return hour, minute
+
+
+def seconds_until_local_time(
+    hour: int, minute: int, *, now: datetime | None = None
+) -> float:
+    """Seconds until the next local clock occurrence of hour:minute."""
+    current = now or datetime.now()
+    target = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= current:
+        target += timedelta(days=1)
+    return max(0.0, (target - current).total_seconds())
+
+
+def yesterday_local_date(*, now: datetime | None = None) -> date:
+    """Calendar yesterday in local PC time (matches alarm clock)."""
+    return (now or datetime.now()).date() - timedelta(days=1)
 
 
 SETTINGS = MemorySettings()
@@ -218,6 +248,7 @@ def configure_from_environ() -> None:
         "yes",
         "on",
     }
+    SETTINGS.summary_scheduler_time = os.environ.get("MEMORY_SUMMARY_CRON_TIME", "00:05").strip()
 
 
 class MemoryService:
@@ -225,6 +256,8 @@ class MemoryService:
         self._ready = False
         self._last_error = ""
         self._schema_checked = False
+        self._summary_stop = threading.Event()
+        self._summary_scheduler_thread: threading.Thread | None = None
 
     @property
     def enabled(self) -> bool:
@@ -267,10 +300,24 @@ class MemoryService:
                     daemon=True,
                     name="memory-summary-catchup",
                 ).start()
+                self._summary_stop.clear()
+                self._summary_scheduler_thread = threading.Thread(
+                    target=self._run_summary_scheduler_loop,
+                    daemon=True,
+                    name="memory-summary-scheduler",
+                )
+                self._summary_scheduler_thread.start()
+                logger.info(
+                    "Memory Phase C scheduler started (daily at %s local)",
+                    SETTINGS.summary_scheduler_time,
+                )
         except Exception as exc:
             self._ready = False
             self._last_error = str(exc)
             logger.warning("Memory layer unavailable: %s", exc)
+
+    def stop(self) -> None:
+        self._summary_stop.set()
 
     def status(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -282,8 +329,18 @@ class MemoryService:
             "min_importance": SETTINGS.min_importance,
             "extraction_enabled": SETTINGS.extraction_enabled,
             "summary_cron_enabled": SETTINGS.summary_cron_enabled,
+            "summary_scheduler_time": SETTINGS.summary_scheduler_time,
+            "summary_yesterday_date": yesterday_local_date().isoformat(),
             "last_error": self._last_error,
         }
+        if self._ready and SETTINGS.summary_cron_enabled:
+            try:
+                hour, minute = parse_summary_scheduler_time(SETTINGS.summary_scheduler_time)
+                out["summary_next_run_in_seconds"] = round(
+                    seconds_until_local_time(hour, minute), 1
+                )
+            except ValueError as exc:
+                out["summary_scheduler_error"] = str(exc)
         if self._ready:
             try:
                 out["table_counts"] = self._fetch_table_counts()
@@ -313,7 +370,7 @@ class MemoryService:
                 memories = self._fetch_top_memories(
                     conn, user_id, SETTINGS.top_memories, SETTINGS.min_importance
                 )
-                summary = self._fetch_latest_summary(conn, user_id)
+                summary = self._fetch_yesterday_summary(conn, user_id)
             recent = filter_recent_turns(recent)
             from memory_filters import filter_memories_for_query
 
@@ -338,6 +395,34 @@ class MemoryService:
         except Exception as exc:
             logger.warning("Memory context load failed: %s", exc)
             self._last_error = str(exc)
+            return None
+
+    def get_latest_summary_text(self, display_name: str) -> str | None:
+        """Phase C — calendar yesterday's summary for greeting + voice."""
+        if not self._ready or not display_name:
+            return None
+        face_id = slug_face_id(display_name)
+        if not face_id:
+            return None
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id FROM users
+                        WHERE face_id = %s OR LOWER(name) = LOWER(%s)
+                        ORDER BY CASE WHEN face_id = %s THEN 0 ELSE 1 END
+                        LIMIT 1
+                        """,
+                        (face_id, display_name.strip(), face_id),
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        return None
+                    user_id = int(row[0])
+                return self._fetch_yesterday_summary(conn, user_id)
+        except Exception as exc:
+            logger.warning("get_latest_summary_text failed: %s", exc)
             return None
 
     def ensure_user(self, display_name: str) -> LoadedMemoryContext | None:
@@ -1130,17 +1215,18 @@ class MemoryService:
             )
             return [str(row[0]) for row in cur.fetchall()]
 
-    def _fetch_latest_summary(self, conn, user_id: int) -> str | None:
+    def _fetch_yesterday_summary(self, conn, user_id: int) -> str | None:
+        return self._fetch_summary_for_date(conn, user_id, yesterday_local_date())
+
+    def _fetch_summary_for_date(self, conn, user_id: int, day: date) -> str | None:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT summary_text
                 FROM summaries
-                WHERE user_id = %s
-                ORDER BY summary_date DESC
-                LIMIT 1
+                WHERE user_id = %s AND summary_date = %s
                 """,
-                (user_id,),
+                (user_id, day),
             )
             row = cur.fetchone()
         return str(row[0]) if row else None
@@ -1295,12 +1381,35 @@ class MemoryService:
         except Exception as exc:
             logger.warning("Memory extraction failed: %s", exc)
 
+    def _run_summary_scheduler_loop(self) -> None:
+        """Phase C — run daily summary catch-up at MEMORY_SUMMARY_CRON_TIME local."""
+        while not self._summary_stop.is_set():
+            try:
+                hour, minute = parse_summary_scheduler_time(SETTINGS.summary_scheduler_time)
+                wait_s = seconds_until_local_time(hour, minute)
+                logger.info(
+                    "Next daily summary scheduled in %.0f s (at %s local)",
+                    wait_s,
+                    SETTINGS.summary_scheduler_time,
+                )
+                if self._summary_stop.wait(wait_s):
+                    break
+                logger.info("Running scheduled daily summary catch-up")
+                self._run_summary_catchup_safe()
+            except ValueError as exc:
+                logger.warning("Summary scheduler disabled: %s", exc)
+                return
+            except Exception as exc:
+                logger.warning("Summary scheduler error: %s", exc)
+                if self._summary_stop.wait(60.0):
+                    break
+
     def _run_summary_catchup_safe(self) -> None:
         """Phase C — summarize yesterday for users with conversations."""
         if not self._ready:
             return
         try:
-            target = date.today() - timedelta(days=1)
+            target = yesterday_local_date()
             with self._connect() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
@@ -1313,6 +1422,11 @@ class MemoryService:
                     user_ids = [int(row[0]) for row in cur.fetchall()]
                 for uid in user_ids:
                     self._summarize_user_day(conn, uid, target)
+            logger.info(
+                "Daily summary catch-up done for %s (%d user(s) with conversations)",
+                target.isoformat(),
+                len(user_ids),
+            )
         except Exception as exc:
             logger.warning("Daily summary catchup failed: %s", exc)
 

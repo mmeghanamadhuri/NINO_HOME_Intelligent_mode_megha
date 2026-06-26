@@ -17708,5 +17708,43 @@
     "client": "192.168.0.97:55813",
     "session_queries": 1,
     "session_seconds": 5.87
+  },
+  {
+    "timestamp": "2026-06-26T22:57:41",
+    "event": "ws_open",
+    "client": "192.168.0.95:58631"
+  },
+  {
+    "timestamp": "2026-06-26T22:57:44",
+    "event": "voice_query",
+    "client": "192.168.0.95:58631",
+    "server_total_seconds": 3.804,
+    "heard": "I like this joke.",
+    "reply_text": "Thank you for liking that joke! Remember to keep sharing your funny moments.",
+    "reply_path": "memory_llm_store",
+    "audio_in_seconds": 1.04,
+    "audio_in_bytes": 33324,
+    "audio_out_seconds": 6.48,
+    "audio_out_bytes": 207492,
+    "stt_engine": "whisper",
+    "stt_seconds": 3.364,
+    "memory_seconds": 0.038,
+    "reply_seconds": 0.38,
+    "tts_seconds": 0.022,
+    "process_total_seconds": 3.804,
+    "voice_viewer": "Chakri",
+    "memory_viewer": "Chakri",
+    "memory_ready": true,
+    "memory_store": "skipped_memory_llm_store",
+    "memory_turns": 5,
+    "memory_facts": 4,
+    "memory_user": "Chakri"
+  },
+  {
+    "timestamp": "2026-06-26T22:57:45",
+    "event": "ws_closed",
+    "client": "192.168.0.95:58631",
+    "session_queries": 1,
+    "session_seconds": 4.113
   }
 ]

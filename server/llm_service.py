@@ -345,27 +345,453 @@ def brief_spoken_message(
     return ollama_generate(prompt, model=model, api_url=api_url, num_predict=64)
 
 
-def greeting_for_face(
+def build_greeting_prompt(
     display_name: str,
     *,
     is_return_visitor: bool,
-    model: str | None = None,
-    api_url: str | None = None,
-    num_predict: int = 48,
-    timeout_s: int = VOICE_QUERY_TIMEOUT_S,
+    session_summary: str | None = None,
+    is_startup_greeting: bool = False,
 ) -> str:
+    """Prompt for camera face greeting; optional Phase C summary from a prior day."""
     visitor = (
         "They have been seen before this session (returning)."
         if is_return_visitor
         else "This is the first time they appear in front of the camera this session."
     )
-    prompt = (
-        f"You are NiNO, a friendly smart-home assistant with a camera.\n"
-        f"The camera just recognized this person: {display_name}.\n"
-        f"{visitor}\n"
-        "Reply with 1–2 short spoken sentences only: warm greeting, use their name, "
-        "offer help. No quotes, no bullet points, no stage directions."
+    lines = [
+        "You are NiNO, a friendly smart-home assistant with a camera.",
+        f"The camera just recognized this person: {display_name}.",
+        visitor,
+    ]
+    summary = (session_summary or "").strip()
+    if summary:
+        if is_startup_greeting:
+            lines.append(
+                "This is the server's first welcome greeting after boot. "
+                "Use the prior-day summary below. Do NOT mention facial expression, "
+                "mood, or how they look — only greet and reference yesterday's topics."
+            )
+        lines.append(
+            "Earlier session summary (from a prior day — weave in naturally, do not read verbatim):\n"
+            f"{summary}"
+        )
+        lines.append(
+            "Reply with 2 short spoken sentences only (max 35 words total): warm greeting using their name, "
+            "mention one topic from the summary, ask if they want to continue. "
+            "No quotes, no bullet points, no stage directions."
+        )
+    else:
+        lines.append(
+            "Reply with 1–2 short spoken sentences only: warm greeting, use their name, "
+            "offer help. No quotes, no bullet points, no stage directions."
+        )
+    return "\n".join(lines)
+
+
+_SUMMARY_PREFERENCE_RE = re.compile(
+    r"\b("
+    r"preferred|prefer(?:s|red)?|favourite|favorite|"
+    r"coffee|tea|chess|gaming preferences|outdoor games|"
+    r"birthday|birthdate|alarm|reminder"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_SUMMARY_TOPIC_PREFIX_RE = re.compile(
+    r"^(?:user\s+)?(?:"
+    r"learned about|received names of|received|discussed|talked about|"
+    r"asked about|explored|covered|conversation shifted to discussing"
+    r")\s+",
+    re.IGNORECASE,
+)
+
+
+def parse_summary_topics_for_greeting(
+    summary_text: str, *, max_topics: int = 2
+) -> list[str]:
+    """Extract speakable topic phrases from a Phase C summary; skip personal prefs."""
+    topics: list[str] = []
+    for raw_line in summary_text.splitlines():
+        line = raw_line.strip().lstrip("-•*").strip()
+        if not line or _SUMMARY_PREFERENCE_RE.search(line):
+            continue
+        if re.search(r"\bshifted to discussing\b", line, re.I):
+            line = re.sub(
+                r"^.*?\bshifted to discussing\s+",
+                "",
+                line,
+                flags=re.IGNORECASE,
+            )
+        line = _SUMMARY_TOPIC_PREFIX_RE.sub("", line).strip()
+        line = line.rstrip(".")
+        if not line:
+            continue
+        if len(line) > 48:
+            line = line[:45].rsplit(" ", 1)[0]
+        topics.append(line)
+        if len(topics) >= max_topics:
+            break
+    return topics
+
+
+@dataclass(frozen=True)
+class StartupGreetingParts:
+    """Three-part startup greeting: hello → yesterday context → counter-question."""
+
+    hello: str
+    yesterday: str
+    question: str
+
+    def spoken(self) -> str:
+        return f"{self.hello} {self.yesterday} {self.question}"
+
+
+def build_startup_greeting_hello(display_name: str) -> str:
+    return f"Hi {display_name.strip()}, good to see you!"
+
+
+def build_startup_greeting_yesterday(primary_topic: str) -> str:
+    topic = primary_topic.strip().rstrip(".")
+    return f"Yesterday we discussed {topic}."
+
+
+def build_startup_greeting_opener(display_name: str, primary_topic: str) -> str:
+    """Fixed spoken opener: hello + yesterday context."""
+    return (
+        f"{build_startup_greeting_hello(display_name)} "
+        f"{build_startup_greeting_yesterday(primary_topic)}"
     )
+
+
+_GREETING_LEAK_RE = re.compile(
+    r"^(?:hi\s+[^,.!?]+[,!]?\s*)?(?:good to see you[,!]?\s*)+",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_closing_question(question: str, display_name: str) -> str:
+    """Keep only sentence 3 — strip greeting leaks from the LLM."""
+    q = question.strip().strip("\"'")
+    if not q:
+        return q
+    for segment in re.split(r"(?<=[.!?])\s+", q):
+        seg = segment.strip()
+        if seg.endswith("?"):
+            q = seg
+    q = _GREETING_LEAK_RE.sub("", q).strip()
+    name = display_name.strip()
+    if name and re.match(rf"^hi\s+{re.escape(name)}\b", q, re.I):
+        q = re.sub(rf"^hi\s+{re.escape(name)}\s*[,!]?\s*", "", q, flags=re.I).strip()
+    lower = q.lower()
+    if "yesterday we discussed" in lower or "good to see you" in lower:
+        q_pos = q.rfind("?")
+        if q_pos > 0:
+            start = q.rfind(".", 0, q_pos)
+            if start >= 0:
+                q = q[start + 1 : q_pos + 1].strip()
+    if q and not q.endswith("?"):
+        q = q.rstrip(".! ") + "?"
+    return q
+
+
+def build_startup_closing_question_prompt(
+    display_name: str,
+    primary_topic: str,
+    hello: str,
+    yesterday: str,
+    summary_text: str,
+) -> str:
+    """LLM prompt for sentence 3 only — after hello and yesterday context were spoken."""
+    name = display_name.strip()
+    topic = primary_topic.strip()
+    summary = summary_text.strip()
+    return (
+        "You are NiNO, a friendly voice assistant.\n"
+        f"You already said aloud to {name} (in order):\n"
+        f'1) "{hello}"\n'
+        f'2) "{yesterday}"\n\n'
+        "Write ONLY line 3 — one short counter-question. The listener already heard "
+        "the greeting and yesterday's topic.\n"
+        "Pick ONE style (vary between startups):\n"
+        "A) Invite to continue (e.g. \"Want to pick up from there?\")\n"
+        f'B) Ask about {topic} (e.g. "Can you describe what a microcontroller is?")\n\n'
+        "Rules:\n"
+        "- Output ONLY the question — no hi, no name, no \"good to see you\", no \"yesterday\"\n"
+        "- Exactly one sentence ending with ?\n"
+        "- Max 10 words, casual spoken English\n"
+        "- No quotes, bullet points, or stage directions\n"
+        f"\nTopic: {topic}\n"
+        f"Prior-day summary:\n{summary[:600]}"
+    )
+
+
+def _startup_greeting_temperature() -> float:
+    temp_raw = os.environ.get("STARTUP_GREETING_TEMPERATURE")
+    if temp_raw is None:
+        temp_raw = os.environ.get("VOICE_REPLY_TEMPERATURE", "0.72")
+    return float(temp_raw)
+
+
+def _startup_closing_question_via_llm(
+    display_name: str,
+    primary_topic: str,
+    hello: str,
+    yesterday: str,
+    summary_text: str,
+    *,
+    model: str | None = None,
+    api_url: str | None = None,
+    timeout_s: int = VOICE_QUERY_TIMEOUT_S,
+) -> str:
+    """LLM sentence 3: counter-question only (no greeting or yesterday recap)."""
+    prompt = build_startup_closing_question_prompt(
+        display_name, primary_topic, hello, yesterday, summary_text
+    )
+    question = ollama_generate(
+        prompt,
+        model=model,
+        api_url=api_url,
+        timeout_s=timeout_s,
+        num_predict=48,
+        temperature=_startup_greeting_temperature(),
+    ).strip()
+    return _sanitize_closing_question(question, display_name)
+
+
+def build_startup_summary_greeting_prompt(
+    display_name: str, summary_text: str
+) -> str:
+    """Fallback LLM prompt when topic extraction fails — full 3-part greeting."""
+    name = display_name.strip()
+    summary = summary_text.strip()
+    topics = parse_summary_topics_for_greeting(summary)
+    lines = [
+        "You are NiNO, a friendly smart-home assistant with a camera.",
+        f"The camera just recognized {name} — first welcome after the server started today.",
+        "Write ONE short spoken reply they will hear aloud.",
+        "",
+        "Use EXACTLY this 3-sentence shape (fresh wording, same structure):",
+        f'1) "Hi {name}, good to see you!"',
+        '2) "Yesterday we discussed [one topic from the summary]."',
+        "3) A question — either invite to continue OR ask a simple follow-up about that topic.",
+        "",
+        "Rules:",
+        "- The LAST sentence MUST be a question ending with ?",
+        "- Max 45 words total. Skip preferences, drinks, birthdays, alarms.",
+        "- Do NOT mention facial expression, mood, or how they look.",
+        "- No quotes, bullet points, or stage directions.",
+        "",
+        "Good examples (do not copy verbatim):",
+        f'Hi {name}, good to see you! Yesterday we discussed microcontrollers and their uses. Want to pick up from there?',
+        f'Hi {name}, good to see you! Yesterday we discussed microcontrollers and their uses. Can you describe what a microcontroller is?',
+    ]
+    if topics:
+        lines.append(f"Discussion topic to use: {topics[0]}.")
+    if summary:
+        lines.append(f"Prior-day session summary:\n{summary}")
+    else:
+        lines.append("No prior-day summary — warm greeting only, offer help briefly.")
+    return "\n".join(lines)
+
+
+def _ends_with_invitation_question(text: str) -> bool:
+    tail = text.strip()[-120:]
+    return "?" in tail
+
+
+def _invite_continuation_via_llm(
+    greeting_so_far: str,
+    display_name: str,
+    primary_topic: str,
+    summary_text: str,
+    *,
+    model: str | None = None,
+    api_url: str | None = None,
+    timeout_s: int = VOICE_QUERY_TIMEOUT_S,
+) -> str:
+    """Ask the LLM for sentence 3 when the fallback full-greeting path omitted it."""
+    body = greeting_so_far.strip()
+    topic = primary_topic.strip() or "our chat"
+    y_marker = "yesterday we discussed"
+    y_idx = body.lower().find(y_marker)
+    if y_idx >= 0:
+        hello = body[:y_idx].strip().rstrip(".!?")
+        rest = body[y_idx:]
+        dot = rest.find(".")
+        yesterday = rest[: dot + 1].strip() if dot >= 0 else rest.strip()
+    else:
+        hello = body.rstrip(".!?") or build_startup_greeting_hello(display_name)
+        yesterday = build_startup_greeting_yesterday(topic)
+    return _startup_closing_question_via_llm(
+        display_name,
+        topic,
+        hello,
+        yesterday,
+        summary_text,
+        model=model,
+        api_url=api_url,
+        timeout_s=timeout_s,
+    )
+
+
+def startup_greeting_parts_from_summary(
+    display_name: str,
+    summary_text: str,
+    *,
+    model: str | None = None,
+    api_url: str | None = None,
+    timeout_s: int = VOICE_QUERY_TIMEOUT_S,
+) -> StartupGreetingParts | None:
+    """Build hello + yesterday (fixed) + LLM counter-question."""
+    name = display_name.strip()
+    summary = summary_text.strip()
+    if not summary:
+        return None
+    topics = parse_summary_topics_for_greeting(summary)
+    primary_topic = topics[0] if topics else ""
+    if not primary_topic:
+        return None
+
+    hello = build_startup_greeting_hello(name)
+    yesterday = build_startup_greeting_yesterday(primary_topic)
+    closing = _startup_closing_question_via_llm(
+        name,
+        primary_topic,
+        hello,
+        yesterday,
+        summary,
+        model=model,
+        api_url=api_url,
+        timeout_s=timeout_s,
+    )
+    if not closing:
+        closing = "Want to pick up from there?"
+    return StartupGreetingParts(hello=hello, yesterday=yesterday, question=closing)
+
+
+def finalize_startup_greeting(
+    text: str,
+    display_name: str,
+    *,
+    primary_topic: str = "",
+    summary_text: str = "",
+    model: str | None = None,
+    api_url: str | None = None,
+    timeout_s: int = VOICE_QUERY_TIMEOUT_S,
+) -> str:
+    """Ensure the spoken greeting ends with an LLM-framed closing question."""
+    body = text.strip()
+    if not body:
+        return body
+    if _ends_with_invitation_question(body):
+        return body
+    topic = primary_topic.strip() or "our chat"
+    invite = _invite_continuation_via_llm(
+        body,
+        display_name,
+        topic,
+        summary_text,
+        model=model,
+        api_url=api_url,
+        timeout_s=timeout_s,
+    )
+    if invite:
+        return f"{body.rstrip('.! ')} {invite}"
+    return f"{body.rstrip('.! ')} Want to pick up from there?"
+
+
+def startup_greeting_from_summary(
+    display_name: str,
+    summary_text: str,
+    *,
+    model: str | None = None,
+    api_url: str | None = None,
+    num_predict: int = 80,
+    timeout_s: int = VOICE_QUERY_TIMEOUT_S,
+) -> str:
+    """Startup greeting: fixed opener from summary topic + LLM closing question."""
+    name = display_name.strip()
+    summary = summary_text.strip()
+    if not summary:
+        return greeting_for_face(
+            name,
+            is_return_visitor=False,
+            session_summary=None,
+            is_startup_greeting=True,
+            model=model,
+            api_url=api_url,
+            num_predict=num_predict,
+            timeout_s=timeout_s,
+        )
+
+    topics = parse_summary_topics_for_greeting(summary)
+    primary_topic = topics[0] if topics else ""
+    parts = startup_greeting_parts_from_summary(
+        name,
+        summary,
+        model=model,
+        api_url=api_url,
+        timeout_s=timeout_s,
+    )
+    if parts is not None:
+        return parts.spoken()
+
+    prompt = build_startup_summary_greeting_prompt(name, summary)
+    top_p_raw = os.environ.get("STARTUP_GREETING_TOP_P")
+    if top_p_raw is None:
+        top_p_raw = os.environ.get("VOICE_REPLY_TOP_P", "0.92")
+
+    text = ollama_generate(
+        prompt,
+        model=model,
+        api_url=api_url,
+        timeout_s=timeout_s,
+        num_predict=num_predict,
+        temperature=_startup_greeting_temperature(),
+        top_p=float(top_p_raw),
+    ).strip()
+    if text:
+        return finalize_startup_greeting(
+            text,
+            name,
+            primary_topic=primary_topic,
+            summary_text=summary,
+            model=model,
+            api_url=api_url,
+            timeout_s=timeout_s,
+        )
+
+    return greeting_for_face(
+        name,
+        is_return_visitor=False,
+        session_summary=summary,
+        is_startup_greeting=True,
+        model=model,
+        api_url=api_url,
+        num_predict=num_predict,
+        timeout_s=timeout_s,
+    )
+
+
+def greeting_for_face(
+    display_name: str,
+    *,
+    is_return_visitor: bool,
+    session_summary: str | None = None,
+    is_startup_greeting: bool = False,
+    model: str | None = None,
+    api_url: str | None = None,
+    num_predict: int = 48,
+    timeout_s: int = VOICE_QUERY_TIMEOUT_S,
+) -> str:
+    prompt = build_greeting_prompt(
+        display_name,
+        is_return_visitor=is_return_visitor,
+        session_summary=session_summary,
+        is_startup_greeting=is_startup_greeting,
+    )
+    if (session_summary or "").strip():
+        num_predict = min(max(num_predict, 64), 80)
     return ollama_generate(
         prompt,
         model=model,

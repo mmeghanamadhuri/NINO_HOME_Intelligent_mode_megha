@@ -14,6 +14,8 @@ FastAPI server for the NiNO ESP32-P4 demo. It pulls camera frames from the board
 - [Voice pipeline](#voice-pipeline)
 - [Face recognition](#face-recognition)
 - [Memory (PostgreSQL)](#memory-postgresql)
+- [Startup summary greeting](#startup-summary-greeting)
+- [ESP TTS chunking](#esp-tts-chunking)
 - [Alarms](#alarms)
 - [HTTP & WebSocket API](#http--websocket-api)
 - [Data files](#data-files)
@@ -35,8 +37,9 @@ app.py
   ├── voice_service.py       WebSocket STT → route → TTS
   ├── llm_service.py         Ollama voice replies + empathy prompts
   ├── tts_service.py         ElevenLabs / SAPI / espeak → esp_playback.py
+  ├── esp_wav_chunking.py    Split long TTS into ESP-sized WAV clips
   ├── alarm_service.py       Voice + scheduler + medical ack
-  └── memory_service.py      PostgreSQL conversations + recall
+  └── memory_service.py      PostgreSQL conversations + recall + daily summaries
 ```
 
 ### Priority model
@@ -44,7 +47,7 @@ app.py
 | Priority | Service | Blocks when |
 | -------- | ------- | ----------- |
 | **P0** | Voice WebSocket (`/ws/voice`) | Active utterance + post-voice cooldown |
-| **P1** | Vision emotion | P0 active, TTS busy, or within `VISION_EMOTION_AFTER_VOICE_SECONDS` |
+| **P1** | Vision emotion | P0 active, TTS busy, startup summary greeting pending, or within `VISION_EMOTION_AFTER_VOICE_SECONDS` |
 
 ---
 
@@ -77,6 +80,8 @@ OLLAMA_URL=http://127.0.0.1:11435/api/generate
 OLLAMA_MODEL=qwen2.5:1.5b
 VISION_EMOTION_ENABLED=1
 EMOTION_BACKEND=keras
+MEMORY_SUMMARY_CRON=1
+MEMORY_SUMMARY_CRON_TIME=00:05
 # ESP_PLAY_WAV_URL=http://192.168.0.96/play_wav
 # ELEVENLABS_API_KEY=sk_...
 ```
@@ -160,6 +165,29 @@ All `*_S` settings are **seconds**, not milliseconds.
 | `EMOTION_SPEAKABLE_MIN` | `0.12` | Absolute min for speakable promotion |
 | `EMOTION_DEVICE` | `auto` | FER+ only: `auto` / `cuda` / `cpu` |
 
+### Memory & summary variables
+
+| Variable | Default | Purpose |
+| -------- | ------- | ------- |
+| `DATABASE_URL` | — | PostgreSQL connection (required for memory) |
+| `MEMORY_EXTRACTION` | on when DB set | Phase B — LLM long-term fact extraction |
+| `MEMORY_RECENT_TURNS` | `10` | Recent conversation lines in voice prompt |
+| `MEMORY_TOP_MEMORIES` | `10` | Max stored facts injected per turn |
+| `MEMORY_MIN_IMPORTANCE` | `5` | Min importance score to store a fact |
+| `MEMORY_SUMMARY_CRON` | `0` | Phase C — enable daily summaries |
+| `MEMORY_SUMMARY_CRON_TIME` | `00:05` | Local time (HH:MM) to summarize yesterday |
+| `STARTUP_GREETING_TEMPERATURE` | `VOICE_REPLY_TEMPERATURE` | LLM variety for startup counter-question |
+| `VISION_EMOTION_AFTER_SUMMARY_GREETING_S` | `180` | Pause empathy after startup summary greeting |
+
+### ESP playback variables
+
+| Variable | Default | Purpose |
+| -------- | ------- | ------- |
+| `ESP_PLAY_WAV_URL` | — | ESP `POST /play_wav` endpoint |
+| `ESP_MAX_PLAY_WAV_BYTES` | `389120` | Max WAV size (~384 KiB firmware limit) |
+| `TTS_PROVIDER` | auto | `elevenlabs`, `sapi`, or `local` (espeak) |
+| `LOCAL_TTS_RATE` | derived | espeak rate tweak (see `tts_service.py`) |
+
 ---
 
 ## Modules
@@ -173,14 +201,15 @@ All `*_S` settings are **seconds**, not milliseconds.
 | `emotion_model_loader.py` | Keras architecture + `.h5` weight load |
 | `vision_emotion_service.py` | Frame accumulation, empathy job queue, overlay state |
 | `pipeline_priority.py` | Voice/vision mutual exclusion |
-| `llm_service.py` | Ollama voice replies, `empathy_for_detected_emotion()` |
+| `llm_service.py` | Ollama voice replies, empathy prompts, startup greeting prompts |
 | `eye_expression.py` | Reply-text → eye tag scoring (voice path) |
-| `tts_service.py` | TTS synthesis, `speak_to_esp()`, head-motion timing |
+| `tts_service.py` | TTS synthesis, startup greeting queue, ESP multi-clip playback |
 | `esp_playback.py` | `POST /play_wav` + `X-Nino-Eye-Expression` header |
+| `esp_wav_chunking.py` | Measure WAV size → split text at sentence/word boundaries |
 | `voice_service.py` | STT, routing (alarm/servo/recap/identity/llm) |
 | `alarm_service.py` | Scheduler, persistence, medical repeat |
 | `alarm_voice.py` | Voice alarm parse + fire |
-| `memory_service.py` | PostgreSQL users, conversations, recall |
+| `memory_service.py` | PostgreSQL users, conversations, recall, daily summaries |
 
 ---
 
@@ -189,12 +218,13 @@ All `*_S` settings are **seconds**, not milliseconds.
 When `VISION_EMOTION_ENABLED=1` (default):
 
 1. **MJPEG loop** reads ESP snapshots and runs face recognition.
-2. **Primary face** selected (largest stabilized or strong candidate match).
-3. **Emotion CNN** runs on padded face crop every frame.
-4. **Votes accumulate** for 2.0–2.5 s while the same person stays in frame.
-5. **Dominant speakable emotion** (≥35% of frames) queues an empathy job.
-6. **Background worker** calls Ollama → TTS → `POST /play_wav` with eye header.
-7. **Cooldown** — same person not addressed again for 120 s.
+2. **Startup summary greeting** (once per boot) may run first — empathy is deferred until it finishes.
+3. **Primary face** selected (largest stabilized or strong candidate match).
+4. **Emotion CNN** runs on padded face crop every frame.
+5. **Votes accumulate** for 2.0–2.5 s while the same person stays in frame.
+6. **Dominant speakable emotion** (≥35% of frames) queues an empathy job.
+7. **Background worker** calls Ollama → TTS → `POST /play_wav` with eye header.
+8. **Cooldown** — same person not addressed again for 120 s.
 
 ### Emotion model (default: Keras)
 
@@ -301,11 +331,85 @@ Requires `DATABASE_URL`. Schema in `scripts/memory_schema.sql`.
 | Phase | Env | Behavior |
 | ----- | --- | -------- |
 | A | `DATABASE_URL` | Log conversations per user |
-| B | `MEMORY_EXTRACTION=1` | LLM extracts long-term facts |
-| C | `MEMORY_SUMMARY_CRON=1` | Nightly summaries |
+| B | `MEMORY_EXTRACTION=1` (default when DB set) | LLM extracts long-term facts after each turn |
+| C | `MEMORY_SUMMARY_CRON=1` | Daily rollup of prior-day conversations into `summaries` |
+
+### Phase C — daily summaries
+
+When `MEMORY_SUMMARY_CRON=1`:
+
+1. **On server startup** — catch-up summarizes **calendar yesterday** for every user who had conversations that day (if not already summarized).
+2. **Every night at `MEMORY_SUMMARY_CRON_TIME`** (default `00:05` local PC time) — same catch-up runs automatically **without restarting** the server.
+3. One row per user per day in `summaries` (`summary_date`, `summary_text`).
+
+Greetings and voice context load **yesterday's** summary only (`summary_date = today - 1`), not the oldest or newest row in the table.
+
+Check scheduler state:
+
+```bash
+curl -s http://localhost:8000/api/status | python3 -c "
+import sys, json
+m = json.load(sys.stdin)['memory']
+print('cron:', m.get('summary_cron_enabled'))
+print('time:', m.get('summary_scheduler_time'))
+print('yesterday:', m.get('summary_yesterday_date'))
+print('next run in (s):', m.get('summary_next_run_in_seconds'))
+"
+```
+
+Row counts:
 
 ```bash
 curl -s http://localhost:8000/api/memory/stats | python3 -m json.tool
+```
+
+More detail: [../phase_c_detailed.md](../phase_c_detailed.md)
+
+---
+
+## Startup summary greeting
+
+When `VISION_EMOTION_ENABLED=1` and a registered face is seen **once per server boot**, NiNO speaks a **Phase C startup greeting** before camera empathy runs.
+
+### Flow
+
+```text
+Face recognized (primary)
+  → memory_service.get_latest_summary_text(name)   # calendar yesterday
+  → llm_service.startup_greeting_parts_from_summary()
+       1) Hi {name}, good to see you!              (fixed)
+       2) Yesterday we discussed {topic}.          (fixed from summary)
+       3) Counter-question                         (LLM — continue or topic follow-up)
+  → tts_service._play_esp_text()                   (auto-chunked WAV clips)
+  → vision empathy deferred ~180 s
+```
+
+### Notes
+
+- Fires **once per boot** per person (`_startup_greeted` in `tts_service.py`).
+- Requires `MEMORY_SUMMARY_CRON=1` and a summary row for **yesterday**; otherwise falls back to a short generic hello.
+- Startup greeting takes priority over vision emotion empathy until it completes.
+
+---
+
+## ESP TTS chunking
+
+The ESP32 `/play_wav` endpoint accepts WAV payloads up to **~384 KiB** (`ESP_MAX_PLAY_WAV_BYTES`). Long spoken replies exceed that at normal TTS speed.
+
+`esp_wav_chunking.py` handles this generically for **any user and any text**:
+
+1. Synthesize at normal rate and **measure** WAV bytes.
+2. If it fits → one `POST /play_wav`.
+3. If not → split at **sentence boundaries**, then **word boundaries** if needed.
+4. Queue **N clips** on the ESP audio FIFO — they play back-to-back.
+
+Used by startup greetings, vision empathy, and any path through `tts_service._play_esp_text()`.
+
+Logs show clip progress:
+
+```text
+ESP play_wav 1/2 (332644 bytes, rate=135): Hi Chakri, good to see you! Yesterday we discussed ...
+ESP play_wav 2/2 (200730 bytes, rate=135): Can you tell me the different types of microcontrollers?
 ```
 
 ---
@@ -383,6 +487,10 @@ python -m unittest discover -v -p 'test_*.py'
 | `test_eye_expression.py` | Reply → eye tag scoring |
 | `test_alarm_voice.py` | Alarm phrase parsing |
 | `test_memory_filters.py` | Recap context filtering |
+| `test_memory_routing.py` | Voice memory routing |
+| `test_memory_summary_scheduler.py` | Phase C midnight scheduler helpers |
+| `test_greeting_summary.py` | Startup greeting prompts and 3-part structure |
+| `test_esp_wav_chunking.py` | Generic ESP WAV text splitting |
 | `test_llm_memory_turn.py` | Memory prompt assembly |
 | `test_volume_command.py` | Volume voice command |
 
@@ -429,9 +537,16 @@ curl -s http://localhost:8000/api/status | python3 -c "import sys,json; print(js
 - Set `ELEVENLABS_API_KEY` for fast STT
 - Confirm `llm.url` points to GPU Ollama (`127.0.0.1:11435`)
 
-### PostgreSQL
+### PostgreSQL / memory
 
 - `"memory": { "ready": false }` → run `init_memory_db.sh`, set `DATABASE_URL`, restart
+- No startup greeting context → enable `MEMORY_SUMMARY_CRON=1`, chat yesterday, wait for `00:05` or restart server for catch-up
+- Stale greeting topic → confirm `summary_yesterday_date` in `/api/status` matches the day you expect
+
+### ESP audio cut off or too fast
+
+- Check logs for `ESP play_wav N/M` — multiple clips at normal `rate=` is expected for long greetings
+- Single clip over ~389120 bytes will fail — chunking should split automatically; report if `last_error` appears in `/api/status` → `tts`
 
 ---
 
@@ -440,4 +555,5 @@ curl -s http://localhost:8000/api/status | python3 -c "import sys,json; print(js
 - [../README.md](../README.md) — project overview, firmware, hardware
 - [../docs/EMOTION_RECOGNITION.md](../docs/EMOTION_RECOGNITION.md) — emotion pipeline deep dive
 - [../docs/ALARM.md](../docs/ALARM.md) — alarm commands and medical flow
+- [../phase_c_detailed.md](../phase_c_detailed.md) — Phase C daily summaries and startup greeting
 - [../docs/serverP.md](../docs/serverP.md) — server architecture notes

@@ -43,10 +43,12 @@ class VisionEmotionService:
         *,
         speak_wav: Callable[[str, str | None], None],
         is_speaker_busy: Callable[[], bool] | None = None,
+        defer_empathy_for: Callable[[str], bool] | None = None,
     ) -> None:
         self._emotion = emotion
         self._speak_wav = speak_wav
         self._is_speaker_busy = is_speaker_busy or (lambda: False)
+        self._defer_empathy_for = defer_empathy_for
 
         self._window_min_s = float(os.environ.get("VISION_EMOTION_WINDOW_MIN_S", "2.0"))
         self._window_max_s = float(os.environ.get("VISION_EMOTION_WINDOW_MAX_S", "2.5"))
@@ -60,6 +62,7 @@ class VisionEmotionService:
         self._accum_conf_sum: dict[str, float] = {}
         self._accum_frames = 0
         self._last_spoken_at: dict[str, float] = {}
+        self._summary_greet_suppress_until: dict[str, float] = {}
         self._last_error = ""
         self._latest_overlay: dict[str, Any] | None = None
         self._pending_jobs: list[_EmpathyJob] = []
@@ -91,6 +94,33 @@ class VisionEmotionService:
         with self._lock:
             return dict(self._latest_overlay) if self._latest_overlay else None
 
+    def notify_summary_greeting_spoken(self, person_name: str) -> None:
+        """Pause empathy after the Phase C startup greeting so the user hears one line."""
+        name = str(person_name or "").strip()
+        if not name or name.lower() in {"unknown", "face"}:
+            return
+        pause_s = float(os.environ.get("VISION_EMOTION_AFTER_SUMMARY_GREETING_S", "180"))
+        until = time.time() + max(30.0, pause_s)
+        with self._lock:
+            self._summary_greet_suppress_until[name] = until
+            self._last_spoken_at[name] = time.time()
+            self._pending_jobs = [j for j in self._pending_jobs if j.person_name != name]
+            self._reset_accum_locked()
+        logger.info(
+            "Vision empathy paused %.0fs after summary greeting for %s",
+            pause_s,
+            name,
+        )
+
+    def _empathy_suppressed(self, name: str) -> bool:
+        now = time.time()
+        with self._lock:
+            if self._summary_greet_suppress_until.get(name, 0.0) > now:
+                return True
+        if self._defer_empathy_for and self._defer_empathy_for(name):
+            return True
+        return False
+
     def process_frame(self, frame: Any, results: list[dict[str, Any]]) -> None:
         """Called from the MJPEG loop on every frame."""
         if not self.enabled():
@@ -110,6 +140,23 @@ class VisionEmotionService:
         box = primary.get("box") or {}
         if not name or name.lower() in {"unknown", "face"}:
             self._reset_accum_locked()
+            return
+
+        if self._empathy_suppressed(name):
+            with self._lock:
+                if self._pending_jobs:
+                    self._pending_jobs = [
+                        j for j in self._pending_jobs if j.person_name != name
+                    ]
+            self._reset_accum_locked()
+            with self._lock:
+                self._latest_overlay = {
+                    "name": name,
+                    "emotion": None,
+                    "confidence": None,
+                    "accum_s": 0.0,
+                    "deferred": "startup_greeting",
+                }
             return
 
         overlay_info = self._emotion.detect_overlay(frame, box)
@@ -219,6 +266,25 @@ class VisionEmotionService:
 
             if job is None:
                 time.sleep(0.05)
+                continue
+
+            now = time.time()
+            with self._lock:
+                if self._summary_greet_suppress_until.get(job.person_name, 0.0) > now:
+                    logger.info(
+                        "Vision empathy skipped (post-summary cooldown) for %s",
+                        job.person_name,
+                    )
+                    continue
+
+            if self._defer_empathy_for and self._defer_empathy_for(job.person_name):
+                logger.info(
+                    "Vision empathy deferred (startup greeting pending) for %s",
+                    job.person_name,
+                )
+                time.sleep(0.2)
+                with self._lock:
+                    self._pending_jobs.insert(0, job)
                 continue
 
             if vision_emotion_blocked() or self._is_speaker_busy():

@@ -13,13 +13,55 @@ import urllib.error
 import urllib.request
 import wave
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
+from esp_wav_chunking import chunk_text_for_esp_limit
 from wav_resample import ESP_PCM_SAMPLE_RATE_HZ, resample_wav_bytes_to_mono_16bit
 
 logger = logging.getLogger(__name__)
+
+_GREETING_MAX_WORDS = 40
+
+
+def _split_invite_question(text: str) -> tuple[str, str | None]:
+    """Return (body, invite) when text ends with a spoken invitation question."""
+    text = text.strip()
+    q_pos = text.rfind("?")
+    if q_pos < 0:
+        return text, None
+    start = max(text.rfind(".", 0, q_pos), text.rfind("!", 0, q_pos))
+    invite = (
+        text[start + 1 : q_pos + 1].strip()
+        if start >= 0
+        else text[: q_pos + 1].strip()
+    )
+    body = text[: start + 1].strip() if start >= 0 else ""
+    return body, invite or None
+
+
+def _clamp_spoken_words(
+    text: str, max_words: int = _GREETING_MAX_WORDS, *, preserve_invite: bool = False
+) -> str:
+    text = text.strip()
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    if preserve_invite and "?" in text:
+        body, invite = _split_invite_question(text)
+        if invite:
+            invite_words = invite.split()
+            body_words = body.split() if body else []
+            body_budget = max(8, max_words - len(invite_words))
+            if len(body_words) > body_budget:
+                body_words = body_words[:body_budget]
+            body = " ".join(body_words).rstrip(".,;:!?")
+            if body:
+                return f"{body}. {invite}"
+            return invite
+    return " ".join(words[:max_words]).rstrip(".,;:") + "?"
+
 
 DEFAULT_ELEVENLABS_TTS_VOICE_ID = "f1K8uOKtx0TAmtXBiLqx"
 DEFAULT_ELEVENLABS_TTS_MODEL = "eleven_multilingual_v2"
@@ -400,6 +442,7 @@ class _SpeechJob:
     llm_return_visitor: bool = False
     #: If True, a successful job updates vision session state (first greet / last_spoken).
     track_vision_session: bool = True
+    is_startup_greeting: bool = False
 
 
 class TTSService:
@@ -424,6 +467,7 @@ class TTSService:
         self._active_name = ""
         self._last_face_seen_at = 0.0
         self._known_seen_once: set[str] = set()
+        self._startup_greeted: set[str] = set()
         self._present_known_names: set[str] = set()
         self._vision_queued: set[str] = set()
         self._pending_jobs: list[_SpeechJob] = []
@@ -441,7 +485,13 @@ class TTSService:
         self._last_spoken_text = ""
         self._lock = threading.Lock()
         self._worker = threading.Thread(target=self._run, name="tts-worker", daemon=True)
+        self._on_summary_greeting_spoken: Callable[[str], None] | None = None
         self._worker.start()
+
+    def set_on_summary_greeting_spoken(
+        self, callback: Callable[[str], None] | None
+    ) -> None:
+        self._on_summary_greeting_spoken = callback
 
     def configure_llm(
         self,
@@ -466,6 +516,7 @@ class TTSService:
             self._last_face_seen_at = 0.0
             self._present_known_names.clear()
             self._known_seen_once.clear()
+            self._startup_greeted.clear()
             self._last_spoken_at.clear()
             self._vision_queued.clear()
             self._pending_jobs.clear()
@@ -476,13 +527,17 @@ class TTSService:
         with self._lock:
             return self._is_speaking or bool(self._pending_jobs)
 
+    def needs_startup_summary_greeting(self, person_name: str) -> bool:
+        """True until this person receives their first summary greeting this session."""
+        name = str(person_name or "").strip()
+        if not name or name.lower() in {"unknown", "face"}:
+            return False
+        with self._lock:
+            return name not in self._startup_greeted
+
     def speak_to_esp(self, text: str, *, eye_expression: str | None = None) -> None:
         """Synthesize and POST WAV to ESP (vision empathy / greetings)."""
-        from esp_playback import post_wav_to_esp
-
-        wav = self._synthesize_wav_windows_sapi(text)
-        wav = resample_wav_bytes_to_mono_16bit(wav, ESP_PCM_SAMPLE_RATE_HZ)
-        post_wav_to_esp(wav, eye_expression=eye_expression)
+        self._output_speech(text, eye_expression=eye_expression)
 
     def notify_voice_interaction(self, viewer_name: str | None) -> None:
         """After a voice reply: drop stale vision greetings and pause auto-welcome."""
@@ -499,6 +554,7 @@ class TTSService:
                 cleaned = str(viewer_name).strip()
                 if cleaned and cleaned.lower() not in {"unknown", "face"}:
                     self._known_seen_once.add(cleaned)
+                    self._startup_greeted.add(cleaned)
                     self._last_spoken_at[cleaned] = now
                     self._active_name = cleaned
                     self._active_mode = "known"
@@ -561,7 +617,10 @@ class TTSService:
                 elif primary_re_entered:
                     self._enqueue_known_greeting_locked(primary, now, welcome_back=True)
             elif now >= self._suppress_vision_until and vision_emotion_on:
-                self._known_seen_once.add(primary)
+                if primary not in self._startup_greeted:
+                    self._enqueue_startup_greeting_locked(primary, now)
+                else:
+                    self._known_seen_once.add(primary)
 
             self._active_mode = "known"
             self._active_name = primary
@@ -664,57 +723,150 @@ class TTSService:
                 time.sleep(0.1)
                 continue
 
+            spoke_ok = False
+            if job.is_startup_greeting:
+                with self._lock:
+                    self._is_speaking = True
+
             try:
                 text = ""
+                startup_parts = None
                 try:
                     from llm_service import greeting_for_face
+                    from memory_service import get_memory_service
 
-                    text = greeting_for_face(
-                        job.llm_name,
-                        is_return_visitor=job.llm_return_visitor,
-                        model=self._ollama_model or None,
-                        api_url=self._ollama_url or None,
-                    )
-                except Exception as exc:
-                    self._last_error = f"LLM greeting: {exc}"
-                    text = ""
+                    session_summary: str | None = None
                     try:
-                        from llm_service import brief_spoken_message
+                        memory_svc = get_memory_service()
+                        if memory_svc.ready:
+                            session_summary = memory_svc.get_latest_summary_text(job.llm_name)
+                    except Exception:
+                        session_summary = None
 
-                        situation = (
-                            f"You could not greet the recognized person {job.llm_name}."
+                    if job.is_startup_greeting:
+                        from llm_service import (
+                            startup_greeting_from_summary,
+                            startup_greeting_parts_from_summary,
                         )
-                        text = brief_spoken_message(
-                            situation,
+
+                        logger.info(
+                            "Startup summary greeting for %s (summary=%s)",
+                            job.llm_name,
+                            "yes" if session_summary else "no",
+                        )
+                        parts = startup_greeting_parts_from_summary(
+                            job.llm_name,
+                            session_summary or "",
                             model=self._ollama_model or None,
                             api_url=self._ollama_url or None,
                         )
-                    except Exception as exc2:
-                        self._last_error = f"LLM greeting: {exc}; recovery: {exc2}"
-                        text = ""
+                        startup_parts = parts
+                        text = (
+                            parts.spoken()
+                            if parts is not None
+                            else startup_greeting_from_summary(
+                                job.llm_name,
+                                session_summary or "",
+                                model=self._ollama_model or None,
+                                api_url=self._ollama_url or None,
+                            )
+                        )
+                        logger.info(
+                            "Startup summary greeting (LLM) for %s: %s",
+                            job.llm_name,
+                            text,
+                        )
+                    else:
+                        text = greeting_for_face(
+                            job.llm_name,
+                            is_return_visitor=job.llm_return_visitor,
+                            session_summary=session_summary,
+                            is_startup_greeting=job.is_startup_greeting,
+                            model=self._ollama_model or None,
+                            api_url=self._ollama_url or None,
+                        )
+                        if text:
+                            text = _clamp_spoken_words(text)
+                except Exception as exc:
+                    self._last_error = f"LLM greeting: {exc}"
+                    text = ""
+                    if not job.is_startup_greeting:
+                        try:
+                            from llm_service import brief_spoken_message
+
+                            situation = (
+                                f"You could not greet the recognized person {job.llm_name}."
+                            )
+                            text = brief_spoken_message(
+                                situation,
+                                model=self._ollama_model or None,
+                                api_url=self._ollama_url or None,
+                            )
+                        except Exception as exc2:
+                            self._last_error = f"LLM greeting: {exc}; recovery: {exc2}"
+                            text = ""
+                    else:
+                        logger.warning(
+                            "Startup summary greeting failed for %s: %s",
+                            job.llm_name,
+                            exc,
+                        )
 
                 if not text:
+                    if job.is_startup_greeting:
+                        logger.warning(
+                            "Startup summary greeting empty for %s — will retry",
+                            job.llm_name,
+                        )
                     time.sleep(0.02)
                 else:
                     try:
                         with self._lock:
                             self._is_speaking = True
-                        self._output_speech(text)
+                        if job.is_startup_greeting and startup_parts is not None:
+                            spoken_text = self._output_startup_greeting(startup_parts)
+                        else:
+                            spoken_text = self._output_speech(text)
+                        spoke_ok = True
                         self._last_error = ""
                         with self._lock:
                             self._spoken_count += 1
-                            self._last_spoken_text = text
+                            self._last_spoken_text = spoken_text or text
                             self._last_spoken_at[job.llm_name] = time.time()
                             if job.track_vision_session and not job.llm_return_visitor:
                                 self._known_seen_once.add(job.llm_name)
+                        if job.is_startup_greeting:
+                            logger.info(
+                                "Startup summary greeting spoke for %s: %s",
+                                job.llm_name,
+                                (spoken_text or text)[:160],
+                            )
+                            cb = self._on_summary_greeting_spoken
+                            if cb is not None:
+                                try:
+                                    cb(job.llm_name)
+                                except Exception as exc:
+                                    logger.warning(
+                                        "Summary greeting callback failed: %s", exc
+                                    )
                     except Exception as exc:
                         self._last_error = str(exc)
+                        logger.warning(
+                            "Startup summary greeting playback failed for %s: %s",
+                            job.llm_name,
+                            exc,
+                        )
                     finally:
                         with self._lock:
                             self._is_speaking = False
             finally:
                 with self._lock:
                     self._vision_queued.discard(job.llm_name)
+                    if job.is_startup_greeting:
+                        self._is_speaking = False
+                        if spoke_ok:
+                            self._startup_greeted.add(job.llm_name)
+                            self._known_seen_once.add(job.llm_name)
                 time.sleep(0.05)
 
     def _speak_once(self, text: str) -> None:
@@ -728,13 +880,99 @@ class TTSService:
         u = os.environ.get("ESP_PLAY_WAV_URL", "").strip()
         return u if u else None
 
-    def _output_speech(self, text: str) -> None:
+    def _synthesize_esp_wav(self, text: str, *, rate: int | None = None) -> bytes:
+        wav, _ = synthesize_sapi_wav_bytes(
+            text, rate=rate if rate is not None else self.rate, volume=self.volume
+        )
+        return resample_wav_bytes_to_mono_16bit(wav, ESP_PCM_SAMPLE_RATE_HZ)
+
+    def _esp_wav_byte_size(self, text: str) -> int:
+        return len(self._synthesize_esp_wav(text, rate=self.rate))
+
+    def _chunk_text_for_esp(self, text: str) -> list[str]:
+        """Split any spoken text into clips that fit ESP limit at normal TTS rate."""
+        from esp_playback import ESP_MAX_PLAY_WAV_BYTES
+
+        return chunk_text_for_esp_limit(
+            text,
+            self._esp_wav_byte_size,
+            ESP_MAX_PLAY_WAV_BYTES,
+        )
+
+    def _play_esp_wav_chunks(
+        self,
+        chunks: list[str],
+        *,
+        eye_expression: str | None = None,
+    ) -> str:
+        """Queue WAV clips on ESP at normal TTS rate (back-to-back playback)."""
+        from esp_playback import ESP_MAX_PLAY_WAV_BYTES, post_wav_to_esp
+
+        spoken: list[str] = []
+        valid = [c.strip() for c in chunks if c.strip()]
+        total = len(valid)
+        for i, chunk in enumerate(valid):
+            wav = self._synthesize_esp_wav(chunk, rate=self.rate)
+            if len(wav) > ESP_MAX_PLAY_WAV_BYTES:
+                raise RuntimeError(
+                    f"WAV chunk too large at rate {self.rate} "
+                    f"({len(wav)} bytes; max {ESP_MAX_PLAY_WAV_BYTES}): {chunk[:100]}"
+                )
+            logger.info(
+                "ESP play_wav %d/%d (%d bytes, rate=%d): %s",
+                i + 1,
+                total,
+                len(wav),
+                self.rate,
+                chunk,
+            )
+            post_wav_to_esp(
+                wav,
+                eye_expression=eye_expression if i == total - 1 else None,
+            )
+            spoken.append(chunk)
+        return " ".join(spoken)
+
+    def _play_esp_text(
+        self,
+        text: str,
+        *,
+        eye_expression: str | None = None,
+    ) -> str:
+        """Play arbitrary text on ESP — auto-chunked by measured WAV size."""
+        text = text.strip()
+        if not text:
+            return text
+        chunks = self._chunk_text_for_esp(text)
+        if len(chunks) == 1:
+            logger.info(
+                "ESP play_wav (1 clip, rate=%d): %s",
+                self.rate,
+                chunks[0],
+            )
+        else:
+            logger.info(
+                "ESP play_wav (%d clips, rate=%d): %s",
+                len(chunks),
+                self.rate,
+                text[:120],
+            )
+        return self._play_esp_wav_chunks(chunks, eye_expression=eye_expression)
+
+    def _output_startup_greeting(self, parts: Any) -> str:
+        text = parts.spoken()
         if self._esp_play_wav_url():
-            wav = self._synthesize_wav_windows_sapi(text)
-            wav = resample_wav_bytes_to_mono_16bit(wav, ESP_PCM_SAMPLE_RATE_HZ)
-            self._post_wav_to_esp(wav)
-            return
+            return self._play_esp_text(text)
         self._speak_with_windows_sapi(text)
+        return text
+
+    def _output_speech(
+        self, text: str, *, eye_expression: str | None = None
+    ) -> str:
+        if self._esp_play_wav_url():
+            return self._play_esp_text(text, eye_expression=eye_expression)
+        self._speak_with_windows_sapi(text)
+        return text
 
     def _synthesize_wav_windows_sapi(self, text: str) -> bytes:
         wav, voice_name = synthesize_sapi_wav_bytes(text, self.rate, self.volume)
@@ -742,30 +980,27 @@ class TTSService:
             self._voice_name = voice_name
         return wav
 
-    def _post_wav_to_esp(self, wav: bytes) -> None:
-        url = self._esp_play_wav_url()
-        if not url:
-            raise RuntimeError("ESP_PLAY_WAV_URL is not set")
+    def _enqueue_startup_greeting_locked(self, name: str, now: float) -> None:
+        """First sight after server boot — template greeting from Phase C summary."""
+        if now < self._suppress_vision_until:
+            return
+        if name in self._vision_queued or name in self._startup_greeted:
+            return
+        if not self._esp_play_wav_url() and not self._ollama_configured():
+            self._last_error = "Neither ESP playback nor Ollama is configured."
+            self._startup_greeted.add(name)
+            return
 
-        req = urllib.request.Request(
-            url,
-            data=wav,
-            method="POST",
-            headers={"Content-Type": "audio/wav"},
+        self._vision_queued.add(name)
+        logger.info("Queued startup summary greeting for %s", name)
+        self._pending_jobs.append(
+            _SpeechJob(
+                llm_name=name,
+                llm_return_visitor=False,
+                track_vision_session=True,
+                is_startup_greeting=True,
+            )
         )
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                if resp.status != 200:
-                    raise RuntimeError(f"ESP play_wav HTTP {resp.status}")
-                body = resp.read()
-                if b'"ok":true' not in body and b'"ok": true' not in body:
-                    if b'"ok":false' in body or b'"ok": false' in body:
-                        raise RuntimeError(body.decode("utf-8", errors="replace"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace") if exc.fp else str(exc)
-            raise RuntimeError(f"ESP HTTP {exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"ESP URL error: {exc}") from exc
 
     def _enqueue_known_greeting_locked(
         self, name: str, now: float, *, welcome_back: bool
