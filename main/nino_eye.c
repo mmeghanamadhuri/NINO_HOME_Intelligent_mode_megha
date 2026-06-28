@@ -1189,6 +1189,9 @@ void nino_eye_set_state(nino_eye_state_t state)
     if (state >= NINO_EYE_STATE_COUNT) {
         return;
     }
+    if (s_state == state) {
+        return; /* Ignore no-op transitions to keep runtime/logs clean. */
+    }
     s_state = state;
     ESP_LOGI(TAG, "state set -> %d", (int)state);
 }
