@@ -121,6 +121,12 @@ class VisionEmotionAccumTests(unittest.TestCase):
             "spoken": "sad",
             "speakable": True,
         }
+        emotion.detect_overlay.return_value = {
+            "label": "sad",
+            "confidence": 0.8,
+            "raw_label": "sad",
+            "speakable": True,
+        }
 
         svc = VisionEmotionService(emotion, speak_wav=_speak, is_speaker_busy=lambda: False)
         svc._window_min_s = 0.05
@@ -154,6 +160,97 @@ class VisionEmotionAccumTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(spoken), 1)
         self.assertEqual(spoken[0][1], "sad")
+
+
+class VisionEmotionDisplayHoldTests(unittest.TestCase):
+    def _make_service(self) -> tuple[VisionEmotionService, MagicMock]:
+        emotion = MagicMock()
+        emotion.available = True
+        emotion.stats.return_value = {"available": True}
+        emotion.detect.return_value = None
+        svc = VisionEmotionService(
+            emotion,
+            speak_wav=lambda _text, _eye: None,
+            is_speaker_busy=lambda: False,
+        )
+        svc._display_sample_s = 0.1
+        svc._display_hold_s = 0.2
+        return svc, emotion
+
+    def _face_results(self, name: str = "Jane") -> list[dict]:
+        return [
+            {
+                "primary": True,
+                "stabilized": True,
+                "recognized": True,
+                "name": name,
+                "box": {"x": 10, "y": 10, "w": 80, "h": 80},
+            }
+        ]
+
+    def test_locks_majority_emotion_after_sample_window(self) -> None:
+        svc, emotion = self._make_service()
+        frame = MagicMock()
+        labels = ["happy", "happy", "sad", "happy"]
+
+        with patch("vision_emotion_service.vision_emotion_blocked", return_value=False):
+            for label in labels:
+                emotion.detect_overlay.return_value = {
+                    "label": label,
+                    "confidence": 0.9,
+                    "raw_label": label,
+                    "speakable": label != "neutral",
+                }
+                svc.process_frame(frame, self._face_results())
+                time.sleep(0.03)
+
+            time.sleep(0.12)
+            emotion.detect_overlay.return_value = {
+                "label": "sad",
+                "confidence": 0.95,
+                "raw_label": "sad",
+                "speakable": True,
+            }
+            svc.process_frame(frame, self._face_results())
+
+        overlay = svc.latest_overlay()
+        self.assertIsNotNone(overlay)
+        assert overlay is not None
+        self.assertEqual(overlay.get("emotion"), "happy")
+        self.assertEqual(overlay.get("display_phase"), "holding")
+
+    def test_keeps_locked_emotion_during_hold_despite_live_change(self) -> None:
+        svc, emotion = self._make_service()
+        frame = MagicMock()
+
+        with patch("vision_emotion_service.vision_emotion_blocked", return_value=False):
+            emotion.detect_overlay.return_value = {
+                "label": "happy",
+                "confidence": 0.9,
+                "raw_label": "happy",
+                "speakable": True,
+            }
+            for _ in range(4):
+                svc.process_frame(frame, self._face_results())
+                time.sleep(0.03)
+            time.sleep(0.12)
+            svc.process_frame(frame, self._face_results())
+
+            emotion.detect_overlay.return_value = {
+                "label": "angry",
+                "confidence": 0.99,
+                "raw_label": "angry",
+                "speakable": True,
+            }
+            for _ in range(3):
+                svc.process_frame(frame, self._face_results())
+                time.sleep(0.02)
+
+        overlay = svc.latest_overlay()
+        self.assertIsNotNone(overlay)
+        assert overlay is not None
+        self.assertEqual(overlay.get("emotion"), "happy")
+        self.assertEqual(overlay.get("display_phase"), "holding")
 
 
 class EmotionServiceInitTests(unittest.TestCase):

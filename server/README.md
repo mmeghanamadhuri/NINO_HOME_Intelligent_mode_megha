@@ -159,6 +159,8 @@ All `*_S` settings are **seconds**, not milliseconds.
 | `VISION_EMOTION_WINDOW_MAX_S` | `2.5` | Max wait for stable emotion |
 | `VISION_EMOTION_DOMINANCE` | `0.35` | Fraction of frames that must agree |
 | `VISION_EMOTION_COOLDOWN_S` | `120` | Per-person empathy cooldown |
+| `VISION_EMOTION_DISPLAY_SAMPLE_S` | `1.0` | Seconds to sample CNN votes before locking overlay |
+| `VISION_EMOTION_DISPLAY_HOLD_S` | `5.0` | Seconds to show locked emotion on video + ESP eyes |
 | `VISION_EMOTION_AFTER_VOICE_SECONDS` | `90` | Pause after voice query |
 | `EMOTION_MIN_CONFIDENCE` | `0.12` | Min confidence for speakable class |
 | `EMOTION_NEUTRAL_SUPPRESS_RATIO` | `0.22` | Promote sad/happy over dominant neutral |
@@ -221,10 +223,11 @@ When `VISION_EMOTION_ENABLED=1` (default):
 2. **Startup summary greeting** (once per boot) may run first — empathy is deferred until it finishes.
 3. **Primary face** selected (largest stabilized or strong candidate match).
 4. **Emotion CNN** runs on padded face crop every frame.
-5. **Votes accumulate** for 2.0–2.5 s while the same person stays in frame.
-6. **Dominant speakable emotion** (≥35% of frames) queues an empathy job.
-7. **Background worker** calls Ollama → TTS → `POST /play_wav` with eye header.
-8. **Cooldown** — same person not addressed again for 120 s.
+5. **Display hold** — sample votes for `VISION_EMOTION_DISPLAY_SAMPLE_S` (1 s), then lock overlay + ESP eyes for `VISION_EMOTION_DISPLAY_HOLD_S` (5 s); repeat.
+6. **Empathy votes accumulate** separately for 2.0–2.5 s while the same person stays in frame.
+7. **Dominant speakable emotion** (≥35% of frames) queues an empathy job.
+8. **Background worker** calls Ollama → TTS → `POST /play_wav` with eye header.
+9. **Cooldown** — same person not addressed again for 120 s.
 
 ### Emotion model (default: Keras)
 
@@ -259,7 +262,7 @@ Set `EMOTION_BACKEND=ferplus` to use ONNX FER+ (`data/models/emotion-ferplus-8.o
 
 ### MJPEG overlay
 
-Pink text on `/video_feed`:
+Pink text on `/video_feed`. The label is **held stable** for 5 s after a 1 s sampling window (not per-frame raw CNN output):
 
 ```text
 sad 21% raw=neutral 2.1s n:75% s:21% h:2%

@@ -34,6 +34,15 @@ class _EmpathyJob:
     confidence: float
 
 
+@dataclass
+class _LockedDisplay:
+    name: str
+    emotion: str | None
+    confidence: float | None
+    raw_emotion: str | None
+    scores: dict[str, float] | None
+
+
 class VisionEmotionService:
     """Accumulate emotion on the primary recognized face for ~2–2.5 s, then speak."""
 
@@ -54,6 +63,8 @@ class VisionEmotionService:
         self._window_max_s = float(os.environ.get("VISION_EMOTION_WINDOW_MAX_S", "2.5"))
         self._cooldown_s = float(os.environ.get("VISION_EMOTION_COOLDOWN_S", "120"))
         self._dominance_ratio = float(os.environ.get("VISION_EMOTION_DOMINANCE", "0.35"))
+        self._display_sample_s = float(os.environ.get("VISION_EMOTION_DISPLAY_SAMPLE_S", "1.0"))
+        self._display_hold_s = float(os.environ.get("VISION_EMOTION_DISPLAY_HOLD_S", "5.0"))
 
         self._lock = threading.Lock()
         self._accum_person: str | None = None
@@ -66,6 +77,15 @@ class VisionEmotionService:
         self._last_error = ""
         self._latest_overlay: dict[str, Any] | None = None
         self._pending_jobs: list[_EmpathyJob] = []
+
+        self._display_person: str | None = None
+        self._display_phase: str = "sample"
+        self._display_phase_started_at: float = 0.0
+        self._display_sample_votes: dict[str, int] = {}
+        self._display_sample_conf_sum: dict[str, float] = {}
+        self._display_sample_raw: dict[str, int] = {}
+        self._display_sample_scores_sum: dict[str, dict[str, float]] = {}
+        self._display_locked: _LockedDisplay | None = None
 
         self._worker = threading.Thread(
             target=self._run_worker, name="vision-emotion-worker", daemon=True
@@ -84,6 +104,12 @@ class VisionEmotionService:
                 "window_min_s": self._window_min_s,
                 "window_max_s": self._window_max_s,
                 "cooldown_s": self._cooldown_s,
+                "display_sample_s": self._display_sample_s,
+                "display_hold_s": self._display_hold_s,
+                "display_phase": self._display_phase,
+                "display_locked_emotion": (
+                    self._display_locked.emotion if self._display_locked else None
+                ),
                 "latest_overlay": dict(self._latest_overlay or {}),
                 "pending_jobs": len(self._pending_jobs),
                 "last_error": self._last_error,
@@ -106,6 +132,7 @@ class VisionEmotionService:
             self._last_spoken_at[name] = time.time()
             self._pending_jobs = [j for j in self._pending_jobs if j.person_name != name]
             self._reset_accum_locked()
+            self._reset_display_hold_locked()
         logger.info(
             "Vision empathy paused %.0fs after summary greeting for %s",
             pause_s,
@@ -125,14 +152,12 @@ class VisionEmotionService:
         """Called from the MJPEG loop on every frame."""
         if not self.enabled():
             return
-        if vision_emotion_blocked() or self._is_speaker_busy():
-            self._reset_accum_locked()
-            return
 
         primary = _primary_face_for_emotion(results)
         if primary is None:
             self._reset_accum_locked()
             with self._lock:
+                self._reset_display_hold_locked()
                 self._latest_overlay = None
             return
 
@@ -140,37 +165,36 @@ class VisionEmotionService:
         box = primary.get("box") or {}
         if not name or name.lower() in {"unknown", "face"}:
             self._reset_accum_locked()
+            with self._lock:
+                self._reset_display_hold_locked()
+                self._latest_overlay = None
             return
 
-        if self._empathy_suppressed(name):
+        overlay_info = self._emotion.detect_overlay(frame, box)
+        now = time.time()
+        with self._lock:
+            overlay = self._update_display_hold_locked(name, overlay_info, now)
+
+        empathy_paused = (
+            vision_emotion_blocked()
+            or self._is_speaker_busy()
+            or self._empathy_suppressed(name)
+        )
+        if empathy_paused:
             with self._lock:
                 if self._pending_jobs:
                     self._pending_jobs = [
                         j for j in self._pending_jobs if j.person_name != name
                     ]
-            self._reset_accum_locked()
-            with self._lock:
-                self._latest_overlay = {
-                    "name": name,
-                    "emotion": None,
-                    "confidence": None,
-                    "accum_s": 0.0,
-                    "deferred": "startup_greeting",
-                }
+                self._reset_accum_locked()
+                if vision_emotion_blocked() or self._is_speaker_busy():
+                    overlay["deferred"] = "voice_or_tts_busy"
+                else:
+                    overlay["deferred"] = "startup_greeting"
+                self._latest_overlay = overlay
             return
 
-        overlay_info = self._emotion.detect_overlay(frame, box)
         detected = self._emotion.detect(frame, box)
-        overlay: dict[str, Any] = {
-            "name": name,
-            "emotion": overlay_info["label"] if overlay_info else None,
-            "confidence": overlay_info["confidence"] if overlay_info else None,
-            "raw_emotion": overlay_info.get("raw_label") if overlay_info else None,
-            "scores": overlay_info.get("scores") if overlay_info else None,
-            "accum_s": 0.0,
-        }
-
-        now = time.time()
         with self._lock:
             if self._accum_person != name:
                 self._accum_person = name
@@ -245,6 +269,133 @@ class VisionEmotionService:
             return None
         avg_conf = self._accum_conf_sum.get(label, 0.0) / max(1, votes)
         return label, votes, avg_conf
+
+    def _reset_display_hold_locked(self) -> None:
+        self._display_person = None
+        self._display_phase = "sample"
+        self._display_phase_started_at = 0.0
+        self._display_sample_votes = {}
+        self._display_sample_conf_sum = {}
+        self._display_sample_raw = {}
+        self._display_sample_scores_sum = {}
+        self._display_locked = None
+
+    def _start_display_sample_locked(self, name: str, now: float) -> None:
+        self._display_person = name
+        self._display_phase = "sample"
+        self._display_phase_started_at = now
+        self._display_sample_votes = {}
+        self._display_sample_conf_sum = {}
+        self._display_sample_raw = {}
+        self._display_sample_scores_sum = {}
+
+    def _record_display_sample_locked(self, overlay_info: dict[str, Any] | None) -> None:
+        if not overlay_info:
+            return
+        label = str(overlay_info.get("label") or "")
+        if not label:
+            return
+        self._display_sample_votes[label] = self._display_sample_votes.get(label, 0) + 1
+        self._display_sample_conf_sum[label] = self._display_sample_conf_sum.get(label, 0.0) + float(
+            overlay_info.get("confidence") or 0.0
+        )
+        raw = str(overlay_info.get("raw_label") or label)
+        self._display_sample_raw[raw] = self._display_sample_raw.get(raw, 0) + 1
+        scores = overlay_info.get("scores") or {}
+        if isinstance(scores, dict):
+            bucket = self._display_sample_scores_sum.setdefault(label, {})
+            for key, value in scores.items():
+                bucket[str(key)] = bucket.get(str(key), 0.0) + float(value)
+
+    def _finalize_display_sample_locked(self, name: str) -> _LockedDisplay:
+        if not self._display_sample_votes:
+            prev = self._display_locked
+            if prev and prev.name == name:
+                return prev
+            return _LockedDisplay(
+                name=name,
+                emotion=None,
+                confidence=None,
+                raw_emotion=None,
+                scores=None,
+            )
+
+        label = max(self._display_sample_votes.items(), key=lambda item: item[1])[0]
+        votes = self._display_sample_votes[label]
+        confidence = self._display_sample_conf_sum.get(label, 0.0) / max(1, votes)
+        raw_emotion = None
+        if self._display_sample_raw:
+            raw_emotion = max(self._display_sample_raw.items(), key=lambda item: item[1])[0]
+        scores_bucket = self._display_sample_scores_sum.get(label) or {}
+        scores = (
+            {k: round(v / max(1, votes), 3) for k, v in scores_bucket.items()}
+            if scores_bucket
+            else None
+        )
+        return _LockedDisplay(
+            name=name,
+            emotion=label,
+            confidence=round(confidence, 3),
+            raw_emotion=raw_emotion,
+            scores=scores,
+        )
+
+    def _overlay_from_locked_locked(self, now: float) -> dict[str, Any]:
+        locked = self._display_locked
+        if locked is None:
+            return {"name": self._display_person or "", "emotion": None, "accum_s": 0.0}
+
+        phase_elapsed = now - self._display_phase_started_at
+        if self._display_phase == "sample":
+            accum_s = round(min(phase_elapsed, self._display_sample_s), 2)
+            phase = "sampling"
+        else:
+            accum_s = round(min(phase_elapsed, self._display_hold_s), 2)
+            phase = "holding"
+
+        return {
+            "name": locked.name,
+            "emotion": locked.emotion,
+            "confidence": locked.confidence,
+            "raw_emotion": locked.raw_emotion,
+            "scores": locked.scores,
+            "accum_s": accum_s,
+            "display_phase": phase,
+        }
+
+    def _update_display_hold_locked(
+        self,
+        name: str,
+        overlay_info: dict[str, Any] | None,
+        now: float,
+    ) -> dict[str, Any]:
+        if self._display_person != name:
+            self._start_display_sample_locked(name, now)
+
+        phase_elapsed = now - self._display_phase_started_at
+
+        if self._display_phase == "sample":
+            self._record_display_sample_locked(overlay_info)
+            if phase_elapsed >= self._display_sample_s:
+                self._display_locked = self._finalize_display_sample_locked(name)
+                self._display_phase = "hold"
+                self._display_phase_started_at = now
+        elif phase_elapsed >= self._display_hold_s:
+            self._start_display_sample_locked(name, now)
+            self._record_display_sample_locked(overlay_info)
+
+        overlay = self._overlay_from_locked_locked(now)
+        if self._display_phase == "sample" and self._display_locked is None and overlay_info:
+            overlay = {
+                **overlay,
+                "name": name,
+                "emotion": overlay_info.get("label"),
+                "confidence": overlay_info.get("confidence"),
+                "raw_emotion": overlay_info.get("raw_label"),
+                "scores": overlay_info.get("scores"),
+            }
+        self._latest_overlay = overlay
+        return overlay
 
     def _reset_accum_locked(self) -> None:
         self._accum_person = None
