@@ -23,7 +23,8 @@ from starlette.staticfiles import StaticFiles as StarletteStaticFiles
 
 from alarm_service import get_alarm_service
 from camera import CameraStream
-from emotion_service import EmotionService
+from emotion_service import EMOTION_TO_EYE, EmotionService
+from esp_eye_stream import EspEyeStream
 from eye_expression import normalize_eye_expression
 from face_service import FaceService
 from memory_service import configure_from_environ as configure_memory_from_environ
@@ -142,6 +143,7 @@ vision_emotion = VisionEmotionService(
     defer_empathy_for=tts.needs_startup_summary_greeting,
 )
 tts.set_on_summary_greeting_spoken(vision_emotion.notify_summary_greeting_spoken)
+eye_stream = EspEyeStream()
 latest_results: list[dict] = []
 # Update vision-driven TTS every frame so greetings start as soon as recognition succeeds
 # (throttling here added a noticeable delay before enqueue).
@@ -437,6 +439,7 @@ def _mjpeg_generator():
             frame = camera.read()
             if frame is None:
                 tts.update_face_state([])
+                eye_stream.publish("idle")
                 time.sleep(0.02)
                 continue
 
@@ -452,7 +455,15 @@ def _mjpeg_generator():
                 if overlay:
                     _draw_emotion_overlay(annotated, overlay)
             except Exception:
+                overlay = None
                 logger.exception("Vision emotion frame failed; continuing MJPEG")
+
+            if overlay and overlay.get("emotion"):
+                label = str(overlay.get("emotion", "")).strip().lower()
+                eye_stream.publish(EMOTION_TO_EYE.get(label))
+            else:
+                # No usable face/emotion context -> keep eyes neutral.
+                eye_stream.publish("idle")
 
             ok, encoded = cv2.imencode(
                 ".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 70]

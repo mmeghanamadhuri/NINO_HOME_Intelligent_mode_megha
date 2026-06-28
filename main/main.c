@@ -1461,8 +1461,20 @@ static esp_err_t play_wav_handler(httpd_req_t *req) {
     prompt_ack = (ack_hdr[0] == '1');
   }
 
+  /* Optional emotion tag from server (e.g. happy/sad/surprised). */
+  nino_eye_state_t eye_state = NINO_EYE_STATE_COUNT;
+  char eye_hdr[24] = {0};
+  if (httpd_req_get_hdr_value_str(req, "X-Nino-Eye-Expression", eye_hdr,
+                                  sizeof(eye_hdr)) == ESP_OK) {
+    eye_state = nino_eye_state_from_name(eye_hdr);
+    if (eye_state < NINO_EYE_STATE_COUNT) {
+      ESP_LOGI(TAG, "HTTP /play_wav eye_expression=%s -> state %d", eye_hdr,
+               (int)eye_state);
+    }
+  }
+
   if (nino_audio_queue_wav(buf, total, false, NINO_AUDIO_SERVO_FULL, prompt_ack,
-                           NINO_EYE_STATE_COUNT) != ESP_OK) {
+                           eye_state) != ESP_OK) {
     httpd_resp_set_status(req, "503 Service Unavailable");
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, "{\"ok\":false,\"error\":\"audio queue down\"}",
@@ -1514,6 +1526,68 @@ static bool parse_json_int_field(const char *body, const char *key, int *out) {
   }
   *out = (int)value;
   return true;
+}
+
+static esp_err_t eye_expression_handler(httpd_req_t *req) {
+  if (req->method != HTTP_POST) {
+    httpd_resp_set_status(req, "405 Method Not Allowed");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"POST only\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+
+  if (req->content_len <= 0 || req->content_len > 128) {
+    httpd_resp_set_status(req, "400 Bad Request");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"bad_body\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+
+  char body[129] = {0};
+  int read_n = 0;
+  while (read_n < req->content_len) {
+    int r = httpd_req_recv(req, body + read_n, req->content_len - read_n);
+    if (r <= 0) {
+      httpd_resp_set_status(req, "400 Bad Request");
+      httpd_resp_set_type(req, "application/json");
+      return httpd_resp_send(req, "{\"ok\":false,\"error\":\"recv\"}",
+                             HTTPD_RESP_USE_STRLEN);
+    }
+    read_n += r;
+  }
+  body[read_n] = '\0';
+
+  char expression[24] = {0};
+  const char *k = strstr(body, "\"expression\"");
+  if (k == NULL) {
+    k = strstr(body, "\"eye_expression\"");
+  }
+  if (k != NULL) {
+    const char *colon = strchr(k, ':');
+    if (colon != NULL) {
+      const char *q1 = strchr(colon, '"');
+      if (q1 != NULL) {
+        q1++;
+        const char *q2 = strchr(q1, '"');
+        if (q2 != NULL && q2 > q1) {
+          size_t n = (size_t)(q2 - q1);
+          if (n >= sizeof(expression)) {
+            n = sizeof(expression) - 1;
+          }
+          memcpy(expression, q1, n);
+          expression[n] = '\0';
+        }
+      }
+    }
+  }
+
+  /* Unknown/empty expression intentionally falls back to idle. */
+  nino_eye_apply_expression(expression);
+  ESP_LOGI(TAG, "HTTP eye expression -> %s", expression[0] ? expression : "idle");
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t speaker_volume_handler(httpd_req_t *req) {
@@ -2314,7 +2388,7 @@ static void start_http_server(void) {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = HTTP_SERVER_PORT;
   config.stack_size = 8192;
-  config.max_uri_handlers = 16;
+  config.max_uri_handlers = 20;
   config.recv_wait_timeout = 45;
   config.send_wait_timeout = 45;
   config.core_id = APP_CORE_NET;
@@ -2349,6 +2423,12 @@ static void start_http_server(void) {
       .uri = "/servo/360",
       .method = HTTP_POST,
       .handler = servo_360_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t eye_expression_uri = {
+      .uri = "/eye/expression",
+      .method = HTTP_POST,
+      .handler = eye_expression_handler,
       .user_ctx = NULL,
   };
   const httpd_uri_t speaker_volume_get_uri = {
@@ -2434,6 +2514,7 @@ static void start_http_server(void) {
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &snapshot_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &play_wav_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &servo_360_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &eye_expression_uri));
   ESP_ERROR_CHECK(
       httpd_register_uri_handler(s_http_server, &speaker_volume_get_uri));
   ESP_ERROR_CHECK(
