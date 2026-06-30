@@ -88,13 +88,13 @@ static bool s_mdns_started = false;
 #define UVC_STREAM_TASK_STACK_SIZE 8192
 #define UVC_STREAM_TASK_PRIORITY 19
 
-#define UVC_TARGET_WIDTH 640
-#define UVC_TARGET_HEIGHT 480
+#define UVC_TARGET_WIDTH 320
+#define UVC_TARGET_HEIGHT 240
 #define UVC_TARGET_FPS 15.0f
 #define UVC_FRAME_QUEUE_LEN 3
 #define UVC_FRAME_BUFFERS 3
-#define UVC_URB_COUNT 4
-#define UVC_URB_SIZE (24 * 1024)
+#define UVC_URB_COUNT 8
+#define UVC_URB_SIZE (12 * 1024)
 #define UVC_FRAME_SIZE_BYTES (92 * 1024)
 #define UVC_FRAME_TIMEOUT_LOG_INTERVAL_MS 15000
 #define UVC_OPEN_TIMEOUT_MS 5000
@@ -102,7 +102,7 @@ static bool s_mdns_started = false;
 #define FACE_TRACK_TASK_PRIORITY 5
 #define FACE_TRACK_NOTIFY_WAIT_MS 40
 /* Run detection below camera FPS so tracking does not steal too much CPU. */
-#define FACE_TRACK_INFERENCE_INTERVAL_MS 250
+#define FACE_TRACK_INFERENCE_INTERVAL_MS 200
 /* Reuse last face briefly when the stream hiccups to avoid servo twitching. */
 #define FACE_TRACK_REUSE_LAST_FACE_MS 8000
 
