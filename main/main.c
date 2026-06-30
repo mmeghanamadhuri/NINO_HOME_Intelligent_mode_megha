@@ -101,11 +101,9 @@ static bool s_mdns_started = false;
 #define FACE_TRACK_TASK_STACK_SIZE (12 * 1024)
 #define FACE_TRACK_TASK_PRIORITY 5
 #define FACE_TRACK_NOTIFY_WAIT_MS 40
-// Sample face detection more slowly than the raw stream so tracking does not
-// compete too hard with UVC transport.
+/* Run detection below camera FPS so tracking does not steal too much CPU. */
 #define FACE_TRACK_INFERENCE_INTERVAL_MS 250
-// Keep chasing the last valid face through brief UVC stalls instead of
-// dropping the head immediately when one or two frames are missed.
+/* Reuse last face briefly when the stream hiccups to avoid servo twitching. */
 #define FACE_TRACK_REUSE_LAST_FACE_MS 8000
 
 #define HTTP_STREAM_BOUNDARY "frame"
@@ -526,8 +524,9 @@ static const char *INDEX_HTML =
     "it will not fight the PC app.</p>"
     "<p>One-frame check (loads once when you open or refresh this page):</p>"
     "<div class=\"card\"><img class=\"rotated\" src=\"/snapshot.jpg\" alt=\"last camera frame\"></div>"
-    "<p>Machine endpoints: <code>/snapshot.jpg</code>, <code>/stream</code> (browser-friendly), "
-    "<code>/stream.mjpeg</code> (raw MJPEG), "
+    "<p>Machine endpoints: <code>/snapshot.jpg</code>, <code>/stream</code> (raw MJPEG), "
+    "<code>/view</code> (rotated browser view), "
+    "<code>/stream.mjpeg</code> (raw MJPEG alias), "
     "<code>/play_wav</code> (POST WAV).</p>"
     "</main></body></html>";
 
@@ -774,8 +773,8 @@ static void wifi_cli_register(void) {
 
 static void voice_cli_register(void);
 static void servo_cli_register(void);
-static void speaker_cli_register(void);
 static void track_cli_register(void);
+static void speaker_cli_register(void);
 static void hstop_cli_register(void);
 
 static int cmd_eye(int argc, char **argv) {
@@ -808,9 +807,9 @@ static void console_init(void) {
   wifi_cli_register();
   voice_cli_register();
   servo_cli_register();
+  track_cli_register();
   speaker_cli_register();
   eye_cli_register();
-  track_cli_register();
   hstop_cli_register();
 
   const esp_console_cmd_t cpu_dump_cmd = {
@@ -2269,7 +2268,7 @@ static void servo_cli_register(void) {
 
 static int cmd_track(int argc, char **argv) {
   if (argc < 2) {
-    printf("Usage: track on | off | status | hon\n");
+    printf("Usage: track on | off | status\n");
     return 0;
   }
 
@@ -2319,37 +2318,14 @@ static int cmd_track(int argc, char **argv) {
     return 0;
   }
 
-  if (strcmp(argv[1], "hon") == 0) {
-    esp_err_t err = nino_servo_dxl_track_hon();
-    if (err == ESP_ERR_INVALID_STATE) {
-      if (!nino_servo_dxl_is_ready()) {
-        printf("Servos not ready — connect U2D2 on J18 hub and wait for joint mode\n");
-      } else if (nino_servo_dxl_spin_is_active()) {
-        printf("Cannot run track hon while 360 spin is active\n");
-      } else if (nino_servo_dxl_track_hon_is_active()) {
-        printf("track hon already running\n");
-      } else {
-        printf("track hon unavailable: servo motion busy\n");
-      }
-      return 1;
-    }
-    if (err != ESP_OK) {
-      printf("track hon failed: %s\n", esp_err_to_name(err));
-      return 1;
-    }
-    printf("track hon started (looping ID2: 512 -> 212 -> 512 -> 800 -> 512)\n");
-    printf("Use 'hstop' to stop and return to neutral\n");
-    return 0;
-  }
-
-  printf("Usage: track on | off | status | hon\n");
+  printf("Usage: track on | off | status\n");
   return 0;
 }
 
 static void track_cli_register(void) {
   const esp_console_cmd_t cmd = {
       .command = "track",
-      .help = "track on | off | status | hon  (pan-only face tracking on servo ID 2)",
+      .help = "track on | off | status  (pan-only face tracking on servo ID 2)",
       .hint = NULL,
       .func = &cmd_track,
       .argtable = NULL,
@@ -2438,6 +2414,12 @@ static void start_http_server(void) {
   };
   const httpd_uri_t stream_uri = {
       .uri = "/stream",
+      .method = HTTP_GET,
+      .handler = stream_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t view_uri = {
+      .uri = "/view",
       .method = HTTP_GET,
       .handler = stream_route_handler,
       .user_ctx = NULL,
@@ -2552,6 +2534,7 @@ static void start_http_server(void) {
 
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &index_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &stream_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &view_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &stream_mjpeg_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &snapshot_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &play_wav_uri));
