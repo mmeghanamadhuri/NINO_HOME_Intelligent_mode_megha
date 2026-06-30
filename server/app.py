@@ -879,6 +879,11 @@ def main() -> None:
         help="Backward compatible alias for --camera-source",
     )
     parser.add_argument(
+        "--camera-rotation",
+        default=os.environ.get("CAMERA_ROTATION", ""),
+        help="Rotate each frame before detection/display: cw90, ccw90, 180, or none",
+    )
+    parser.add_argument(
         "--esp-play-wav-url",
         default=DEFAULT_ESP_PLAY_WAV_URL,
         help="POST synthesized WAV to this URL for ESP32-P4 speaker (e.g. http://IP/play_wav)",
@@ -1007,6 +1012,8 @@ def main() -> None:
     camera_source = args.camera_url or args.camera_source
     os.environ["CAMERA_SOURCE"] = camera_source
     camera.source = camera_source
+    if args.camera_rotation.strip():
+        os.environ["CAMERA_ROTATION"] = args.camera_rotation.strip()
 
     if args.esp_play_wav_url.strip():
         os.environ["ESP_PLAY_WAV_URL"] = args.esp_play_wav_url.strip()

@@ -17746,5 +17746,25 @@
     "client": "192.168.0.95:58631",
     "session_queries": 1,
     "session_seconds": 4.113
+  },
+  {
+    "timestamp": "2026-06-29T17:24:35",
+    "event": "ws_open",
+    "client": "192.168.0.87:53459"
+  },
+  {
+    "timestamp": "2026-06-29T17:24:40",
+    "event": "voice_query",
+    "client": "192.168.0.87:53459",
+    "server_total_seconds": 4.574,
+    "audio_in_bytes": 26924,
+    "error": "No speech recognized from input audio."
+  },
+  {
+    "timestamp": "2026-06-29T17:24:40",
+    "event": "ws_closed",
+    "client": "192.168.0.87:53459",
+    "session_queries": 1,
+    "session_seconds": 4.944
   }
 ]

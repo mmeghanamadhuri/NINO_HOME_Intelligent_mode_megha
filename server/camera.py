@@ -29,6 +29,52 @@ SNAPSHOT_POLL_INTERVAL_SECONDS = 0.04
 _JPEG_DECODE_LOCK = threading.Lock()
 
 
+def parse_camera_rotation(raw: str | None) -> int | None:
+    """Map CAMERA_ROTATION env/CLI value to an OpenCV rotate code."""
+    if not raw or not str(raw).strip():
+        return None
+    key = str(raw).strip().lower()
+    if key in {"0", "none", "off", "normal"}:
+        return None
+    if key in {"90", "cw", "cw90", "clockwise", "right"}:
+        return cv2.ROTATE_90_CLOCKWISE
+    if key in {
+        "-90",
+        "270",
+        "ccw",
+        "ccw90",
+        "counterclockwise",
+        "counter-clockwise",
+        "left",
+    }:
+        return cv2.ROTATE_90_COUNTERCLOCKWISE
+    if key in {"180", "flip"}:
+        return cv2.ROTATE_180
+    try:
+        deg = int(key)
+    except ValueError:
+        return None
+    if deg == 0:
+        return None
+    if deg == 90:
+        return cv2.ROTATE_90_CLOCKWISE
+    if deg == 180:
+        return cv2.ROTATE_180
+    if deg in {-90, 270}:
+        return cv2.ROTATE_90_COUNTERCLOCKWISE
+    return None
+
+
+def _rotation_label(rotate_code: int | None) -> str:
+    if rotate_code == cv2.ROTATE_90_CLOCKWISE:
+        return "cw90"
+    if rotate_code == cv2.ROTATE_90_COUNTERCLOCKWISE:
+        return "ccw90"
+    if rotate_code == cv2.ROTATE_180:
+        return "180"
+    return "none"
+
+
 def _extract_first_jpeg(data: bytes) -> bytes | None:
     """Keep one JPEG (SOI … EOI). Drops leading/trailing HTTP noise; avoids duplicate images."""
     if not data:
@@ -84,10 +130,12 @@ class CameraStream:
         self._last_error = ""
         self._last_frame_at = 0.0
         self._frames_received = 0
+        self._rotation_code: int | None = None
 
     def start(self, source: str | None = None) -> None:
         if source:
             self.source = source
+        self._rotation_code = parse_camera_rotation(os.getenv("CAMERA_ROTATION", ""))
 
         if self._thread and self._thread.is_alive():
             return
@@ -143,11 +191,18 @@ class CameraStream:
             "source": self.source,
             "active_source": self.active_source,
             "transport": transport,
+            "rotation": _rotation_label(self._rotation_code),
             "connected": connected_ui,
             "frames_received": self._frames_received,
             "last_frame_age_seconds": age,
             "last_error": self._last_error,
         }
+
+    def _store_frame(self, frame: np.ndarray) -> None:
+        if self._rotation_code is not None:
+            frame = cv2.rotate(frame, self._rotation_code)
+        with self._lock:
+            self._frame = frame
 
     def _http_snapshot_poll_url(self, raw: str) -> str | None:
         """ESP32 (and similar) HTTP servers: one MJPEG /stream client can starve OpenCV.
@@ -196,8 +251,7 @@ class CameraStream:
                     )
                 if frame is None:
                     raise ValueError("snapshot is not a valid JPEG")
-                with self._lock:
-                    self._frame = frame
+                self._store_frame(frame)
                 self._frames_received += 1
                 self._last_frame_at = time.time()
                 self._connected = True
@@ -242,12 +296,11 @@ class CameraStream:
                 time.sleep(0.5)
                 continue
 
-            with self._lock:
-                self._frame = frame
-                self._frames_received += 1
-                self._last_frame_at = time.time()
-                self._connected = True
-                self._last_error = ""
+            self._store_frame(frame)
+            self._frames_received += 1
+            self._last_frame_at = time.time()
+            self._connected = True
+            self._last_error = ""
 
         self._connected = False
 
@@ -275,8 +328,7 @@ class CameraStream:
                 ok, frame = capture.read()
 
             if ok and frame is not None:
-                with self._lock:
-                    self._frame = frame
+                self._store_frame(frame)
                 self.active_source = source
                 with self._capture_lock:
                     self._capture = capture

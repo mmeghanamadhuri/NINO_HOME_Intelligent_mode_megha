@@ -118,7 +118,18 @@ h2 {
 /* ---- Live feed ---- */
 
 .stream-card {
+  /* Shrink the card to match the video — no extra white space on the sides. */
+  --stream-max-h: min(64vh, 840px);
+  --stream-w: min(700px, 100%, calc(var(--stream-max-h) * 3 / 4));
+  width: var(--stream-w);
+  max-width: 100%;
+  margin-inline: auto;
   margin-bottom: var(--space-3);
+  padding: 10px 12px;
+}
+
+.stream-card .card-header {
+  margin-bottom: 8px;
 }
 
 .stream-frame {
@@ -126,14 +137,14 @@ h2 {
   border-radius: var(--radius-sm);
   overflow: hidden;
   background: var(--black);
+  width: 100%;
+  line-height: 0;
 }
 
-img {
+#stream {
   display: block;
   width: 100%;
-  aspect-ratio: 4 / 3;
-  max-height: min(62vh, 680px);
-  object-fit: contain;
+  height: auto;
   background: var(--black);
 }
 
@@ -356,9 +367,12 @@ code {
     align-items: flex-start;
   }
 
-  img {
-    max-height: none;
-    min-height: 220px;
+  .stream-card {
+    --stream-max-h: min(58vh, 720px);
+  }
+
+  .stream-frame {
+    min-height: 160px;
   }
 }
 
