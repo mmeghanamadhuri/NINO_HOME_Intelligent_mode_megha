@@ -1582,8 +1582,15 @@ static esp_err_t eye_expression_handler(httpd_req_t *req) {
   }
 
   /* Unknown/empty expression intentionally falls back to idle. */
-  nino_eye_apply_expression(expression);
-  ESP_LOGI(TAG, "HTTP eye expression -> %s", expression[0] ? expression : "idle");
+  nino_eye_state_t target_state = nino_eye_state_from_name(expression);
+  if (target_state >= NINO_EYE_STATE_COUNT) {
+    target_state = NINO_EYE_IDLE;
+  }
+  nino_eye_state_t current_state = nino_eye_get_state();
+  if (current_state != target_state) {
+    nino_eye_set_state(target_state);
+    ESP_LOGI(TAG, "HTTP eye expression -> %s", expression[0] ? expression : "idle");
+  }
 
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -2799,8 +2806,8 @@ static void uvc_driver_event_callback(const uvc_host_driver_event_data_t *event,
 void app_main(void) {
   esp_log_level_set("esp_driver_usb", ESP_LOG_WARN);
   esp_log_level_set("uvc", ESP_LOG_WARN);
-  /* uvc-isoc "frame error" / "missed EoF" are recoverable ISO drops; hide at WARN. */
-  esp_log_level_set("uvc-isoc", ESP_LOG_ERROR);
+  /* uvc-isoc "missed EoF" spam is recoverable; keep it quiet in normal runtime. */
+  esp_log_level_set("uvc-isoc", ESP_LOG_NONE);
 
   esp_err_t err = nvs_flash_init();
   if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
