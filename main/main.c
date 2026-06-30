@@ -111,7 +111,10 @@ static bool s_mdns_started = false;
 #define HTTP_STREAM_BOUNDARY "frame"
 #define HTTP_SERVER_PORT 80
 #define HTTP_STREAM_POLL_MS 25
+#define HTTP_STREAM_ROTATE_DEG 90
 #define MAX_PLAY_WAV_BYTES (384 * 1024)
+#define STR_HELPER(x) #x
+#define STR(x) STR_HELPER(x)
 #define DEVICE_NAME_DEFAULT WIFI_PROV_BLE_DEVICE_NAME_DEFAULT
 #define MDNS_SERVICE_TYPE "_nino"
 #define MDNS_SERVICE_PROTO "_tcp"
@@ -511,6 +514,8 @@ static const char *INDEX_HTML =
     "16px 40px rgba(0,0,0,.25);}"
     "img{display:block;width:100%;max-width:640px;height:auto;border-radius:12px;"
     "background:#000;}"
+    ".rotated{transform:rotate(" STR(HTTP_STREAM_ROTATE_DEG) "deg);"
+    "transform-origin:center center;}"
     "code{background:#0d141b;padding:2px 6px;border-radius:6px;}"
     "</style></head>"
     "<body><main><h1>NiNO camera host</h1>"
@@ -520,10 +525,26 @@ static const char *INDEX_HTML =
     "<p>Opening this page does <strong>not</strong> start a second MJPEG viewer, so "
     "it will not fight the PC app.</p>"
     "<p>One-frame check (loads once when you open or refresh this page):</p>"
-    "<div class=\"card\"><img src=\"/snapshot.jpg\" alt=\"last camera frame\"></div>"
-    "<p>Machine endpoints: <code>/snapshot.jpg</code>, <code>/stream</code> (MJPEG), "
+    "<div class=\"card\"><img class=\"rotated\" src=\"/snapshot.jpg\" alt=\"last camera frame\"></div>"
+    "<p>Machine endpoints: <code>/snapshot.jpg</code>, <code>/stream</code> (browser-friendly), "
+    "<code>/stream.mjpeg</code> (raw MJPEG), "
     "<code>/play_wav</code> (POST WAV).</p>"
     "</main></body></html>";
+
+static const char *STREAM_VIEW_HTML =
+    "<!DOCTYPE html>"
+    "<html><head><meta charset=\"utf-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    "<title>NiNO live stream</title>"
+    "<style>"
+    "body{margin:0;background:#000;display:flex;align-items:center;justify-content:center;"
+    "min-height:100vh;}"
+    "img{max-width:100vw;max-height:100vh;"
+    "transform:rotate(" STR(HTTP_STREAM_ROTATE_DEG) "deg);"
+    "transform-origin:center center;}"
+    "</style></head><body>"
+    "<img src=\"/stream.mjpeg\" alt=\"camera stream\">"
+    "</body></html>";
 
 static int cmd_cpu_dump(int argc, char **argv) {
   (void)argc;
@@ -1326,6 +1347,7 @@ static void tcp_message_server_task(void *arg) {
 
 static esp_err_t index_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "text/html; charset=utf-8");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
 }
 
@@ -1412,6 +1434,12 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 
   free(buffer);
   return err;
+}
+
+static esp_err_t stream_route_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "text/html; charset=utf-8");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  return httpd_resp_send(req, STREAM_VIEW_HTML, HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t play_wav_handler(httpd_req_t *req) {
@@ -2411,6 +2439,12 @@ static void start_http_server(void) {
   const httpd_uri_t stream_uri = {
       .uri = "/stream",
       .method = HTTP_GET,
+      .handler = stream_route_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t stream_mjpeg_uri = {
+      .uri = "/stream.mjpeg",
+      .method = HTTP_GET,
       .handler = stream_handler,
       .user_ctx = NULL,
   };
@@ -2518,6 +2552,7 @@ static void start_http_server(void) {
 
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &index_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &stream_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &stream_mjpeg_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &snapshot_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &play_wav_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &servo_360_uri));
