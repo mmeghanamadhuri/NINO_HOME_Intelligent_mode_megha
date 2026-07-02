@@ -790,6 +790,54 @@ def is_valid_memory_text(
     return True
 
 
+# ---------------------------------------------------------------------------
+# Follow-up detection — decide whether recent conversation lines should be
+# injected into the LLM prompt. Standalone questions must NOT inherit prior
+# turns (that caused context bleed, e.g. "which planet has a ring?" answered
+# from an earlier Pluto discussion).
+# ---------------------------------------------------------------------------
+
+_FOLLOWUP_CONNECTOR = re.compile(
+    r"^\s*(?:and|so|then|also|besides|plus|but|what about|how about|"
+    r"what else|anything else|and then|ok(?:ay)?\s+(?:and|so))\b",
+    re.IGNORECASE,
+)
+
+_FOLLOWUP_CONTINUATION = re.compile(
+    r"\b(?:tell me more|more about (?:it|that|this|them|those)|go on|continue|"
+    r"say more|explain (?:that|it|this|more|again)|"
+    r"(?:what|how) about (?:it|that|this|them|those)|"
+    r"why is that|how come|what else|and you|elaborate)\b",
+    re.IGNORECASE,
+)
+
+_ANAPHORA = re.compile(
+    r"\b(?:it|its|it's|that|this|these|those|them|they|he|she|his|her|him|their)\b",
+    re.IGNORECASE,
+)
+
+
+def query_needs_recent_context(user_text: str) -> bool:
+    """True only when the query is a follow-up that references prior turns.
+
+    Standalone questions ('which planet has a ring?', 'what's the weather?')
+    return False so recent conversation lines are NOT fed to the LLM — this
+    prevents unrelated new questions from inheriting stale context.
+    """
+    text = user_text.strip()
+    if not text:
+        return False
+    if _FOLLOWUP_CONNECTOR.search(text):
+        return True
+    if _FOLLOWUP_CONTINUATION.search(text):
+        return True
+    # Short anaphoric follow-ups ('what is it made of?', 'how does that work?').
+    word_count = len(re.findall(r"[A-Za-z0-9']+", text))
+    if word_count <= 8 and _ANAPHORA.search(text):
+        return True
+    return False
+
+
 def filter_recent_turns_for_prompt(
     recent: list[tuple[str, str]],
 ) -> list[tuple[str, str]]:

@@ -73,26 +73,54 @@ _CANCEL_WORD = re.compile(
     re.IGNORECASE,
 )
 
+# Shared medication nouns for set-command and label extraction.
+MED_OBJECT_RE = (
+    r"(?:meds?|medicines?|medication|medications|pills?|tablets?|capsules?|"
+    r"insulin|inhalers?|vitamins?|supplements?|antibiotics?|prescriptions?|"
+    r"eye\s*drops?|eyedrops?|doses?|dosages?|injections?|shots?|"
+    r"blood\s+pressure\s+medicine|blood\s+sugar\s+medicine|glucose\s+medicine)"
+)
+MY_MED_RE = rf"(?:my\s+)?{MED_OBJECT_RE}"
+TAKE_MED_RE = rf"(?:take|use|have)\s+{MY_MED_RE}"
+TIME_AFTER_RE = r"(?:at|for|by)\s+(.+)"
+
+_MEDICAL_SET_PATTERN_STRINGS: tuple[str, ...] = (
+    rf"\b(?:medication|medicine|meds?)\s+reminder\s+(?:at|for)\s+(.+)",
+    rf"\bremind\s+me\s+to\s+{TAKE_MED_RE}(?:\s+{TIME_AFTER_RE})?",
+    rf"\bremind\s+me\s+about\s+{MY_MED_RE}\s+{TIME_AFTER_RE}",
+    rf"\b(?:set|create|make)\s+(?:an?\s+)?(?:alarm|reminder)\s+.+?\b(?:take|use)\s+{MY_MED_RE}\b",
+    rf"\b(?:set|schedule)\s+(?:my\s+)?(?:medicine|medication|meds?|pills?)\s+{TIME_AFTER_RE}",
+    # Whisper often drops "re-" or hears "find" instead of "remind".
+    rf"\b(?:find|mind)\s+me\s+to\s+{TAKE_MED_RE}",
+    rf"\b{TAKE_MED_RE}\s+{TIME_AFTER_RE}",
+    rf"^(?:me\s+)?to\s+{TAKE_MED_RE}\b",
+    rf"\bi\s+need\s+to\s+{TAKE_MED_RE}\s+{TIME_AFTER_RE}",
+    rf"\bi\s+have\s+to\s+{TAKE_MED_RE}\s+{TIME_AFTER_RE}",
+    rf"\b(?:don't|do not)\s+(?:let\s+me\s+)?forget\s+(?:to\s+)?(?:(?:take|use)\s+)?{MY_MED_RE}\s+{TIME_AFTER_RE}",
+    rf"\b(?:don't|do not)\s+forget\s+{MY_MED_RE}\s+{TIME_AFTER_RE}",
+    rf"\bremember\s+(?:to\s+)?(?:(?:take|use)\s+)?{MY_MED_RE}\s+{TIME_AFTER_RE}",
+    rf"\bwake\s+me\s+(?:up\s+)?to\s+{TAKE_MED_RE}\s+{TIME_AFTER_RE}",
+    rf"\b(?:pill|medicine|medication|meds?)\s+(?:alarm|reminder)\s+(?:at|for)\s+(.+)",
+)
+
 _MEDICAL_SET_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
-    re.compile(p, re.IGNORECASE)
-    for p in (
-        r"\b(?:medication|medicine|meds?)\s+reminder\s+(?:at|for)\s+(.+)",
-        r"\bremind\s+me\s+to\s+(?:take|use)\s+(?:my\s+)?(?:meds?|medicines?|medication|pills?)(?:\s+at\s+(.+))?",
-        r"\b(?:set|create|make)\s+(?:an?\s+)?(?:alarm|reminder)\s+.+?\b(?:take|use)\s+(?:my\s+)?(?:meds?|medicines?|medication|pills?)\b",
-        # Whisper often drops "re-" or hears "find" instead of "remind".
-        r"\b(?:find|mind)\s+me\s+to\s+(?:take|use)\s+(?:my\s+)?(?:meds?|medicines?|medication|pills?)",
-        r"\b(?:take|use)\s+(?:my\s+)?(?:meds?|medicines?|medication|pills?)\s+at\s+(.+)",
-        r"^(?:me\s+)?to\s+(?:take|use)\s+(?:my\s+)?(?:meds?|medicines?|medication|pills?)\b",
-    )
+    re.compile(p, re.IGNORECASE) for p in _MEDICAL_SET_PATTERN_STRINGS
 )
 
 _MEDICINE_REMINDER_HINT_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p, re.IGNORECASE)
     for p in (
-        r"\b(?:find|mind)\s+me\s+to\s+.*\b(?:meds?|medicines?|medication|pills?)\b",
-        r"\bme\s+to\s+take\s+(?:my\s+)?(?:meds?|medicines?|medication|pills?)\b",
-        r"^to\s+take\s+(?:my\s+)?(?:meds?|medicines?|medication|pills?)\b",
-        r"\b(?:take|use)\s+(?:my\s+)?(?:meds?|medicines?|medication|pills?)\s+at\b",
+        rf"\b(?:find|mind)\s+me\s+to\s+.*\b{MED_OBJECT_RE}\b",
+        rf"\bme\s+to\s+take\s+{MY_MED_RE}\b",
+        rf"^to\s+take\s+{MY_MED_RE}\b",
+        rf"\b{TAKE_MED_RE}\s+(?:at|for|by)\b",
+        rf"\b(?:don't|do not)\s+forget\s+.*\b{MED_OBJECT_RE}\b",
+        rf"\bremember\s+.*\b{MED_OBJECT_RE}\b",
+        rf"\bi\s+need\s+to\s+take\s+.*\b{MED_OBJECT_RE}\b",
+        rf"\bi\s+have\s+to\s+take\s+.*\b{MED_OBJECT_RE}\b",
+        rf"\bremind\s+me\s+about\s+.*\b{MED_OBJECT_RE}\b",
+        rf"\b(?:pill|medicine|medication|meds?)\s+(?:alarm|reminder)\b",
+        rf"\bwake\s+me\s+.*\b{MED_OBJECT_RE}\b",
     )
 )
 
@@ -152,9 +180,86 @@ def wants_cancel(user_text: str) -> bool:
     return bool(_CANCEL_WORD.search(user_text.strip()))
 
 
+def normalize_label_for_user(label: str) -> str:
+    """Rewrite a user-spoken task so the bot addresses them (my → your, me → you)."""
+    text = label.strip()
+    if not text:
+        return text
+    replacements: tuple[tuple[re.Pattern[str], str], ...] = (
+        (re.compile(r"\bmyself\b", re.IGNORECASE), "yourself"),
+        (re.compile(r"\bmine\b", re.IGNORECASE), "yours"),
+        (re.compile(r"\bmy\b", re.IGNORECASE), "your"),
+        (re.compile(r"\bme\b", re.IGNORECASE), "you"),
+        (re.compile(r"\bI'm\b", re.IGNORECASE), "you're"),
+        (re.compile(r"\bI've\b", re.IGNORECASE), "you've"),
+        (re.compile(r"\bI'll\b", re.IGNORECASE), "you'll"),
+        (re.compile(r"\bI\b"), "you"),
+    )
+    for pattern, replacement in replacements:
+        text = pattern.sub(replacement, text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def ack_prompt_suffix() -> str:
     return " Say yes or no."
 
 
+def medical_ack_prompt_suffix() -> str:
+    return " Please confirm if you have taken it or not."
+
+
 def repeat_prompt_suffix() -> str:
     return " Yes or no?"
+
+
+_MED_WITHOUT_YOUR = re.compile(
+    rf"^(take|use|have)\s+(?!your\b)({MED_OBJECT_RE})\b",
+    re.IGNORECASE,
+)
+
+_LEADING_TASK_VERB = re.compile(
+    r"^(?:to\s+)?(?:take|use|have|do|complete|finish)\s+(?:your\s+)?",
+    re.IGNORECASE,
+)
+
+
+def medical_label_object(label: str) -> str:
+    """Extract the task object for acknowledgment sentences.
+
+    'take medicines' -> 'medicines', 'take my medicines' -> 'medicines'.
+    Used so replies read 'your medicines' instead of 'your take medicines'.
+    """
+    text = normalize_label_for_user((label or "").strip())
+    text = _LEADING_TASK_VERB.sub("", text).strip()
+    return text or "medication"
+
+
+def format_medical_fire_phrase(label: str) -> str:
+    """Turn a stored task label into natural speech, e.g. 'take medicines' → 'it's time to take your medicines'."""
+    text = normalize_label_for_user((label or "").strip())
+    text = re.sub(r"^to\s+", "", text, flags=re.IGNORECASE)
+    if not text:
+        text = "take your medication"
+    text = _MED_WITHOUT_YOUR.sub(r"\1 your \2", text)
+    if re.match(r"^(take|use|have)\b", text, re.IGNORECASE):
+        return f"it's time to {text}"
+    return f"it's time for {text}"
+
+
+def format_medical_fire_message(
+    *,
+    label: str = "",
+    person_name: str = "",
+    repeat: bool = False,
+) -> str:
+    """Spoken medical alert addressing the user (not echoing their original command)."""
+    name = (person_name or "").strip()
+    phrase = format_medical_fire_phrase(label)
+    suffix = medical_ack_prompt_suffix()
+    if repeat:
+        if name:
+            return f"{name}, {phrase}.{suffix}"
+        return f"{phrase[0].upper()}{phrase[1:]}.{suffix}"
+    if name:
+        return f"{name}, {phrase}.{suffix}"
+    return f"{phrase[0].upper()}{phrase[1:]}.{suffix}"

@@ -105,8 +105,9 @@ class StartupGreetingTests(unittest.TestCase):
             yesterday,
             "- User learned about topic alpha.",
         )
-        self.assertIn("Want to pick up from there?", prompt)
-        self.assertIn("Ask about topic alpha", prompt)
+        self.assertIn("Want to pick up where we left off?", prompt)
+        self.assertIn("Ask a simple follow-up about topic alpha", prompt)
+        self.assertIn("about topic alpha and nothing else", prompt)
         self.assertIn(hello, prompt)
         self.assertIn(yesterday, prompt)
 
@@ -117,7 +118,8 @@ class StartupGreetingTests(unittest.TestCase):
         )
         prompt = build_startup_summary_greeting_prompt(_TEST_DISPLAY_NAME, summary)
         self.assertIn(_TEST_DISPLAY_NAME, prompt)
-        self.assertIn("microcontrollers", prompt)
+        self.assertIn("topic alpha and their uses", prompt)
+        self.assertIn("SAME single topic", prompt)
         self.assertIn("Yesterday we discussed", prompt)
 
     def test_clamp_preserves_invitation_question(self) -> None:
@@ -147,8 +149,8 @@ class StartupGreetingTests(unittest.TestCase):
         self.assertEqual(text, expected)
         mock_generate.assert_called_once()
         prompt = mock_generate.call_args[0][0]
-        self.assertIn("Want to pick up from there?", prompt)
-        self.assertIn("Ask about topic alpha", prompt)
+        self.assertIn("Want to pick up where we left off?", prompt)
+        self.assertIn("Ask a simple follow-up about topic alpha", prompt)
 
     def test_sanitize_strips_greeting_leak(self) -> None:
         raw = (

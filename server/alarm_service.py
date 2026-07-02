@@ -24,7 +24,9 @@ from alarm_medical import (
     PRIORITY_NORMAL,
     ack_prompt_suffix,
     classify_alarm_text,
+    format_medical_fire_message,
     medical_repeat_minutes,
+    normalize_label_for_user,
     repeat_prompt_suffix,
 )
 from alarm_time import system_clock_info, system_now, system_now_iso
@@ -87,38 +89,26 @@ class Alarm:
         """Spoken alert when the alarm fires on the ESP."""
         when = self.spoken_time()
         name = (self.person_name or "").strip()
+        if self.is_medical():
+            return format_medical_fire_message(
+                label=self.label,
+                person_name=name,
+                repeat=repeat,
+            )
+
         if repeat and self.requires_ack:
-            if self.is_medical():
-                if name:
-                    return f"{name}, medication reminder. Yes or no?"
-                return "Medication reminder. Yes or no?"
             suffix = ""
         else:
             suffix = ack_prompt_suffix() if self.requires_ack else ""
 
         if self.label:
-            from alarm_voice import normalize_label_for_user
-
             label = normalize_label_for_user(self.label.strip())
-            if self.is_medical():
-                core = (
-                    f"{name}, medication at {when}: {label}."
-                    if name
-                    else f"Medication at {when}: {label}."
-                )
-            elif name:
+            if name:
                 core = f"{name}, it's {when}, time for {label}."
             else:
                 core = f"It's {when}, time for {label}."
             return core + suffix
 
-        if self.is_medical():
-            core = (
-                f"{name}, medication at {when}."
-                if name
-                else f"Medication at {when}."
-            )
-            return core + suffix
         if name:
             return f"{name}, alarm. It's {when}."
         return f"Alarm. It's {when}."

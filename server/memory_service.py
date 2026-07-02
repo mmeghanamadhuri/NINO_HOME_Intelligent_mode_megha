@@ -372,7 +372,10 @@ class MemoryService:
                 )
                 summary = self._fetch_yesterday_summary(conn, user_id)
             recent = filter_recent_turns(recent)
-            from memory_filters import filter_memories_for_query
+            from memory_filters import (
+                filter_memories_for_query,
+                query_needs_recent_context,
+            )
 
             memories = filter_memories_for_query(memories, query_text)
             block = self._format_prompt_block(
@@ -380,6 +383,7 @@ class MemoryService:
                 recent=recent,
                 memories=memories,
                 summary=summary,
+                include_recent=query_needs_recent_context(query_text),
             )
             return LoadedMemoryContext(
                 user_id=user_id,
@@ -1238,6 +1242,7 @@ class MemoryService:
         recent: list[tuple[str, str]],
         memories: list[str],
         summary: str | None,
+        include_recent: bool = False,
     ) -> str:
         parts: list[str] = [
             f"You are speaking directly to {name}. Always use second person (you/we). "
@@ -1251,7 +1256,7 @@ class MemoryService:
         if summary:
             parts.append(f"Earlier session summary:\n{summary.strip()}")
 
-        if recent:
+        if recent and include_recent:
             lines: list[str] = []
             for user_text, _assistant_text in recent:
                 cleaned_user = truncate_context_text(user_text)

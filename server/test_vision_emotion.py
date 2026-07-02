@@ -161,6 +161,64 @@ class VisionEmotionAccumTests(unittest.TestCase):
         self.assertGreaterEqual(len(spoken), 1)
         self.assertEqual(spoken[0][1], "sad")
 
+    def test_does_not_fire_twice_while_speaking(self) -> None:
+        """Same emotion must not be re-queued while the empathy clip is still in flight."""
+        spoken: list[tuple[str, str | None]] = []
+
+        def _speak(text: str, eye: str | None) -> None:
+            # Simulate LLM synth + POST latency, during which frames keep arriving.
+            time.sleep(0.3)
+            spoken.append((text, eye))
+
+        emotion = MagicMock()
+        emotion.available = True
+        emotion.stats.return_value = {"available": True}
+        emotion.detect.return_value = {
+            "label": "sad",
+            "confidence": 0.8,
+            "eye_expression": "sad",
+            "spoken": "sad",
+            "speakable": True,
+        }
+        emotion.detect_overlay.return_value = {
+            "label": "sad",
+            "confidence": 0.8,
+            "raw_label": "sad",
+            "speakable": True,
+        }
+
+        svc = VisionEmotionService(emotion, speak_wav=_speak, is_speaker_busy=lambda: False)
+        svc._window_min_s = 0.05
+        svc._window_max_s = 0.08
+        svc._dominance_ratio = 0.3
+        svc._cooldown_s = 100.0
+
+        results = [
+            {
+                "primary": True,
+                "stabilized": True,
+                "recognized": True,
+                "name": "Jane",
+                "box": {"x": 10, "y": 10, "w": 80, "h": 80},
+            }
+        ]
+        frame = MagicMock()
+
+        with patch("vision_emotion_service.vision_emotion_blocked", return_value=False):
+            with patch(
+                "llm_service.empathy_for_detected_emotion",
+                return_value="You look a bit down today, Jane.",
+            ):
+                # Keep feeding frames well past the accumulation window and past the
+                # simulated speak latency, so a race would enqueue a second clip.
+                deadline = time.time() + 0.8
+                while time.time() < deadline:
+                    svc.process_frame(frame, results)
+                    time.sleep(0.02)
+                time.sleep(0.4)
+
+        self.assertEqual(len(spoken), 1)
+
 
 class VisionEmotionDisplayHoldTests(unittest.TestCase):
     def _make_service(self) -> tuple[VisionEmotionService, MagicMock]:

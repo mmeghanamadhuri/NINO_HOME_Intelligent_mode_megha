@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from alarm_medical import is_medical_set_command, looks_like_medicine_reminder_set
+from alarm_medical import is_medical_set_command, looks_like_medicine_reminder_set, normalize_label_for_user, MY_MED_RE, TAKE_MED_RE
 from alarm_service import Alarm, get_alarm_service
 from alarm_time import system_now
 
@@ -70,7 +70,7 @@ _REMINDER_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     )
 )
 
-_AT_TIME_SUFFIX = re.compile(r"\s+at\s+(.+)$", re.IGNORECASE)
+_AT_TIME_SUFFIX = re.compile(r"\s+(?:at|for|by)\s+(.+)$", re.IGNORECASE)
 
 _TIME_TOKEN = re.compile(
     r"""
@@ -327,12 +327,50 @@ def _extract_time_phrase_from_text(user_text: str) -> str:
 
 def _extract_medical_label(user_text: str) -> str:
     direct = re.search(
-        r"\b((?:take|use)\s+(?:my\s+)?(?:meds?|medicines?|medication|pills?))\s+at\b",
+        rf"\b(({TAKE_MED_RE}))\s+(?:at|for|by)\b",
         user_text,
         re.IGNORECASE,
     )
     if direct:
         return _clean_reminder_label(direct.group(1))
+
+    forget = re.search(
+        rf"\b(?:don't|do not)\s+(?:let\s+me\s+)?forget\s+(?:to\s+)?(?:(?:take|use)\s+)?({MY_MED_RE})\s+(?:at|for|by)\b",
+        user_text,
+        re.IGNORECASE,
+    )
+    if forget:
+        return _clean_reminder_label(f"take {forget.group(1)}")
+
+    remember = re.search(
+        rf"\bremember\s+(?:to\s+)?(?:(?:take|use)\s+)?({MY_MED_RE})\s+(?:at|for|by)\b",
+        user_text,
+        re.IGNORECASE,
+    )
+    if remember:
+        return _clean_reminder_label(f"take {remember.group(1)}")
+
+    remind_about = re.search(
+        rf"\bremind\s+me\s+about\s+({MY_MED_RE})\s+(?:at|for|by)\b",
+        user_text,
+        re.IGNORECASE,
+    )
+    if remind_about:
+        return _clean_reminder_label(f"take {remind_about.group(1)}")
+
+    pill_reminder = re.search(
+        r"\b(pill|medicine|medication|meds?)\s+(?:alarm|reminder)\b",
+        user_text,
+        re.IGNORECASE,
+    )
+    if pill_reminder:
+        noun = pill_reminder.group(1).lower()
+        if noun in {"med", "meds", "medication", "medicine"}:
+            return _clean_reminder_label("take your medication")
+        if noun == "pill":
+            return _clean_reminder_label("take your pills")
+        return _clean_reminder_label(f"take your {noun}")
+
     tail = _extract_reminder_tail(user_text)
     if tail:
         split = _split_label_and_time_phrase(tail)
@@ -345,26 +383,6 @@ def _extract_medical_label(user_text: str) -> str:
             if split:
                 return _clean_reminder_label(split[0])
     return "take your medication"
-
-
-def normalize_label_for_user(label: str) -> str:
-    """Rewrite a user-spoken task so the bot addresses them (my → your, me → you)."""
-    text = label.strip()
-    if not text:
-        return text
-    replacements: tuple[tuple[re.Pattern[str], str], ...] = (
-        (re.compile(r"\bmyself\b", re.IGNORECASE), "yourself"),
-        (re.compile(r"\bmine\b", re.IGNORECASE), "yours"),
-        (re.compile(r"\bmy\b", re.IGNORECASE), "your"),
-        (re.compile(r"\bme\b", re.IGNORECASE), "you"),
-        (re.compile(r"\bI'm\b", re.IGNORECASE), "you're"),
-        (re.compile(r"\bI've\b", re.IGNORECASE), "you've"),
-        (re.compile(r"\bI'll\b", re.IGNORECASE), "you'll"),
-        (re.compile(r"\bI\b"), "you"),
-    )
-    for pattern, replacement in replacements:
-        text = pattern.sub(replacement, text)
-    return re.sub(r"\s+", " ", text).strip()
 
 
 def _clean_reminder_label(label: str) -> str:
@@ -452,14 +470,20 @@ def parse_alarm_datetime(phrase: str) -> AlarmParseResult:
         cleaned = re.sub(r"\btomorrow\b", "", cleaned, flags=re.IGNORECASE).strip()
     cleaned = re.sub(r"\btoday\b", "", cleaned, flags=re.IGNORECASE).strip()
 
-    match = _TIME_TOKEN.search(cleaned)
-    if not match:
-        return AlarmParseResult(error="I could not understand that time. Try something like 4:30 AM.")
-
-    hour = int(match.group("hour"))
-    minute_raw = match.group("minute") or match.group("minute_spaced") or match.group("minute_compact")
-    minute = int(minute_raw) if minute_raw else 0
-    ampm = (match.group("ampm") or "").lower().replace(".", "")
+    if re.search(r"\bnoon\b", lower):
+        hour, minute, ampm = 12, 0, "pm"
+        match = None
+    elif re.search(r"\bmidnight\b", lower):
+        hour, minute, ampm = 12, 0, "am"
+        match = None
+    else:
+        match = _TIME_TOKEN.search(cleaned)
+        if not match:
+            return AlarmParseResult(error="I could not understand that time. Try something like 4:30 AM.")
+        hour = int(match.group("hour"))
+        minute_raw = match.group("minute") or match.group("minute_spaced") or match.group("minute_compact")
+        minute = int(minute_raw) if minute_raw else 0
+        ampm = (match.group("ampm") or "").lower().replace(".", "")
 
     if minute > 59 or hour > 23:
         return AlarmParseResult(error="That time does not look valid.")

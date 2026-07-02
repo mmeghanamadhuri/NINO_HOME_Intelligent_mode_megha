@@ -25,8 +25,36 @@ from memory_filters import (
     memory_extract_skip_reason,
     parse_like_dislike_update,
     parse_preference_update,
+    query_needs_recent_context,
     should_extract_memories,
 )
+
+
+class FollowUpContextTests(unittest.TestCase):
+    def test_standalone_questions_do_not_need_recent_context(self) -> None:
+        for text in (
+            "Which planet has a ring?",
+            "What's the weather today?",
+            "Can you explain the Solar System?",
+            "Which is the largest plant?",
+            "Football is my favorite sport.",
+            "What are you doing?",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(query_needs_recent_context(text), msg=text)
+
+    def test_followups_need_recent_context(self) -> None:
+        for text in (
+            "Tell me more about it.",
+            "What about Saturn?",
+            "And then what happened?",
+            "How does that work?",
+            "Explain that again.",
+            "Why is that?",
+            "What is it made of?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(query_needs_recent_context(text), msg=text)
 
 
 class MemoryFilterTests(unittest.TestCase):

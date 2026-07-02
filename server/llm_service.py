@@ -377,7 +377,8 @@ def build_greeting_prompt(
         )
         lines.append(
             "Reply with 2 short spoken sentences only (max 35 words total): warm greeting using their name, "
-            "mention one topic from the summary, ask if they want to continue. "
+            "mention exactly ONE topic from the summary, then ask if they want to continue THAT SAME topic. "
+            "Do not reference a second, different topic. "
             "No quotes, no bullet points, no stage directions."
         )
     else:
@@ -423,6 +424,9 @@ def parse_summary_topics_for_greeting(
                 flags=re.IGNORECASE,
             )
         line = _SUMMARY_TOPIC_PREFIX_RE.sub("", line).strip()
+        # Keep only the first clause so a topic is a single subject, never a
+        # run-on with a second topic (which caused mixed greetings).
+        line = re.split(r"[.;:]", line, maxsplit=1)[0].strip()
         line = line.rstrip(".")
         if not line:
             continue
@@ -501,27 +505,32 @@ def build_startup_closing_question_prompt(
     yesterday: str,
     summary_text: str,
 ) -> str:
-    """LLM prompt for sentence 3 only — after hello and yesterday context were spoken."""
+    """LLM prompt for sentence 3 only — after hello and yesterday context were spoken.
+
+    The closing question MUST stay on the same topic as sentence 2. We do not
+    pass the full summary here — that previously caused the model to drift to a
+    different topic (e.g. yesterday 'API' but the question asked about
+    'microcontroller').
+    """
     name = display_name.strip()
     topic = primary_topic.strip()
-    summary = summary_text.strip()
     return (
         "You are NiNO, a friendly voice assistant.\n"
         f"You already said aloud to {name} (in order):\n"
         f'1) "{hello}"\n'
         f'2) "{yesterday}"\n\n'
-        "Write ONLY line 3 — one short counter-question. The listener already heard "
-        "the greeting and yesterday's topic.\n"
+        f"Write ONLY line 3 — one short counter-question strictly about the SAME topic: {topic}.\n"
+        "The listener already heard the greeting and yesterday's topic.\n"
         "Pick ONE style (vary between startups):\n"
-        "A) Invite to continue (e.g. \"Want to pick up from there?\")\n"
-        f'B) Ask about {topic} (e.g. "Can you describe what a microcontroller is?")\n\n'
+        'A) Invite to continue that same topic (e.g. "Want to pick up where we left off?")\n'
+        f'B) Ask a simple follow-up about {topic} (e.g. "Can you tell me more about {topic}?")\n\n'
         "Rules:\n"
+        f"- The question MUST be about {topic} and nothing else. Never mention any other subject.\n"
         "- Output ONLY the question — no hi, no name, no \"good to see you\", no \"yesterday\"\n"
         "- Exactly one sentence ending with ?\n"
-        "- Max 10 words, casual spoken English\n"
+        "- Max 12 words, casual spoken English\n"
         "- No quotes, bullet points, or stage directions\n"
         f"\nTopic: {topic}\n"
-        f"Prior-day summary:\n{summary[:600]}"
     )
 
 
@@ -565,6 +574,7 @@ def build_startup_summary_greeting_prompt(
     name = display_name.strip()
     summary = summary_text.strip()
     topics = parse_summary_topics_for_greeting(summary)
+    the_topic = topics[0] if topics else ""
     lines = [
         "You are NiNO, a friendly smart-home assistant with a camera.",
         f"The camera just recognized {name} — first welcome after the server started today.",
@@ -572,21 +582,31 @@ def build_startup_summary_greeting_prompt(
         "",
         "Use EXACTLY this 3-sentence shape (fresh wording, same structure):",
         f'1) "Hi {name}, good to see you!"',
-        '2) "Yesterday we discussed [one topic from the summary]."',
-        "3) A question — either invite to continue OR ask a simple follow-up about that topic.",
+        '2) "Yesterday we discussed [ONE topic]."',
+        "3) A question — either invite to continue OR ask a simple follow-up about THAT SAME topic.",
         "",
         "Rules:",
+        "- Sentences 2 and 3 MUST refer to the SAME single topic — never two different topics.",
         "- The LAST sentence MUST be a question ending with ?",
         "- Max 45 words total. Skip preferences, drinks, birthdays, alarms.",
         "- Do NOT mention facial expression, mood, or how they look.",
         "- No quotes, bullet points, or stage directions.",
-        "",
-        "Good examples (do not copy verbatim):",
-        f'Hi {name}, good to see you! Yesterday we discussed microcontrollers and their uses. Want to pick up from there?',
-        f'Hi {name}, good to see you! Yesterday we discussed microcontrollers and their uses. Can you describe what a microcontroller is?',
     ]
-    if topics:
-        lines.append(f"Discussion topic to use: {topics[0]}.")
+    if the_topic:
+        lines += [
+            "",
+            f"Use ONLY this topic for BOTH sentence 2 and sentence 3: {the_topic}.",
+            "Good examples (do not copy verbatim, keep the same single topic):",
+            f'Hi {name}, good to see you! Yesterday we discussed {the_topic}. Want to pick up from there?',
+            f'Hi {name}, good to see you! Yesterday we discussed {the_topic}. Can you tell me more about {the_topic}?',
+        ]
+    else:
+        lines += [
+            "",
+            "Good examples (do not copy verbatim; pick ONE real topic from the summary "
+            "and use it in BOTH sentence 2 and sentence 3):",
+            f'Hi {name}, good to see you! Yesterday we discussed that topic. Want to pick up from there?',
+        ]
     if summary:
         lines.append(f"Prior-day session summary:\n{summary}")
     else:

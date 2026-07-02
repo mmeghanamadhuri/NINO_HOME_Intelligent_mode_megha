@@ -14,7 +14,8 @@ from alarm_medical import (
     wants_reschedule,
 )
 from alarm_service import get_alarm_service
-from alarm_voice import AlarmVoiceResult, normalize_label_for_user, parse_alarm_datetime
+from alarm_medical import medical_label_object
+from alarm_voice import AlarmVoiceResult, parse_alarm_datetime
 
 logger = logging.getLogger(__name__)
 
@@ -42,20 +43,20 @@ def handle_alarm_ack_voice(user_text: str) -> AlarmVoiceResult:
 
     if is_positive_ack(text):
         if service.confirm_ack(target.id):
-            label = normalize_label_for_user((target.label or "medication").strip())
+            obj = medical_label_object(target.label)
             return AlarmVoiceResult(
                 handled=True,
-                reply=f"Thank you. I've noted that you completed your {label} reminder.",
+                reply=f"Thank you. I've noted that you have taken your {obj}.",
             )
         return AlarmVoiceResult(handled=False)
 
     if is_negative_ack(text):
         if service.decline_ack(target.id):
-            label = normalize_label_for_user((target.label or "medication").strip())
+            obj = medical_label_object(target.label)
             return AlarmVoiceResult(
                 handled=True,
                 reply=(
-                    f"I understand you have not taken your {label} yet. "
+                    f"I understand you have not taken your {obj} yet. "
                     "Would you like to reschedule this reminder, or cancel it?"
                 ),
             )
@@ -87,10 +88,10 @@ def _handle_reschedule_follow_up(user_text: str, alarm_id: str) -> AlarmVoiceRes
         updated = service.reschedule_alarm(alarm_id, parsed.fire_at)
         if updated:
             when = updated.spoken_time()
-            label = normalize_label_for_user((updated.label or "medication").strip())
+            obj = medical_label_object(updated.label)
             return AlarmVoiceResult(
                 handled=True,
-                reply=f"OK, I rescheduled your {label} reminder for {when}.",
+                reply=f"OK, I rescheduled your {obj} reminder for {when}.",
             )
 
     if wants_reschedule(user_text):

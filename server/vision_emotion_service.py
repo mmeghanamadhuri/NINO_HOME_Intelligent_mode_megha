@@ -77,6 +77,7 @@ class VisionEmotionService:
         self._last_error = ""
         self._latest_overlay: dict[str, Any] | None = None
         self._pending_jobs: list[_EmpathyJob] = []
+        self._inflight_person: str | None = None
 
         self._display_person: str | None = None
         self._display_phase: str = "sample"
@@ -240,7 +241,9 @@ class VisionEmotionService:
             if last > 0.0 and (now - last) < self._cooldown_s:
                 return
 
-            if any(j.person_name == name for j in self._pending_jobs):
+            if self._inflight_person == name or any(
+                j.person_name == name for j in self._pending_jobs
+            ):
                 return
 
             label, _vote_count, avg_conf = dominant
@@ -414,6 +417,7 @@ class VisionEmotionService:
             with self._lock:
                 if self._pending_jobs:
                     job = self._pending_jobs.pop(0)
+                    self._inflight_person = job.person_name
 
             if job is None:
                 time.sleep(0.05)
@@ -426,6 +430,7 @@ class VisionEmotionService:
                         "Vision empathy skipped (post-summary cooldown) for %s",
                         job.person_name,
                     )
+                    self._inflight_person = None
                     continue
 
             if self._defer_empathy_for and self._defer_empathy_for(job.person_name):
@@ -433,9 +438,10 @@ class VisionEmotionService:
                     "Vision empathy deferred (startup greeting pending) for %s",
                     job.person_name,
                 )
-                time.sleep(0.2)
                 with self._lock:
                     self._pending_jobs.insert(0, job)
+                    self._inflight_person = None
+                time.sleep(0.2)
                 continue
 
             if vision_emotion_blocked() or self._is_speaker_busy():
@@ -444,9 +450,10 @@ class VisionEmotionService:
                     job.person_name,
                     job.emotion_label,
                 )
-                time.sleep(0.2)
                 with self._lock:
                     self._pending_jobs.insert(0, job)
+                    self._inflight_person = None
+                time.sleep(0.2)
                 continue
 
             try:
@@ -475,6 +482,9 @@ class VisionEmotionService:
                 logger.exception("Vision empathy failed for %s", job.person_name)
                 with self._lock:
                     self._last_error = str(exc)[:240]
+            finally:
+                with self._lock:
+                    self._inflight_person = None
             time.sleep(0.05)
 
 
