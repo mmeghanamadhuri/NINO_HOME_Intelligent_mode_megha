@@ -2278,13 +2278,13 @@ static int cmd_track(int argc, char **argv) {
       return 1;
     }
     nino_face_tracker_set_enabled(true);
-    printf("Pan tracking ON (servo ID 2)\n");
+    printf("Pan/tilt tracking ON (tilt ID 1, pan ID 2)\n");
     return 0;
   }
 
   if (strcmp(argv[1], "off") == 0) {
     nino_face_tracker_set_enabled(false);
-    printf("Pan tracking OFF\n");
+    printf("Pan/tilt tracking OFF\n");
     return 0;
   }
 
@@ -2294,10 +2294,12 @@ static int cmd_track(int argc, char **argv) {
     printf("track: %s\n", status.enabled ? "ON" : "OFF");
     printf("detector: %s\n", status.detector_ready ? "ready" : "not ready");
     printf("pan goal: %d\n", status.pan_goal);
+    printf("tilt goal: %d\n", status.tilt_goal);
     printf("last frame seq: %lu\n", (unsigned long)status.last_frame_sequence);
     printf("face: %s\n", status.face_found ? "found" : "not found");
-    if (status.face_found && status.last_frame_w > 0) {
-      printf("face cx/frame_w: %d/%d\n", status.last_face_cx, status.last_frame_w);
+    if (status.face_found && status.last_frame_w > 0 && status.last_frame_h > 0) {
+      printf("face cx/cy/frame: %d/%d (%dx%d)\n", status.last_face_cx,
+             status.last_face_cy, status.last_frame_w, status.last_frame_h);
     }
     if (status.paused_for_motion || status.paused_for_spin ||
         status.paused_for_servo) {
@@ -2325,7 +2327,7 @@ static int cmd_track(int argc, char **argv) {
 static void track_cli_register(void) {
   const esp_console_cmd_t cmd = {
       .command = "track",
-      .help = "track on | off | status  (pan-only face tracking on servo ID 2)",
+      .help = "track on | off | status  (pan+tilt face tracking on servo IDs 1/2)",
       .hint = NULL,
       .func = &cmd_track,
       .argtable = NULL,

@@ -6,6 +6,7 @@
 #include "audio_playback.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "face_tracker.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -46,6 +47,15 @@ static bool s_has_suspended;
 static bool is_touch_job(const audio_play_job_t *job) {
   return job->servo_mode == NINO_AUDIO_SERVO_NOD_LR ||
          job->servo_mode == NINO_AUDIO_SERVO_PRIORITY_NONE;
+}
+
+static nino_audio_servo_mode_t effective_servo_mode(nino_audio_servo_mode_t mode) {
+  if (nino_face_tracker_is_enabled() &&
+      (mode == NINO_AUDIO_SERVO_FULL || mode == NINO_AUDIO_SERVO_NOD_LR)) {
+    ESP_LOGI(TAG, "Face tracking on — WAV audio only (no L/R/U/D)");
+    return NINO_AUDIO_SERVO_NONE;
+  }
+  return mode;
 }
 
 static void servo_motion_for_mode(nino_audio_servo_mode_t mode, bool start) {
@@ -95,7 +105,8 @@ static bool play_touch_job(audio_play_job_t *job) {
   job->data = NULL;
 
   size_t offset = 0;
-  (void)play_decoded_job(&decoded, &offset, job->servo_mode, false);
+  const nino_audio_servo_mode_t servo_mode = effective_servo_mode(job->servo_mode);
+  (void)play_decoded_job(&decoded, &offset, servo_mode, false);
   nino_decoded_wav_free(&decoded);
   return true;
 }
@@ -122,8 +133,8 @@ static bool play_normal_job(audio_play_job_t *job) {
   }
 
   size_t offset = 0;
-  const bool completed =
-      play_decoded_job(&decoded, &offset, job->servo_mode, true);
+  const nino_audio_servo_mode_t servo_mode = effective_servo_mode(job->servo_mode);
+  const bool completed = play_decoded_job(&decoded, &offset, servo_mode, true);
 
   if (!completed && offset < decoded.num_bytes) {
     s_suspended.decoded = decoded;
@@ -161,7 +172,9 @@ static bool play_suspended(void) {
   s_has_suspended = false;
   memset(&s_suspended, 0, sizeof(s_suspended));
 
-  const bool completed = play_decoded_job(&snap.decoded, &snap.pcm_offset, snap.servo_mode, true);
+  const nino_audio_servo_mode_t servo_mode = effective_servo_mode(snap.servo_mode);
+  const bool completed =
+      play_decoded_job(&snap.decoded, &snap.pcm_offset, servo_mode, true);
 
   if (!completed && snap.pcm_offset < snap.decoded.num_bytes) {
     s_suspended = snap;

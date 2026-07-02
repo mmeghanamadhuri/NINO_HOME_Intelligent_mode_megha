@@ -16,8 +16,11 @@ typedef struct {
   bool face_found;
   uint32_t last_frame_sequence;
   int pan_goal;
+  int tilt_goal;
   int last_face_cx;
+  int last_face_cy;
   int last_frame_w;
+  int last_frame_h;
 } nino_face_tracker_status_t;
 
 void nino_face_tracker_init(void);
