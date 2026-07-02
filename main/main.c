@@ -1555,6 +1555,38 @@ static bool parse_json_int_field(const char *body, const char *key, int *out) {
   return true;
 }
 
+static bool parse_json_bool_field(const char *body, const char *key, bool *out) {
+  if (body == NULL || key == NULL || out == NULL) {
+    return false;
+  }
+  char pattern[24];
+  int pn = snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+  if (pn <= 0 || pn >= (int)sizeof(pattern)) {
+    return false;
+  }
+  const char *p = strstr(body, pattern);
+  if (p == NULL) {
+    return false;
+  }
+  p = strchr(p + pn, ':');
+  if (p == NULL) {
+    return false;
+  }
+  p++;
+  while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+    p++;
+  }
+  if (strncmp(p, "true", 4) == 0) {
+    *out = true;
+    return true;
+  }
+  if (strncmp(p, "false", 5) == 0) {
+    *out = false;
+    return true;
+  }
+  return false;
+}
+
 static esp_err_t eye_expression_handler(httpd_req_t *req) {
   if (req->method != HTTP_POST) {
     httpd_resp_set_status(req, "405 Method Not Allowed");
@@ -1813,18 +1845,48 @@ static bool json_copy_quoted_value(const char *start, char *out, size_t out_sz) 
   return true;
 }
 
+static int face_track_status_json(char *buf, size_t buf_sz) {
+  nino_face_tracker_status_t status = {};
+  nino_face_tracker_get_status(&status);
+
+  return snprintf(
+      buf, buf_sz,
+      "{\"ok\":true,\"enabled\":%s,\"detector_ready\":%s,\"face_found\":%s,"
+      "\"pan_goal\":%d,\"tilt_goal\":%d,"
+      "\"last_face_cx\":%d,\"last_face_cy\":%d,"
+      "\"last_frame_w\":%d,\"last_frame_h\":%d,"
+      "\"last_frame_sequence\":%lu,"
+      "\"paused_for_motion\":%s,\"paused_for_spin\":%s,"
+      "\"paused_for_servo\":%s}",
+      status.enabled ? "true" : "false",
+      status.detector_ready ? "true" : "false",
+      status.face_found ? "true" : "false", status.pan_goal, status.tilt_goal,
+      status.last_face_cx, status.last_face_cy, status.last_frame_w,
+      status.last_frame_h, (unsigned long)status.last_frame_sequence,
+      status.paused_for_motion ? "true" : "false",
+      status.paused_for_spin ? "true" : "false",
+      status.paused_for_servo ? "true" : "false");
+}
+
 static int app_status_json(char *buf, size_t buf_sz) {
   char sta_ip[16] = "0.0.0.0";
   wifi_config_get_sta_ip(sta_ip, sizeof(sta_ip));
   const char *fw_version = PROJECT_VER;
+  nino_face_tracker_status_t face_track = {};
+  nino_face_tracker_get_status(&face_track);
 
   return snprintf(
       buf, buf_sz,
       "{\"ok\":true,\"device_name\":\"%s\",\"wifi_ssid\":\"%s\","
       "\"volume\":%d,\"firmware\":\"%s\",\"sta_connected\":%s,"
-      "\"ip\":\"%s\",\"mdns_host\":\"%s.local\"}",
+      "\"ip\":\"%s\",\"mdns_host\":\"%s.local\","
+      "\"face_track\":{\"enabled\":%s,\"detector_ready\":%s,"
+      "\"face_found\":%s}}",
       s_device_name, s_sta_ssid, nino_audio_get_volume_percent(), fw_version,
-      s_sta_connected ? "true" : "false", sta_ip, s_device_name);
+      s_sta_connected ? "true" : "false", sta_ip, s_device_name,
+      face_track.enabled ? "true" : "false",
+      face_track.detector_ready ? "true" : "false",
+      face_track.face_found ? "true" : "false");
 }
 
 int wifi_config_status_json(char *buf, size_t buf_sz) {
@@ -1850,6 +1912,98 @@ int wifi_config_status_json(char *buf, size_t buf_sz) {
       wifi_config_is_provisioned() ? "true" : "false");
 }
 
+static esp_err_t face_track_handler(httpd_req_t *req) {
+  if (req->method == HTTP_OPTIONS) {
+    httpd_resp_set_status(req, "204 No Content");
+    wifi_http_set_cors(req);
+    return httpd_resp_send(req, NULL, 0);
+  }
+
+  httpd_resp_set_type(req, "application/json");
+  wifi_http_set_cors(req);
+
+  if (req->method == HTTP_GET) {
+    char body[384];
+    int n = face_track_status_json(body, sizeof(body));
+    if (n < 0 || n >= (int)sizeof(body)) {
+      return httpd_resp_send_500(req);
+    }
+    return httpd_resp_send(req, body, n);
+  }
+
+  if (req->method != HTTP_POST) {
+    httpd_resp_set_status(req, "405 Method Not Allowed");
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"GET or POST only\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+
+  if (req->content_len <= 0 || req->content_len > 128) {
+    httpd_resp_set_status(req, "400 Bad Request");
+    return httpd_resp_send(
+        req,
+        "{\"ok\":false,\"error\":\"bad_body\","
+        "\"hint\":\"POST {\\\"enabled\\\":true} or {\\\"action\\\":\\\"on\\\"}\"}",
+        HTTPD_RESP_USE_STRLEN);
+  }
+
+  char body[129] = {0};
+  int read_n = 0;
+  while (read_n < req->content_len) {
+    int r = httpd_req_recv(req, body + read_n, req->content_len - read_n);
+    if (r <= 0) {
+      httpd_resp_set_status(req, "400 Bad Request");
+      return httpd_resp_send(req, "{\"ok\":false,\"error\":\"recv\"}",
+                             HTTPD_RESP_USE_STRLEN);
+    }
+    read_n += r;
+  }
+  body[read_n] = '\0';
+
+  bool want_enable = false;
+  bool have_command = false;
+  if (parse_json_bool_field(body, "enabled", &want_enable)) {
+    have_command = true;
+  } else {
+    char action[8] = {0};
+    const char *action_start = json_value_start(body, "action");
+    if (action_start != NULL &&
+        json_copy_quoted_value(action_start, action, sizeof(action))) {
+      if (strcmp(action, "on") == 0) {
+        want_enable = true;
+        have_command = true;
+      } else if (strcmp(action, "off") == 0) {
+        want_enable = false;
+        have_command = true;
+      }
+    }
+  }
+
+  if (!have_command) {
+    httpd_resp_set_status(req, "400 Bad Request");
+    return httpd_resp_send(
+        req,
+        "{\"ok\":false,\"error\":\"missing_or_invalid_command\","
+        "\"hint\":\"POST {\\\"enabled\\\":true} or {\\\"action\\\":\\\"on\\\"}\"}",
+        HTTPD_RESP_USE_STRLEN);
+  }
+
+  if (want_enable && !nino_face_detect_is_ready()) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"detector_not_ready\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+
+  nino_face_tracker_set_enabled(want_enable);
+  ESP_LOGI(TAG, "HTTP face track -> %s", want_enable ? "ON" : "OFF");
+
+  char response[384];
+  int n = face_track_status_json(response, sizeof(response));
+  if (n < 0 || n >= (int)sizeof(response)) {
+    return httpd_resp_send_500(req);
+  }
+  return httpd_resp_send(req, response, n);
+}
+
 static esp_err_t status_handler(httpd_req_t *req) {
   if (req->method != HTTP_GET) {
     httpd_resp_set_status(req, "405 Method Not Allowed");
@@ -1858,7 +2012,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
                            HTTPD_RESP_USE_STRLEN);
   }
 
-  char body[320];
+  char body[512];
   int n = app_status_json(body, sizeof(body));
   if (n < 0 || n >= (int)sizeof(body)) {
     return httpd_resp_send_500(req);
@@ -1871,7 +2025,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
 
 #if CONFIG_HTTPD_WS_SUPPORT
 static esp_err_t status_ws_send(httpd_req_t *req) {
-  char body[320];
+  char body[512];
   int n = app_status_json(body, sizeof(body));
   if (n < 0 || n >= (int)sizeof(body)) {
     return ESP_FAIL;
@@ -2401,7 +2555,7 @@ static void start_http_server(void) {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = HTTP_SERVER_PORT;
   config.stack_size = 8192;
-  config.max_uri_handlers = 20;
+  config.max_uri_handlers = 24;
   config.recv_wait_timeout = 45;
   config.send_wait_timeout = 45;
   config.core_id = APP_CORE_NET;
@@ -2486,6 +2640,24 @@ static void start_http_server(void) {
       .handler = status_handler,
       .user_ctx = NULL,
   };
+  const httpd_uri_t face_track_get_uri = {
+      .uri = "/face/track",
+      .method = HTTP_GET,
+      .handler = face_track_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t face_track_post_uri = {
+      .uri = "/face/track",
+      .method = HTTP_POST,
+      .handler = face_track_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t face_track_opts_uri = {
+      .uri = "/face/track",
+      .method = HTTP_OPTIONS,
+      .handler = face_track_handler,
+      .user_ctx = NULL,
+  };
 #if CONFIG_HTTPD_WS_SUPPORT
   const httpd_uri_t status_ws_uri = {
       .uri = "/ws/status",
@@ -2549,6 +2721,9 @@ static void start_http_server(void) {
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &volume_get_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &volume_post_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &status_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &face_track_get_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &face_track_post_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &face_track_opts_uri));
 #if CONFIG_HTTPD_WS_SUPPORT
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &status_ws_uri));
 #endif
@@ -2925,7 +3100,7 @@ void app_main(void) {
   };
   ESP_ERROR_CHECK(uvc_host_install(&uvc_driver_config));
 
-  esp_err_t ble_err = wifi_prov_ble_start();
+  esp_err_t ble_err = wifi_prov_ble_start_if_needed();
   if (ble_err != ESP_OK && ble_err != ESP_ERR_NOT_SUPPORTED) {
     ESP_LOGW(TAG, "BLE Wi-Fi provisioning not started: %s",
              esp_err_to_name(ble_err));

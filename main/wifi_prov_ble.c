@@ -476,7 +476,19 @@ esp_err_t wifi_prov_ble_start(void) {
   return ESP_OK;
 }
 
+esp_err_t wifi_prov_ble_start_if_needed(void) {
+  if (wifi_config_is_provisioned()) {
+    ESP_LOGI(TAG,
+             "Wi-Fi credentials found in NVS — BLE provisioning not started");
+    return ESP_OK;
+  }
+  ESP_LOGI(TAG, "No Wi-Fi credentials in NVS — starting BLE provisioning");
+  return wifi_prov_ble_start();
+}
+
 #else /* !CONFIG_BT_NIMBLE_ENABLED || !CONFIG_ESP_HOSTED_ENABLE_BT_NIMBLE */
+
+#include "wifi_config.h"
 
 static char s_prov_device_name[WIFI_PROV_BLE_DEVICE_NAME_MAX + 1] =
     WIFI_PROV_BLE_DEVICE_NAME_DEFAULT;
@@ -487,6 +499,16 @@ esp_err_t wifi_prov_ble_start(void) {
            "sdkconfig (see sdkconfig.defaults.esp32p4), then idf.py fullclean "
            "build");
   return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t wifi_prov_ble_start_if_needed(void) {
+  if (wifi_config_is_provisioned()) {
+    ESP_LOGI("wifi_prov_ble",
+             "Wi-Fi credentials found in NVS — BLE provisioning not started");
+    return ESP_OK;
+  }
+  ESP_LOGI("wifi_prov_ble", "No Wi-Fi credentials in NVS — BLE not available");
+  return wifi_prov_ble_start();
 }
 
 void wifi_prov_ble_on_sta_ip_changed(bool connected) {

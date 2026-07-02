@@ -7,6 +7,9 @@
 /** Start NimBLE GATT Wi-Fi provisioning (ESP32-P4 + hosted C6 BT). */
 esp_err_t wifi_prov_ble_start(void);
 
+/** Start BLE provisioning only when no STA credentials are saved in NVS. */
+esp_err_t wifi_prov_ble_start_if_needed(void);
+
 /** Call when STA gets or loses IP (updates status characteristic notify). */
 void wifi_prov_ble_on_sta_ip_changed(bool connected);
 
