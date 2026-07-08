@@ -6,14 +6,13 @@
 
 #include "audio_capture.h"
 #include "audio_playback.h"
-#include "bsp/esp32_p4_function_ev_board.h"
-#include "esp_codec_dev.h"
-#include "esp_codec_dev_types.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "usb_mic.h"
 
 #include "nino_eye.h"
 #include "voice_wake.h"
@@ -28,7 +27,7 @@ static const char *TAG = "voice_ast";
 #define WAV_HEADER_SIZE 44
 #define VAD_FRAME_MS 20
 #define VAD_LISTEN_TIMEOUT_MS 3000
-#define VAD_TRAILING_SILENCE_MS 700
+#define VAD_TRAILING_SILENCE_MS 450
 #define VAD_PRE_ROLL_MS 200
 #define VAD_START_CONSECUTIVE_FRAMES 3
 #define VAD_STATUS_LOG_PERIOD_MS 1000
@@ -36,7 +35,6 @@ static const char *TAG = "voice_ast";
 #define VAD_MIN_START_ENERGY 1800
 #define VAD_MIN_CONTINUE_ENERGY 1200
 #define VAD_NOISE_FLOOR_DEFAULT 220
-#define VAD_MIC_GAIN_DB 35.0f
 
 #define VAD_FRAME_SAMPLES ((VOICE_MIC_RATE * VAD_FRAME_MS) / 1000)
 #define VAD_FRAME_BYTES (VAD_FRAME_SAMPLES * (int)sizeof(int16_t))
@@ -173,13 +171,83 @@ static esp_err_t vad_append_frame(vad_cap_t *cap, size_t *pcm_samples, const int
   return ESP_OK;
 }
 
-static esp_err_t play_embedded_beep(void) {
-  const size_t len = (size_t)(beep_wav_end - beep_wav_start);
-  if (len < WAV_HEADER_SIZE) {
+static int16_t *s_beep_pcm16 = NULL;
+static size_t s_beep_pcm16_samples = 0;
+
+/** Decode embedded main/beep.wav once; resample to 16 kHz mono for fast ES8311 playback. */
+static esp_err_t ensure_beep_pcm16(void) {
+  if (s_beep_pcm16 != NULL && s_beep_pcm16_samples > 0) {
+    return ESP_OK;
+  }
+
+  const size_t wav_len = (size_t)(beep_wav_end - beep_wav_start);
+  if (wav_len < WAV_HEADER_SIZE) {
     ESP_LOGE(TAG, "embedded beep.wav missing or too small");
     return ESP_ERR_INVALID_SIZE;
   }
-  return nino_audio_play_wav(beep_wav_start, len);
+
+  nino_decoded_wav_t dec = {};
+  esp_err_t e = nino_audio_decode_wav(beep_wav_start, wav_len, &dec);
+  if (e != ESP_OK) {
+    return e;
+  }
+
+  const size_t in_frames = dec.num_bytes / sizeof(int16_t);
+  if (in_frames == 0) {
+    nino_decoded_wav_free(&dec);
+    return ESP_ERR_INVALID_SIZE;
+  }
+
+  if (dec.sample_rate_hz == (uint32_t)VOICE_MIC_RATE) {
+    s_beep_pcm16 = (int16_t *)malloc(dec.num_bytes);
+    if (s_beep_pcm16 == NULL) {
+      nino_decoded_wav_free(&dec);
+      return ESP_ERR_NO_MEM;
+    }
+    memcpy(s_beep_pcm16, dec.samples, dec.num_bytes);
+    s_beep_pcm16_samples = in_frames;
+    nino_decoded_wav_free(&dec);
+    return ESP_OK;
+  }
+
+  const size_t out_frames = (in_frames * (size_t)VOICE_MIC_RATE) / dec.sample_rate_hz + 2U;
+  s_beep_pcm16 = (int16_t *)calloc(out_frames, sizeof(int16_t));
+  if (s_beep_pcm16 == NULL) {
+    nino_decoded_wav_free(&dec);
+    return ESP_ERR_NO_MEM;
+  }
+
+  size_t produced = 0;
+  for (size_t o = 0; o < out_frames; o++) {
+    const size_t src = (o * dec.sample_rate_hz) / (uint32_t)VOICE_MIC_RATE;
+    if (src >= in_frames) {
+      break;
+    }
+    s_beep_pcm16[o] = dec.samples[src];
+    produced = o + 1U;
+  }
+  s_beep_pcm16_samples = produced;
+  nino_decoded_wav_free(&dec);
+
+  ESP_LOGI(TAG, "beep.wav cached: %u samples @ %d Hz (from embedded WAV)", (unsigned)s_beep_pcm16_samples,
+           VOICE_MIC_RATE);
+  return ESP_OK;
+}
+
+static esp_err_t play_embedded_beep(void) {
+  esp_err_t e = ensure_beep_pcm16();
+  if (e != ESP_OK) {
+    return e;
+  }
+  return nino_audio_play_chime_pcm16_mono(s_beep_pcm16, s_beep_pcm16_samples, (uint32_t)VOICE_MIC_RATE);
+}
+
+esp_err_t nino_voice_preload_wake_chime(void) {
+  esp_err_t e = ensure_beep_pcm16();
+  if (e != ESP_OK) {
+    return e;
+  }
+  return nino_audio_warm_chime_path((uint32_t)VOICE_MIC_RATE);
 }
 
 esp_err_t nino_voice_play_wake_chime(void) {
@@ -207,7 +275,6 @@ esp_err_t nino_voice_capture_vad_wav(int max_seconds, uint8_t **out_wav, size_t 
   uint32_t silence_streak = 0;
   bool recording = false;
   esp_err_t result = ESP_FAIL;
-  esp_codec_dev_handle_t mic = NULL;
 
   cap.wav = (uint8_t *)malloc(wav_capacity);
   cap.frame = (int16_t *)heap_caps_malloc(VAD_FRAME_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -226,49 +293,22 @@ esp_err_t nino_voice_capture_vad_wav(int max_seconds, uint8_t **out_wav, size_t 
   cap.wav_capacity = wav_capacity;
   cap.noise_floor = VAD_NOISE_FLOOR_DEFAULT;
 
-  nino_audio_bus_lock();
-
-  esp_err_t err = bsp_i2c_init();
-  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-    ESP_LOGE(TAG, "bsp_i2c_init: %s", esp_err_to_name(err));
-    result = err;
-    goto unlock_cleanup;
+  if (!usb_mic_ready()) {
+    ESP_LOGW(TAG, "USB mic not ready");
+    result = ESP_ERR_INVALID_STATE;
+    goto cleanup;
   }
 
-  mic = bsp_audio_codec_microphone_init();
-  if (mic == NULL) {
-    ESP_LOGE(TAG, "mic init failed");
-    result = ESP_FAIL;
-    goto unlock_cleanup;
-  }
+  nino_voice_wake_set_mic_capture_hold(true);
+  usb_mic_flush();
 
-  esp_codec_dev_set_in_gain(mic, VAD_MIC_GAIN_DB);
-
-  esp_codec_dev_sample_info_t fs = {
-      .bits_per_sample = 16,
-      .channel = 1,
-      .channel_mask = 0,
-      .sample_rate = VOICE_MIC_RATE,
-      .mclk_multiple = 0,
-  };
-
-  int cr = esp_codec_dev_open(mic, &fs);
-  if (cr != ESP_CODEC_DEV_OK) {
-    ESP_LOGE(TAG, "mic open failed: %d", cr);
-    result = ESP_FAIL;
-    goto unlock_cleanup;
-  }
-
-  /* Mic is live: show the listening face until this capture session ends. */
-  nino_eye_listening();
-
-  ESP_LOGI(TAG, "VAD armed (max %d s)", max_seconds);
+  ESP_LOGI(TAG, "VAD armed (USB mic, max %d s)", max_seconds);
 
   while (1) {
-    cr = esp_codec_dev_read(mic, cap.frame, VAD_FRAME_BYTES);
-    if (cr != ESP_CODEC_DEV_OK) {
-      ESP_LOGE(TAG, "mic read failed: %d", cr);
-      result = ESP_FAIL;
+    esp_err_t rr = usb_mic_read(cap.frame, VAD_FRAME_SAMPLES);
+    if (rr != ESP_OK) {
+      ESP_LOGW(TAG, "USB mic read: %s", esp_err_to_name(rr));
+      result = ESP_ERR_TIMEOUT;
       break;
     }
 
@@ -351,17 +391,8 @@ esp_err_t nino_voice_capture_vad_wav(int max_seconds, uint8_t **out_wav, size_t 
     result = ESP_ERR_NOT_FOUND;
   }
 
-unlock_cleanup:
-  /* Eyes stay in listening here: the captured audio still has to reach the
-   * server. nino_voice_ws_exchange() (or the caller on failure) ends it. */
-  if (mic != NULL) {
-    esp_codec_dev_close(mic);
-    mic = NULL;
-  }
-  nino_voice_wake_drop_mic_locked();
-  nino_audio_bus_unlock();
-
 cleanup:
+  nino_voice_wake_set_mic_capture_hold(false);
   free(cap.wav);
   free(cap.preroll);
   free(cap.frame);
@@ -393,12 +424,15 @@ static esp_err_t run_ws_and_queue(int max_seconds, bool *prompt_after_out) {
     return ESP_ERR_INVALID_STATE;
   }
 
+  const int64_t t_query = esp_timer_get_time();
+
   uint8_t *cap = NULL;
   size_t cap_len = 0;
   esp_err_t e = nino_voice_capture_vad_wav(max_seconds, &cap, &cap_len);
+  ESP_LOGI(TAG, "latency: VAD capture %" PRId64 " ms", (esp_timer_get_time() - t_query) / 1000LL);
   if (e != ESP_OK) {
     ESP_LOGE(TAG, "VAD capture failed: %s", esp_err_to_name(e));
-    nino_eye_idle(); /* nothing to send; end the listening face */
+    nino_eye_idle();
     return e;
   }
 
@@ -406,8 +440,11 @@ static esp_err_t run_ws_and_queue(int max_seconds, bool *prompt_after_out) {
   size_t resp_len = 0;
   bool prompt_after = false;
   char eye_expr[16] = {0};
+  const int64_t t_ws = esp_timer_get_time();
   e = nino_voice_ws_exchange(uri, cap, cap_len, &resp, &resp_len, 300000, &prompt_after,
                              eye_expr, sizeof(eye_expr));
+  ESP_LOGI(TAG, "latency: WS round-trip %" PRId64 " ms", (esp_timer_get_time() - t_ws) / 1000LL);
+  ESP_LOGI(TAG, "latency: query total %" PRId64 " ms", (esp_timer_get_time() - t_query) / 1000LL);
   nino_audio_capture_free(cap);
 
   if (e != ESP_OK || resp == NULL || resp_len == 0) {

@@ -42,6 +42,8 @@ class FaceService:
 
         self._lock = threading.Lock()
         self._state_lock = threading.Lock()
+        # YuNet / SFace are not thread-safe; serialize all native model calls.
+        self._model_lock = threading.RLock()
         # person_id -> (display_name, embeddings ndarray [n_samples, 128])
         self._embeddings: dict[str, tuple[str, np.ndarray]] = {}
         self._session_primary_name: str | None = None
@@ -204,8 +206,9 @@ class FaceService:
         h, w = frame.shape[:2]
         bgr = frame if frame.ndim == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         try:
-            self._yunet.setInputSize((w, h))
-            _, faces = self._yunet.detect(bgr)
+            with self._model_lock:
+                self._yunet.setInputSize((w, h))
+                _, faces = self._yunet.detect(bgr)
         except cv2.error:
             return []
 
@@ -291,7 +294,8 @@ class FaceService:
 
         if row is not None and self._sface is not None:
             try:
-                aligned = self._sface.alignCrop(bgr, row)
+                with self._model_lock:
+                    aligned = self._sface.alignCrop(bgr, row)
                 if aligned is not None and aligned.size > 0:
                     return aligned
             except cv2.error:
@@ -311,7 +315,8 @@ class FaceService:
         if self._sface is None:
             return None
         try:
-            feature = self._sface.feature(aligned_bgr)
+            with self._model_lock:
+                feature = self._sface.feature(aligned_bgr)
         except cv2.error:
             return None
         vec = np.asarray(feature, dtype=np.float32).reshape(-1)
@@ -463,17 +468,37 @@ class FaceService:
         if aligned is not None:
             embedding = self._embed(aligned)
             if embedding is not None:
-                self._append_embedding(person_id, self._display_name(person_id), embedding)
+                self._append_embedding(
+                    person_id,
+                    self._display_name(person_id),
+                    embedding,
+                    persist=False,
+                )
 
         return output_path
 
-    def _append_embedding(self, person_id: str, display_name: str, embedding: np.ndarray) -> None:
+    def _append_embedding(
+        self,
+        person_id: str,
+        display_name: str,
+        embedding: np.ndarray,
+        *,
+        persist: bool = True,
+    ) -> None:
         with self._lock:
-            _, existing = self._embeddings.get(person_id, (display_name, np.empty((0, embedding.shape[0]), dtype=np.float32)))
+            _, existing = self._embeddings.get(
+                person_id,
+                (display_name, np.empty((0, embedding.shape[0]), dtype=np.float32)),
+            )
             stacked = np.vstack([existing, embedding[None, :]])
             if stacked.shape[0] > self.max_samples_per_person:
                 stacked = stacked[-self.max_samples_per_person :]
             self._embeddings[person_id] = (display_name, stacked.astype(np.float32))
+            if persist:
+                self._save_embeddings_locked()
+
+    def persist_embeddings(self) -> None:
+        with self._lock:
             self._save_embeddings_locked()
 
     # ---------------------------------------------------------------- training
@@ -486,33 +511,38 @@ class FaceService:
                 f"{SFACE_FILENAME} (check the data/models folder or network)."
             )
 
-        new_store: dict[str, tuple[str, np.ndarray]] = {}
-        total = 0
-        for person_dir in sorted(self.faces_dir.iterdir()):
-            if not person_dir.is_dir():
-                continue
-            sample_paths = sorted(
-                person_dir.glob("*.jpg"), key=lambda p: p.stat().st_mtime, reverse=True
-            )[: self.max_samples_per_person]
-            vectors: list[np.ndarray] = []
-            for sample_path in sample_paths:
-                embedding = self._embed_image_file(sample_path)
-                if embedding is not None:
-                    vectors.append(embedding)
-            if not vectors:
-                continue
-            new_store[person_dir.name] = (
-                self._display_name(person_dir.name),
-                np.vstack(vectors).astype(np.float32),
-            )
-            total += len(vectors)
+        # Hold the model lock for the whole rebuild so the live MJPEG thread
+        # cannot call YuNet/SFace at the same time (native crash on Windows).
+        with self._model_lock:
+            new_store: dict[str, tuple[str, np.ndarray]] = {}
+            total = 0
+            for person_dir in sorted(self.faces_dir.iterdir()):
+                if not person_dir.is_dir():
+                    continue
+                sample_paths = sorted(
+                    person_dir.glob("*.jpg"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )[: self.max_samples_per_person]
+                vectors: list[np.ndarray] = []
+                for sample_path in sample_paths:
+                    embedding = self._embed_image_file(sample_path)
+                    if embedding is not None:
+                        vectors.append(embedding)
+                if not vectors:
+                    continue
+                new_store[person_dir.name] = (
+                    self._display_name(person_dir.name),
+                    np.vstack(vectors).astype(np.float32),
+                )
+                total += len(vectors)
 
-        if not new_store:
-            raise ValueError("No registered face samples found")
+            if not new_store:
+                raise ValueError("No registered face samples found")
 
-        with self._lock:
-            self._embeddings = new_store
-            self._save_embeddings_locked()
+            with self._lock:
+                self._embeddings = new_store
+                self._save_embeddings_locked()
 
         return {"people": len(new_store), "samples": total}
 

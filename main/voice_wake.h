@@ -16,11 +16,13 @@ bool nino_voice_wake_is_enabled(void);
 bool nino_voice_wake_hw_ready(void);
 
 /**
- * Call while holding `nino_audio_bus_lock()` after any other code path has opened/closed
- * the ES8311 (e.g. WAV playback at 22.05 kHz or VAD mic). Drops the wake task's mic handle
- * so the next read re-opens at 16 kHz. Prevents "i2s_channel_read: channel is not enabled".
+ * Kept for API compatibility after switching to USB header mic.
+ * Wake feed pauses during after-wake via s_after_wake_busy instead of closing a codec mic.
  */
 void nino_voice_wake_drop_mic_locked(void);
+
+/** Pause wake_feed USB reads while VAD or other capture owns the mic ring. */
+void nino_voice_wake_set_mic_capture_hold(bool hold);
 
 #ifdef __cplusplus
 }

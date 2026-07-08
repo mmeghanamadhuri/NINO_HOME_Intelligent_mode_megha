@@ -1,20 +1,21 @@
 #include "voice_ws_client.h"
 
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_websocket_client.h"
 #include "nino_eye.h"
+#include "audio_playback.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
 static const char *TAG = "nino_vws";
 
-/* Long TTS replies at 16 kHz mono: ~4 min max; must exceed largest WS binary frame reassembly. */
 #define MAX_VOICE_WAV (4 * 1024 * 1024)
-
 #define EYE_EXPR_MAX 16
 
 typedef struct {
@@ -27,7 +28,21 @@ typedef struct {
   bool error;
   bool prompt_medical_ack;
   char eye_expr[EYE_EXPR_MAX];
+  bool wav_msg_open;
 } vws_ctx_t;
+
+static esp_websocket_client_config_t make_ws_cfg(const char *uri) {
+  esp_websocket_client_config_t ws_cfg = {
+      .uri = uri,
+      .buffer_size = 65536,
+      .network_timeout_ms = 300000,
+      .task_stack = 12288,
+      .task_prio = 5,
+      .disable_pingpong_discon = true,
+      .ping_interval_sec = 30,
+  };
+  return ws_cfg;
+}
 
 static bool chunk_contains(const char *hay, size_t hay_len, const char *needle) {
   const size_t needle_len = strlen(needle);
@@ -42,11 +57,6 @@ static bool chunk_contains(const char *hay, size_t hay_len, const char *needle) 
   return false;
 }
 
-/*
- * Pull the quoted string value of "eye_expression" out of the JSON metadata,
- * matching the server format e.g. {"prompt_medical_ack": false, "eye_expression": "sad"}.
- * Tolerant of spaces around ':' and the key being anywhere in the object.
- */
 static void parse_eye_expression(vws_ctx_t *ctx, const char *text, size_t len) {
   static const char key[] = "\"eye_expression\"";
   const size_t key_len = sizeof(key) - 1;
@@ -63,7 +73,6 @@ static void parse_eye_expression(vws_ctx_t *ctx, const char *text, size_t len) {
     return;
   }
   size_t p = i + key_len;
-  /* Skip whitespace and the ':' separator. */
   while (p < len && (text[p] == ' ' || text[p] == '\t' || text[p] == ':')) {
     p++;
   }
@@ -83,9 +92,6 @@ static void parse_metadata_text(vws_ctx_t *ctx, const char *text, size_t len) {
     return;
   }
   parse_eye_expression(ctx, text, len);
-  /* Show the expression the instant the tag arrives (the reply WAV is still
-   * downloading); it then holds through playback and the audio queue reverts to
-   * idle once the reply finishes. */
   if (ctx->eye_expr[0] != '\0') {
     nino_eye_apply_expression(ctx->eye_expr);
   }
@@ -124,17 +130,30 @@ static void append_chunk(vws_ctx_t *ctx, const void *data, size_t len) {
 }
 
 static void signal_done(vws_ctx_t *ctx) {
-  if (ctx->complete) {
+  if (ctx == NULL || ctx->complete) {
     return;
   }
   ctx->complete = true;
   xSemaphoreGive(ctx->done);
 }
 
+static void try_finish_wav_reply(vws_ctx_t *ctx) {
+  if (ctx == NULL || ctx->complete || !ctx->wav_msg_open) {
+    return;
+  }
+  if (!nino_audio_wav_bytes_valid(ctx->buf, ctx->len)) {
+    return;
+  }
+  signal_done(ctx);
+}
+
 static void on_event(void *handler_args, esp_event_base_t base, int32_t event_id,
                      void *event_data) {
   (void)base;
   vws_ctx_t *ctx = (vws_ctx_t *)handler_args;
+  if (ctx == NULL) {
+    return;
+  }
   esp_websocket_event_data_t *ws = (esp_websocket_event_data_t *)event_data;
 
   switch (event_id) {
@@ -142,26 +161,33 @@ static void on_event(void *handler_args, esp_event_base_t base, int32_t event_id
     ESP_LOGI(TAG, "WS connected");
     break;
   case WEBSOCKET_EVENT_DATA:
-    /* esp_websocket passes one transport slice per event; data_ptr is that slice only.
-     * payload_offset is the offset in the full WS message — do NOT subtract it from data_len
-     * or continuation frames append 0 bytes and the WAV is truncated (~buffer_size). */
     if (ws->data_ptr == NULL || ws->data_len <= 0) {
       break;
     }
-    if (ws->op_code != 0x02 && ws->op_code != 0x00) {
-      if (ws->op_code == 0x01 && ws->data_ptr != NULL && ws->data_len > 0) {
-        parse_metadata_text(ctx, (const char *)ws->data_ptr, (size_t)ws->data_len);
-      }
+    if (ws->op_code == 0x01) {
+      parse_metadata_text(ctx, (const char *)ws->data_ptr, (size_t)ws->data_len);
       break;
+    }
+    if (ws->op_code != 0x02 && ws->op_code != 0x00) {
+      break;
+    }
+    if (ws->op_code == 0x02) {
+      ctx->wav_msg_open = true;
     }
     append_chunk(ctx, (const uint8_t *)ws->data_ptr, (size_t)ws->data_len);
     if (ws->fin) {
-      signal_done(ctx);
+      try_finish_wav_reply(ctx);
     }
     break;
   case WEBSOCKET_EVENT_DISCONNECTED:
     ESP_LOGI(TAG, "WS disconnected, collected %u bytes", (unsigned)ctx->len);
-    signal_done(ctx);
+    if (!ctx->complete) {
+      if (!nino_audio_wav_bytes_valid(ctx->buf, ctx->len)) {
+        ESP_LOGW(TAG, "WS closed before full WAV (%u bytes)", (unsigned)ctx->len);
+        ctx->error = true;
+      }
+      signal_done(ctx);
+    }
     break;
   case WEBSOCKET_EVENT_ERROR:
     ESP_LOGW(TAG, "WS error type=%d sock_errno=%d msg=%.*s", (int)ws->error_handle.error_type,
@@ -173,6 +199,23 @@ static void on_event(void *handler_args, esp_event_base_t base, int32_t event_id
   default:
     break;
   }
+}
+
+static void ws_client_shutdown(vws_ctx_t *ctx) {
+  if (ctx == NULL || ctx->client == NULL) {
+    return;
+  }
+  esp_websocket_unregister_events(ctx->client, WEBSOCKET_EVENT_ANY, on_event);
+  esp_websocket_client_stop(ctx->client);
+  esp_websocket_client_destroy(ctx->client);
+  ctx->client = NULL;
+}
+
+void nino_voice_ws_preconnect_cancel(void) {}
+
+esp_err_t nino_voice_ws_preconnect(const char *ws_uri) {
+  (void)ws_uri;
+  return ESP_OK;
 }
 
 esp_err_t nino_voice_ws_exchange(const char *ws_uri, const uint8_t *wav_in,
@@ -193,105 +236,101 @@ esp_err_t nino_voice_ws_exchange(const char *ws_uri, const uint8_t *wav_in,
     eye_expr_out[0] = '\0';
   }
 
-  vws_ctx_t ctx = {.done = xSemaphoreCreateBinary(),
-                   .client = NULL,
-                   .buf = NULL,
-                   .len = 0,
-                   .cap = 0,
-                   .complete = false,
-                   .error = false,
-                   .prompt_medical_ack = false,
-                   .eye_expr = {0}};
-  if (ctx.done == NULL) {
+  const int64_t t_exchange = esp_timer_get_time();
+
+  vws_ctx_t *ctx = (vws_ctx_t *)calloc(1, sizeof(vws_ctx_t));
+  if (ctx == NULL) {
+    return ESP_ERR_NO_MEM;
+  }
+  ctx->done = xSemaphoreCreateBinary();
+  if (ctx->done == NULL) {
+    free(ctx);
     return ESP_ERR_NO_MEM;
   }
 
-  esp_websocket_client_config_t ws_cfg = {
-      .uri = ws_uri,
-      .buffer_size = 65536,
-      .network_timeout_ms = 300000,
-      .task_stack = 12288,
-      .task_prio = 5,
-      .disable_pingpong_discon = true,
-      .ping_interval_sec = 30,
-  };
-
-  ctx.client = esp_websocket_client_init(&ws_cfg);
-  if (ctx.client == NULL) {
-    vSemaphoreDelete(ctx.done);
+  esp_websocket_client_config_t ws_cfg = make_ws_cfg(ws_uri);
+  ctx->client = esp_websocket_client_init(&ws_cfg);
+  if (ctx->client == NULL) {
+    vSemaphoreDelete(ctx->done);
+    free(ctx);
     return ESP_ERR_NO_MEM;
   }
 
-  esp_websocket_register_events(ctx.client, WEBSOCKET_EVENT_ANY, on_event, &ctx);
+  esp_websocket_register_events(ctx->client, WEBSOCKET_EVENT_ANY, on_event, ctx);
 
-  esp_err_t err = esp_websocket_client_start(ctx.client);
+  esp_err_t err = esp_websocket_client_start(ctx->client);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "ws start failed: %s", esp_err_to_name(err));
-    esp_websocket_client_destroy(ctx.client);
-    vSemaphoreDelete(ctx.done);
+    ws_client_shutdown(ctx);
+    vSemaphoreDelete(ctx->done);
+    free(ctx);
     return err;
   }
 
-  /* Wait until connected then send (poll start is async). */
+  const int64_t t_connect = esp_timer_get_time();
   for (int i = 0; i < 200; i++) {
-    if (esp_websocket_client_is_connected(ctx.client)) {
+    if (esp_websocket_client_is_connected(ctx->client)) {
       break;
     }
     vTaskDelay(pdMS_TO_TICKS(50));
   }
-  if (!esp_websocket_client_is_connected(ctx.client)) {
+  if (!esp_websocket_client_is_connected(ctx->client)) {
     ESP_LOGE(TAG, "WS connect timeout");
-    ctx.error = true;
+    ctx->error = true;
     goto cleanup;
   }
+  ESP_LOGI(TAG, "WS connect took %" PRId64 " ms", (esp_timer_get_time() - t_connect) / 1000LL);
 
-  int sent = esp_websocket_client_send_bin(ctx.client, (const char *)wav_in,
+  int sent = esp_websocket_client_send_bin(ctx->client, (const char *)wav_in,
                                            (int)wav_in_len, pdMS_TO_TICKS(30000));
   if (sent < 0 || (size_t)sent != wav_in_len) {
     ESP_LOGE(TAG, "send_bin failed: %d", sent);
-    ctx.error = true;
+    ctx->error = true;
     goto cleanup;
   }
   ESP_LOGI(TAG, "Sent %u bytes to voice WS", (unsigned)wav_in_len);
-  /* Voice has reached the server: listening ends, ponder until the reply. */
   nino_eye_thinking();
 
-  if (xSemaphoreTake(ctx.done, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+  const int64_t t_server = esp_timer_get_time();
+  if (xSemaphoreTake(ctx->done, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
     ESP_LOGE(TAG, "Response timeout");
-    ctx.error = true;
+    ctx->error = true;
+  } else {
+    ESP_LOGI(TAG, "Server reply took %" PRId64 " ms", (esp_timer_get_time() - t_server) / 1000LL);
   }
 
 cleanup:
-  esp_websocket_client_stop(ctx.client);
-  esp_websocket_client_destroy(ctx.client);
-  vSemaphoreDelete(ctx.done);
+  ws_client_shutdown(ctx);
+  vSemaphoreDelete(ctx->done);
 
-  if (ctx.error || ctx.len == 0 || ctx.buf == NULL) {
-    /* Failed/empty: nothing will play to revert the eyes, so clear any emotion
-     * (or stuck listening/thinking) back to idle now. */
+  if (ctx->error || ctx->len == 0 || ctx->buf == NULL ||
+      !nino_audio_wav_bytes_valid(ctx->buf, ctx->len)) {
     nino_eye_idle();
-    if (ctx.len > 0 && ctx.buf != NULL) {
-      ESP_LOGW(TAG, "WS done but error=%d len=%u (reply dropped)", (int)ctx.error, (unsigned)ctx.len);
+    if (ctx->len > 0 && ctx->buf != NULL) {
+      ESP_LOGE(TAG, "WS reply invalid WAV (%u bytes, magic=%.4s)", (unsigned)ctx->len,
+               ctx->buf);
     }
-    free(ctx.buf);
-    return ctx.error ? ESP_FAIL : ESP_ERR_NOT_FOUND;
+    const bool failed = ctx->error || ctx->len > 0;
+    free(ctx->buf);
+    free(ctx);
+    return failed ? ESP_FAIL : ESP_ERR_NOT_FOUND;
   }
 
-  /* Success: if the server sent an expression it is already showing and must
-   * persist until the reply finishes (the audio queue reverts to idle then).
-   * With no tag, drop the thinking face to idle for this reply. */
-  if (ctx.eye_expr[0] == '\0') {
+  if (ctx->eye_expr[0] == '\0') {
     nino_eye_idle();
   }
 
-  *wav_out = ctx.buf;
-  *wav_out_len = ctx.len;
+  *wav_out = ctx->buf;
+  *wav_out_len = ctx->len;
+  ESP_LOGI(TAG, "WS reply WAV ok (%u bytes)", (unsigned)ctx->len);
   if (prompt_medical_ack_out != NULL) {
-    *prompt_medical_ack_out = ctx.prompt_medical_ack;
+    *prompt_medical_ack_out = ctx->prompt_medical_ack;
   }
   if (eye_expr_out != NULL && eye_expr_cap > 0) {
-    strncpy(eye_expr_out, ctx.eye_expr, eye_expr_cap - 1);
+    strncpy(eye_expr_out, ctx->eye_expr, eye_expr_cap - 1);
     eye_expr_out[eye_expr_cap - 1] = '\0';
   }
+  ESP_LOGI(TAG, "WS exchange total %" PRId64 " ms", (esp_timer_get_time() - t_exchange) / 1000LL);
+  free(ctx);
   return ESP_OK;
 }

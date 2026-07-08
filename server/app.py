@@ -47,6 +47,10 @@ def _load_env_file() -> None:
         pass
 
 
+# Must run before EmotionService / other services read os.environ at import time.
+_load_env_file()
+
+
 class _GracefulShutdownFilter(logging.Filter):
     """Suppress expected Ctrl+C / CancelledError tracebacks during uvicorn shutdown."""
 
@@ -353,13 +357,30 @@ def register(req: RegisterRequest) -> dict:
             errors.append(str(exc))
         except cv2.error as exc:
             errors.append(f"Face detection error: {exc}")
+        except Exception as exc:
+            logger.exception("Register sample failed")
+            errors.append(f"Register error: {exc}")
 
         time.sleep(req.interval_ms / 1000)
 
     if saved == 0:
         raise HTTPException(status_code=422, detail=errors[-1] if errors else "No samples saved")
 
-    training = faces.train()
+    # Persist incremental embeddings from this capture session.
+    try:
+        faces.persist_embeddings()
+    except Exception:
+        logger.exception("Failed to persist face embeddings after register")
+
+    # Rebuild from on-disk photos (also drops orphan embeddings). Serialized
+    # with the live video thread so OpenCV models are not used concurrently.
+    training: dict = {"people": 0, "samples": saved, "rebuilt": False}
+    try:
+        training = {**faces.train(), "rebuilt": True}
+    except Exception as exc:
+        logger.exception("Post-register train failed; samples still saved")
+        errors.append(f"Train error: {exc}")
+
     return {
         "ok": True,
         "saved_samples": saved,

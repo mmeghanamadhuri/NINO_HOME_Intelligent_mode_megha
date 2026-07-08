@@ -3,19 +3,16 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "audio_playback.h"
-#include "bsp/esp32_p4_function_ev_board.h"
-#include "esp_codec_dev.h"
-#include "esp_codec_dev_types.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "usb_mic.h"
+#include "voice_wake.h"
 
 static const char *TAG = "nino_cap";
 
-/* Must match I2S "peer" rate after speaker playback (typical SAPI WAV is 22050 Hz). */
-#define CAP_SAMPLE_RATE 22050
+#define CAP_SAMPLE_RATE 16000
 #define CAP_BYTES_PER_SAMPLE 2
 #define CAP_MAX_MS 10000
 
@@ -43,42 +40,13 @@ esp_err_t nino_audio_capture_wav(uint8_t **out_wav, size_t *out_len,
   if (duration_ms == 0 || duration_ms > CAP_MAX_MS) {
     return ESP_ERR_INVALID_ARG;
   }
-
-  nino_audio_bus_lock();
+  if (!usb_mic_ready()) {
+    ESP_LOGW(TAG, "USB mic not ready");
+    return ESP_ERR_INVALID_STATE;
+  }
 
   esp_err_t err = ESP_FAIL;
-  esp_codec_dev_handle_t mic = NULL;
   uint8_t *pcm = NULL;
-
-  err = bsp_i2c_init();
-  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-    ESP_LOGE(TAG, "bsp_i2c_init: %s", esp_err_to_name(err));
-    goto out_unlock;
-  }
-
-  mic = bsp_audio_codec_microphone_init();
-  if (mic == NULL) {
-    ESP_LOGE(TAG, "bsp_audio_codec_microphone_init failed");
-    err = ESP_FAIL;
-    goto out_unlock;
-  }
-
-  esp_codec_dev_set_in_gain(mic, 35.0f);
-
-  esp_codec_dev_sample_info_t fs = {
-      .bits_per_sample = 16,
-      .channel = 1,
-      .channel_mask = 0,
-      .sample_rate = CAP_SAMPLE_RATE,
-      .mclk_multiple = 0,
-  };
-
-  int cr = esp_codec_dev_open(mic, &fs);
-  if (cr != ESP_CODEC_DEV_OK) {
-    ESP_LOGE(TAG, "esp_codec_dev_open(mic) failed: %d", cr);
-    err = ESP_FAIL;
-    goto out_unlock;
-  }
 
   const size_t pcm_bytes =
       (size_t)CAP_SAMPLE_RATE * (size_t)duration_ms / 1000U * CAP_BYTES_PER_SAMPLE;
@@ -87,33 +55,27 @@ esp_err_t nino_audio_capture_wav(uint8_t **out_wav, size_t *out_len,
     pcm = malloc(pcm_bytes);
   }
   if (pcm == NULL) {
-    esp_codec_dev_close(mic);
-    mic = NULL;
     err = ESP_ERR_NO_MEM;
-    goto out_unlock;
+    goto out;
   }
+
+  nino_voice_wake_set_mic_capture_hold(true);
+  usb_mic_flush();
 
   size_t got = 0;
   while (got < pcm_bytes) {
-    int chunk = (int)(pcm_bytes - got);
-    if (chunk > 4096) {
-      chunk = 4096;
-    }
-    cr = esp_codec_dev_read(mic, pcm + got, chunk);
-    if (cr != ESP_CODEC_DEV_OK) {
-      ESP_LOGE(TAG, "esp_codec_dev_read failed: %d", cr);
+    const size_t chunk_samples = (pcm_bytes - got) / CAP_BYTES_PER_SAMPLE;
+    const int to_read = (chunk_samples > 512) ? 512 : (int)chunk_samples;
+    esp_err_t rr = usb_mic_read((int16_t *)(pcm + got), to_read);
+    if (rr != ESP_OK) {
+      ESP_LOGE(TAG, "usb_mic_read failed: %s", esp_err_to_name(rr));
       free(pcm);
       pcm = NULL;
-      esp_codec_dev_close(mic);
-      mic = NULL;
       err = ESP_FAIL;
-      goto out_unlock;
+      goto out;
     }
-    got += (size_t)chunk;
+    got += (size_t)to_read * CAP_BYTES_PER_SAMPLE;
   }
-
-  esp_codec_dev_close(mic);
-  mic = NULL;
 
   const uint32_t data_size = (uint32_t)pcm_bytes;
   const uint32_t riff_size = 36 + data_size;
@@ -126,7 +88,7 @@ esp_err_t nino_audio_capture_wav(uint8_t **out_wav, size_t *out_len,
     free(pcm);
     pcm = NULL;
     err = ESP_ERR_NO_MEM;
-    goto out_unlock;
+    goto out;
   }
 
   memcpy(wav, "RIFF", 4);
@@ -148,11 +110,11 @@ esp_err_t nino_audio_capture_wav(uint8_t **out_wav, size_t *out_len,
 
   *out_wav = wav;
   *out_len = wav_size;
-  ESP_LOGI(TAG, "Captured WAV %u ms, %u bytes", (unsigned)duration_ms,
+  ESP_LOGI(TAG, "Captured WAV %u ms, %u bytes (USB mic)", (unsigned)duration_ms,
            (unsigned)wav_size);
   err = ESP_OK;
 
-out_unlock:
-  nino_audio_bus_unlock();
+out:
+  nino_voice_wake_set_mic_capture_hold(false);
   return err;
 }

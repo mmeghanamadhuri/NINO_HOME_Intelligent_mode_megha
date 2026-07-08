@@ -10,6 +10,12 @@
 extern "C" {
 #endif
 
+/** Start WS connect in background (call before beep/VAD to hide connect latency). */
+esp_err_t nino_voice_ws_preconnect(const char *ws_uri);
+
+/** Cancel any in-flight preconnect. */
+void nino_voice_ws_preconnect_cancel(void);
+
 /**
  * Send one WAV (binary) to PC NiNO server `ws://.../voice-query` or `.../ws/voice`,
  * wait for one JSON metadata text frame (optional) then one WAV reply.

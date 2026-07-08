@@ -20,6 +20,9 @@ typedef struct {
 esp_err_t nino_audio_decode_wav(const uint8_t *wav_bytes, size_t wav_len,
                                 nino_decoded_wav_t *out);
 
+/** True when @p wav_bytes is a complete PCM WAV the ESP speaker path can play. */
+bool nino_audio_wav_bytes_valid(const uint8_t *wav_bytes, size_t wav_len);
+
 void nino_decoded_wav_free(nino_decoded_wav_t *decoded);
 
 /**
@@ -34,7 +37,14 @@ esp_err_t nino_audio_play_decoded(const nino_decoded_wav_t *decoded, size_t *pcm
 esp_err_t nino_audio_play_pcm16_mono(const int16_t *samples, size_t sample_count,
                                      uint32_t sample_rate_hz);
 
-/** Serialize access to the shared ES8311 / I2S path (playback vs microphone). */
+/** Fast wake/done chime: reuse open 16 kHz codec when possible; leaves path warm. */
+esp_err_t nino_audio_play_chime_pcm16_mono(const int16_t *samples, size_t sample_count,
+                                           uint32_t sample_rate_hz);
+
+/** Open speaker at 16 kHz once at boot so the first wake beep has no codec setup delay. */
+esp_err_t nino_audio_warm_chime_path(uint32_t sample_rate_hz);
+
+/** Serialize access to the ES8311 speaker I2S path (playback). */
 void nino_audio_bus_lock(void);
 void nino_audio_bus_unlock(void);
 

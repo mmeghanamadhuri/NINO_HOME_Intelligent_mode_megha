@@ -24,6 +24,9 @@ esp_err_t nino_voice_assist_init_mutex(void);
 /** Embedded main/beep.wav — played on "Hi ESP" wake. */
 esp_err_t nino_voice_play_wake_chime(void);
 
+/** Decode beep + warm ES8311 at 16 kHz — call once after nino_audio_init(). */
+esp_err_t nino_voice_preload_wake_chime(void);
+
 /** Same embedded beep.wav — played after voice reply playback. */
 esp_err_t nino_voice_play_done_chime(void);
 

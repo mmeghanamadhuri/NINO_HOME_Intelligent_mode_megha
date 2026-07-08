@@ -25,6 +25,7 @@
 #include "lwip/sockets.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "sdkconfig.h"
 #include "usb/usb_host.h"
 #include "usb/uvc_host.h"
 
@@ -48,6 +49,7 @@
 #include "servo_dxl.h"
 #include "servo_motion.h"
 #include "touch_sensor.h"
+#include "usb_mic.h"
 #include "voice_assist.h"
 #include "voice_wake.h"
 #include "wifi_config.h"
@@ -2351,6 +2353,9 @@ static int cmd_voice(int argc, char **argv) {
   if (argc >= 2 && strcmp(argv[1], "status") == 0) {
     printf("voice wake hw: %s\n", nino_voice_wake_hw_ready() ? "ready" : "not loaded");
     printf("voice wake: %s\n", nino_voice_wake_is_enabled() ? "on" : "off");
+    printf("usb header mic: %s\n", usb_mic_ready() ? "streaming" : "not ready (check GPIO 24/25 wiring)");
+    usb_mic_print_status();
+    usb_mic_print_usb_devices();
     printf("voice url: \"%s\"\n", s_voice_ws_url[0] ? s_voice_ws_url : "(not set)");
     printf("Tip: voice connect must use your PC LAN IP (where python app.py runs), not 192.168.x.x of the board.\n");
     return 0;
@@ -2975,6 +2980,7 @@ static void uvc_driver_event_callback(const uvc_host_driver_event_data_t *event,
 
   s_selected_stream.dev_addr = event->device_connected.dev_addr;
   s_selected_stream.stream_index = event->device_connected.uvc_stream_index;
+  usb_mic_block_dev_addr(event->device_connected.dev_addr);
   if (!select_stream_format(s_frame_info_list, s_frame_info_count,
                             &s_selected_stream.format)) {
     ESP_LOGE(TAG, "No MJPEG format available for HTTP streaming");
@@ -3044,6 +3050,9 @@ void app_main(void) {
              "Speaker (BSP audio) init failed; POST /play_wav may not work");
   }
   (void)nino_audio_load_saved_volume();
+  if (nino_voice_preload_wake_chime() != ESP_OK) {
+    ESP_LOGW(TAG, "Wake chime preload failed — first beep may be slower");
+  }
   ESP_ERROR_CHECK(nino_audio_queue_start());
   if (s_sta_connected && s_wifi_connected_chime_pending) {
     if (play_wifi_connected_clip()) {
@@ -3064,11 +3073,29 @@ void app_main(void) {
   /* HTTP-only mode for now: keep status/websocket on port 80. */
 
   ESP_LOGI(TAG, "Installing USB host stack");
+#if CONFIG_USB4MIC_USB_PHY_ON_HEADER
+  esp_err_t phy_err = usb_mic_phy_init_for_header();
+  if (phy_err != ESP_OK) {
+    ESP_LOGE(TAG, "USB header mic PHY init failed: %s", esp_err_to_name(phy_err));
+  }
+#endif
   const usb_host_config_t usb_host_config = {
+#if CONFIG_USB4MIC_USB_PHY_ON_HEADER
+      /* HS (J18 camera + U2D2) + FS (GPIO 24/25 USB mic) — single host install (ESP-USB 1.3+). */
+      .peripheral_map = BIT0 | BIT1,
+      .skip_phy_setup = true,
+#else
+      .peripheral_map = 0,
       .skip_phy_setup = false,
+#endif
       .intr_flags = ESP_INTR_FLAG_LOWMED,
   };
-  ESP_ERROR_CHECK(usb_host_install(&usb_host_config));
+  esp_err_t usb_err = usb_host_install(&usb_host_config);
+  if (usb_err != ESP_OK) {
+    ESP_LOGE(TAG, "usb_host_install failed: %s (need ESP-USB 1.3+ for dual host on P4)",
+             esp_err_to_name(usb_err));
+    ESP_ERROR_CHECK(usb_err);
+  }
 
   /* Lib task must run before clients enumerate hub downstream devices (camera + U2D2). */
   BaseType_t ok = xTaskCreatePinnedToCore(
@@ -3076,6 +3103,13 @@ void app_main(void) {
       USB_LIB_TASK_PRIORITY, NULL, APP_CORE_USB);
   assert(ok == pdPASS);
   vTaskDelay(pdMS_TO_TICKS(300));
+
+  esp_err_t mic_err = usb_mic_start();
+  if (mic_err != ESP_OK) {
+    ESP_LOGE(TAG, "USB header mic UAC failed: %s", esp_err_to_name(mic_err));
+  } else {
+    ESP_LOGI(TAG, "USB 4-mic UAC started (GPIO D-=24 D+=25, 5V+GND)");
+  }
 
   if (nino_servo_dxl_start() != ESP_OK) {
     ESP_LOGW(TAG, "Dynamixel servo task not started (connect U2D2 on J18 USB hub)");
@@ -3111,6 +3145,7 @@ void app_main(void) {
                                 APP_CORE_NET);
 
   ESP_LOGI(TAG, "J18: powered USB hub -> UVC camera + FTDI U2D2 (Dynamixel)");
+  ESP_LOGI(TAG, "GPIO header: USB 4-mic for voice (separate from J18 hub)");
   ESP_LOGI(
       TAG,
       "Open / in a browser on your camera's IP address (check 'wifi status')");

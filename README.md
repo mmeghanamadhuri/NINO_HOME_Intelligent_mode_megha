@@ -33,7 +33,7 @@ ESP32-P4 (firmware)                         PC — FastAPI server
 ─────────────────────                       ────────────────────
 UVC camera ──► GET /stream ───────────────► CameraStream + YuNet/SFace face ID
                                              Keras CNN emotion on face crop
-Wake word + mic ──► WS /voice-query ───────► STT → LLM → TTS → WAV reply
+Wake word + USB mic ──► WS /voice-query ───────► STT → LLM → TTS → WAV reply
 Speaker ◄──── POST /play_wav ◄───────────── empathy, alarms, voice replies
 OLED eyes ◄── X-Nino-Eye-Expression ◄────── happy / sad / surprised tags
 Servo ◄──── POST /servo/360 ◄────────────── voice-triggered 360° spin
@@ -55,13 +55,17 @@ Voice always wins. Vision empathy is blocked during a voice query and for ~90 s 
 
 ### Voice query flow
 
-1. User says **"Hi ESP"** on the board → VAD captures speech → WebSocket to PC.
-2. Server transcribes audio (ElevenLabs Scribe or local Whisper).
-3. Camera resolves who is speaking from **live face recognition**.
-4. If memory is enabled, recent conversation history is loaded from PostgreSQL.
-5. Request is routed: volume / alarm / servo / identity / recap / general LLM.
-6. Reply is synthesized to 16 kHz WAV and streamed back over the WebSocket.
-7. Exchange is logged to PostgreSQL (when ready) and to `server/data/latency_log.json`.
+1. User says **"Hi ESP"** — detected on the **USB 4-mic** (GPIO header) via WakeNet.
+2. Board plays **beep.wav** on the ES8311 speaker (preloaded at boot), then **VAD** captures speech.
+3. Captured audio is sent over **WebSocket** to the PC.
+4. Server transcribes audio (ElevenLabs Scribe or local Whisper).
+5. Camera resolves who is speaking from **live face recognition**.
+6. If memory is enabled, recent conversation history is loaded from PostgreSQL.
+7. Request is routed: volume / alarm / servo / identity / recap / general LLM.
+8. Reply is synthesized to 16 kHz WAV and streamed back over the WebSocket.
+9. Exchange is logged to PostgreSQL (when ready) and to `server/data/latency_log.json`.
+
+**VAD:** recording ends after **450 ms** of trailing silence once speech has started (`VAD_TRAILING_SILENCE_MS` in `voice_assist.c`).
 
 ---
 
@@ -71,7 +75,7 @@ Voice always wins. Vision empathy is blocked during a voice query and for ~90 s 
 | ---- | -------------- |
 | **Vision** | YuNet detection + SFace 128-D embeddings; web UI registration |
 | **Emotion** | 48×48 Keras CNN on face crop; ~2 s stabilization; empathetic TTS + OLED eyes |
-| **Voice** | Wake word on ESP; ElevenLabs or Whisper STT; Ollama (Qwen) replies; cross-platform TTS |
+| **Voice** | USB 4-mic wake word on GPIO header; ElevenLabs or Whisper STT; Ollama (Qwen) replies; cross-platform TTS |
 | **Memory** | PostgreSQL per-user conversation log; recap questions from recent history |
 | **Alarms** | Voice-set reminders; medical (P0) with yes/no auto-listen; web UI ack/delete |
 | **Servo** | Dynamixel AX head motion during TTS; ID2 full 360° via voice, HTTP, or CLI |
@@ -86,13 +90,16 @@ Voice always wins. Vision empathy is blocked during a voice query and for ~90 s 
 | Component | Details |
 | --------- | ------- |
 | **Board** | ESP32-P4 Function EV Board (16 MB flash recommended) |
-| **Camera** | USB UVC webcam on J18 host port (640×480 stream) |
+| **Camera** | USB UVC webcam on **J18** host hub (320×240 MJPEG stream) |
+| **USB mic** | **Seeed ReSpeaker 4-mic** (2886:0018) on **GPIO header** — 5V, GND, **D− GPIO 24**, **D+ GPIO 25** |
 | **Servos** | ROBOTIS Dynamixel AX — ID **1** tilt, ID **2** pan — via **U2D2** on J18 hub |
-| **Touch** | QT2120 on I2C — **SDA GPIO 7**, **SCL GPIO 8**, address `0x1C` |
+| **Touch** | QT2120 on I2C — **SDA GPIO 7**, **SCL GPIO 8**, address `0x1C` (optional) |
 | **Eyes** | 2× Waveshare 1.27" SSD1351 OLED (128×96) — CLK 23, DIN 22, DC 21, RST 20, CS 26/27 |
-| **Audio** | ES8311 codec (mic + speaker) |
+| **Audio out** | ES8311 codec + speaker — **playback only** (beep, TTS, touch WAV) |
 | **Network** | ESP and PC on the same LAN |
 | **LLM host** | PC with Ollama (`qwen2.5:1.5b` default) |
+
+> **Dual USB host:** J18 (HS) = camera + U2D2; GPIO 24/25 (FS) = 4-mic. One `usb_host_install()` with `BIT0 | BIT1`. See [docs/USB-4MIC-INTEGRATION.md](docs/USB-4MIC-INTEGRATION.md).
 
 > U2D2 and the UVC camera share the J18 USB hub. Servo scan may log `ESP_ERR_INVALID_STATE` while the camera is enumerating — normal if U2D2 is unplugged.
 
@@ -185,9 +192,12 @@ Open the web UI at **[http://localhost:8000](http://localhost:8000)** — regist
 ```text
 voice connect <PC_IP> 8000
 voice wake on
+voice status
 ```
 
-Say **"Hi ESP"**, then ask a question. Eyes animate: **listening** → **thinking** → reply expression → **idle**.
+Say **"Hi ESP"** — you should hear a **beep**, then speak your question. Eyes animate: **listening** → **thinking** → reply expression → **idle**.
+
+Use your **PC’s LAN IP** (where `python app.py` runs), not the board’s IP. `voice status` shows USB mic streaming (`rx_chunks`, `peak` when you speak).
 
 ---
 
@@ -255,6 +265,18 @@ Look for `"memory": { "ready": true, ... }`.
 ---
 
 ## Voice assistant
+
+### On-device voice path (firmware)
+
+| Stage | Module | Notes |
+| ----- | ------ | ----- |
+| Capture | `usb_mic.c` | ReSpeaker UAC iface **2**, **channel 0** (beamformed), 16 kHz mono ring buffer |
+| Wake word | `voice_wake.cpp` | WakeNet **"Hi ESP"**; AFE runs wake-only (no AEC/NS/AGC) |
+| Chime | `voice_assist.c` + `audio_playback.c` | `beep.wav` preloaded + ES8311 warmed at boot |
+| VAD | `voice_assist.c` | Energy VAD; **450 ms** trailing silence to end clip |
+| Server | `voice_ws_client.c` | Binary WAV in/out over WebSocket |
+
+Full wiring, boot flow, and troubleshooting: **[docs/USB-4MIC-INTEGRATION.md](docs/USB-4MIC-INTEGRATION.md)**
 
 ### Speech-to-text (STT)
 
@@ -342,9 +364,12 @@ Serial test: `eye idle` / `eye listening` / `eye thinking`
 
 | File | Role |
 | ---- | ---- |
-| `main/main.c` | UVC, Wi-Fi, HTTP server, voice console |
-| `main/voice_assist.c` | VAD, medical ack listen |
+| `main/main.c` | UVC, dual USB host, Wi-Fi, HTTP server, voice console |
+| `main/usb_mic.c` | USB 4-mic UAC capture on GPIO 24/25 |
+| `main/voice_wake.cpp` | WakeNet feed/fetch, post-wake beep + query task |
+| `main/voice_assist.c` | VAD, beep cache, medical ack listen |
 | `main/voice_ws_client.c` | WebSocket to PC |
+| `main/audio_playback.c` | ES8311 speaker (playback only) |
 | `main/audio_queue.c` | Touch-priority dual queues |
 | `main/servo_dxl.c` | Dynamixel + 360 spin |
 | `main/nino_eye.c` | Eye animation engine |
@@ -477,7 +502,11 @@ See [server/README.md](server/README.md) and [docs/EMOTION_RECOGNITION.md](docs/
 
 ### Voice
 
-- ESP cannot reach PC → `voice connect <PC_LAN_IP> 8000` and confirm firewall
+- ESP cannot reach PC → `voice connect <PC_LAN_IP> 8000` (PC IP, not board IP) and confirm firewall
+- No wake / weak wake → `voice status`; ReSpeaker should show `addr=… iface=2`, `rx_chunks` increasing, `peak` when speaking
+- Slow beep after wake → flash latest firmware (beep must not block WakeNet `fetch()`); see USB-4MIC doc
+- `PCM ring full — dropped N bytes` → USB mic still streaming while wake/VAD paused briefly; occasional drops are OK
+- `AFE: Ringbuffer of AFE(FEED) is full` → usually fixed in current firmware (feed paused during beep/VAD)
 - Slow STT → set `ELEVENLABS_API_KEY` or use `--stt-provider whisper`
 - Slow LLM → start GPU Ollama: `bash server/scripts/start_ollama_gpu.sh`
 
@@ -503,7 +532,11 @@ See [server/README.md](server/README.md) and [docs/EMOTION_RECOGNITION.md](docs/
 | [docs/SERVO.md](docs/SERVO.md) | Dynamixel wiring, 360 sequence |
 | [docs/WIFI_PROVISION.md](docs/WIFI_PROVISION.md) | BLE / soft-AP Wi-Fi setup |
 | [docs/Eye states.md](docs/Eye%20states.md) | OLED eye states and triggers |
+| [docs/USB-4MIC-INTEGRATION.md](docs/USB-4MIC-INTEGRATION.md) | USB 4-mic wiring, wake/VAD flow, dual USB host, troubleshooting |
+| [docs/Integrate-4mic.md](docs/Integrate-4mic.md) | Portable `usb_mic` module guide for other ESP-IDF projects |
 | [docs/TEST_QUESTIONS.md](docs/TEST_QUESTIONS.md) | Suggested demo questions |
+
+Reference USB wake-word demo: [ESP-P4-UK-Demo / USB-4-mic-wake-word](https://github.com/Sirena-Technologies/ESP-P4-UK-Demo/tree/USB-4-mic-wake-word)
 
 ---
 
