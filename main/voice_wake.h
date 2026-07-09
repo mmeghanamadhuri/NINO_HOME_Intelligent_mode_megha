@@ -17,12 +17,15 @@ bool nino_voice_wake_hw_ready(void);
 
 /**
  * Kept for API compatibility after switching to USB header mic.
- * Wake feed pauses during after-wake via s_after_wake_busy instead of closing a codec mic.
+ * Wake feed pauses only while VAD holds the mic (mic_capture_hold).
  */
 void nino_voice_wake_drop_mic_locked(void);
 
 /** Pause wake_feed USB reads while VAD or other capture owns the mic ring. */
 void nino_voice_wake_set_mic_capture_hold(bool hold);
+
+/** Clear after-wake busy so WakeNet can re-trigger (call before slow WS I/O). */
+void nino_voice_wake_release_after_wake(void);
 
 #ifdef __cplusplus
 }

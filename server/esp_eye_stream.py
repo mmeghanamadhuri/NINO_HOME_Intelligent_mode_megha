@@ -11,6 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from esp_playback import esp_play_wav_url
 from eye_expression import normalize_eye_expression
 
 logger = logging.getLogger(__name__)
@@ -22,7 +23,7 @@ def _enabled() -> bool:
 
 
 def _expression_url() -> str | None:
-    play_wav_url = os.environ.get("ESP_PLAY_WAV_URL", "").strip()
+    play_wav_url = (esp_play_wav_url() or "").strip()
     if not play_wav_url:
         return None
     parsed = urllib.parse.urlparse(play_wav_url)
@@ -63,7 +64,7 @@ class EspEyeStream:
             headers={"Content-Type": "application/json"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=1.5) as resp:
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
                 if resp.status != 200:
                     raise RuntimeError(f"ESP eye expression HTTP {resp.status}")
                 _ = resp.read()

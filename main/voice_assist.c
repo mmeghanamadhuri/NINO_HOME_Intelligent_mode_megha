@@ -6,6 +6,7 @@
 
 #include "audio_capture.h"
 #include "audio_playback.h"
+#include "audio_queue.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -35,12 +36,17 @@ static const char *TAG = "voice_ast";
 #define VAD_MIN_START_ENERGY 1800
 #define VAD_MIN_CONTINUE_ENERGY 1200
 #define VAD_NOISE_FLOOR_DEFAULT 220
+/** USB mic ambient often sits above VAD_MIN_CONTINUE_ENERGY — end when energy
+ * drops below this fraction of the utterance peak (percent). */
+#define VAD_SILENCE_PEAK_RATIO_PCT 30
+#define VAD_MIN_SPEECH_MS 300
 
 #define VAD_FRAME_SAMPLES ((VOICE_MIC_RATE * VAD_FRAME_MS) / 1000)
 #define VAD_FRAME_BYTES (VAD_FRAME_SAMPLES * (int)sizeof(int16_t))
 #define VAD_LISTEN_FRAMES (VAD_LISTEN_TIMEOUT_MS / VAD_FRAME_MS)
 #define VAD_SILENCE_STOP_FRAMES (VAD_TRAILING_SILENCE_MS / VAD_FRAME_MS)
 #define VAD_PRE_ROLL_FRAMES (VAD_PRE_ROLL_MS / VAD_FRAME_MS)
+#define VAD_MIN_SPEECH_FRAMES (VAD_MIN_SPEECH_MS / VAD_FRAME_MS)
 
 #define VOICE_WS_URI_MAX 200
 #define VOICE_QUERY_VAD_MAX_SEC 10
@@ -120,6 +126,11 @@ static uint32_t vad_continue_threshold(uint32_t noise_floor) {
   return max_u32(VAD_MIN_CONTINUE_ENERGY, noise_floor * 2U);
 }
 
+static uint32_t vad_silence_end_threshold(uint32_t peak_energy, uint32_t noise_floor) {
+  const uint32_t from_peak = (peak_energy * (uint32_t)VAD_SILENCE_PEAK_RATIO_PCT) / 100U;
+  return max_u32(vad_start_threshold(noise_floor), from_peak);
+}
+
 static void vad_update_noise_floor(uint32_t *noise_floor, uint32_t energy, bool speech_active) {
   const uint32_t weight = speech_active ? 63U : 31U;
   *noise_floor = ((*noise_floor * weight) + energy) / (weight + 1U);
@@ -133,6 +144,7 @@ typedef struct {
   size_t preroll_count;
   size_t preroll_head;
   uint32_t noise_floor;
+  uint32_t peak_energy;
   uint32_t status_log_ms;
   uint32_t speaking_log_ms;
 } vad_cap_t;
@@ -251,6 +263,7 @@ esp_err_t nino_voice_preload_wake_chime(void) {
 }
 
 esp_err_t nino_voice_play_wake_chime(void) {
+  nino_audio_queue_preempt_for_wake();
   return play_embedded_beep();
 }
 
@@ -302,7 +315,10 @@ esp_err_t nino_voice_capture_vad_wav(int max_seconds, uint8_t **out_wav, size_t 
   nino_voice_wake_set_mic_capture_hold(true);
   usb_mic_flush();
 
-  ESP_LOGI(TAG, "VAD armed (USB mic, max %d s)", max_seconds);
+  /* Mic is live: show the listening face until this capture session ends. */
+  nino_eye_listening();
+
+  ESP_LOGI(TAG, "VAD armed (max %d s)", max_seconds);
 
   while (1) {
     esp_err_t rr = usb_mic_read(cap.frame, VAD_FRAME_SAMPLES);
@@ -343,6 +359,7 @@ esp_err_t nino_voice_capture_vad_wav(int max_seconds, uint8_t **out_wav, size_t 
         recording = true;
         silence_streak = 0;
         cap.speaking_log_ms = 0;
+        cap.peak_energy = energy;
         ESP_LOGI(TAG, "VAD speech start");
       } else if (listen_frames >= VAD_LISTEN_FRAMES) {
         ESP_LOGW(TAG, "VAD timeout (no speech)");
@@ -357,20 +374,36 @@ esp_err_t nino_voice_capture_vad_wav(int max_seconds, uint8_t **out_wav, size_t 
       break;
     }
 
-    if (speech_frame) {
+    if (energy > cap.peak_energy) {
+      cap.peak_energy = energy;
+    }
+
+    const uint32_t silence_end_th = vad_silence_end_threshold(cap.peak_energy, cap.noise_floor);
+    const bool still_speaking = energy >= silence_end_th;
+
+    if (still_speaking) {
       silence_streak = 0;
       cap.speaking_log_ms += VAD_FRAME_MS;
       if (cap.speaking_log_ms >= VAD_SPEAKING_LOG_PERIOD_MS) {
-        ESP_LOGI(TAG, "VAD speaking energy=%" PRIu32, energy);
+        ESP_LOGI(TAG, "VAD speaking energy=%" PRIu32 " peak=%" PRIu32 " end_th=%" PRIu32, energy,
+                 cap.peak_energy, silence_end_th);
         cap.speaking_log_ms = 0;
       }
     } else {
       silence_streak++;
       vad_update_noise_floor(&cap.noise_floor, energy, true);
+      cap.speaking_log_ms += VAD_FRAME_MS;
+      if (cap.speaking_log_ms >= VAD_SPEAKING_LOG_PERIOD_MS) {
+        ESP_LOGI(TAG, "VAD trailing energy=%" PRIu32 " peak=%" PRIu32 " end_th=%" PRIu32 " silence=%" PRIu32 "ms",
+                 energy, cap.peak_energy, silence_end_th, silence_streak * VAD_FRAME_MS);
+        cap.speaking_log_ms = 0;
+      }
     }
 
-    if (silence_streak >= VAD_SILENCE_STOP_FRAMES) {
-      ESP_LOGI(TAG, "VAD end on silence");
+    if (silence_streak >= VAD_SILENCE_STOP_FRAMES &&
+        (pcm_samples / VAD_FRAME_SAMPLES) >= VAD_MIN_SPEECH_FRAMES) {
+      ESP_LOGI(TAG, "VAD end on silence (peak=%" PRIu32 " end_th=%" PRIu32 ")", cap.peak_energy,
+               silence_end_th);
       break;
     }
 
@@ -392,6 +425,8 @@ esp_err_t nino_voice_capture_vad_wav(int max_seconds, uint8_t **out_wav, size_t 
   }
 
 cleanup:
+  /* Eyes stay in listening here: the captured audio still has to reach the
+   * server. nino_voice_ws_exchange() (or the caller on failure) ends it. */
   nino_voice_wake_set_mic_capture_hold(false);
   free(cap.wav);
   free(cap.preroll);
@@ -409,7 +444,79 @@ esp_err_t nino_voice_assist_init_mutex(void) {
   return ESP_OK;
 }
 
-static esp_err_t run_ws_and_queue(int max_seconds, bool *prompt_after_out) {
+#define VOICE_WS_JOB_STACK 20480
+
+typedef struct {
+  uint8_t *cap;
+  size_t cap_len;
+  char uri[VOICE_WS_URI_MAX];
+  bool medical_ack_session;
+} voice_ws_job_t;
+
+static void voice_ws_job_task(void *pv) {
+  voice_ws_job_t *job = (voice_ws_job_t *)pv;
+  if (job == NULL) {
+    vTaskDelete(NULL);
+    return;
+  }
+
+  uint8_t *resp = NULL;
+  size_t resp_len = 0;
+  bool prompt_after = false;
+  char eye_expr[16] = {0};
+  const int64_t t_ws = esp_timer_get_time();
+  esp_err_t e = nino_voice_ws_exchange(job->uri, job->cap, job->cap_len, &resp, &resp_len, 300000,
+                                       &prompt_after, eye_expr, sizeof(eye_expr));
+  ESP_LOGI(TAG, "latency: WS round-trip %" PRId64 " ms", (esp_timer_get_time() - t_ws) / 1000LL);
+  nino_audio_capture_free(job->cap);
+  const bool medical_ack = job->medical_ack_session;
+  free(job);
+
+  if (e != ESP_OK || resp == NULL || resp_len == 0) {
+    ESP_LOGE(TAG, "WS exchange failed: %s", esp_err_to_name(e));
+    free(resp);
+    nino_eye_idle();
+    vTaskDelete(NULL);
+    return;
+  }
+
+  nino_eye_state_t eye_state = nino_eye_state_from_name(eye_expr);
+  if (eye_state < NINO_EYE_STATE_COUNT) {
+    ESP_LOGI(TAG, "Reply eye_expression=%s -> state %d", eye_expr, (int)eye_state);
+  }
+  nino_main_queue_audio_wav(resp, resp_len, true, prompt_after, eye_state);
+  if (medical_ack && prompt_after) {
+    ESP_LOGI(TAG, "Medical follow-up listen scheduled after reply");
+  }
+  vTaskDelete(NULL);
+}
+
+static esp_err_t spawn_voice_ws_job(uint8_t *cap, size_t cap_len, const char *uri,
+                                    bool medical_ack_session) {
+  voice_ws_job_t *job = (voice_ws_job_t *)malloc(sizeof(voice_ws_job_t));
+  if (job == NULL) {
+    nino_audio_capture_free(cap);
+    return ESP_ERR_NO_MEM;
+  }
+  job->cap = cap;
+  job->cap_len = cap_len;
+  strncpy(job->uri, uri, sizeof(job->uri) - 1);
+  job->uri[sizeof(job->uri) - 1] = '\0';
+  job->medical_ack_session = medical_ack_session;
+
+  BaseType_t ok =
+      xTaskCreate(voice_ws_job_task, "voice_ws", VOICE_WS_JOB_STACK, job, 3, NULL);
+  if (ok != pdPASS) {
+    free(job);
+    nino_audio_capture_free(cap);
+    ESP_LOGE(TAG, "Could not start voice_ws task");
+    return ESP_ERR_NO_MEM;
+  }
+  ESP_LOGI(TAG, "Voice query running in background (wake already re-armed)");
+  return ESP_OK;
+}
+
+static esp_err_t run_ws_and_queue(int max_seconds, bool medical_ack_session) {
   char uri[VOICE_WS_URI_MAX];
   if (s_ws_uri_mutex == NULL) {
     return ESP_ERR_INVALID_STATE;
@@ -421,6 +528,7 @@ static esp_err_t run_ws_and_queue(int max_seconds, bool *prompt_after_out) {
 
   if (uri[0] == '\0') {
     ESP_LOGW(TAG, "WS URI not set");
+    nino_voice_wake_release_after_wake();
     return ESP_ERR_INVALID_STATE;
   }
 
@@ -433,41 +541,16 @@ static esp_err_t run_ws_and_queue(int max_seconds, bool *prompt_after_out) {
   if (e != ESP_OK) {
     ESP_LOGE(TAG, "VAD capture failed: %s", esp_err_to_name(e));
     nino_eye_idle();
+    nino_voice_wake_release_after_wake();
     return e;
   }
 
-  uint8_t *resp = NULL;
-  size_t resp_len = 0;
-  bool prompt_after = false;
-  char eye_expr[16] = {0};
-  const int64_t t_ws = esp_timer_get_time();
-  e = nino_voice_ws_exchange(uri, cap, cap_len, &resp, &resp_len, 300000, &prompt_after,
-                             eye_expr, sizeof(eye_expr));
-  ESP_LOGI(TAG, "latency: WS round-trip %" PRId64 " ms", (esp_timer_get_time() - t_ws) / 1000LL);
-  ESP_LOGI(TAG, "latency: query total %" PRId64 " ms", (esp_timer_get_time() - t_query) / 1000LL);
-  nino_audio_capture_free(cap);
-
-  if (e != ESP_OK || resp == NULL || resp_len == 0) {
-    ESP_LOGE(TAG, "WS exchange failed: %s", esp_err_to_name(e));
-    free(resp);
-    return (e != ESP_OK) ? e : ESP_ERR_NOT_FOUND;
-  }
-
-  /* Map the server's eye_expression tag to a state (NINO_EYE_STATE_COUNT when
-   * absent/unknown -> the reply plays on idle). */
-  nino_eye_state_t eye_state = nino_eye_state_from_name(eye_expr);
-  if (eye_state < NINO_EYE_STATE_COUNT) {
-    ESP_LOGI(TAG, "Reply eye_expression=%s -> state %d", eye_expr, (int)eye_state);
-  }
-  nino_main_queue_audio_wav(resp, resp_len, true, prompt_after, eye_state);
-  if (prompt_after_out != NULL) {
-    *prompt_after_out = prompt_after;
-  }
-  return ESP_OK;
+  nino_voice_wake_release_after_wake();
+  return spawn_voice_ws_job(cap, cap_len, uri, medical_ack_session);
 }
 
 esp_err_t nino_voice_assist_run_query_only(void) {
-  return run_ws_and_queue(VOICE_QUERY_VAD_MAX_SEC, NULL);
+  return run_ws_and_queue(VOICE_QUERY_VAD_MAX_SEC, false);
 }
 
 #define MED_ACK_TASK_STACK 20480
@@ -486,12 +569,9 @@ static void medical_ack_prompt_task(void *arg) {
   if (chime != ESP_OK) {
     ESP_LOGW(TAG, "Medical ack chime failed: %s", esp_err_to_name(chime));
   }
-  bool prompt_after = false;
-  esp_err_t e = run_ws_and_queue(MED_ACK_VAD_MAX_SEC, &prompt_after);
+  esp_err_t e = run_ws_and_queue(MED_ACK_VAD_MAX_SEC, true);
   if (e != ESP_OK) {
     ESP_LOGW(TAG, "Medical ack voice query failed: %s", esp_err_to_name(e));
-  } else if (prompt_after) {
-    ESP_LOGI(TAG, "Medical follow-up listen scheduled after reply");
   }
   vTaskDelete(NULL);
 }

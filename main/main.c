@@ -81,6 +81,7 @@ static char s_sta_pass[WIFI_CONFIG_STA_PASS_MAX] = "";
 static wifi_mode_t s_wifi_mode = WIFI_MODE_AP;
 static bool s_sta_connected = false;
 static bool s_wifi_connected_chime_pending = false;
+static bool s_boot_greeting_done = false;
 static bool s_mdns_started = false;
 
 #define USB_LIB_TASK_STACK_SIZE 4096
@@ -283,10 +284,25 @@ static bool wifi_disconnect_is_connect_failure(uint8_t reason) {
  *  - Provisioned and connected -> greet with Hello-home after the WIFI.wav clip.
  *    Falls back to greeting anyway if Wi-Fi never connects within the timeout,
  *    unless we already played the "unable to connect" prompt. */
+static void finish_boot_greeting_and_enable_wake(void) {
+  nino_audio_queue_wait_idle(45000);
+  if (nino_voice_preload_wake_chime() == ESP_OK) {
+    ESP_LOGI(TAG, "Wake chime path ready after boot greeting");
+  } else {
+    ESP_LOGW(TAG, "Wake chime warm after boot greeting failed");
+  }
+  s_boot_greeting_done = true;
+  if (nino_voice_wake_hw_ready()) {
+    nino_voice_wake_set_enabled(true);
+    ESP_LOGI(TAG, "Wake word on — say \"Hi ESP\"");
+  }
+}
+
 static void hello_home_task(void *arg) {
   (void)arg;
   if (s_sta_ssid[0] == '\0') {
     play_go_app_clip();
+    finish_boot_greeting_and_enable_wake();
     vTaskDelete(NULL);
     return;
   }
@@ -301,6 +317,7 @@ static void hello_home_task(void *arg) {
   if (s_sta_connected) {
     play_hello_home_clip();
   }
+  finish_boot_greeting_and_enable_wake();
   vTaskDelete(NULL);
 }
 
@@ -383,7 +400,11 @@ static void voice_wake_start_once(void) {
   s_voice_wake_started = true;
   nino_voice_wake_init();
   if (nino_voice_wake_hw_ready()) {
-    nino_voice_wake_set_enabled(true);
+    if (s_boot_greeting_done) {
+      nino_voice_wake_set_enabled(true);
+    } else {
+      ESP_LOGI(TAG, "Wake hardware ready — waiting for boot greeting to finish");
+    }
     if (s_voice_ws_url[0] == '\0') {
       ESP_LOGW(TAG,
                "Voice PC URL not set — serial: voice connect <YOUR_PC_LAN_IP> 8000 "
@@ -2561,6 +2582,8 @@ static void start_http_server(void) {
   config.server_port = HTTP_SERVER_PORT;
   config.stack_size = 8192;
   config.max_uri_handlers = 24;
+  config.max_open_sockets = 7; /* ESP-IDF max on this target (httpd reserves 3 internally) */
+  config.lru_purge_enable = true;
   config.recv_wait_timeout = 45;
   config.send_wait_timeout = 45;
   config.core_id = APP_CORE_NET;

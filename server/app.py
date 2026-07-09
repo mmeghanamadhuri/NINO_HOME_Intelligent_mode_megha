@@ -29,7 +29,13 @@ from eye_expression import normalize_eye_expression
 from face_service import FaceService
 from memory_service import configure_from_environ as configure_memory_from_environ
 from memory_service import get_memory_service, normalize_database_url
-from pipeline_priority import begin_voice_query, end_voice_query
+from esp_playback import ensure_esp_play_wav_url_configured, esp_play_wav_url
+from pipeline_priority import (
+    begin_voice_query,
+    end_voice_query,
+    vision_emotion_blocked,
+    voice_pipeline_active,
+)
 from tts_service import TTSService, synthesize_sapi_wav_bytes
 from vision_emotion_service import VisionEmotionService
 
@@ -181,6 +187,15 @@ def startup() -> None:
     configure_memory_from_environ()
     get_memory_service().startup()
     get_alarm_service().start()
+    ensure_esp_play_wav_url_configured()
+    play_url = esp_play_wav_url()
+    if play_url:
+        logger.info("ESP speaker/eyes playback URL: %s", play_url)
+    else:
+        logger.warning(
+            "ESP_PLAY_WAV_URL not set — camera empathy TTS and eye tags will not reach the board. "
+            "Set ESP_PLAY_WAV_URL or CAMERA_SOURCE=http://<ESP_IP>/stream"
+        )
     camera.start()
     import threading
 
@@ -479,12 +494,14 @@ def _mjpeg_generator():
                 overlay = None
                 logger.exception("Vision emotion frame failed; continuing MJPEG")
 
-            if overlay and overlay.get("emotion"):
-                label = str(overlay.get("emotion", "")).strip().lower()
-                eye_stream.publish(EMOTION_TO_EYE.get(label))
-            else:
-                # No usable face/emotion context -> keep eyes neutral.
-                eye_stream.publish("idle")
+            # Live eye mirror (P1): skip while voice is active so listening/thinking
+            # are not overridden. Requires VISION_EYE_STREAM_ENABLED=1 on the server.
+            if not vision_emotion_blocked() and not voice_pipeline_active():
+                if overlay and overlay.get("emotion"):
+                    label = str(overlay.get("emotion", "")).strip().lower()
+                    eye_stream.publish(EMOTION_TO_EYE.get(label))
+                else:
+                    eye_stream.publish("idle")
 
             ok, encoded = cv2.imencode(
                 ".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 70]
@@ -1038,6 +1055,7 @@ def main() -> None:
 
     if args.esp_play_wav_url.strip():
         os.environ["ESP_PLAY_WAV_URL"] = args.esp_play_wav_url.strip()
+    ensure_esp_play_wav_url_configured(camera_source=camera_source)
 
     if args.alarm_wav.strip():
         os.environ["ALARM_WAV_PATH"] = args.alarm_wav.strip()

@@ -42,3 +42,9 @@ esp_err_t nino_audio_queue_wav_copy(const uint8_t *wav, size_t len, bool play_do
  *  pass NINO_EYE_STATE_COUNT for no expression. */
 void nino_main_queue_audio_wav(uint8_t *pcm_wav, size_t len, bool play_done_chime,
                                bool prompt_ack_after, nino_eye_state_t eye_state);
+
+/** Block until the normal playback queue is idle (boot clips finished). */
+void nino_audio_queue_wait_idle(uint32_t timeout_ms);
+
+/** Stop any interruptible normal clip so the wake beep can take the speaker. */
+void nino_audio_queue_preempt_for_wake(void);

@@ -269,10 +269,14 @@ esp_err_t nino_audio_warm_chime_path(uint32_t sample_rate_hz) {
   }
   xSemaphoreTake(s_mutex, portMAX_DELAY);
   esp_err_t e = spk_stream_open_locked(sample_rate_hz, true);
-  xSemaphoreGive(s_mutex);
   if (e == ESP_OK) {
+    /* Prime I2S DMA so the first wake beep does not pay open latency on cold start. */
+    int16_t silence[320] = {0};
+    (void)esp_codec_dev_write(s_spk, silence, sizeof(silence));
+    vTaskDelay(pdMS_TO_TICKS(25));
     ESP_LOGI(TAG, "Chime path warm @ %u Hz", (unsigned)sample_rate_hz);
   }
+  xSemaphoreGive(s_mutex);
   return e;
 }
 

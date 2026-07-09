@@ -32,7 +32,8 @@
 
 /*
  * The Waveshare remap (0x74) uses a swapped colour sub-order (BGR).
- * If red/blue look swapped on your panel, set this to 1 and rebuild.
+ * Keeping this at 1 makes ssd1351_color(255,0,0) appear red on screen.
+ * If red/blue look swapped on your panel, set this to 0 and rebuild.
  */
 #ifndef SSD1351_SWAP_RB
 #define SSD1351_SWAP_RB 0

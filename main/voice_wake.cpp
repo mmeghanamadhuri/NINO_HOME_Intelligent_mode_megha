@@ -87,15 +87,19 @@ static int64_t s_last_wake_us = 0;
 
 static void after_wake_task(void *arg) {
   (void)arg;
-  (void)nino_voice_play_wake_chime();
+  esp_err_t beep_e = nino_voice_play_wake_chime();
+  if (beep_e != ESP_OK) {
+    ESP_LOGW(TAG, "wake chime failed: %s", esp_err_to_name(beep_e));
+  }
   ESP_LOGI(TAG, "Hi ESP → VAD → server");
   nino_eye_listening();
   usb_mic_flush();
   esp_err_t e = nino_voice_assist_run_query_only();
   if (e != ESP_OK) {
     ESP_LOGW(TAG, "voice query failed: %s", esp_err_to_name(e));
+    nino_eye_idle();
+    nino_voice_wake_release_after_wake();
   }
-  s_after_wake_busy = false;
   vTaskDelete(NULL);
 }
 
@@ -128,24 +132,25 @@ static void wake_feed_task(void *arg) {
 
   while (true) {
     const bool armed = s_wake_enabled;
-    const bool busy = s_after_wake_busy || s_mic_capture_hold;
+    /* Only pause feed while VAD owns the mic. Keep feeding during beep/WS so
+     * WakeNet stays armed if the PC voice server is slow or unreachable. */
+    const bool mic_exclusive = s_mic_capture_hold;
 
-    if (!armed && !busy) {
+    if (!armed && !mic_exclusive) {
       vTaskDelay(pdMS_TO_TICKS(WAKE_IDLE_DELAY_MS));
       continue;
     }
 
-    if (armed && !busy) {
-      if (usb_mic_read(buff, feed_chunksize) != ESP_OK) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-        continue;
-      }
-      s_afe->feed(afe_data, buff);
+    if (mic_exclusive) {
       vTaskDelay(pdMS_TO_TICKS(ms_chunk > 0 ? ms_chunk : 1));
       continue;
     }
 
-    /* Beep/VAD/query: pause AFE feed — fetch must drain without new samples. */
+    if (usb_mic_read(buff, feed_chunksize) != ESP_OK) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+    s_afe->feed(afe_data, buff);
     vTaskDelay(pdMS_TO_TICKS(ms_chunk > 0 ? ms_chunk : 1));
   }
 }
@@ -238,6 +243,15 @@ extern "C" void nino_voice_wake_drop_mic_locked(void) {
 
 extern "C" void nino_voice_wake_set_mic_capture_hold(bool hold) {
   s_mic_capture_hold = hold;
+}
+
+extern "C" void nino_voice_wake_release_after_wake(void) {
+  if (!s_after_wake_busy) {
+    return;
+  }
+  usb_mic_flush();
+  s_after_wake_busy = false;
+  ESP_LOGI(TAG, "wake armed — say \"Hi ESP\"");
 }
 
 extern "C" void nino_voice_wake_set_enabled(bool on) {

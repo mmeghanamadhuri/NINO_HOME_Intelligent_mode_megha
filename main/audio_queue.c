@@ -21,6 +21,11 @@ static const char *TAG = "audio_q";
 #define TOUCH_QUEUE_LEN 8
 #define AUDIO_PLAY_TASK_STACK_SIZE 6144
 #define AUDIO_PLAY_TASK_PRIORITY 6
+#define WAKE_CHIME_RATE_HZ 16000
+
+static void rewarm_wake_chime_path(void) {
+  (void)nino_audio_warm_chime_path(WAKE_CHIME_RATE_HZ);
+}
 
 typedef struct {
   uint8_t *data;
@@ -41,6 +46,7 @@ typedef struct {
 static QueueHandle_t s_normal_queue;
 static QueueHandle_t s_touch_queue;
 static volatile bool s_stop_requested;
+static volatile bool s_normal_playing;
 static suspended_playback_t s_suspended;
 static bool s_has_suspended;
 
@@ -104,10 +110,13 @@ static bool play_touch_job(audio_play_job_t *job) {
   free(job->data);
   job->data = NULL;
 
+  s_normal_playing = true;
   size_t offset = 0;
   const nino_audio_servo_mode_t servo_mode = effective_servo_mode(job->servo_mode);
   (void)play_decoded_job(&decoded, &offset, servo_mode, false);
+  s_normal_playing = false;
   nino_decoded_wav_free(&decoded);
+  rewarm_wake_chime_path();
   return true;
 }
 
@@ -132,6 +141,7 @@ static bool play_normal_job(audio_play_job_t *job) {
     nino_eye_set_state(job->eye_state);
   }
 
+  s_normal_playing = true;
   size_t offset = 0;
   const nino_audio_servo_mode_t servo_mode = effective_servo_mode(job->servo_mode);
   const bool completed = play_decoded_job(&decoded, &offset, servo_mode, true);
@@ -143,6 +153,7 @@ static bool play_normal_job(audio_play_job_t *job) {
     s_suspended.servo_mode = job->servo_mode;
     s_has_suspended = true;
     s_stop_requested = false;
+    s_normal_playing = false;
     ESP_LOGI(TAG, "Server WAV paused at %u/%u bytes for touch",
              (unsigned)offset, (unsigned)decoded.num_bytes);
     return false;
@@ -160,6 +171,8 @@ static bool play_normal_job(audio_play_job_t *job) {
     nino_voice_assist_prompt_medical_ack();
   }
   nino_decoded_wav_free(&decoded);
+  s_normal_playing = false;
+  rewarm_wake_chime_path();
   return true;
 }
 
@@ -172,6 +185,7 @@ static bool play_suspended(void) {
   s_has_suspended = false;
   memset(&s_suspended, 0, sizeof(s_suspended));
 
+  s_normal_playing = true;
   const nino_audio_servo_mode_t servo_mode = effective_servo_mode(snap.servo_mode);
   const bool completed =
       play_decoded_job(&snap.decoded, &snap.pcm_offset, servo_mode, true);
@@ -180,6 +194,7 @@ static bool play_suspended(void) {
     s_suspended = snap;
     s_has_suspended = true;
     s_stop_requested = false;
+    s_normal_playing = false;
     ESP_LOGI(TAG, "Server WAV paused again at %u/%u bytes for touch",
              (unsigned)snap.pcm_offset, (unsigned)snap.decoded.num_bytes);
     return false;
@@ -189,6 +204,8 @@ static bool play_suspended(void) {
     (void)nino_voice_play_done_chime();
   }
   nino_decoded_wav_free(&snap.decoded);
+  s_normal_playing = false;
+  rewarm_wake_chime_path();
   return true;
 }
 
@@ -334,5 +351,37 @@ void nino_main_queue_audio_wav(uint8_t *pcm_wav, size_t len, bool play_done_chim
                                        NINO_AUDIO_SERVO_FULL, prompt_ack_after, eye_state);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "voice: queue WAV failed: %s", esp_err_to_name(err));
+  }
+}
+
+static bool audio_queue_is_idle(void) {
+  if (s_normal_queue == NULL) {
+    return true;
+  }
+  if (s_normal_playing || s_has_suspended) {
+    return false;
+  }
+  return uxQueueMessagesWaiting(s_normal_queue) == 0;
+}
+
+void nino_audio_queue_wait_idle(uint32_t timeout_ms) {
+  const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+  while (xTaskGetTickCount() < deadline) {
+    if (audio_queue_is_idle()) {
+      return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+  ESP_LOGW(TAG, "Audio queue wait_idle timed out after %u ms", (unsigned)timeout_ms);
+}
+
+void nino_audio_queue_preempt_for_wake(void) {
+  if (s_normal_queue == NULL) {
+    return;
+  }
+  s_stop_requested = true;
+  const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(600);
+  while (s_normal_playing && xTaskGetTickCount() < deadline) {
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }

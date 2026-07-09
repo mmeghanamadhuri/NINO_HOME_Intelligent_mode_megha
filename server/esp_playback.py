@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 
 logger = logging.getLogger(__name__)
@@ -13,9 +14,37 @@ logger = logging.getLogger(__name__)
 ESP_MAX_PLAY_WAV_BYTES = int(os.environ.get("ESP_MAX_PLAY_WAV_BYTES", str(380 * 1024)))
 
 
+def derive_esp_base_url(camera_source: str) -> str | None:
+    """Extract http://host from CAMERA_SOURCE (e.g. http://192.168.0.89/stream)."""
+    raw = (camera_source or "").strip()
+    if not raw.lower().startswith(("http://", "https://")):
+        return None
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return None
+
+
+def ensure_esp_play_wav_url_configured(*, camera_source: str | None = None) -> str | None:
+    """Set ESP_PLAY_WAV_URL from CAMERA_SOURCE when unset."""
+    existing = os.environ.get("ESP_PLAY_WAV_URL", "").strip()
+    if existing:
+        return existing
+    cam = camera_source if camera_source is not None else os.environ.get("CAMERA_SOURCE", "")
+    base = derive_esp_base_url(cam)
+    if not base:
+        return None
+    url = f"{base}/play_wav"
+    os.environ["ESP_PLAY_WAV_URL"] = url
+    logger.info("ESP_PLAY_WAV_URL derived from camera source: %s", url)
+    return url
+
+
 def esp_play_wav_url() -> str | None:
     url = os.environ.get("ESP_PLAY_WAV_URL", "").strip()
-    return url if url else None
+    if url:
+        return url
+    return ensure_esp_play_wav_url_configured()
 
 
 def post_wav_to_esp(
@@ -28,7 +57,9 @@ def post_wav_to_esp(
     """Queue raw WAV bytes on the board speaker via POST /play_wav."""
     url = esp_play_wav_url()
     if not url:
-        raise RuntimeError("ESP_PLAY_WAV_URL is not set")
+        raise RuntimeError(
+            "ESP_PLAY_WAV_URL is not set (set it or use CAMERA_SOURCE=http://<ESP_IP>/stream)"
+        )
     if not wav:
         raise RuntimeError("WAV payload is empty")
     if len(wav) > ESP_MAX_PLAY_WAV_BYTES:

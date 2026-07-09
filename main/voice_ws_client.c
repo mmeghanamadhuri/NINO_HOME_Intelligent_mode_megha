@@ -36,6 +36,7 @@ static esp_websocket_client_config_t make_ws_cfg(const char *uri) {
       .uri = uri,
       .buffer_size = 65536,
       .network_timeout_ms = 300000,
+      .reconnect_timeout_ms = 10000,
       .task_stack = 12288,
       .task_prio = 5,
       .disable_pingpong_discon = true,
@@ -201,14 +202,20 @@ static void on_event(void *handler_args, esp_event_base_t base, int32_t event_id
   }
 }
 
-static void ws_client_shutdown(vws_ctx_t *ctx) {
+static void ws_client_shutdown(vws_ctx_t *ctx, bool force_destroy) {
   if (ctx == NULL || ctx->client == NULL) {
     return;
   }
-  esp_websocket_unregister_events(ctx->client, WEBSOCKET_EVENT_ANY, on_event);
-  esp_websocket_client_stop(ctx->client);
-  esp_websocket_client_destroy(ctx->client);
+  esp_websocket_client_handle_t client = ctx->client;
   ctx->client = NULL;
+  esp_websocket_unregister_events(client, WEBSOCKET_EVENT_ANY, on_event);
+  if (force_destroy) {
+    /* Connect/response errors: avoid blocking wake recovery on a hung stop(). */
+    esp_websocket_client_destroy(client);
+    return;
+  }
+  esp_websocket_client_stop(client);
+  esp_websocket_client_destroy(client);
 }
 
 void nino_voice_ws_preconnect_cancel(void) {}
@@ -261,7 +268,7 @@ esp_err_t nino_voice_ws_exchange(const char *ws_uri, const uint8_t *wav_in,
   esp_err_t err = esp_websocket_client_start(ctx->client);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "ws start failed: %s", esp_err_to_name(err));
-    ws_client_shutdown(ctx);
+    ws_client_shutdown(ctx, true);
     vSemaphoreDelete(ctx->done);
     free(ctx);
     return err;
@@ -300,7 +307,8 @@ esp_err_t nino_voice_ws_exchange(const char *ws_uri, const uint8_t *wav_in,
   }
 
 cleanup:
-  ws_client_shutdown(ctx);
+  ESP_LOGI(TAG, "WS cleanup (error=%d)", ctx->error ? 1 : 0);
+  ws_client_shutdown(ctx, ctx->error);
   vSemaphoreDelete(ctx->done);
 
   if (ctx->error || ctx->len == 0 || ctx->buf == NULL ||
