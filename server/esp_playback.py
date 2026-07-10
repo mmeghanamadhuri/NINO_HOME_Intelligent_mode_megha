@@ -8,6 +8,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from network_util import voice_ws_url_for_esp
+
 logger = logging.getLogger(__name__)
 
 # ESP32 main.c MAX_PLAY_WAV_BYTES — keep a little under for safety
@@ -52,6 +54,7 @@ def post_wav_to_esp(
     *,
     timeout: float = 60.0,
     prompt_ack: bool = False,
+    prompt_ack_chime: bool = True,
     eye_expression: str | None = None,
 ) -> None:
     """Queue raw WAV bytes on the board speaker via POST /play_wav."""
@@ -70,6 +73,15 @@ def post_wav_to_esp(
     headers = {"Content-Type": "audio/wav"}
     if prompt_ack:
         headers["X-Nino-Prompt-Ack"] = "1"
+        headers["X-Nino-Prompt-Ack-Chime"] = "1" if prompt_ack_chime else "0"
+        ws_url = voice_ws_url_for_esp()
+        if ws_url:
+            headers["X-Nino-Voice-Ws-Url"] = ws_url
+        else:
+            logger.warning(
+                "prompt_ack without VOICE_WS_URL / NINO_SERVER_LAN_HOST — "
+                "ESP may not reach PC voice WebSocket"
+            )
     if eye_expression:
         headers["X-Nino-Eye-Expression"] = eye_expression.strip().lower()
     req = urllib.request.Request(

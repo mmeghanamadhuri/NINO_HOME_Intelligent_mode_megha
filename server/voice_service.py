@@ -110,6 +110,7 @@ class VoiceReplyMeta:
     trigger_servo_360: bool = False
     prompt_medical_ack: bool = False
     eye_expression: str | None = None
+    registered_face_name: str | None = None
     # Per-stage latency info for this query (stt/reply/tts seconds, heard text,
     # reply path, audio sizes). Filled by process_voice_wav; logged by app.py.
     timings: dict[str, Any] = field(default_factory=dict)
@@ -647,6 +648,7 @@ def process_voice_wav(
     from alarm_voice import handle_alarm_voice
 
     from memory_service import get_memory_service, resolve_alarm_user
+    from face_registration_service import get_face_registration_service
 
     memory_svc = get_memory_service()
     memory_name = _live_memory_viewer_name(
@@ -662,22 +664,37 @@ def process_voice_wav(
     )
     t_memory = time.perf_counter()
 
-    alarm_result = handle_alarm_voice(
-        user_text,
-        user_id=alarm_user_id,
-        person_name=alarm_person_name,
-        camera_identity_name=camera_identity_name,
-        camera_identity_state=camera_identity_state,
-    )
-    if alarm_result.handled:
-        reply_path = "alarm"
-        logger.info("Voice alarm command | heard: %s", user_text[:120])
-        reply = alarm_result.reply
-        from alarm_service import get_alarm_service
+    face_reg = get_face_registration_service()
+    if face_reg is not None and face_reg.is_awaiting_name():
+        reg_result = face_reg.handle_voice(user_text)
+        if reg_result.handled:
+            reply_path = "face_registration"
+            reply = reg_result.reply
+            if reg_result.registered_name:
+                meta.registered_face_name = reg_result.registered_name
+            logger.info(
+                "Voice face registration | registered=%s heard: %s",
+                reg_result.registered_name or "(none)",
+                user_text[:120],
+            )
 
-        if get_alarm_service().get_reschedule_prompt_alarm() is not None:
-            meta.prompt_medical_ack = True
-    elif is_servo_360_command(user_text):
+    if reply_path == "llm":
+        alarm_result = handle_alarm_voice(
+            user_text,
+            user_id=alarm_user_id,
+            person_name=alarm_person_name,
+            camera_identity_name=camera_identity_name,
+            camera_identity_state=camera_identity_state,
+        )
+        if alarm_result.handled:
+            reply_path = "alarm"
+            logger.info("Voice alarm command | heard: %s", user_text[:120])
+            reply = alarm_result.reply
+            from alarm_service import get_alarm_service
+
+            if get_alarm_service().get_reschedule_prompt_alarm() is not None:
+                meta.prompt_medical_ack = True
+    if reply_path == "llm" and is_servo_360_command(user_text):
         reply_path = "servo_360"
         logger.info("Voice servo 360 command | heard: %s", user_text[:120])
         if esp_servo_360_url() is None:

@@ -731,6 +731,7 @@ class TTSService:
             try:
                 text = ""
                 startup_parts = None
+                greeting_error: Exception | None = None
                 try:
                     from llm_service import greeting_for_face
                     from memory_service import get_memory_service
@@ -788,6 +789,7 @@ class TTSService:
                         if text:
                             text = _clamp_spoken_words(text)
                 except Exception as exc:
+                    greeting_error = exc
                     self._last_error = f"LLM greeting: {exc}"
                     text = ""
                     if not job.is_startup_greeting:
@@ -814,11 +816,21 @@ class TTSService:
 
                 if not text:
                     if job.is_startup_greeting:
-                        logger.warning(
-                            "Startup summary greeting empty for %s — will retry",
-                            job.llm_name,
-                        )
-                    time.sleep(0.02)
+                        text = f"Hello {job.llm_name}."
+                        if greeting_error is not None:
+                            logger.info(
+                                "Startup summary greeting fallback for %s (LLM error: %s)",
+                                job.llm_name,
+                                greeting_error,
+                            )
+                        else:
+                            logger.info(
+                                "Startup summary greeting fallback for %s (empty LLM)",
+                                job.llm_name,
+                            )
+                    else:
+                        time.sleep(0.02)
+                        continue
                 else:
                     try:
                         with self._lock:

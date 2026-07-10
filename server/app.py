@@ -26,6 +26,7 @@ from camera import CameraStream
 from emotion_service import EMOTION_TO_EYE, EmotionService
 from esp_eye_stream import EspEyeStream
 from eye_expression import normalize_eye_expression
+from face_registration_service import capture_face_samples, configure_face_registration
 from face_service import FaceService
 from memory_service import configure_from_environ as configure_memory_from_environ
 from memory_service import get_memory_service, normalize_database_url
@@ -143,6 +144,7 @@ app.mount("/static", NoCacheStaticFiles(directory=str(BASE_DIR / "static")), nam
 
 camera = CameraStream(DEFAULT_CAMERA_SOURCE)
 faces = FaceService(BASE_DIR / "data")
+face_registration = configure_face_registration(faces, camera.read)
 emotion = EmotionService(BASE_DIR / "data")
 _tts_face_interval = float(os.environ.get("FACE_GREETING_INTERVAL_SECONDS", "600"))
 tts = TTSService(cooldown_seconds=0.0, face_greeting_interval_seconds=_tts_face_interval)
@@ -184,6 +186,7 @@ class AlarmAckRequest(BaseModel):
 def startup() -> None:
     _load_env_file()
     faces.apply_settings_from_environ()
+    face_registration.apply_settings_from_environ()
     configure_memory_from_environ()
     get_memory_service().startup()
     get_alarm_service().start()
@@ -195,6 +198,16 @@ def startup() -> None:
         logger.warning(
             "ESP_PLAY_WAV_URL not set — camera empathy TTS and eye tags will not reach the board. "
             "Set ESP_PLAY_WAV_URL or CAMERA_SOURCE=http://<ESP_IP>/stream"
+        )
+    from network_util import voice_ws_url_for_esp
+
+    ws_url = voice_ws_url_for_esp()
+    if ws_url:
+        logger.info("ESP voice WebSocket URL (sent on prompt_ack): %s", ws_url)
+    else:
+        logger.warning(
+            "Could not derive VOICE_WS_URL — set VOICE_WS_URL or NINO_SERVER_LAN_HOST "
+            "so face-registration listen can reach this PC"
         )
     camera.start()
     import threading
@@ -299,6 +312,7 @@ def status() -> dict:
         ),
         "alarms": get_alarm_service().status(),
         "memory": get_memory_service().status(),
+        "face_registration": face_registration.status(),
         "latest_results": latest_results,
     }
 
@@ -355,52 +369,23 @@ def ack_alarm(alarm_id: str, req: AlarmAckRequest) -> dict:
 
 @app.post("/api/register")
 def register(req: RegisterRequest) -> dict:
-    saved = 0
-    errors: list[str] = []
-
-    for _ in range(req.samples):
-        frame = camera.read()
-        if frame is None:
-            errors.append("No camera frame available")
-            time.sleep(req.interval_ms / 1000)
-            continue
-
-        try:
-            faces.register_sample(req.name, frame)
-            saved += 1
-        except ValueError as exc:
-            errors.append(str(exc))
-        except cv2.error as exc:
-            errors.append(f"Face detection error: {exc}")
-        except Exception as exc:
-            logger.exception("Register sample failed")
-            errors.append(f"Register error: {exc}")
-
-        time.sleep(req.interval_ms / 1000)
-
-    if saved == 0:
-        raise HTTPException(status_code=422, detail=errors[-1] if errors else "No samples saved")
-
-    # Persist incremental embeddings from this capture session.
-    try:
-        faces.persist_embeddings()
-    except Exception:
-        logger.exception("Failed to persist face embeddings after register")
-
-    # Rebuild from on-disk photos (also drops orphan embeddings). Serialized
-    # with the live video thread so OpenCV models are not used concurrently.
-    training: dict = {"people": 0, "samples": saved, "rebuilt": False}
-    try:
-        training = {**faces.train(), "rebuilt": True}
-    except Exception as exc:
-        logger.exception("Post-register train failed; samples still saved")
-        errors.append(f"Train error: {exc}")
-
+    capture = capture_face_samples(
+        faces,
+        camera.read,
+        req.name,
+        samples=req.samples,
+        interval_ms=req.interval_ms,
+    )
+    if capture.saved_samples == 0:
+        raise HTTPException(
+            status_code=422,
+            detail=capture.errors[-1] if capture.errors else "No samples saved",
+        )
     return {
         "ok": True,
-        "saved_samples": saved,
-        "training": training,
-        "last_error": errors[-1] if errors else "",
+        "saved_samples": capture.saved_samples,
+        "training": capture.training,
+        "last_error": capture.errors[-1] if capture.errors else "",
     }
 
 
@@ -481,6 +466,14 @@ def _mjpeg_generator():
 
             annotated, results = faces.annotate(frame)
             latest_results = results
+            try:
+                face_registration.on_frame(
+                    results,
+                    voice_active=voice_pipeline_active(),
+                    vision_blocked=vision_emotion_blocked(),
+                )
+            except Exception:
+                logger.exception("Face registration frame hook failed")
             now = time.time()
             if now - last_tts_update_at >= TTS_UPDATE_INTERVAL_SECONDS:
                 _update_tts_face_state(results)
@@ -832,6 +825,9 @@ async def _voice_ws_pipeline(websocket: WebSocket) -> None:
                     record["error"] = pipeline_error
                 await run_in_threadpool(_append_latency_record, record)
                 session_queries += 1
+
+                if reply_meta.registered_face_name:
+                    _remember_voice_viewer(reply_meta.registered_face_name)
 
                 await run_in_threadpool(tts.notify_voice_interaction, active_viewer)
 
