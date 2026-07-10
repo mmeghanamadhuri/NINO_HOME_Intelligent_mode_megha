@@ -619,7 +619,15 @@ def process_voice_wav(
         )
         return wav_out, meta
 
-    if is_likely_tts_echo(user_text) or is_unintelligible_stt(user_text):
+    from face_registration_service import get_face_registration_service
+
+    face_reg = get_face_registration_service()
+    awaiting_face_reg = face_reg is not None and face_reg.is_awaiting_name()
+
+    if (
+        not awaiting_face_reg
+        and (is_likely_tts_echo(user_text) or is_unintelligible_stt(user_text))
+    ):
         reply_path = "stt_rejected"
         logger.info("Voice STT rejected (echo/garbled) | heard: %s", user_text[:120])
         reply = "Sorry, I didn't catch that. Could you say that again?"
@@ -648,7 +656,6 @@ def process_voice_wav(
     from alarm_voice import handle_alarm_voice
 
     from memory_service import get_memory_service, resolve_alarm_user
-    from face_registration_service import get_face_registration_service
 
     memory_svc = get_memory_service()
     memory_name = _live_memory_viewer_name(

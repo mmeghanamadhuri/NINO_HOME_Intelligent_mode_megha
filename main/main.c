@@ -1511,6 +1511,23 @@ static esp_err_t play_wav_handler(httpd_req_t *req) {
     prompt_ack = (ack_hdr[0] == '1');
   }
 
+  bool prompt_ack_chime = true;
+  char chime_hdr[4] = {0};
+  if (httpd_req_get_hdr_value_str(req, "X-Nino-Prompt-Ack-Chime", chime_hdr,
+                                  sizeof(chime_hdr)) == ESP_OK) {
+    prompt_ack_chime = (chime_hdr[0] != '0');
+  }
+
+  char ws_hdr[160] = {0};
+  if (httpd_req_get_hdr_value_str(req, "X-Nino-Voice-Ws-Url", ws_hdr,
+                                  sizeof(ws_hdr)) == ESP_OK) {
+    apply_voice_ws_url_from_server(ws_hdr);
+  }
+
+  if (prompt_ack) {
+    nino_voice_assist_set_next_prompt_ack_chime(prompt_ack_chime);
+  }
+
   /* Optional emotion tag from server (e.g. happy/sad/surprised). */
   nino_eye_state_t eye_state = NINO_EYE_STATE_COUNT;
   char eye_hdr[24] = {0};
@@ -2314,6 +2331,23 @@ static void load_voice_ws_from_nvs(void) {
   size_t sz = sizeof(s_voice_ws_url);
   (void)nvs_get_str(h, NVS_KEY_VOICE_WS, s_voice_ws_url, &sz);
   nvs_close(h);
+}
+
+static void apply_voice_ws_url_from_server(const char *uri) {
+  if (uri == NULL || uri[0] == '\0') {
+    return;
+  }
+  strncpy(s_voice_ws_url, uri, sizeof(s_voice_ws_url) - 1);
+  s_voice_ws_url[sizeof(s_voice_ws_url) - 1] = '\0';
+  nvs_handle_t h;
+  if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+    (void)nvs_set_str(h, NVS_KEY_VOICE_WS, s_voice_ws_url);
+    (void)nvs_commit(h);
+    nvs_close(h);
+  }
+  nino_voice_assist_set_ws_uri(s_voice_ws_url);
+  nino_voice_wake_set_enabled(true);
+  ESP_LOGI(TAG, "Voice WS URL from server: %s", s_voice_ws_url);
 }
 
 static int cmd_voice(int argc, char **argv) {

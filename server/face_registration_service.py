@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 FaceRegState = Literal["idle", "awaiting_name", "capturing"]
 
 REGISTRATION_PROMPT = (
-    "I haven't registered your face yet. To register, please tell me your name."
+    "I haven't registered your face yet. After the beep, please tell me your name."
 )
 
 VOICE_REG_TTS_RATE_HZ = 16000
@@ -153,8 +153,6 @@ class FaceRegistrationService:
         """Called from MJPEG loop — may trigger proactive registration prompt."""
         if not self.enabled:
             return
-        if voice_active or vision_blocked:
-            return
 
         now = time.time()
         with self._lock:
@@ -170,6 +168,9 @@ class FaceRegistrationService:
                     logger.info("Face registration: awaiting_name timeout")
                     self._reset_locked()
                 return
+
+        if voice_active or vision_blocked:
+            return
 
         if self._primary_recognized(results):
             with self._lock:
@@ -263,14 +264,14 @@ class FaceRegistrationService:
 
         wav = self._synthesize_prompt_wav(REGISTRATION_PROMPT)
         try:
-            post_wav_to_esp(wav, prompt_ack=True, prompt_ack_chime=False)
+            post_wav_to_esp(wav, prompt_ack=True, prompt_ack_chime=True)
         except Exception as exc:
             logger.warning("Face registration prompt failed: %s", exc)
             with self._lock:
                 self._reset_locked()
             return
 
-        logger.info("Face registration prompt sent (awaiting name)")
+        logger.info("Face registration prompt sent (awaiting name, beep then listen)")
 
     @staticmethod
     def _synthesize_prompt_wav(text: str) -> bytes:

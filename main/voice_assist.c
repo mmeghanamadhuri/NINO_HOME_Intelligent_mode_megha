@@ -27,7 +27,7 @@ static const char *TAG = "voice_ast";
 #define VOICE_MIC_RATE 16000
 #define WAV_HEADER_SIZE 44
 #define VAD_FRAME_MS 20
-#define VAD_LISTEN_TIMEOUT_MS 3000
+#define VAD_LISTEN_TIMEOUT_MS 6000
 #define VAD_TRAILING_SILENCE_MS 450
 #define VAD_PRE_ROLL_MS 200
 #define VAD_START_CONSECUTIVE_FRAMES 3
@@ -54,6 +54,11 @@ static const char *TAG = "voice_ast";
 
 static char s_ws_uri[VOICE_WS_URI_MAX];
 static SemaphoreHandle_t s_ws_uri_mutex;
+static volatile bool s_next_prompt_ack_play_chime = true;
+
+void nino_voice_assist_set_next_prompt_ack_chime(bool play_chime) {
+  s_next_prompt_ack_play_chime = play_chime;
+}
 
 void nino_voice_assist_set_ws_uri(const char *uri) {
   if (s_ws_uri_mutex == NULL) {
@@ -554,9 +559,39 @@ esp_err_t nino_voice_assist_run_query_only(void) {
 }
 
 #define MED_ACK_TASK_STACK 20480
+#define PROMPT_ACK_POST_PLAY_MS 900
+
+static void prompt_listen_task(void *arg) {
+  (void)arg;
+  const bool play_chime = s_next_prompt_ack_play_chime;
+  s_next_prompt_ack_play_chime = true;
+
+  vTaskDelay(pdMS_TO_TICKS(PROMPT_ACK_POST_PLAY_MS));
+  if (!nino_voice_assist_has_ws_uri()) {
+    ESP_LOGW(TAG,
+             "Prompt listen: PC voice not linked — need voice connect or "
+             "X-Nino-Voice-Ws-Url from server");
+    vTaskDelete(NULL);
+    return;
+  }
+  ESP_LOGI(TAG, "Prompt listen — VAD (%d s, chime=%d)", MED_ACK_VAD_MAX_SEC, (int)play_chime);
+  if (play_chime) {
+    esp_err_t chime = nino_voice_play_wake_chime();
+    if (chime != ESP_OK) {
+      ESP_LOGW(TAG, "Prompt listen chime failed: %s", esp_err_to_name(chime));
+    }
+    vTaskDelay(pdMS_TO_TICKS(350));
+  }
+  esp_err_t e = run_ws_and_queue(MED_ACK_VAD_MAX_SEC, false);
+  if (e != ESP_OK) {
+    ESP_LOGW(TAG, "Prompt listen voice query failed: %s", esp_err_to_name(e));
+  }
+  vTaskDelete(NULL);
+}
 
 static void medical_ack_prompt_task(void *arg) {
   (void)arg;
+  s_next_prompt_ack_play_chime = true;
   vTaskDelay(pdMS_TO_TICKS(500));
   if (!nino_voice_assist_has_ws_uri()) {
     ESP_LOGW(TAG,
@@ -577,10 +612,10 @@ static void medical_ack_prompt_task(void *arg) {
 }
 
 void nino_voice_assist_prompt_medical_ack(void) {
-  BaseType_t ok = xTaskCreate(medical_ack_prompt_task, "med_ack", MED_ACK_TASK_STACK,
-                              NULL, 3, NULL);
+  BaseType_t ok =
+      xTaskCreate(prompt_listen_task, "prompt_listen", MED_ACK_TASK_STACK, NULL, 3, NULL);
   if (ok != pdPASS) {
-    ESP_LOGW(TAG, "Could not start medical ack listen task");
+    ESP_LOGW(TAG, "Could not start prompt listen task");
   }
 }
 

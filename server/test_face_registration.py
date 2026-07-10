@@ -65,6 +65,7 @@ class FaceRegistrationServiceTests(unittest.TestCase):
         self.assertEqual(self.svc.state, "awaiting_name")
         post_wav.assert_called_once()
         self.assertTrue(post_wav.call_args.kwargs.get("prompt_ack"))
+        self.assertTrue(post_wav.call_args.kwargs.get("prompt_ack_chime"))
 
     def test_handle_voice_registers_name(self) -> None:
         frame = MagicMock()

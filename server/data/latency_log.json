@@ -30536,5 +30536,157 @@
     "client": "192.168.0.89:50500",
     "session_queries": 1,
     "session_seconds": 3.203
+  },
+  {
+    "timestamp": "2026-07-10T15:12:27",
+    "event": "ws_open",
+    "client": "192.168.0.89:63722"
+  },
+  {
+    "timestamp": "2026-07-10T15:12:29",
+    "event": "voice_query",
+    "client": "192.168.0.89:63722",
+    "server_total_seconds": 1.175,
+    "audio_in_bytes": 35884,
+    "error": "404 Client Error: Not Found for url: http://127.0.0.1:11434/api/generate"
+  },
+  {
+    "timestamp": "2026-07-10T15:12:30",
+    "event": "ws_closed",
+    "client": "192.168.0.89:63722",
+    "session_queries": 1,
+    "session_seconds": 2.424
+  },
+  {
+    "timestamp": "2026-07-10T15:12:42",
+    "event": "ws_open",
+    "client": "192.168.0.89:63723"
+  },
+  {
+    "timestamp": "2026-07-10T15:12:46",
+    "event": "voice_query",
+    "client": "192.168.0.89:63723",
+    "server_total_seconds": 3.944,
+    "audio_in_bytes": 49324,
+    "error": "404 Client Error: Not Found for url: http://127.0.0.1:11434/api/generate"
+  },
+  {
+    "timestamp": "2026-07-10T15:12:47",
+    "event": "ws_closed",
+    "client": "192.168.0.89:63723",
+    "session_queries": 1,
+    "session_seconds": 5.24
+  },
+  {
+    "timestamp": "2026-07-10T15:18:45",
+    "event": "ws_open",
+    "client": "192.168.0.89:63724"
+  },
+  {
+    "timestamp": "2026-07-10T15:18:56",
+    "event": "voice_query",
+    "client": "192.168.0.89:63724",
+    "server_total_seconds": 10.64,
+    "heard": "Sir, I'm in call.",
+    "reply_text": "Ah, good to see you there! Just wanted to remind, no one's actually here with the camera on right now.",
+    "reply_path": "llm",
+    "audio_in_seconds": 2.06,
+    "audio_in_bytes": 65964,
+    "audio_out_seconds": 9.04,
+    "audio_out_bytes": 289358,
+    "stt_engine": "whisper",
+    "stt_seconds": 9.141,
+    "memory_seconds": 0.034,
+    "reply_seconds": 1.141,
+    "tts_seconds": 0.322,
+    "process_total_seconds": 10.639,
+    "voice_viewer": "Dimple",
+    "memory_viewer": "Dimple",
+    "memory_ready": true,
+    "memory_store": "queued",
+    "memory_turns": 1,
+    "memory_facts": 0,
+    "memory_user": "Dimple",
+    "eye_expression": "curious"
+  },
+  {
+    "timestamp": "2026-07-10T15:18:57",
+    "event": "ws_closed",
+    "client": "192.168.0.89:63724",
+    "session_queries": 1,
+    "session_seconds": 12.031
+  },
+  {
+    "timestamp": "2026-07-10T15:19:15",
+    "event": "ws_open",
+    "client": "192.168.0.89:63725"
+  },
+  {
+    "timestamp": "2026-07-10T15:19:19",
+    "event": "voice_query",
+    "client": "192.168.0.89:63725",
+    "server_total_seconds": 3.204,
+    "heard": "Saturn Alarm at 3.30pm today",
+    "reply_text": "OK, alarm set for 3:30 PM today.",
+    "reply_path": "alarm",
+    "audio_in_seconds": 2.7,
+    "audio_in_bytes": 86444,
+    "audio_out_seconds": 4.51,
+    "audio_out_bytes": 144478,
+    "stt_engine": "whisper",
+    "stt_seconds": 2.895,
+    "memory_seconds": 0.0,
+    "reply_seconds": 0.021,
+    "tts_seconds": 0.287,
+    "process_total_seconds": 3.203,
+    "voice_viewer": "",
+    "memory_viewer": "",
+    "memory_ready": true,
+    "memory_store": "skipped"
+  },
+  {
+    "timestamp": "2026-07-10T15:19:20",
+    "event": "ws_closed",
+    "client": "192.168.0.89:63725",
+    "session_queries": 1,
+    "session_seconds": 4.508
+  },
+  {
+    "timestamp": "2026-07-10T15:21:42",
+    "event": "ws_open",
+    "client": "192.168.0.89:63726"
+  },
+  {
+    "timestamp": "2026-07-10T15:21:46",
+    "event": "voice_query",
+    "client": "192.168.0.89:63726",
+    "server_total_seconds": 4.022,
+    "heard": "Set an alarm for Teja at 3.35pm today.",
+    "reply_text": "OK Teja, alarm set for 3:35 PM today.",
+    "reply_path": "alarm",
+    "audio_in_seconds": 4.32,
+    "audio_in_bytes": 138284,
+    "audio_out_seconds": 5.34,
+    "audio_out_bytes": 170774,
+    "stt_engine": "whisper",
+    "stt_seconds": 3.536,
+    "memory_seconds": 0.043,
+    "reply_seconds": 0.022,
+    "tts_seconds": 0.421,
+    "process_total_seconds": 4.021,
+    "voice_viewer": "Teja",
+    "memory_viewer": "Teja",
+    "memory_ready": true,
+    "memory_store": "skipped",
+    "memory_turns": 0,
+    "memory_facts": 0,
+    "memory_user": "Teja"
+  },
+  {
+    "timestamp": "2026-07-10T15:21:47",
+    "event": "ws_closed",
+    "client": "192.168.0.89:63726",
+    "session_queries": 1,
+    "session_seconds": 5.686
   }
 ]

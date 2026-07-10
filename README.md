@@ -321,6 +321,7 @@ Force provider: `--stt-provider elevenlabs|whisper`
 - **Threshold:** `FACE_MATCH_THRESHOLD` (default **0.42** — higher = stricter)
 - **Session hold:** primary viewer remembered ~90 s across brief gaps
 - **Registration:** web UI at `http://localhost:8000` — samples encode instantly
+- **Voice registration (automatic):** unknown face ~3 s → bot asks for name → USB mic after beep → capture — see [docs/VOICE_FACE_REGISTRATION.md](docs/VOICE_FACE_REGISTRATION.md)
 
 ---
 
@@ -528,6 +529,7 @@ See [server/README.md](server/README.md) and [docs/EMOTION_RECOGNITION.md](docs/
 | [server/README.md](server/README.md) | Server modules, setup, tests, API details |
 | [docs/EMOTION_RECOGNITION.md](docs/EMOTION_RECOGNITION.md) | Camera emotion pipeline, tuning, overlay |
 | [docs/emotion-detect.md](docs/emotion-detect.md) | Original design vs implementation |
+| [docs/VOICE_FACE_REGISTRATION.md](docs/VOICE_FACE_REGISTRATION.md) | Automatic unknown-face → voice name → register |
 | [docs/ALARM.md](docs/ALARM.md) | Voice alarm commands, medical flow |
 | [docs/SERVO.md](docs/SERVO.md) | Dynamixel wiring, 360 sequence |
 | [docs/WIFI_PROVISION.md](docs/WIFI_PROVISION.md) | BLE / soft-AP Wi-Fi setup |

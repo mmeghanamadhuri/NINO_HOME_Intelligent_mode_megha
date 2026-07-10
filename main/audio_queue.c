@@ -41,6 +41,7 @@ typedef struct {
   size_t pcm_offset;
   bool play_done_chime;
   nino_audio_servo_mode_t servo_mode;
+  bool prompt_ack_after;
 } suspended_playback_t;
 
 static QueueHandle_t s_normal_queue;
@@ -151,6 +152,7 @@ static bool play_normal_job(audio_play_job_t *job) {
     s_suspended.pcm_offset = offset;
     s_suspended.play_done_chime = job->play_done_chime;
     s_suspended.servo_mode = job->servo_mode;
+    s_suspended.prompt_ack_after = job->prompt_ack_after;
     s_has_suspended = true;
     s_stop_requested = false;
     s_normal_playing = false;
@@ -202,6 +204,9 @@ static bool play_suspended(void) {
 
   if (snap.play_done_chime) {
     (void)nino_voice_play_done_chime();
+  }
+  if (snap.prompt_ack_after) {
+    nino_voice_assist_prompt_medical_ack();
   }
   nino_decoded_wav_free(&snap.decoded);
   s_normal_playing = false;
