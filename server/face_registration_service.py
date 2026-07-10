@@ -6,6 +6,8 @@ import logging
 import os
 import threading
 import time
+import wave
+import io
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
@@ -24,6 +26,14 @@ REGISTRATION_PROMPT = (
     "I haven't registered your face yet. After the beep, please tell me your name."
 )
 
+NAME_RETRY_PROMPT = (
+    "I didn't catch your name. After the beep, please say your name again."
+)
+
+NO_SPEECH_RETRY_PROMPT = (
+    "I haven't heard anything. After the beep, please say your name again."
+)
+
 VOICE_REG_TTS_RATE_HZ = 16000
 
 _service: FaceRegistrationService | None = None
@@ -34,6 +44,7 @@ class FaceRegVoiceResult:
     handled: bool = False
     reply: str = ""
     registered_name: str | None = None
+    relisten_after_reply: bool = False
 
 
 @dataclass
@@ -99,6 +110,10 @@ class FaceRegistrationService:
         self._unknown_since: float | None = None
         self._last_prompt_at: float = 0.0
         self._awaiting_since: float = 0.0
+        self._listen_prompt_at: float = 0.0
+        self._last_prompt_playback_seconds: float = 0.0
+        self._voice_heard_since_listen: bool = False
+        self._no_speech_retries: int = 0
         self.apply_settings_from_environ()
 
     def apply_settings_from_environ(self) -> None:
@@ -118,6 +133,15 @@ class FaceRegistrationService:
         )
         self.await_name_seconds = float(
             os.environ.get("FACE_REG_AWAIT_NAME_SECONDS", "45")
+        )
+        self.no_speech_retry_seconds = float(
+            os.environ.get("FACE_REG_NO_SPEECH_RETRY_SECONDS", "6")
+        )
+        self.listen_open_delay_seconds = float(
+            os.environ.get("FACE_REG_LISTEN_OPEN_DELAY_SECONDS", "3")
+        )
+        self.max_no_speech_retries = max(
+            0, int(os.environ.get("FACE_REG_MAX_NO_SPEECH_RETRIES", "2"))
         )
 
     @property
@@ -141,6 +165,9 @@ class FaceRegistrationService:
                 "unknown_since": self._unknown_since,
                 "last_prompt_at": self._last_prompt_at,
                 "awaiting_since": self._awaiting_since,
+                "listen_prompt_at": self._listen_prompt_at,
+                "voice_heard_since_listen": self._voice_heard_since_listen,
+                "no_speech_retries": self._no_speech_retries,
             }
 
     def on_frame(
@@ -155,19 +182,32 @@ class FaceRegistrationService:
             return
 
         now = time.time()
+        retry_prompt: str | None = None
         with self._lock:
             if self._state == "capturing":
                 return
             if self._state == "awaiting_name":
                 if voice_active:
                     self._awaiting_since = now
-                elif (
-                    self._awaiting_since > 0
-                    and (now - self._awaiting_since) > self.await_name_seconds
-                ):
-                    logger.info("Face registration: awaiting_name timeout")
+                    self._voice_heard_since_listen = True
+                    return
+                retry_prompt = self._plan_no_speech_retry_locked(now)
+                if self._state != "awaiting_name":
+                    return
+                if retry_prompt is None:
+                    if (
+                        self._awaiting_since > 0
+                        and (now - self._awaiting_since) > self.await_name_seconds
+                    ):
+                        logger.info("Face registration: awaiting_name timeout")
+                        self._reset_locked()
+                    return
+
+        if retry_prompt:
+            if not self._send_listen_prompt(retry_prompt):
+                with self._lock:
                     self._reset_locked()
-                return
+            return
 
         if voice_active or vision_blocked:
             return
@@ -194,7 +234,22 @@ class FaceRegistrationService:
 
         self._try_prompt_registration()
 
+    def on_voice_query_started(self) -> None:
+        """ESP audio reached the server — cancel no-speech retry for this listen window."""
+        with self._lock:
+            if self._state == "awaiting_name":
+                self._voice_heard_since_listen = True
+                self._awaiting_since = time.time()
+
+    def note_voice_received(self) -> None:
+        """Mark that the ESP sent audio during the current listen window."""
+        with self._lock:
+            if self._state == "awaiting_name":
+                self._voice_heard_since_listen = True
+
     def handle_voice(self, user_text: str) -> FaceRegVoiceResult:
+        self.note_voice_received()
+
         with self._lock:
             if self._state != "awaiting_name":
                 return FaceRegVoiceResult(handled=False)
@@ -203,10 +258,8 @@ class FaceRegistrationService:
         if not name:
             return FaceRegVoiceResult(
                 handled=True,
-                reply=(
-                    "I didn't catch your name. Please say something like "
-                    "my name is, and then your name."
-                ),
+                reply=NAME_RETRY_PROMPT,
+                relisten_after_reply=True,
             )
 
         with self._lock:
@@ -261,17 +314,87 @@ class FaceRegistrationService:
             self._awaiting_since = time.time()
             self._last_prompt_at = self._awaiting_since
             self._unknown_since = None
+            self._no_speech_retries = 0
 
-        wav = self._synthesize_prompt_wav(REGISTRATION_PROMPT)
+        if not self._send_listen_prompt(REGISTRATION_PROMPT):
+            with self._lock:
+                self._reset_locked()
+
+    def relisten_after_missed_name(self) -> None:
+        """Play beep + open mic again when the name was not understood."""
+        with self._lock:
+            if self._state != "awaiting_name":
+                return
+        self._send_listen_prompt(NAME_RETRY_PROMPT)
+
+    def _no_speech_check_after_locked(self) -> float:
+        """Earliest time we may treat the listen window as silent. Holds lock."""
+        return (
+            self._listen_prompt_at
+            + self._last_prompt_playback_seconds
+            + self.listen_open_delay_seconds
+            + self.no_speech_retry_seconds
+        )
+
+    def _plan_no_speech_retry_locked(self, now: float) -> str | None:
+        """Return retry prompt text when the listen window passed with no voice. Holds lock."""
+        if self._voice_heard_since_listen or self._listen_prompt_at <= 0:
+            return None
+        if now < self._no_speech_check_after_locked():
+            return None
+        if self._no_speech_retries >= self.max_no_speech_retries:
+            logger.info(
+                "Face registration: no speech after %d listen(s), giving up",
+                self._no_speech_retries + 1,
+            )
+            self._reset_locked()
+            return None
+        self._no_speech_retries += 1
+        logger.info(
+            "Face registration: no speech detected, retry %d/%d",
+            self._no_speech_retries,
+            self.max_no_speech_retries,
+        )
+        return NO_SPEECH_RETRY_PROMPT
+
+    @staticmethod
+    def _wav_playback_seconds(wav: bytes, rate_hz: int = VOICE_REG_TTS_RATE_HZ) -> float:
+        if len(wav) <= 44:
+            return 0.0
+        try:
+            with wave.open(io.BytesIO(wav), "rb") as wf:
+                frames = wf.getnframes()
+                rate = wf.getframerate() or rate_hz
+                return frames / float(rate)
+        except wave.Error:
+            pcm_bytes = max(0, len(wav) - 44)
+            return pcm_bytes / (rate_hz * 2)
+
+    def _send_listen_prompt(self, text: str) -> bool:
+        if esp_play_wav_url() is None:
+            logger.debug("Face registration listen prompt skipped: ESP_PLAY_WAV_URL not set")
+            return False
+
+        wav = self._synthesize_prompt_wav(text)
         try:
             post_wav_to_esp(wav, prompt_ack=True, prompt_ack_chime=True)
         except Exception as exc:
-            logger.warning("Face registration prompt failed: %s", exc)
-            with self._lock:
-                self._reset_locked()
-            return
+            logger.warning("Face registration listen prompt failed: %s", exc)
+            return False
 
-        logger.info("Face registration prompt sent (awaiting name, beep then listen)")
+        now = time.time()
+        playback_s = self._wav_playback_seconds(wav)
+        with self._lock:
+            self._listen_prompt_at = now
+            self._last_prompt_playback_seconds = playback_s
+            self._voice_heard_since_listen = False
+            self._awaiting_since = now
+        logger.info(
+            "Face registration listen prompt sent (%.1fs TTS + beep then listen): %s",
+            playback_s,
+            text[:80],
+        )
+        return True
 
     @staticmethod
     def _synthesize_prompt_wav(text: str) -> bytes:
@@ -307,6 +430,10 @@ class FaceRegistrationService:
         self._state = "idle"
         self._unknown_since = None
         self._awaiting_since = 0.0
+        self._listen_prompt_at = 0.0
+        self._last_prompt_playback_seconds = 0.0
+        self._voice_heard_since_listen = False
+        self._no_speech_retries = 0
 
 
 def get_face_registration_service() -> FaceRegistrationService | None:

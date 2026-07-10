@@ -111,6 +111,7 @@ class VoiceReplyMeta:
     prompt_medical_ack: bool = False
     eye_expression: str | None = None
     registered_face_name: str | None = None
+    face_reg_relisten: bool = False
     # Per-stage latency info for this query (stt/reply/tts seconds, heard text,
     # reply path, audio sizes). Filled by process_voice_wav; logged by app.py.
     timings: dict[str, Any] = field(default_factory=dict)
@@ -679,11 +680,25 @@ def process_voice_wav(
             reply = reg_result.reply
             if reg_result.registered_name:
                 meta.registered_face_name = reg_result.registered_name
+            if reg_result.relisten_after_reply:
+                meta.face_reg_relisten = True
             logger.info(
                 "Voice face registration | registered=%s heard: %s",
                 reg_result.registered_name or "(none)",
                 user_text[:120],
             )
+            if reg_result.relisten_after_reply:
+                audio_in_seconds = max(0, len(wav_bytes) - 44) / (16000 * 2)
+                meta.timings = {
+                    "heard": user_text[:200],
+                    "reply_text": "(face registration relisten scheduled)",
+                    "reply_path": reply_path,
+                    "audio_in_seconds": round(audio_in_seconds, 2),
+                    "audio_in_bytes": len(wav_bytes),
+                    "stt_engine": stt_engine,
+                    "stt_seconds": round(t_stt - t_start, 3),
+                }
+                return b"", meta
 
     if reply_path == "llm":
         alarm_result = handle_alarm_voice(

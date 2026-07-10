@@ -637,6 +637,13 @@ async def _delayed_esp_servo_360(delay_seconds: float) -> None:
         logger.warning("ESP servo 360 failed after voice confirmation: %s", err or "unknown")
 
 
+async def _delayed_face_reg_relisten(delay_seconds: float) -> None:
+    wait = max(0.0, delay_seconds)
+    if wait:
+        await asyncio.sleep(wait)
+    await run_in_threadpool(face_registration.relisten_after_missed_name)
+
+
 LATENCY_LOG_PATH = BASE_DIR / "data" / "latency_log.json"
 _LATENCY_LOG_LOCK = threading.Lock()
 
@@ -759,6 +766,7 @@ async def _voice_ws_pipeline(websocket: WebSocket) -> None:
             t_query_start = time.perf_counter()
             pipeline_error: str | None = None
             await run_in_threadpool(begin_voice_query)
+            await run_in_threadpool(face_registration.on_voice_query_started)
             try:
                 try:
                     identity_name, identity_state = await run_in_threadpool(
@@ -810,7 +818,7 @@ async def _voice_ws_pipeline(websocket: WebSocket) -> None:
                         logger.exception("Voice pipeline recovery failed")
                         wav_out = minimal_voice_reply_wav()
 
-                if not wav_out:
+                if not wav_out and not reply_meta.face_reg_relisten:
                     wav_out = minimal_voice_reply_wav()
 
                 timings = dict(reply_meta.timings)
@@ -843,7 +851,11 @@ async def _voice_ws_pipeline(websocket: WebSocket) -> None:
                         client_label,
                     )
                 await websocket.send_json(ws_meta)
-                await websocket.send_bytes(wav_out)
+                if wav_out:
+                    await websocket.send_bytes(wav_out)
+
+                if reply_meta.face_reg_relisten:
+                    asyncio.create_task(_delayed_face_reg_relisten(0.5))
 
                 if reply_meta.trigger_servo_360:
                     asyncio.create_task(

@@ -87,6 +87,75 @@ class FaceRegistrationServiceTests(unittest.TestCase):
         result = self.svc.handle_voice("My name is Alex")
         self.assertFalse(result.handled)
 
+    @patch("face_registration_service.post_wav_to_esp")
+    @patch("face_registration_service.esp_play_wav_url", return_value="http://esp/play_wav")
+    @patch("face_registration_service.FaceRegistrationService._synthesize_prompt_wav")
+    def test_no_speech_retry_prompt(self, _synth, _url, post_wav) -> None:
+        self.svc.no_speech_retry_seconds = 5.0
+        self.svc.listen_open_delay_seconds = 0.0
+        self.svc.max_no_speech_retries = 2
+        with self.svc._lock:
+            self.svc._state = "awaiting_name"
+            self.svc._listen_prompt_at = 100.0
+            self.svc._last_prompt_playback_seconds = 0.0
+            self.svc._voice_heard_since_listen = False
+            self.svc._no_speech_retries = 0
+
+        with patch("face_registration_service.time.time", return_value=103.0):
+            self.svc.on_frame([], voice_active=False)
+        post_wav.assert_not_called()
+
+        with patch("face_registration_service.time.time", return_value=106.0):
+            self.svc.on_frame([], voice_active=False)
+
+        self.assertEqual(self.svc.state, "awaiting_name")
+        self.assertEqual(self.svc._no_speech_retries, 1)
+        post_wav.assert_called_once()
+        self.assertTrue(post_wav.call_args.kwargs.get("prompt_ack"))
+        self.assertTrue(post_wav.call_args.kwargs.get("prompt_ack_chime"))
+
+    @patch("face_registration_service.post_wav_to_esp")
+    @patch("face_registration_service.esp_play_wav_url", return_value="http://esp/play_wav")
+    @patch("face_registration_service.FaceRegistrationService._synthesize_prompt_wav")
+    def test_no_speech_gives_up_after_max_retries(self, _synth, _url, post_wav) -> None:
+        self.svc.no_speech_retry_seconds = 5.0
+        self.svc.listen_open_delay_seconds = 0.0
+        self.svc.max_no_speech_retries = 1
+        with self.svc._lock:
+            self.svc._state = "awaiting_name"
+            self.svc._listen_prompt_at = 100.0
+            self.svc._last_prompt_playback_seconds = 0.0
+            self.svc._voice_heard_since_listen = False
+            self.svc._no_speech_retries = 1
+
+        with patch("face_registration_service.time.time", return_value=106.0):
+            self.svc.on_frame([], voice_active=False)
+
+        self.assertEqual(self.svc.state, "idle")
+        post_wav.assert_not_called()
+
+    def test_note_voice_received_blocks_no_speech_retry(self) -> None:
+        self.svc.no_speech_retry_seconds = 5.0
+        self.svc.listen_open_delay_seconds = 0.0
+        with self.svc._lock:
+            self.svc._state = "awaiting_name"
+            self.svc._listen_prompt_at = 100.0
+            self.svc._last_prompt_playback_seconds = 0.0
+        self.svc.on_voice_query_started()
+
+        with patch("face_registration_service.time.time", return_value=106.0):
+            with patch("face_registration_service.post_wav_to_esp") as post_wav:
+                self.svc.on_frame([], voice_active=False)
+                post_wav.assert_not_called()
+
+    def test_handle_voice_name_miss_schedules_relisten(self) -> None:
+        with self.svc._lock:
+            self.svc._state = "awaiting_name"
+        result = self.svc.handle_voice("hello there")
+        self.assertTrue(result.handled)
+        self.assertTrue(result.relisten_after_reply)
+        self.assertEqual(self.svc.state, "awaiting_name")
+
 
 if __name__ == "__main__":
     unittest.main()
