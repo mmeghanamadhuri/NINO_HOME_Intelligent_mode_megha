@@ -26,6 +26,12 @@ void nino_servo_dxl_set_servo_goal(uint8_t id, int goal);
 esp_err_t nino_servo_dxl_get_present_position(uint8_t id, int *position);
 
 /**
+ * Broadcast PING on the Dynamixel bus and collect responding servo IDs.
+ * Requires U2D2 open (not necessarily joint-ready). IDs are sorted ascending.
+ */
+esp_err_t nino_servo_dxl_scan_chain(uint8_t *ids, size_t max_ids, size_t *out_count);
+
+/**
  * ID2 full rotation: neutral (512) if needed, then 512→0→1023→512.
  * Runs in a background task; returns ESP_ERR_INVALID_STATE if already running or bus not ready.
  */

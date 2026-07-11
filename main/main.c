@@ -1464,6 +1464,8 @@ static esp_err_t stream_route_handler(httpd_req_t *req) {
   return httpd_resp_send(req, STREAM_VIEW_HTML, HTTPD_RESP_USE_STRLEN);
 }
 
+static void apply_voice_ws_url_from_server(const char *uri);
+
 static esp_err_t play_wav_handler(httpd_req_t *req) {
   if (req->method != HTTP_POST) {
     httpd_resp_set_status(req, "405 Method Not Allowed");
@@ -2469,15 +2471,78 @@ static int cmd_servo_360(int argc, char **argv) {
   return 0;
 }
 
+static int cmd_servo_status(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+
+  printf("servo bus: %s\n",
+         nino_servo_dxl_bus_open() ? "open" : "not open (connect U2D2 on J18 hub)");
+  printf("servo ready: %s\n",
+         nino_servo_dxl_is_ready() ? "yes" : "no");
+  printf("spin360: %s\n",
+         nino_servo_dxl_spin_is_active() ? "running" : "idle");
+  printf("track hon: %s\n",
+         nino_servo_dxl_track_hon_is_active() ? "running" : "idle");
+
+  if (!nino_servo_dxl_bus_open()) {
+    printf("servo chain: (bus not open)\n");
+    return 1;
+  }
+
+  uint8_t ids[32];
+  size_t count = 0;
+  esp_err_t err = nino_servo_dxl_scan_chain(ids, sizeof(ids) / sizeof(ids[0]), &count);
+  if (err == ESP_ERR_NOT_FOUND || count == 0) {
+    printf("servo chain: none found (check power, TTL wiring, IDs, 1 Mbps baud)\n");
+    return 1;
+  }
+  if (err != ESP_OK) {
+    printf("servo chain scan failed: %s\n", esp_err_to_name(err));
+    return 1;
+  }
+
+  printf("servo chain (%u):", (unsigned)count);
+  for (size_t i = 0; i < count; i++) {
+    printf(" ID%u", ids[i]);
+    if (ids[i] == 1) {
+      printf("(tilt)");
+    } else if (ids[i] == 2) {
+      printf("(pan)");
+    }
+  }
+  printf("\n");
+  return 0;
+}
+
+static int cmd_servo(int argc, char **argv) {
+  if (argc >= 2 && strcmp(argv[1], "status") == 0) {
+    return cmd_servo_status(0, NULL);
+  }
+  if (argc >= 2 && strcmp(argv[1], "360") == 0) {
+    return cmd_servo_360(argc - 1, argv + 1);
+  }
+  printf("Usage: servo status | servo 360\n");
+  return 0;
+}
+
 static void servo_cli_register(void) {
-  const esp_console_cmd_t cmd = {
+  const esp_console_cmd_t servo_cmd = {
+      .command = "servo",
+      .help = "servo status | servo 360",
+      .hint = NULL,
+      .func = &cmd_servo,
+      .argtable = NULL,
+  };
+  ESP_ERROR_CHECK(esp_console_cmd_register(&servo_cmd));
+
+  const esp_console_cmd_t spin_cmd = {
       .command = "360",
       .help = "ID2 full rotation: home to 512 if needed, then 512->0->1023->512",
       .hint = NULL,
       .func = &cmd_servo_360,
       .argtable = NULL,
   };
-  ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+  ESP_ERROR_CHECK(esp_console_cmd_register(&spin_cmd));
 }
 
 static int cmd_track(int argc, char **argv) {

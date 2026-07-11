@@ -94,12 +94,16 @@
 #define DXL_TRACK_HON_TASK_STACK              4096
 #define DXL_TRACK_HON_TASK_PRIO               4
 #define DXL_TRACK_HON_HOLD_MS                 500
+#define DXL_BROADCAST_ID                      0xFE
+#define DXL_MAX_SCAN_IDS                      32
+#define DXL_SCAN_COLLECT_MS                   200
 
 typedef enum {
     DXL_SYNC_IDLE = 0,
     DXL_SYNC_READ_PENDING,
     DXL_SYNC_READ_WAIT_RSP,
     DXL_SYNC_PING_WAIT_RSP,
+    DXL_SYNC_SCAN_WAIT_RSP,
 } dxl_sync_state_t;
 
 typedef struct {
@@ -189,6 +193,8 @@ static SemaphoreHandle_t s_read_done_sem;
 static TaskHandle_t s_spin360_task;
 static TaskHandle_t s_track_hon_task;
 static volatile bool s_track_hon_stop_requested;
+static uint8_t s_scan_ids[DXL_MAX_SCAN_IDS];
+static size_t s_scan_count;
 
 static void usb_client_task(void *arg);
 
@@ -220,6 +226,9 @@ static int clamp_goal(int goal);
 static int servo_index_for_id(uint8_t id);
 static esp_err_t dynamixel_read_word_blocking(uint8_t id, uint8_t addr, uint16_t *out, TickType_t timeout);
 static esp_err_t dynamixel_ping_blocking(uint8_t id, TickType_t timeout);
+static esp_err_t dynamixel_scan_chain_blocking(uint8_t *ids, size_t max_ids, size_t *out_count);
+static void scan_add_id(uint8_t id);
+static void scan_sort_ids(uint8_t *ids, size_t count);
 static bool dynamixel_wait_servo_at(uint8_t id, int target, TickType_t timeout_ms);
 static bool track_hon_wait_target_or_stop(uint8_t id, int target, TickType_t timeout_ms);
 static void spin360_task(void *arg);
@@ -369,6 +378,11 @@ esp_err_t nino_servo_dxl_get_present_position(uint8_t id, int *position)
 
     *position = (int)raw;
     return ESP_OK;
+}
+
+esp_err_t nino_servo_dxl_scan_chain(uint8_t *ids, size_t max_ids, size_t *out_count)
+{
+    return dynamixel_scan_chain_blocking(ids, max_ids, out_count);
 }
 
 esp_err_t nino_servo_dxl_spin_360(void)
@@ -587,6 +601,90 @@ done:
     s_track_hon_stop_requested = false;
     s_track_hon_task = NULL;
     vTaskDelete(NULL);
+}
+
+static void scan_add_id(uint8_t id)
+{
+    if (id == 0 || id == DXL_BROADCAST_ID) {
+        return;
+    }
+
+    for (size_t i = 0; i < s_scan_count; i++) {
+        if (s_scan_ids[i] == id) {
+            return;
+        }
+    }
+
+    if (s_scan_count < DXL_MAX_SCAN_IDS) {
+        s_scan_ids[s_scan_count++] = id;
+    }
+}
+
+static void scan_sort_ids(uint8_t *ids, size_t count)
+{
+    for (size_t i = 0; i + 1 < count; i++) {
+        for (size_t j = i + 1; j < count; j++) {
+            if (ids[j] < ids[i]) {
+                const uint8_t tmp = ids[i];
+                ids[i] = ids[j];
+                ids[j] = tmp;
+            }
+        }
+    }
+}
+
+static esp_err_t dynamixel_scan_chain_blocking(uint8_t *ids, size_t max_ids, size_t *out_count)
+{
+    if (ids == NULL || out_count == NULL || max_ids == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_sync_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_ftdi.device_ready || s_ftdi.client_hdl == NULL) {
+        *out_count = 0;
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    *out_count = 0;
+
+    xSemaphoreTake(s_sync_mutex, portMAX_DELAY);
+    if (s_sync.state != DXL_SYNC_IDLE) {
+        xSemaphoreGive(s_sync_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_sync.state = DXL_SYNC_SCAN_WAIT_RSP;
+    s_scan_count = 0;
+    xSemaphoreGive(s_sync_mutex);
+
+    esp_err_t err = dynamixel_send_ping(&s_ftdi, DXL_BROADCAST_ID);
+    if (err != ESP_OK) {
+        xSemaphoreTake(s_sync_mutex, portMAX_DELAY);
+        s_sync.state = DXL_SYNC_IDLE;
+        xSemaphoreGive(s_sync_mutex);
+        return err;
+    }
+
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(DXL_SCAN_COLLECT_MS);
+    while (xTaskGetTickCount() < deadline) {
+        if (s_ftdi.device_gone) {
+            break;
+        }
+        (void)usb_host_client_handle_events(s_ftdi.client_hdl, pdMS_TO_TICKS(10));
+    }
+
+    xSemaphoreTake(s_sync_mutex, portMAX_DELAY);
+    s_sync.state = DXL_SYNC_IDLE;
+    const size_t found = s_scan_count;
+    const size_t copy_count = (found < max_ids) ? found : max_ids;
+    for (size_t i = 0; i < copy_count; i++) {
+        ids[i] = s_scan_ids[i];
+    }
+    xSemaphoreGive(s_sync_mutex);
+
+    scan_sort_ids(ids, copy_count);
+    *out_count = copy_count;
+    return (copy_count > 0) ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
 static esp_err_t dynamixel_ping_blocking(uint8_t id, TickType_t timeout)
@@ -1213,6 +1311,14 @@ static void dynamixel_handle_status_packet(const dynamixel_status_packet_t *pack
         return;
     }
 
+    if (s_sync.state == DXL_SYNC_SCAN_WAIT_RSP) {
+        if (packet->error == 0) {
+            scan_add_id(packet->id);
+        }
+        xSemaphoreGive(s_sync_mutex);
+        return;
+    }
+
     if ((s_sync.state == DXL_SYNC_READ_WAIT_RSP || s_sync.state == DXL_SYNC_PING_WAIT_RSP) &&
         packet->id == s_sync.id) {
         if (packet->error != 0) {
@@ -1571,8 +1677,16 @@ static void usb_client_task(void *arg)
                 }
 
                 if (!s_torque_enabled) {
-                    err = dynamixel_ping_blocking(DXL_PRIMARY_ID, pdMS_TO_TICKS(400));
-                    if (err != ESP_OK) {
+                    bool sync_busy = false;
+                    if (s_sync_mutex != NULL && xSemaphoreTake(s_sync_mutex, 0) == pdTRUE) {
+                        sync_busy = (s_sync.state != DXL_SYNC_IDLE &&
+                                     s_sync.state != DXL_SYNC_READ_PENDING);
+                        xSemaphoreGive(s_sync_mutex);
+                    }
+                    if (!sync_busy) {
+                        err = dynamixel_ping_blocking(DXL_PRIMARY_ID, pdMS_TO_TICKS(400));
+                    }
+                    if (!sync_busy && err != ESP_OK) {
                         s_ping_fail_streak++;
                         if (s_ping_fail_streak == 1 || (s_ping_fail_streak % 4) == 0) {
                             if (err == ESP_ERR_TIMEOUT) {
@@ -1591,7 +1705,7 @@ static void usb_client_task(void *arg)
                             s_ping_fail_streak = 0;
                             s_ftdi.actions |= DEVICE_ACTION_CLOSE;
                         }
-                    } else {
+                    } else if (!sync_busy) {
                         s_ping_fail_streak = 0;
                         ESP_LOGI(TAG, "Dynamixel ID%u responded to PING", DXL_PRIMARY_ID);
                         err = dynamixel_set_joint_mode(&s_ftdi);
