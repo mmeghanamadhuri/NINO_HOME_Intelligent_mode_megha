@@ -814,12 +814,21 @@ class MemoryService:
             is_conversation_recap_question,
         )
         from memory_filters import (
+            is_ephemeral_query,
             is_memory_recall_question,
             is_preference_update_statement,
+            is_question_query,
+            is_trivia_query,
             user_shares_personal_fact,
         )
 
         if is_conversation_recap_question(user_text):
+            return None
+
+        # Trivia and general knowledge belong in the main LLM, not personal memory.
+        if is_trivia_query(user_text) or is_ephemeral_query(user_text):
+            return None
+        if is_question_query(user_text) and not is_memory_recall_question(user_text):
             return None
 
         resolved_model = model or os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL)
@@ -902,6 +911,11 @@ class MemoryService:
             return "memory_llm_recall", reply
 
         if decision.action == "store":
+            if not (
+                is_preference_update_statement(user_text)
+                or user_shares_personal_fact(user_text)
+            ):
+                return None
             stored = self.store_llm_memory_items(
                 user_id, decision.store, user_text=user_text
             )

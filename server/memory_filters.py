@@ -48,6 +48,11 @@ _TRIVIA_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"\bhow (?:do|does)\b.{0,16}\b(?:work|works)\b",
         r"\btell me how\b",
         r"\bdifference between\b.{0,40}\b(?:led|lcd|display)\b",
+        # General knowledge / acronym questions (Whisper often drops "what is the").
+        r"\b(?:full\s+form|meaning|definition|acronym|abbreviation|stands?\s+for|short\s+for|expand)\b",
+        r"^(?:full\s+form|meaning|definition|acronym|abbreviation)\s+of\b",
+        r"\bwhat(?:'s| is)\s+(?:the\s+)?(?:full\s+form|meaning|acronym|abbreviation)\b",
+        r"\bspell(?:ing)?\s+(?:of\s+)?\w+",
     )
 )
 
@@ -745,8 +750,21 @@ def enrich_llm_memory_text(memory_text: str, memory_key: str, user_text: str) ->
         if any(signal in user.lower() for signal in durable_signals):
             return user
     if memory_key.startswith("favorite_"):
+        pref_signals = (
+            "favorite",
+            "favourite",
+            "prefer",
+            "like",
+            "love",
+            "hate",
+            "dislike",
+            "instead",
+        )
         topic = memory_key.replace("favorite_", "", 1).replace("_", " ")
-        return f"Favorite {topic} is {mem}"
+        if any(signal in user.lower() for signal in pref_signals) or topic in user.lower():
+            return f"Favorite {topic} is {mem}"
+        # LLM mis-keyed a non-preference utterance (e.g. "full form of Wi-Fi" → favorite_food).
+        return mem
     if memory_key == "birthdate":
         return f"My birthday is on {mem}"
     label = memory_key.replace("_", " ")

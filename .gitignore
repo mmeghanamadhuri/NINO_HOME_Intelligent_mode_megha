@@ -78,7 +78,13 @@ Desktop.ini
 *.sln.docstates # Visual Studio
 
 server/data/face_model.yml
+server/emotion-aws-local/.env
+server/.env
 
+# Large archives and model weights (download separately; see docs/SERVER_INTEGRATION.md)
+server.zip
+*.safetensors
+server/emotion-aws-local/drgm_convnextv2l_fer7/
 
 server/data/faces/**/*.jpg
 

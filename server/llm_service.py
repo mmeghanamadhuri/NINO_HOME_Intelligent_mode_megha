@@ -821,36 +821,6 @@ def greeting_for_face(
     )
 
 
-def empathy_for_detected_emotion(
-    display_name: str,
-    emotion_spoken: str,
-    *,
-    emotion_label: str = "",
-    model: str | None = None,
-    api_url: str | None = None,
-    num_predict: int = 64,
-    timeout_s: int = VOICE_QUERY_TIMEOUT_S,
-) -> str:
-    """Speak empathetically after camera emotion detection picks up an expression."""
-    label_note = f" ({emotion_label})" if emotion_label else ""
-    prompt = (
-        "You are NiNO, a friendly smart-home assistant with a camera.\n"
-        f"Internal vision log: person detected is {display_name} and emotion is "
-        f"{emotion_spoken}{label_note}.\n"
-        "Reply with 1–2 short spoken sentences only: warm, empathetic, use their name. "
-        "Reflect how they seem to feel (e.g. if sad: you look a bit down today). "
-        "Offer gentle support — do not diagnose or lecture. "
-        "No quotes, no bullet points, no stage directions."
-    )
-    return ollama_generate(
-        prompt,
-        model=model,
-        api_url=api_url,
-        timeout_s=timeout_s,
-        num_predict=num_predict,
-    )
-
-
 def answer_identity_question(
     user_text: str,
     *,

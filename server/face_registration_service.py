@@ -45,6 +45,18 @@ class FaceRegVoiceResult:
     reply: str = ""
     registered_name: str | None = None
     relisten_after_reply: bool = False
+    already_registered_as: str | None = None
+
+
+def already_registered_reply(existing_name: str) -> str:
+    return (
+        f"You're already registered as {existing_name}. "
+        "I won't register your face under a different name."
+    )
+
+
+def same_person_refresh_reply(name: str) -> str:
+    return f"All set, {name}. I've added more face samples for you."
 
 
 @dataclass
@@ -66,8 +78,18 @@ def capture_face_samples(
     saved = 0
     errors: list[str] = []
 
-    for _ in range(samples):
-        frame = read_frame()
+    probe = read_frame()
+    if probe is not None and hasattr(faces, "validate_registration_name"):
+        allowed, existing = faces.validate_registration_name(probe, name)
+        if not allowed and existing:
+            return CaptureResult(
+                saved_samples=0,
+                training={"people": 0, "samples": 0, "rebuilt": False},
+                errors=[f"already_registered_as:{existing}"],
+            )
+
+    for i in range(samples):
+        frame = probe if i == 0 and probe is not None else read_frame()
         if frame is None:
             errors.append("No camera frame available")
             time.sleep(interval_ms / 1000)
@@ -143,6 +165,10 @@ class FaceRegistrationService:
         self.max_no_speech_retries = max(
             0, int(os.environ.get("FACE_REG_MAX_NO_SPEECH_RETRIES", "2"))
         )
+        self.unknown_confirm_frames = max(
+            5, int(os.environ.get("FACE_REG_UNKNOWN_CONFIRM_FRAMES", "30"))
+        )
+        self._unknown_streak = 0
 
     @property
     def state(self) -> FaceRegState:
@@ -168,6 +194,8 @@ class FaceRegistrationService:
                 "listen_prompt_at": self._listen_prompt_at,
                 "voice_heard_since_listen": self._voice_heard_since_listen,
                 "no_speech_retries": self._no_speech_retries,
+                "unknown_confirm_frames": self.unknown_confirm_frames,
+                "unknown_streak": self._unknown_streak,
             }
 
     def on_frame(
@@ -175,10 +203,18 @@ class FaceRegistrationService:
         results: list[dict[str, Any]],
         *,
         voice_active: bool = False,
-        vision_blocked: bool = False,
     ) -> None:
         """Called from MJPEG loop — may trigger proactive registration prompt."""
         if not self.enabled:
+            return
+
+        if self._primary_recognized(results):
+            with self._lock:
+                self._unknown_since = None
+                self._unknown_streak = 0
+                if self._state == "awaiting_name":
+                    logger.info("Face registration: cancelled — recognized face in frame")
+                    self._reset_locked()
             return
 
         now = time.time()
@@ -209,20 +245,19 @@ class FaceRegistrationService:
                     self._reset_locked()
             return
 
-        if voice_active or vision_blocked:
-            return
-
-        if self._primary_recognized(results):
-            with self._lock:
-                self._unknown_since = None
+        if voice_active:
             return
 
         if not self._primary_unknown_face(results):
             with self._lock:
                 self._unknown_since = None
+                self._unknown_streak = 0
             return
 
         with self._lock:
+            self._unknown_streak += 1
+            if self._unknown_streak < self.unknown_confirm_frames:
+                return
             if self._unknown_since is None:
                 self._unknown_since = now
                 return
@@ -262,6 +297,26 @@ class FaceRegistrationService:
                 relisten_after_reply=True,
             )
 
+        frame = self._read_frame()
+        existing_before: str | None = None
+        if frame is not None and hasattr(self._faces, "identify_registered_face"):
+            existing_before = self._faces.identify_registered_face(frame)
+        if frame is not None and hasattr(self._faces, "validate_registration_name"):
+            allowed, existing = self._faces.validate_registration_name(frame, name)
+            if not allowed and existing:
+                with self._lock:
+                    self._reset_locked()
+                logger.info(
+                    "Face registration blocked: already %s, heard name %s",
+                    existing,
+                    name,
+                )
+                return FaceRegVoiceResult(
+                    handled=True,
+                    reply=already_registered_reply(existing),
+                    already_registered_as=existing,
+                )
+
         with self._lock:
             self._state = "capturing"
 
@@ -279,6 +334,18 @@ class FaceRegistrationService:
 
         if capture.saved_samples == 0:
             detail = capture.errors[-1] if capture.errors else "No samples saved"
+            if detail.startswith("already_registered_as:"):
+                existing = detail.split(":", 1)[1]
+                logger.info(
+                    "Face registration blocked during capture: already %s, heard %s",
+                    existing,
+                    name,
+                )
+                return FaceRegVoiceResult(
+                    handled=True,
+                    reply=already_registered_reply(existing),
+                    already_registered_as=existing,
+                )
             logger.warning("Face registration failed for %s: %s", name, detail)
             return FaceRegVoiceResult(
                 handled=True,
@@ -294,9 +361,19 @@ class FaceRegistrationService:
             capture.saved_samples,
             capture.training,
         )
+        refresh = bool(
+            existing_before
+            and hasattr(self._faces, "same_person")
+            and self._faces.same_person(name, existing_before)
+        )
+        reply = (
+            same_person_refresh_reply(name)
+            if refresh
+            else f"All set, {name}. I've registered your face."
+        )
         return FaceRegVoiceResult(
             handled=True,
-            reply=f"All set, {name}. I've registered your face.",
+            reply=reply,
             registered_name=name,
         )
 
@@ -401,14 +478,25 @@ class FaceRegistrationService:
         wav, _ = synthesize_sapi_wav_bytes(text.strip())
         return resample_wav_bytes_to_mono_16bit(wav, VOICE_REG_TTS_RATE_HZ)
 
-    @staticmethod
-    def _primary_recognized(results: list[dict[str, Any]]) -> bool:
+    def _primary_recognized(self, results: list[dict[str, Any]]) -> bool:
+        soft_threshold = float(
+            getattr(self._faces, "match_soft_threshold", 0.42)
+        )
         for result in results:
             if not result.get("primary", True):
                 continue
             if result.get("recognized") or result.get("stabilized"):
                 name = str(result.get("name", "")).strip().lower()
-                if name and name not in {"unknown", "face"}:
+                if name and name not in {"unknown", "face"} and "[hold]" not in name:
+                    return True
+            if result.get("pending"):
+                candidate = str(result.get("candidate_name") or "").strip()
+                score = float(result.get("candidate_score") or 0.0)
+                if (
+                    candidate
+                    and candidate.lower() not in {"unknown", "face"}
+                    and score >= soft_threshold
+                ):
                     return True
         return False
 
@@ -417,6 +505,10 @@ class FaceRegistrationService:
         for result in results:
             if not result.get("primary", True):
                 continue
+            if not result.get("detection_valid", False):
+                return False
+            if not result.get("registration_eligible", False):
+                return False
             box = result.get("box") or {}
             area = int(box.get("w", 0)) * int(box.get("h", 0))
             if area < 400:
@@ -429,6 +521,7 @@ class FaceRegistrationService:
     def _reset_locked(self) -> None:
         self._state = "idle"
         self._unknown_since = None
+        self._unknown_streak = 0
         self._awaiting_since = 0.0
         self._listen_prompt_at = 0.0
         self._last_prompt_playback_seconds = 0.0

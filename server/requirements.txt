@@ -1,12 +1,35 @@
-fastapi
-uvicorn[standard]
-opencv-contrib-python
-numpy
-tensorflow>=2.16.0
-onnxruntime>=1.16.0
-jinja2
-pyttsx3
-requests>=2.32.0
+# NiNO Python server dependencies
+# Install: python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+# Python 3.10+ (3.12 tested on NVIDIA DGX / Linux aarch64)
+
+# --- Web server ---
+fastapi>=0.100.0
+uvicorn[standard]>=0.27.0
+jinja2>=3.1.0
+
+# --- Vision / face recognition ---
+opencv-contrib-python>=4.8.0
+numpy>=1.24.0
+
+# --- Camera emotion (AWS Rekognition + local DrGM fallback) ---
+boto3>=1.34
+torch>=2.0
+torchvision>=0.15
+transformers>=4.40
+safetensors
+pillow
+
+# --- Voice STT (local Whisper fallback) ---
+# ElevenLabs Scribe uses requests + ELEVENLABS_API_KEY (no extra pip package)
 faster-whisper>=1.1.0
+
+# --- TTS ---
+# Windows: pyttsx3 (SAPI). Linux: also install system espeak-ng for local TTS.
+pyttsx3>=2.90
+
+# --- PostgreSQL memory (optional; set DATABASE_URL) ---
 psycopg2-binary>=2.9.9
+
+# --- HTTP / environment ---
+requests>=2.32.0
 python-dotenv>=1.0.0

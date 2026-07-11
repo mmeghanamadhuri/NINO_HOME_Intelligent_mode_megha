@@ -1,6 +1,6 @@
-# NiNO Home — ESP32-P4 Voice, Vision, Emotion & Memory
+# NiNO Home — ESP32-P4 Voice, Vision & Memory
 
-NiNO is a smart-home demo built around the **ESP32-P4 Function EV Board**. The board handles camera streaming, wake-word capture, speaker playback, capacitive touch, servo motion, and animated OLED eyes. A **Python FastAPI server** on a PC runs face recognition, **camera emotion detection**, speech-to-text, LLM replies, persistent conversation memory, alarms, and TTS — then sends audio and eye-expression tags back to the board.
+NiNO is a smart-home demo built around the **ESP32-P4 Function EV Board**. The board handles camera streaming, wake-word capture, speaker playback, capacitive touch, servo motion, and animated OLED eyes. A **Python FastAPI server** on a PC runs face recognition, speech-to-text, LLM replies, persistent conversation memory, alarms, and TTS — then sends audio and eye-expression tags back to the board.
 
 ---
 
@@ -11,7 +11,6 @@ NiNO is a smart-home demo built around the **ESP32-P4 Function EV Board**. The b
 - [Hardware](#hardware)
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
-- [Vision emotion (camera empathy)](#vision-emotion-camera-empathy)
 - [PostgreSQL conversation memory](#postgresql-conversation-memory)
 - [Voice assistant](#voice-assistant)
 - [Face recognition](#face-recognition)
@@ -32,9 +31,8 @@ NiNO is a smart-home demo built around the **ESP32-P4 Function EV Board**. The b
 ESP32-P4 (firmware)                         PC — FastAPI server
 ─────────────────────                       ────────────────────
 UVC camera ──► GET /stream ───────────────► CameraStream + YuNet/SFace face ID
-                                             Keras CNN emotion on face crop
 Wake word + USB mic ──► WS /voice-query ───────► STT → LLM → TTS → WAV reply
-Speaker ◄──── POST /play_wav ◄───────────── empathy, alarms, voice replies
+Speaker ◄──── POST /play_wav ◄───────────── greetings, alarms, voice replies
 OLED eyes ◄── X-Nino-Eye-Expression ◄────── happy / sad / surprised tags
 Servo ◄──── POST /servo/360 ◄────────────── voice-triggered 360° spin
 Touch / eyes ── onboard only
@@ -43,15 +41,6 @@ Touch / eyes ── onboard only
                                             users, conversations,
                                             memories, summaries
 ```
-
-### Pipeline priorities
-
-| Priority | Pipeline | Trigger | Eye delivery |
-| -------- | -------- | ------- | ------------ |
-| **P0** | Voice WebSocket | User says "Hi ESP" and speaks | JSON `eye_expression` + binary WAV |
-| **P1** | Vision emotion | Registered face + stable emotion ~2 s | HTTP header `X-Nino-Eye-Expression` + WAV |
-
-Voice always wins. Vision empathy is blocked during a voice query and for ~90 s afterward.
 
 ### Voice query flow
 
@@ -74,7 +63,6 @@ Voice always wins. Vision empathy is blocked during a voice query and for ~90 s 
 | Area | What NiNO does |
 | ---- | -------------- |
 | **Vision** | YuNet detection + SFace 128-D embeddings; web UI registration |
-| **Emotion** | 48×48 Keras CNN on face crop; ~2 s stabilization; empathetic TTS + OLED eyes |
 | **Voice** | USB 4-mic wake word on GPIO header; ElevenLabs or Whisper STT; Ollama (Qwen) replies; cross-platform TTS |
 | **Memory** | PostgreSQL per-user conversation log; recap questions from recent history |
 | **Alarms** | Voice-set reminders; medical (P0) with yes/no auto-listen; web UI ack/delete |
@@ -116,7 +104,7 @@ Voice always wins. Vision empathy is blocked during a voice query and for ~90 s 
 
 - Python **3.10+**
 - **Windows** or **Linux** (Ubuntu / NVIDIA DGX tested)
-- [Ollama](https://ollama.com) for voice + alarm NLP + empathy replies
+- [Ollama](https://ollama.com) for voice + alarm NLP replies
 - See [`server/requirements.txt`](server/requirements.txt) — includes `tensorflow`, `opencv-contrib-python`, `fastapi`, `faster-whisper`, `onnxruntime`, `psycopg2-binary`
 - **PostgreSQL** (optional, for conversation memory)
 - **TTS** — one of: ElevenLabs API key, Windows SAPI, or Linux espeak-ng
@@ -185,7 +173,7 @@ python app.py --host 0.0.0.0 --port 8000 \
   --database-url "postgresql://nino:nino@127.0.0.1:5432/nino_memory"
 ```
 
-Open the web UI at **[http://localhost:8000](http://localhost:8000)** — register faces, watch the live feed with emotion overlay, and manage alarms.
+Open the web UI at **[http://localhost:8000](http://localhost:8000)** — register faces, watch the live feed, and manage alarms.
 
 ### 4. Connect voice on the ESP console
 
@@ -198,29 +186,6 @@ voice status
 Say **"Hi ESP"** — you should hear a **beep**, then speak your question. Eyes animate: **listening** → **thinking** → reply expression → **idle**.
 
 Use your **PC’s LAN IP** (where `python app.py` runs), not the board’s IP. `voice status` shows USB mic streaming (`rx_chunks`, `peak` when you speak).
-
----
-
-## Vision emotion (camera empathy)
-
-When a **registered person** stands in front of the camera without speaking, NiNO can detect their expression and respond empathetically.
-
-**Flow:**
-
-1. Face recognized (YuNet + SFace).
-2. Keras CNN runs on a 48×48 grayscale face crop every frame.
-3. Emotion votes accumulate for **2.0–2.5 seconds**.
-4. Ollama generates a short empathetic line (*"You look a bit down today, Chakri"*).
-5. TTS plays on the ESP with an eye tag (`happy`, `sad`, `surprised`, …).
-
-**Speakable emotions:** happy, surprise, sad, anger, fear  
-**Overlay only:** neutral, disgust
-
-**Live feed:** `/video_feed` shows a pink emotion overlay (effective label, confidence, accumulation time).
-
-**Model:** `server/data/models/emotion_model_best.h5` (7-class CNN, TensorFlow). Optional fallback: `EMOTION_BACKEND=ferplus` for ONNX FER+.
-
-Full details: **[docs/EMOTION_RECOGNITION.md](docs/EMOTION_RECOGNITION.md)**
 
 ---
 
@@ -357,7 +322,7 @@ Details: **[docs/SERVO.md](docs/SERVO.md)**
 | **Idle** | Boot, after reply finishes |
 | **Listening** | Wake word through end of user speech |
 | **Thinking** | Audio sent to server until reply received |
-| **happy / sad / surprised** | Voice reply text or camera emotion empathy |
+| **happy / sad / surprised** | Voice reply text (`eye_expression.py`) |
 
 Serial test: `eye idle` / `eye listening` / `eye thinking`
 
@@ -380,7 +345,7 @@ Serial test: `eye idle` / `eye listening` / `eye thinking`
 
 ## Server setup
 
-See **[server/README.md](server/README.md)** for module map, configuration, tests, and emotion tuning.
+See **[server/README.md](server/README.md)** for module map, configuration, and tests.
 
 ### Configuration precedence
 
@@ -417,8 +382,8 @@ python app.py \
 | Method | Path | Description |
 | ------ | ---- | ----------- |
 | GET | `/` | Web UI (faces, alarms) |
-| GET | `/video_feed` | Annotated MJPEG with face boxes + emotion overlay |
-| GET | `/api/status` | Camera, faces, emotion, vision emotion, TTS, LLM, alarms, memory |
+| GET | `/video_feed` | Annotated MJPEG with face boxes |
+| GET | `/api/status` | Camera, faces, TTS, LLM, alarms, memory |
 | GET | `/api/latency-log?limit=50` | Recent voice timing events |
 | GET | `/api/memory/stats` | PostgreSQL row counts |
 | GET | `/api/alarms` | List alarms |
@@ -441,25 +406,12 @@ python app.py \
 | Variable | Default | Purpose |
 | -------- | ------- | ------- |
 | `DATABASE_URL` | — | PostgreSQL URL for conversation memory |
-| `ESP_PLAY_WAV_URL` | CLI / config | TTS, alarms, empathy; derives servo host |
+| `ESP_PLAY_WAV_URL` | CLI / config | TTS, alarms; derives servo host |
 | `OLLAMA_URL` | `auto` | Ollama API; `auto` prefers GPU `:11435` on Linux |
 | `OLLAMA_MODEL` | `qwen2.5:1.5b` | LLM model name |
 | `ELEVENLABS_API_KEY` | — | Cloud STT/TTS |
 | `STT_PROVIDER` | auto | `elevenlabs` or `whisper` |
 | `TTS_PROVIDER` | auto | `elevenlabs`, `sapi`, or `local` |
-
-### Vision emotion
-
-| Variable | Default | Purpose |
-| -------- | ------- | ------- |
-| `VISION_EMOTION_ENABLED` | `1` | Master switch for camera empathy |
-| `EMOTION_BACKEND` | `keras` | `keras` (default) or `ferplus` (ONNX fallback) |
-| `VISION_EMOTION_WINDOW_MIN_S` | `2.0` | Min seconds in frame before empathy |
-| `VISION_EMOTION_COOLDOWN_S` | `120` | Seconds before same person gets empathy again |
-| `VISION_EMOTION_AFTER_VOICE_SECONDS` | `90` | Pause empathy after voice query |
-| `EMOTION_MIN_CONFIDENCE` | `0.12` | Min confidence for speakable class |
-
-See [server/README.md](server/README.md) and [docs/EMOTION_RECOGNITION.md](docs/EMOTION_RECOGNITION.md) for the full list.
 
 ---
 
@@ -470,15 +422,12 @@ See [server/README.md](server/README.md) and [docs/EMOTION_RECOGNITION.md](docs/
 ├── main/                    ESP-IDF firmware (camera, audio, eyes, servo, voice WS)
 ├── server/                  Python FastAPI server — see server/README.md
 │   ├── app.py               HTTP/WS entry point
-│   ├── emotion_service.py   Keras / FER+ inference
-│   ├── vision_emotion_service.py  Emotion accumulation + empathy queue
 │   ├── face_service.py      YuNet + SFace
-│   ├── llm_service.py       Ollama voice + empathy prompts
+│   ├── llm_service.py       Ollama voice replies
 │   ├── tts_service.py       TTS + ESP playback
-│   ├── data/models/         emotion_model_best.h5, YuNet, SFace, …
+│   ├── data/models/         YuNet, SFace, …
 │   └── scripts/             DB init, Ollama GPU helpers
-├── emotion-trial/           Original training weights + loader (seed for data/models)
-├── docs/                    Design docs, alarm/servo/wifi guides, emotion flow
+├── docs/                    Design docs, alarm/servo/wifi guides
 ├── tools/                   Build helpers
 └── README.md                This file
 ```
@@ -493,13 +442,6 @@ See [server/README.md](server/README.md) and [docs/EMOTION_RECOGNITION.md](docs/
 - Register varied samples (angles, lighting)
 - Too many false accepts → raise `FACE_MATCH_THRESHOLD` (e.g. `0.45`)
 - Too many rejects → lower it (e.g. `0.38`)
-
-### Vision emotion
-
-- Check `GET /api/status` → `"emotion": { "available": true, "backend": "keras" }`
-- No empathy spoken → hold expression ~2 s; only speakable emotions trigger TTS
-- Blocked after voice → wait `VISION_EMOTION_AFTER_VOICE_SECONDS` (default 90 s)
-- Wrong labels → confirm training label order matches FER2013 (anger, disgust, fear, happy, sad, surprise, neutral)
 
 ### Voice
 
@@ -527,8 +469,6 @@ See [server/README.md](server/README.md) and [docs/EMOTION_RECOGNITION.md](docs/
 | Document | Contents |
 | -------- | -------- |
 | [server/README.md](server/README.md) | Server modules, setup, tests, API details |
-| [docs/EMOTION_RECOGNITION.md](docs/EMOTION_RECOGNITION.md) | Camera emotion pipeline, tuning, overlay |
-| [docs/emotion-detect.md](docs/emotion-detect.md) | Original design vs implementation |
 | [docs/VOICE_FACE_REGISTRATION.md](docs/VOICE_FACE_REGISTRATION.md) | Automatic unknown-face → voice name → register |
 | [docs/ALARM.md](docs/ALARM.md) | Voice alarm commands, medical flow |
 | [docs/SERVO.md](docs/SERVO.md) | Dynamixel wiring, 360 sequence |
@@ -545,6 +485,5 @@ Reference USB wake-word demo: [ESP-P4-UK-Demo / USB-4-mic-wake-word](https://git
 ## Notes
 
 - Touch audio **preempts** server/voice playback and resumes afterward.
-- Generic face greetings are disabled when vision emotion is enabled — empathy replaces them.
-- Voice WebSocket replies derive eye expression from **reply text**; camera empathy uses **CNN labels**.
+- Voice WebSocket replies derive eye expression from **reply text** via `eye_expression.py`.
 - Keep `server/server_config.json`, `.env`, and API keys **out of public commits**.

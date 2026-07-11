@@ -376,6 +376,19 @@ class MemoryFilterTests(unittest.TestCase):
     def test_trivia_helper_still_detects_known_patterns(self) -> None:
         self.assertTrue(is_trivia_query("Tell me how does a GPU works?"))
 
+    def test_full_form_queries_are_trivia_not_memory(self) -> None:
+        for text in (
+            "Full form of Wi-Fi.",
+            "What is the full form of CPU and GPU?",
+            "What is the full form of CNN?",
+            "Ah... What is the full form of CNN in image processing?",
+            "spell password",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(is_trivia_query(text), msg=text)
+                self.assertFalse(is_preference_update_statement(text), msg=text)
+                self.assertFalse(user_explicitly_states_personal_fact(text), msg=text)
+
     def test_favorite_food_recall_detected(self) -> None:
         for text in (
             "What is my favourite food?",

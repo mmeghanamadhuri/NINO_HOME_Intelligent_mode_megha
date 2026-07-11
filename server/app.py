@@ -23,22 +23,14 @@ from starlette.staticfiles import StaticFiles as StarletteStaticFiles
 
 from alarm_service import get_alarm_service
 from camera import CameraStream
-from emotion_service import EMOTION_TO_EYE, EmotionService
-from esp_eye_stream import EspEyeStream
 from eye_expression import normalize_eye_expression
 from face_registration_service import capture_face_samples, configure_face_registration
 from face_service import FaceService
 from memory_service import configure_from_environ as configure_memory_from_environ
 from memory_service import get_memory_service, normalize_database_url
 from esp_playback import ensure_esp_play_wav_url_configured, esp_play_wav_url
-from pipeline_priority import (
-    begin_voice_query,
-    end_voice_query,
-    vision_emotion_blocked,
-    voice_pipeline_active,
-)
+from emotion_service import EmotionService
 from tts_service import TTSService, synthesize_sapi_wav_bytes
-from vision_emotion_service import VisionEmotionService
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +46,27 @@ def _load_env_file() -> None:
         pass
 
 
-# Must run before EmotionService / other services read os.environ at import time.
 _load_env_file()
+
+_voice_query_lock = threading.Lock()
+_voice_query_depth = 0
+
+
+def begin_voice_query() -> None:
+    global _voice_query_depth
+    with _voice_query_lock:
+        _voice_query_depth += 1
+
+
+def end_voice_query() -> None:
+    global _voice_query_depth
+    with _voice_query_lock:
+        _voice_query_depth = max(0, _voice_query_depth - 1)
+
+
+def voice_pipeline_active() -> bool:
+    with _voice_query_lock:
+        return _voice_query_depth > 0
 
 
 class _GracefulShutdownFilter(logging.Filter):
@@ -145,17 +156,9 @@ app.mount("/static", NoCacheStaticFiles(directory=str(BASE_DIR / "static")), nam
 camera = CameraStream(DEFAULT_CAMERA_SOURCE)
 faces = FaceService(BASE_DIR / "data")
 face_registration = configure_face_registration(faces, camera.read)
-emotion = EmotionService(BASE_DIR / "data")
+emotion = EmotionService()
 _tts_face_interval = float(os.environ.get("FACE_GREETING_INTERVAL_SECONDS", "600"))
 tts = TTSService(cooldown_seconds=0.0, face_greeting_interval_seconds=_tts_face_interval)
-vision_emotion = VisionEmotionService(
-    emotion,
-    speak_wav=lambda text, eye: tts.speak_to_esp(text, eye_expression=eye),
-    is_speaker_busy=tts.is_speaking,
-    defer_empathy_for=tts.needs_startup_summary_greeting,
-)
-tts.set_on_summary_greeting_spoken(vision_emotion.notify_summary_greeting_spoken)
-eye_stream = EspEyeStream()
 latest_results: list[dict] = []
 # Update vision-driven TTS every frame so greetings start as soon as recognition succeeds
 # (throttling here added a noticeable delay before enqueue).
@@ -165,7 +168,7 @@ TTS_UPDATE_INTERVAL_SECONDS = 0.0
 _voice_viewer_lock = threading.Lock()
 _voice_viewer_name: str | None = None
 _voice_viewer_at: float = 0.0
-VOICE_VIEWER_TTL_SECONDS = float(os.environ.get("VOICE_VIEWER_TTL_SECONDS", "900"))
+VOICE_VIEWER_TTL_SECONDS = float(os.environ.get("VOICE_VIEWER_TTL_SECONDS", "120"))
 
 
 class CameraRequest(BaseModel):
@@ -196,7 +199,7 @@ def startup() -> None:
         logger.info("ESP speaker/eyes playback URL: %s", play_url)
     else:
         logger.warning(
-            "ESP_PLAY_WAV_URL not set — camera empathy TTS and eye tags will not reach the board. "
+            "ESP_PLAY_WAV_URL not set — face greeting TTS will not reach the board. "
             "Set ESP_PLAY_WAV_URL or CAMERA_SOURCE=http://<ESP_IP>/stream"
         )
     from network_util import voice_ws_url_for_esp
@@ -297,14 +300,12 @@ def latency_log(limit: int = 50) -> dict:
 @app.get("/api/status")
 def status() -> dict:
     from llm_service import ollama_runtime_status
-    from pipeline_priority import status as pipeline_status
 
     return {
         "camera": camera.status(),
         "faces": faces.stats(),
         "emotion": emotion.stats(),
-        "vision_emotion": vision_emotion.status(),
-        "pipeline_priority": pipeline_status(),
+        "voice_pipeline_active": voice_pipeline_active(),
         "tts": tts.status(),
         "llm": ollama_runtime_status(
             model=os.environ.get("OLLAMA_MODEL"),
@@ -369,6 +370,18 @@ def ack_alarm(alarm_id: str, req: AlarmAckRequest) -> dict:
 
 @app.post("/api/register")
 def register(req: RegisterRequest) -> dict:
+    probe = camera.read()
+    if probe is not None:
+        allowed, existing = faces.validate_registration_name(probe, req.name)
+        if not allowed and existing:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"You're already registered as {existing}. "
+                    "Use the same name to add more samples, or retrain only."
+                ),
+            )
+
     capture = capture_face_samples(
         faces,
         camera.read,
@@ -377,6 +390,16 @@ def register(req: RegisterRequest) -> dict:
         interval_ms=req.interval_ms,
     )
     if capture.saved_samples == 0:
+        detail = capture.errors[-1] if capture.errors else "No samples saved"
+        if detail.startswith("already_registered_as:"):
+            existing = detail.split(":", 1)[1]
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"You're already registered as {existing}. "
+                    "Use the same name to add more samples."
+                ),
+            )
         raise HTTPException(
             status_code=422,
             detail=capture.errors[-1] if capture.errors else "No samples saved",
@@ -403,7 +426,12 @@ def snapshot() -> Response:
     if frame is None:
         raise HTTPException(status_code=503, detail="No camera frame available")
 
-    annotated, _ = faces.annotate(frame)
+    results = faces.recognize(frame)
+    try:
+        emotion.attach_emotions(frame, results)
+    except Exception:
+        logger.exception("Emotion detection failed for snapshot")
+    annotated, _ = faces.annotate(frame, results=results)
     ok, encoded = cv2.imencode(".jpg", annotated)
     if not ok:
         raise HTTPException(status_code=500, detail="Could not encode snapshot")
@@ -419,39 +447,6 @@ def video_feed() -> StreamingResponse:
     )
 
 
-def _draw_emotion_overlay(frame, overlay: dict) -> None:
-    """Live emotion label on MJPEG (debug / demo)."""
-    label = overlay.get("emotion")
-    if not label:
-        return
-    conf = overlay.get("confidence")
-    raw = overlay.get("raw_emotion")
-    accum = overlay.get("accum_s")
-    scores = overlay.get("scores") or {}
-    parts = [str(label)]
-    if conf is not None:
-        parts.append(f"{float(conf):.0%}")
-    if raw and raw != label:
-        parts.append(f"raw={raw}")
-    if accum is not None:
-        parts.append(f"{float(accum):.1f}s")
-    if scores:
-        score_txt = " ".join(f"{k[:1]}:{v:.0%}" for k, v in list(scores.items())[:3])
-        parts.append(score_txt)
-    text = " ".join(parts)
-    h = frame.shape[0]
-    cv2.putText(
-        frame,
-        text,
-        (12, max(24, h - 16)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        (180, 80, 255),
-        2,
-        cv2.LINE_AA,
-    )
-
-
 def _mjpeg_generator():
     global latest_results
     last_tts_update_at = 0.0
@@ -460,17 +455,20 @@ def _mjpeg_generator():
             frame = camera.read()
             if frame is None:
                 tts.update_face_state([])
-                eye_stream.publish("idle")
                 time.sleep(0.02)
                 continue
 
-            annotated, results = faces.annotate(frame)
+            results = faces.recognize(frame)
+            try:
+                emotion.attach_emotions(frame, results)
+            except Exception:
+                logger.exception("Emotion detection failed; continuing MJPEG")
+            annotated, results = faces.annotate(frame, results=results)
             latest_results = results
             try:
                 face_registration.on_frame(
                     results,
                     voice_active=voice_pipeline_active(),
-                    vision_blocked=vision_emotion_blocked(),
                 )
             except Exception:
                 logger.exception("Face registration frame hook failed")
@@ -478,23 +476,6 @@ def _mjpeg_generator():
             if now - last_tts_update_at >= TTS_UPDATE_INTERVAL_SECONDS:
                 _update_tts_face_state(results)
                 last_tts_update_at = now
-            try:
-                vision_emotion.process_frame(frame, results)
-                overlay = vision_emotion.latest_overlay()
-                if overlay:
-                    _draw_emotion_overlay(annotated, overlay)
-            except Exception:
-                overlay = None
-                logger.exception("Vision emotion frame failed; continuing MJPEG")
-
-            # Live eye mirror (P1): skip while voice is active so listening/thinking
-            # are not overridden. Requires VISION_EYE_STREAM_ENABLED=1 on the server.
-            if not vision_emotion_blocked() and not voice_pipeline_active():
-                if overlay and overlay.get("emotion"):
-                    label = str(overlay.get("emotion", "")).strip().lower()
-                    eye_stream.publish(EMOTION_TO_EYE.get(label))
-                else:
-                    eye_stream.publish("idle")
 
             ok, encoded = cv2.imencode(
                 ".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 70]
@@ -541,8 +522,11 @@ def _update_tts_face_state(results: list[dict]) -> None:
     for result in results:
         if not result.get("primary", True):
             continue
-        if result.get("recognized") or result.get("stabilized"):
-            recognized_names.append(str(result.get("name", "")))
+        if not result.get("stabilized"):
+            continue
+        name = str(result.get("name", "")).strip()
+        if name and name.lower() not in {"unknown", "face"} and "[hold]" not in name:
+            recognized_names.append(name)
     primary = _primary_recognized_viewer(results)
     tts.update_face_state(recognized_names, primary_name=primary)
     if primary:

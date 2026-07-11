@@ -541,9 +541,6 @@ class TTSService:
 
     def notify_voice_interaction(self, viewer_name: str | None) -> None:
         """After a voice reply: drop stale vision greetings and pause auto-welcome."""
-        from pipeline_priority import notify_voice_interaction as _notify_priority
-
-        _notify_priority()
         with self._lock:
             now = time.time()
             self._suppress_vision_until = now + self._voice_cooldown_seconds
@@ -604,23 +601,12 @@ class TTSService:
             primary_re_entered = primary not in prev_present
             self._present_known_names = current_known
 
-            vision_emotion_on = os.environ.get("VISION_EMOTION_ENABLED", "1").strip().lower() in {
-                "1",
-                "true",
-                "yes",
-                "on",
-            }
-            if now >= self._suppress_vision_until and not vision_emotion_on:
+            if now >= self._suppress_vision_until:
                 seen_before = primary in self._known_seen_once
                 if not seen_before:
                     self._enqueue_known_greeting_locked(primary, now, welcome_back=False)
                 elif primary_re_entered:
                     self._enqueue_known_greeting_locked(primary, now, welcome_back=True)
-            elif now >= self._suppress_vision_until and vision_emotion_on:
-                if primary not in self._startup_greeted:
-                    self._enqueue_startup_greeting_locked(primary, now)
-                else:
-                    self._known_seen_once.add(primary)
 
             self._active_mode = "known"
             self._active_name = primary
@@ -638,8 +624,8 @@ class TTSService:
             return name
 
     def viewer_name_for_voice(self) -> str | None:
-        """Longer hold than vision UI — keeps name for voice follow-up questions."""
-        voice_hold = max(self.face_hold_seconds, 120.0)
+        """Short hold for voice follow-up — avoids ghost identities."""
+        voice_hold = float(os.environ.get("FACE_VOICE_VIEWER_HOLD_SECONDS", "30"))
         with self._lock:
             name = str(self._active_name or "").strip()
             if not name or name.lower() in {"unknown", "face"}:

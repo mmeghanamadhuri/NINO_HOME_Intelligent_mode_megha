@@ -1,6 +1,6 @@
 # NiNO Python Server
 
-FastAPI server for the NiNO ESP32-P4 demo. It pulls camera frames from the board (or a local webcam), runs face recognition and **camera emotion detection**, handles voice queries over WebSocket, manages alarms and PostgreSQL memory, and sends TTS audio plus eye-expression tags back to the ESP.
+FastAPI server for the NiNO ESP32-P4 demo. It pulls camera frames from the board (or a local webcam), runs face recognition, handles voice queries over WebSocket, supports **automatic voice face registration** for unknown visitors, manages alarms and PostgreSQL memory, and sends TTS audio plus eye-expression tags back to the ESP.
 
 ---
 
@@ -10,9 +10,9 @@ FastAPI server for the NiNO ESP32-P4 demo. It pulls camera frames from the board
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
 - [Modules](#modules)
-- [Vision emotion pipeline](#vision-emotion-pipeline)
 - [Voice pipeline](#voice-pipeline)
 - [Face recognition](#face-recognition)
+- [Automatic face registration](#automatic-face-registration)
 - [Memory (PostgreSQL)](#memory-postgresql)
 - [Startup summary greeting](#startup-summary-greeting)
 - [ESP TTS chunking](#esp-tts-chunking)
@@ -31,23 +31,17 @@ FastAPI server for the NiNO ESP32-P4 demo. It pulls camera frames from the board
 app.py
   ├── camera.py              ESP snapshot / MJPEG / local webcam
   ├── face_service.py        YuNet + SFace → face_embeddings.json
-  ├── emotion_service.py     Keras CNN (default) or FER+ ONNX
-  ├── vision_emotion_service.py  2–2.5 s accumulation → empathy jobs
-  ├── pipeline_priority.py   P0 voice blocks P1 vision emotion
+  ├── face_registration_service.py  Unknown face → prompt → name → capture
+  ├── face_registration_voice.py    Parse “my name is …” from STT
   ├── voice_service.py       WebSocket STT → route → TTS
-  ├── llm_service.py         Ollama voice replies + empathy prompts
+  ├── llm_service.py         Ollama voice replies + greeting prompts
   ├── tts_service.py         ElevenLabs / SAPI / espeak → esp_playback.py
+  ├── esp_playback.py        POST /play_wav + eye / prompt_ack headers
   ├── esp_wav_chunking.py    Split long TTS into ESP-sized WAV clips
+  ├── network_util.py        LAN IP + VOICE_WS_URL for ESP pairing
   ├── alarm_service.py       Voice + scheduler + medical ack
   └── memory_service.py      PostgreSQL conversations + recall + daily summaries
 ```
-
-### Priority model
-
-| Priority | Service | Blocks when |
-| -------- | ------- | ----------- |
-| **P0** | Voice WebSocket (`/ws/voice`) | Active utterance + post-voice cooldown |
-| **P1** | Vision emotion | P0 active, TTS busy, startup summary greeting pending, or within `VISION_EMOTION_AFTER_VOICE_SECONDS` |
 
 ---
 
@@ -62,9 +56,7 @@ source .venv/bin/activate          # Windows: .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-**Dependencies:** FastAPI, OpenCV, NumPy, **TensorFlow** (Keras emotion model), ONNX Runtime (optional FER+ fallback), faster-whisper, psycopg2, python-dotenv.
-
-TensorFlow adds ~1.4 GB to the venv — required for the default emotion backend.
+**Dependencies:** FastAPI, OpenCV, NumPy, faster-whisper, psycopg2, python-dotenv.
 
 ### 2. Environment file
 
@@ -78,11 +70,11 @@ Edit `.env` for your machine:
 DATABASE_URL=postgresql://nino:nino@127.0.0.1:5432/nino_memory
 OLLAMA_URL=http://127.0.0.1:11435/api/generate
 OLLAMA_MODEL=qwen2.5:1.5b
-VISION_EMOTION_ENABLED=1
-EMOTION_BACKEND=keras
 MEMORY_SUMMARY_CRON=1
 MEMORY_SUMMARY_CRON_TIME=00:05
 # ESP_PLAY_WAV_URL=http://192.168.0.96/play_wav
+# VOICE_WS_URL=ws://192.168.0.100:8000/voice-query
+# FACE_REG_ENABLED=1
 # ELEVENLABS_API_KEY=sk_...
 ```
 
@@ -146,28 +138,6 @@ voice wake on
 | `--tts-provider` | `elevenlabs`, `sapi`, or `local` |
 | `--face-threshold` | SFace match threshold (default 0.42) |
 
-### Vision emotion variables
-
-All `*_S` settings are **seconds**, not milliseconds.
-
-| Variable | Default | Purpose |
-| -------- | ------- | ------- |
-| `VISION_EMOTION_ENABLED` | `1` | Master switch |
-| `EMOTION_BACKEND` | `keras` | `keras`, `ferplus`, `trial`, or `h5` |
-| `EMOTION_KERAS_MODEL_PATH` | `data/models/emotion_model_best.h5` | Override weights path |
-| `VISION_EMOTION_WINDOW_MIN_S` | `2.0` | Min time in frame before empathy |
-| `VISION_EMOTION_WINDOW_MAX_S` | `2.5` | Max wait for stable emotion |
-| `VISION_EMOTION_DOMINANCE` | `0.35` | Fraction of frames that must agree |
-| `VISION_EMOTION_COOLDOWN_S` | `120` | Per-person empathy cooldown |
-| `VISION_EMOTION_DISPLAY_SAMPLE_S` | `1.0` | Seconds to sample CNN votes before locking overlay |
-| `VISION_EMOTION_DISPLAY_HOLD_S` | `5.0` | Seconds to show locked emotion on video + ESP eyes |
-| `VISION_EMOTION_AFTER_VOICE_SECONDS` | `90` | Pause after voice query |
-| `EMOTION_MIN_CONFIDENCE` | `0.12` | Min confidence for speakable class |
-| `EMOTION_NEUTRAL_SUPPRESS_RATIO` | `0.22` | Promote sad/happy over dominant neutral |
-| `EMOTION_SPEAKABLE_MIN` | `0.12` | Absolute min for speakable promotion |
-| `EMOTION_DEVICE` | `auto` | FER+ only: `auto` / `cuda` / `cpu` |
-
-### Memory & summary variables
 
 | Variable | Default | Purpose |
 | -------- | ------- | ------- |
@@ -179,16 +149,34 @@ All `*_S` settings are **seconds**, not milliseconds.
 | `MEMORY_SUMMARY_CRON` | `0` | Phase C — enable daily summaries |
 | `MEMORY_SUMMARY_CRON_TIME` | `00:05` | Local time (HH:MM) to summarize yesterday |
 | `STARTUP_GREETING_TEMPERATURE` | `VOICE_REPLY_TEMPERATURE` | LLM variety for startup counter-question |
-| `VISION_EMOTION_AFTER_SUMMARY_GREETING_S` | `180` | Pause empathy after startup summary greeting |
 
 ### ESP playback variables
 
 | Variable | Default | Purpose |
 | -------- | ------- | ------- |
-| `ESP_PLAY_WAV_URL` | — | ESP `POST /play_wav` endpoint |
+| `ESP_PLAY_WAV_URL` | derived from `CAMERA_SOURCE` | ESP `POST /play_wav` endpoint |
 | `ESP_MAX_PLAY_WAV_BYTES` | `389120` | Max WAV size (~384 KiB firmware limit) |
 | `TTS_PROVIDER` | auto | `elevenlabs`, `sapi`, or `local` (espeak) |
 | `LOCAL_TTS_RATE` | derived | espeak rate tweak (see `tts_service.py`) |
+| `VOICE_WS_URL` | — | Full WebSocket URL pushed to ESP on `prompt_ack` |
+| `NINO_SERVER_LAN_HOST` | auto-detect | PC LAN IP when building `VOICE_WS_URL` |
+| `NINO_SERVER_PORT` | `8000` | Port in auto-built `VOICE_WS_URL` |
+
+### Face registration variables
+
+| Variable | Default | Purpose |
+| -------- | ------- | ------- |
+| `FACE_REG_ENABLED` | `1` | Automatic voice registration for unknown faces |
+| `FACE_REG_UNKNOWN_SECONDS` | `3` | Seconds unknown face must stay in frame before prompt |
+| `FACE_REG_PROMPT_COOLDOWN_SECONDS` | `600` | Min seconds between registration prompts |
+| `FACE_REG_SAMPLES` | `15` | Face crops per registration (same as web UI) |
+| `FACE_REG_INTERVAL_MS` | `150` | Delay between sample captures |
+| `FACE_REG_AWAIT_NAME_SECONDS` | `45` | Drop `awaiting_name` if no voice response |
+| `FACE_REG_NO_SPEECH_RETRY_SECONDS` | `6` | Wait after prompt playback before no-speech retry |
+| `FACE_REG_LISTEN_OPEN_DELAY_SECONDS` | `3` | Extra delay before treating listen window as silent |
+| `FACE_REG_MAX_NO_SPEECH_RETRIES` | `2` | Max automatic re-prompts when mic stays silent |
+
+Requires `ESP_PLAY_WAV_URL` (or `CAMERA_SOURCE=http://<ESP_IP>/stream`) for proactive prompts.
 
 ---
 
@@ -199,11 +187,10 @@ All `*_S` settings are **seconds**, not milliseconds.
 | `app.py` | FastAPI routes, MJPEG generator, voice WebSocket, wiring |
 | `camera.py` | HTTP snapshot polling, local USB fallback |
 | `face_service.py` | YuNet detection, SFace embeddings, registration |
-| `emotion_service.py` | Face crop, CNN inference, label mapping, neutral suppression |
-| `emotion_model_loader.py` | Keras architecture + `.h5` weight load |
-| `vision_emotion_service.py` | Frame accumulation, empathy job queue, overlay state |
-| `pipeline_priority.py` | Voice/vision mutual exclusion |
-| `llm_service.py` | Ollama voice replies, empathy prompts, startup greeting prompts |
+| `face_registration_service.py` | Unknown-face timer, proactive prompt, capture + train |
+| `face_registration_voice.py` | Parse name phrases from STT (“my name is …”, “call me …”) |
+| `network_util.py` | LAN IP guess + `VOICE_WS_URL` for ESP voice pairing |
+| `llm_service.py` | Ollama voice replies, startup greeting prompts |
 | `eye_expression.py` | Reply-text → eye tag scoring (voice path) |
 | `tts_service.py` | TTS synthesis, startup greeting queue, ESP multi-clip playback |
 | `esp_playback.py` | `POST /play_wav` + `X-Nino-Eye-Expression` header |
@@ -215,95 +202,20 @@ All `*_S` settings are **seconds**, not milliseconds.
 
 ---
 
-## Vision emotion pipeline
-
-When `VISION_EMOTION_ENABLED=1` (default):
-
-1. **MJPEG loop** reads ESP snapshots and runs face recognition.
-2. **Startup summary greeting** (once per boot) may run first — empathy is deferred until it finishes.
-3. **Primary face** selected (largest stabilized or strong candidate match).
-4. **Emotion CNN** runs on padded face crop every frame.
-5. **Display hold** — sample votes for `VISION_EMOTION_DISPLAY_SAMPLE_S` (1 s), then lock overlay + ESP eyes for `VISION_EMOTION_DISPLAY_HOLD_S` (5 s); repeat.
-6. **Empathy votes accumulate** separately for 2.0–2.5 s while the same person stays in frame.
-7. **Dominant speakable emotion** (≥35% of frames) queues an empathy job.
-8. **Background worker** calls Ollama → TTS → `POST /play_wav` with eye header.
-9. **Cooldown** — same person not addressed again for 120 s.
-
-### Emotion model (default: Keras)
-
-| Item | Detail |
-| ---- | ------ |
-| Weights | `data/models/emotion_model_best.h5` |
-| Loader | `emotion_model_loader.py` |
-| Input | 48×48 grayscale, `/255.0`, no CLAHE |
-| Classes | anger, disgust, fear, happy, sad, surprise, neutral |
-| Runtime | TensorFlow CPU |
-| Seed source | `../emotion-trial/emotion_model_best.h5` if missing from `data/models/` |
-
-### FER+ fallback
-
-Set `EMOTION_BACKEND=ferplus` to use ONNX FER+ (`data/models/emotion-ferplus-8.onnx`, auto-downloaded). 64×64 input, 8 classes, CLAHE preprocessing.
-
-### Speakable vs overlay-only
-
-**Triggers empathy + eyes:** happy, surprise, sad, anger, fear  
-**Overlay only:** neutral, disgust
-
-### Eye tag mapping
-
-| Detected | ESP header |
-| -------- | ---------- |
-| happy | `happy` |
-| surprise | `surprised` |
-| sad | `sad` |
-| anger | `sad` |
-| fear | `surprised` |
-| neutral / disgust | (none — idle) |
-
-### MJPEG overlay
-
-Pink text on `/video_feed`. The label is **held stable** for 5 s after a 1 s sampling window (not per-frame raw CNN output):
-
-```text
-sad 21% raw=neutral 2.1s n:75% s:21% h:2%
-```
-
-Check status:
-
-```bash
-curl -s http://localhost:8000/api/status | python3 -m json.tool
-```
-
-Expect:
-
-```json
-"emotion": {
-  "available": true,
-  "backend": "keras",
-  "model": "emotion_model_best.h5",
-  "input_size": [48, 48]
-},
-"vision_emotion": {
-  "enabled": true,
-  "accumulating_for": "Chakri",
-  "accum_frames": 42
-}
-```
-
-Full design doc: [../docs/EMOTION_RECOGNITION.md](../docs/EMOTION_RECOGNITION.md)
-
----
-
 ## Voice pipeline
 
 1. ESP sends 16 kHz WAV over WebSocket (`/ws/voice` or `/voice-query`).
 2. STT: ElevenLabs Scribe (if key set) or faster-whisper.
 3. Live face identity attached from camera (with TTL fallback).
-4. Route: alarm / servo_360 / recap / identity / general LLM.
+4. Route (after volume + STT echo rejection):
+   - **Face registration** (if `awaiting_name`)
+   - alarm / servo_360 / recap / identity / general LLM
 5. TTS → WAV streamed back; JSON metadata includes `eye_expression` from reply text.
 6. Latency logged to `data/latency_log.json`; conversation queued to PostgreSQL.
 
-Voice eyes come from **`eye_expression.py`** (text analysis), not the CNN — camera emotion is passive-only.
+Voice eyes come from **`eye_expression.py`** (text analysis on the LLM reply).
+
+When face registration is waiting for a name, STT echo/garbage rejection is skipped so short name utterances are not dropped.
 
 ---
 
@@ -323,7 +235,48 @@ export FACE_CONFIRM_FRAMES=3
 export FACE_SESSION_PRIMARY_HOLD_SECONDS=90
 ```
 
-Register via web UI (`POST /api/register`) or the home page form.
+Register via web UI (`POST /api/register`), the home page form, or **automatic voice registration** (below). Both paths call the same `capture_face_samples()` helper.
+
+---
+
+## Automatic face registration
+
+When `FACE_REG_ENABLED=1` (default), an **unknown** primary face held in frame for ~3 s triggers proactive registration — no “register my face” command required.
+
+### Flow
+
+```text
+Unknown face stable (FACE_REG_UNKNOWN_SECONDS)
+  → TTS prompt → ESP POST /play_wav  (X-Nino-Prompt-Ack: 1)
+  → ESP plays prompt → beep → USB mic VAD (same pattern as medical alarm ack)
+  → User: “My name is Sirena”
+  → ESP WAV → WebSocket /voice-query
+  → STT → parse name → capture_face_samples × N → train()
+  → TTS: “All set, Sirena. I've registered your face.”
+```
+
+Camera (face samples) and USB mic (name) are separate hardware paths; the server joins them in software.
+
+### States
+
+| State | Meaning |
+| ----- | ------- |
+| `idle` | Normal operation |
+| `awaiting_name` | Prompt played; next voice utterance should contain a name |
+| `capturing` | Saving face samples during the voice turn |
+
+If the name is not understood, the server re-opens the mic (`relisten_after_missed_name`). If the ESP sends no audio after the listen window, automatic no-speech retries run up to `FACE_REG_MAX_NO_SPEECH_RETRIES`.
+
+### Status
+
+```bash
+curl -s http://localhost:8000/api/status | python3 -c "
+import sys, json
+print(json.dumps(json.load(sys.stdin)['face_registration'], indent=2))
+"
+```
+
+Full design doc: [../docs/VOICE_FACE_REGISTRATION.md](../docs/VOICE_FACE_REGISTRATION.md)
 
 ---
 
@@ -372,7 +325,7 @@ More detail: [../phase_c_detailed.md](../phase_c_detailed.md)
 
 ## Startup summary greeting
 
-When `VISION_EMOTION_ENABLED=1` and a registered face is seen **once per server boot**, NiNO speaks a **Phase C startup greeting** before camera empathy runs.
+When a registered face is seen **once per server boot**, NiNO can speak a **Phase C startup greeting** (if daily summaries are enabled).
 
 ### Flow
 
@@ -384,14 +337,12 @@ Face recognized (primary)
        2) Yesterday we discussed {topic}.          (fixed from summary)
        3) Counter-question                         (LLM — continue or topic follow-up)
   → tts_service._play_esp_text()                   (auto-chunked WAV clips)
-  → vision empathy deferred ~180 s
 ```
 
 ### Notes
 
 - Fires **once per boot** per person (`_startup_greeted` in `tts_service.py`).
 - Requires `MEMORY_SUMMARY_CRON=1` and a summary row for **yesterday**; otherwise falls back to a short generic hello.
-- Startup greeting takes priority over vision emotion empathy until it completes.
 
 ---
 
@@ -406,7 +357,7 @@ The ESP32 `/play_wav` endpoint accepts WAV payloads up to **~384 KiB** (`ESP_MAX
 3. If not → split at **sentence boundaries**, then **word boundaries** if needed.
 4. Queue **N clips** on the ESP audio FIFO — they play back-to-back.
 
-Used by startup greetings, vision empathy, and any path through `tts_service._play_esp_text()`.
+Used by startup greetings and any path through `tts_service._play_esp_text()`.
 
 Logs show clip progress:
 
@@ -433,7 +384,7 @@ See [../docs/ALARM.md](../docs/ALARM.md).
 | Method | Path | Description |
 | ------ | ---- | ----------- |
 | GET | `/` | Web UI |
-| GET | `/video_feed` | MJPEG with face boxes + emotion overlay |
+| GET | `/video_feed` | MJPEG with face boxes |
 | GET | `/snapshot.jpg` | Latest annotated JPEG |
 | GET | `/api/status` | Full system status |
 | GET | `/api/latency-log?limit=N` | Voice timing events |
@@ -453,7 +404,9 @@ See [../docs/ALARM.md](../docs/ALARM.md).
 | Header | Purpose |
 | ------ | ------- |
 | `X-Nino-Eye-Expression` | `happy`, `sad`, `surprised`, … |
-| `X-Nino-Prompt-Ack` | `1` — ESP listens for yes/no after medical TTS |
+| `X-Nino-Prompt-Ack` | `1` — ESP opens mic after TTS (medical ack, face registration) |
+| `X-Nino-Prompt-Ack-Chime` | `0` = listen immediately after prompt (no extra beep) |
+| `X-Nino-Voice-Ws-Url` | PC WebSocket URL auto-configured on ESP (`VOICE_WS_URL` or LAN detect) |
 
 ---
 
@@ -462,8 +415,6 @@ See [../docs/ALARM.md](../docs/ALARM.md).
 ```text
 data/
 ├── models/
-│   ├── emotion_model_best.h5      Keras emotion weights (default)
-│   ├── emotion-ferplus-8.onnx     FER+ fallback (auto-download)
 │   ├── face_detection_yunet_2023mar.onnx
 │   └── face_recognition_sface_2021dec.onnx
 ├── faces/                         Registered face crops
@@ -486,7 +437,6 @@ python -m unittest discover -v -p 'test_*.py'
 
 | Test file | Covers |
 | --------- | ------ |
-| `test_vision_emotion.py` | Emotion mapping, accumulation, Keras init |
 | `test_eye_expression.py` | Reply → eye tag scoring |
 | `test_alarm_voice.py` | Alarm phrase parsing |
 | `test_memory_filters.py` | Recap context filtering |
@@ -494,6 +444,7 @@ python -m unittest discover -v -p 'test_*.py'
 | `test_memory_summary_scheduler.py` | Phase C midnight scheduler helpers |
 | `test_greeting_summary.py` | Startup greeting prompts and 3-part structure |
 | `test_esp_wav_chunking.py` | Generic ESP WAV text splitting |
+| `test_face_registration.py` | Name parsing, unknown-face prompt, no-speech retry |
 | `test_llm_memory_turn.py` | Memory prompt assembly |
 | `test_volume_command.py` | Volume voice command |
 
@@ -512,23 +463,6 @@ python -m unittest discover -v -p 'test_*.py'
 ---
 
 ## Troubleshooting
-
-### Emotion not available
-
-```bash
-curl -s http://localhost:8000/api/status | python3 -c "import sys,json; print(json.load(sys.stdin)['emotion'])"
-```
-
-- `"available": false` → check `data/models/emotion_model_best.h5` exists
-- `tensorflow not installed` → `pip install tensorflow`
-- Switch to FER+: `EMOTION_BACKEND=ferplus` in `.env`
-
-### No empathy spoken
-
-- Person must be **registered** and recognized (not `unknown`)
-- Hold a **speakable** expression for ~2 s
-- Check cooldown: `vision_emotion.last_error` in `/api/status`
-- After voice query, wait `VISION_EMOTION_AFTER_VOICE_SECONDS` (90 s default)
 
 ### Camera disconnected
 
@@ -551,12 +485,25 @@ curl -s http://localhost:8000/api/status | python3 -c "import sys,json; print(js
 - Check logs for `ESP play_wav N/M` — multiple clips at normal `rate=` is expected for long greetings
 - Single clip over ~389120 bytes will fail — chunking should split automatically; report if `last_error` appears in `/api/status` → `tts`
 
+### Face registration not prompting
+
+- Confirm `face_registration.enabled` is `true` and `state` is `idle` in `/api/status`
+- Set `ESP_PLAY_WAV_URL` or use `CAMERA_SOURCE=http://<ESP_IP>/stream` (URL is derived automatically)
+- Unknown face must stay primary in frame for `FACE_REG_UNKNOWN_SECONDS` (default 3 s)
+- Check `prompt_cooldown_seconds` — a recent prompt blocks repeats for 600 s by default
+- Set `VOICE_WS_URL` or `NINO_SERVER_LAN_HOST` if ESP cannot reach the PC WebSocket after `prompt_ack`
+
+### Face registration hears name but fails capture
+
+- Look at the camera during the voice turn — samples are taken from live frames while `capturing`
+- Check `data/faces/<name>/` and re-run with better lighting / face centered in frame
+
 ---
 
 ## Related docs
 
 - [../README.md](../README.md) — project overview, firmware, hardware
-- [../docs/EMOTION_RECOGNITION.md](../docs/EMOTION_RECOGNITION.md) — emotion pipeline deep dive
 - [../docs/ALARM.md](../docs/ALARM.md) — alarm commands and medical flow
+- [../docs/VOICE_FACE_REGISTRATION.md](../docs/VOICE_FACE_REGISTRATION.md) — automatic voice face registration
 - [../phase_c_detailed.md](../phase_c_detailed.md) — Phase C daily summaries and startup greeting
 - [../docs/serverP.md](../docs/serverP.md) — server architecture notes

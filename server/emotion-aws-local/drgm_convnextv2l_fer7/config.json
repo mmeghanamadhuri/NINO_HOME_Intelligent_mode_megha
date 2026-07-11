@@ -1,0 +1,59 @@
+{
+  "architectures": [
+    "ConvNextV2ForImageClassification"
+  ],
+  "depths": [
+    3,
+    3,
+    27,
+    3
+  ],
+  "drop_path_rate": 0.0,
+  "dtype": "float32",
+  "hidden_act": "gelu",
+  "hidden_sizes": [
+    192,
+    384,
+    768,
+    1536
+  ],
+  "id2label": {
+    "0": "angry",
+    "1": "disgust",
+    "2": "fear",
+    "3": "happy",
+    "4": "neutral",
+    "5": "sad",
+    "6": "surprise"
+  },
+  "image_size": 224,
+  "initializer_range": 0.02,
+  "label2id": {
+    "angry": 0,
+    "disgust": 1,
+    "fear": 2,
+    "happy": 3,
+    "neutral": 4,
+    "sad": 5,
+    "surprise": 6
+  },
+  "layer_norm_eps": 1e-12,
+  "model_type": "convnextv2",
+  "num_channels": 3,
+  "num_stages": 4,
+  "out_features": [
+    "stage4"
+  ],
+  "out_indices": [
+    4
+  ],
+  "patch_size": 4,
+  "stage_names": [
+    "stem",
+    "stage1",
+    "stage2",
+    "stage3",
+    "stage4"
+  ],
+  "transformers_version": "5.13.0"
+}

@@ -59,6 +59,22 @@ class MemoryRoutingTests(unittest.TestCase):
         result = svc.handle_llm_memory_turn(1, "favorite", person_name="Uday")
         self.assertIsNone(result)
 
+    @patch("llm_service.analyze_memory_turn")
+    def test_full_form_wifi_skips_memory_store(self, mock_analyze: MagicMock) -> None:
+        from llm_service import MemoryTurnDecision
+
+        mock_analyze.return_value = MemoryTurnDecision(
+            action="store",
+            store=[{"key": "favorite_food", "memory": "full form of Wi-Fi", "importance": 8}],
+        )
+        svc = MemoryService.__new__(MemoryService)
+        svc._ready = True
+        svc.list_memory_keys_for_user = MagicMock(return_value=["favorite_food"])
+
+        result = svc.handle_llm_memory_turn(1, "Full form of Wi-Fi.", person_name="Chakri")
+        self.assertIsNone(result)
+        mock_analyze.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
