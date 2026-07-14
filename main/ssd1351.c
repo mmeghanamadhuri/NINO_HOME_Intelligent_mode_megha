@@ -43,6 +43,7 @@ static const int s_cs_pins[OLED_COUNT] = { OLED_PIN_CS0, OLED_PIN_CS1 };
 static spi_device_handle_t s_spi[OLED_COUNT];
 static int s_target = SSD1351_TARGET_ALL;
 static uint8_t s_color_chunk[CHUNK_PIXELS * 2];
+static bool s_bus_ready = false;
 
 static void dev_write_cmd(spi_device_handle_t dev, uint8_t cmd)
 {
@@ -111,6 +112,31 @@ int ssd1351_get_target(void)
     return s_target;
 }
 
+static esp_err_t attach_spi_devices(void)
+{
+    for (int i = 0; i < OLED_COUNT; i++) {
+        if (s_spi[i] != NULL) {
+            spi_bus_remove_device(s_spi[i]);
+            s_spi[i] = NULL;
+        }
+
+        spi_device_interface_config_t devcfg = {
+            .clock_speed_hz = SPI_CLOCK_HZ,
+            .mode = 0,
+            .spics_io_num = s_cs_pins[i],
+            .queue_size = 1,
+            .flags = SPI_DEVICE_NO_DUMMY,
+        };
+
+        esp_err_t err = spi_bus_add_device(SPI_HOST_ID, &devcfg, &s_spi[i]);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+
+    return ESP_OK;
+}
+
 static esp_err_t init_spi_bus(void)
 {
     spi_bus_config_t buscfg = {
@@ -127,22 +153,7 @@ static esp_err_t init_spi_bus(void)
         return err;
     }
 
-    for (int i = 0; i < OLED_COUNT; i++) {
-        spi_device_interface_config_t devcfg = {
-            .clock_speed_hz = SPI_CLOCK_HZ,
-            .mode = 0,
-            .spics_io_num = s_cs_pins[i],
-            .queue_size = 1,
-            .flags = SPI_DEVICE_NO_DUMMY,
-        };
-
-        err = spi_bus_add_device(SPI_HOST_ID, &devcfg, &s_spi[i]);
-        if (err != ESP_OK) {
-            return err;
-        }
-    }
-
-    return ESP_OK;
+    return attach_spi_devices();
 }
 
 static void hardware_reset(void)
@@ -253,6 +264,7 @@ esp_err_t ssd1351_init(void)
     s_target = SSD1351_TARGET_ALL;
     ssd1351_fill_screen(0x0000);
 
+    s_bus_ready = true;
     ESP_LOGI(TAG, "SSD1351 ready: %d panel(s) %dx%d", OLED_COUNT, OLED_WIDTH, OLED_HEIGHT);
     return ESP_OK;
 }

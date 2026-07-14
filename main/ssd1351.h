@@ -9,14 +9,19 @@
  *
  * ESP32-P4-Function-EV-Board J1 header wiring (all free I/O on this board):
  *   CLK -> GPIO23 (J1 pin 7), DIN -> GPIO22 (pin 12), DC -> GPIO21 (pin 11),
- *   RST -> GPIO20 (pin 13), CS left -> GPIO26 (pin 31), CS right -> GPIO27 (pin 38).
+ *   RST -> GPIO20 (pin 13), CS left -> GPIO32, CS right -> GPIO33.
+ *
+ * CS was moved off GPIO 26/27 because those are the ESP32-P4 USB OTG FS PHY
+ * D-/D+ pads; enabling the header mic (CONFIG_USB4MIC_USB_PHY_ON_HEADER) claims
+ * them and blanked the eyes. GPIO 32/33 are plain digital I/O with no USB
+ * overlap, so eyes and the USB mic now run together with no workaround.
  */
 #define OLED_PIN_SCLK   23   /* shared CLK -> both displays */
 #define OLED_PIN_MOSI   22   /* shared DIN -> both displays */
 #define OLED_PIN_DC     21   /* shared DC  -> both displays */
 #define OLED_PIN_RST    20   /* shared RST -> both displays */
-#define OLED_PIN_CS0    26   /* CS for display 0 (left eye)  */
-#define OLED_PIN_CS1    27   /* CS for display 1 (right eye) */
+#define OLED_PIN_CS0    32   /* CS for display 0 (left eye)  */
+#define OLED_PIN_CS1    33   /* CS for display 1 (right eye) */
 
 /* Number of OLED panels on the shared bus. */
 #define OLED_COUNT      2

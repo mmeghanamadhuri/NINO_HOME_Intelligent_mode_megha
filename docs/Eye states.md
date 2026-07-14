@@ -12,7 +12,7 @@ This document describes the **9 eye states** driven by the NINO eye animation en
 4. thinking
 5. curious
 6. sad
-7. surprised
+7. surprisedś
 8. listening
 9. recalling
 

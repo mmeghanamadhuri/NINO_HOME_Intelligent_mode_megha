@@ -22,7 +22,8 @@ CONFIG_ESP_HOSTED_SDIO_TX_Q_SIZE=10
 CONFIG_ESP_HOSTED_SDIO_RX_Q_SIZE=10
 CONFIG_ESP_HOSTED_DFLT_TASK_FROM_SPIRAM=y
 
-# USB 4-mic on 40-pin header (GPIO 24/25); separate from J18 hub (camera + U2D2)
+# USB 4-mic on 40-pin header (GPIO 24/25); separate from J18 hub (camera + U2D2).
+# Safe to enable now that the OLED CS lines moved off the FS PHY pads to GPIO 32/33.
 CONFIG_USB4MIC_USB_PHY_ON_HEADER=y
 CONFIG_USB4MIC_USB_DM_GPIO=24
 CONFIG_USB4MIC_USB_DP_GPIO=25

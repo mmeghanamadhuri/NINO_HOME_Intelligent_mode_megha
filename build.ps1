@@ -10,10 +10,10 @@ param(
 $ErrorActionPreference = "Stop"
 $ProjectDir = $PSScriptRoot
 $BuildDir = "C:\esp\sirena-p4-build"
-$IdfPython = "C:\Users\kchak\.espressif\python_env\idf5.5_py3.11_env\Scripts\python.exe"
+$IdfPython = "C:\Users\udayk\.espressif\python_env\idf5.5_py3.10_env\Scripts\python.exe"
 
 if (-not (Test-Path $IdfPython)) {
-    $IdfPython = "C:\Users\kchak\.espressif\python_env\idf5.5_py3.10_env\Scripts\python.exe"
+    $IdfPython = "C:\Users\udayk\.espressif\tools\idf-python\3.11.2\python.exe"
 }
 
 if (-not (Test-Path $IdfPython)) {

@@ -1539,6 +1539,7 @@ static esp_err_t play_wav_handler(httpd_req_t *req) {
     if (eye_state < NINO_EYE_STATE_COUNT) {
       ESP_LOGI(TAG, "HTTP /play_wav eye_expression=%s -> state %d", eye_hdr,
                (int)eye_state);
+      nino_eye_set_state(eye_state);
     }
   }
 

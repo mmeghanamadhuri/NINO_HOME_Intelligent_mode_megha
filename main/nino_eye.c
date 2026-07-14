@@ -59,6 +59,7 @@ typedef struct {
 } nino_state_profile_t;
 
 static volatile nino_eye_state_t s_state = NINO_EYE_IDLE;
+static volatile bool s_restart_requested = false;
 
 static const nino_state_profile_t s_profiles[NINO_EYE_STATE_COUNT] = {
     /* idle: neutral / half-open, normal pupil, slow blink (~5 s). */
@@ -66,7 +67,7 @@ static const nino_state_profile_t s_profiles[NINO_EYE_STATE_COUNT] = {
         .mode = NINO_RENDER_BLINK,
         .rx = 24,
         .ry = 30,
-        .hold_ms = 10000,
+        .hold_ms = 5000,
         .closed_hold_ms = 240,
         .blink_step = 3,
         .blink_ms = 45,
@@ -501,6 +502,10 @@ static bool delay_ms_interruptible(int total_ms, nino_eye_state_t expected)
 {
     int elapsed = 0;
     while (elapsed < total_ms) {
+        if (s_restart_requested) {
+            s_restart_requested = false;
+            return false;
+        }
         if (current_state() != expected) {
             return false;
         }
@@ -1190,9 +1195,10 @@ void nino_eye_set_state(nino_eye_state_t state)
         return;
     }
     if (s_state == state) {
-        return; /* Ignore no-op transitions to keep runtime/logs clean. */
+        return;
     }
     s_state = state;
+    s_restart_requested = true;
     ESP_LOGI(TAG, "state set -> %d", (int)state);
 }
 
@@ -1374,4 +1380,10 @@ void nino_eye_begin(void)
     s_engine_started = true;
     ESP_LOGI(TAG, "Nino eye starting (engine only)");
     xTaskCreate(eye_engine_task, "nino_eye", 8192, NULL, 5, NULL);
+}
+
+void nino_eye_restart_current(void)
+{
+    s_restart_requested = true;
+    ESP_LOGI(TAG, "eye animation restart requested");
 }

@@ -33,6 +33,9 @@ typedef enum {
 
 void nino_eye_begin(void);
 
+/** Break out of the current animation loop and redraw (e.g. after SPI CS reclaim). */
+void nino_eye_restart_current(void);
+
 void nino_eye_set_state(nino_eye_state_t state);
 nino_eye_state_t nino_eye_get_state(void);
 
