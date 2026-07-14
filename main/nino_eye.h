@@ -9,9 +9,10 @@ extern "C" {
 /*
  * NINO eye animation engine.
  *
- * Nine states rendered on the dual SSD1351 OLEDs (idle + 6 emotions + the two
- * functional states listening/thinking). State changes are instant and
- * non-blocking: the running animation switches on its next frame.
+ * Ten states rendered on the dual SSD1351 OLEDs (idle + 6 emotions + the two
+ * functional states listening/thinking + the med capsule for medical reminders).
+ * State changes are instant and non-blocking: the running animation switches on
+ * its next frame.
  *
  * Integration:
  *   1) ssd1351_init();       // bring up the displays (once)
@@ -28,6 +29,7 @@ typedef enum {
     NINO_EYE_SURPRISED,
     NINO_EYE_LISTENING,
     NINO_EYE_RECALLING,
+    NINO_EYE_MED,
     NINO_EYE_STATE_COUNT,
 } nino_eye_state_t;
 
@@ -39,7 +41,7 @@ void nino_eye_restart_current(void);
 void nino_eye_set_state(nino_eye_state_t state);
 nino_eye_state_t nino_eye_get_state(void);
 
-/** Parse a console token: "0"-"8", or idle/happy/tired/.../recalling. Returns false if unknown. */
+/** Parse a console token: "0"-"9", or idle/happy/tired/.../recalling/med. Returns false if unknown. */
 bool nino_eye_apply_command(const char *line);
 
 /**
@@ -66,6 +68,8 @@ void nino_eye_sad(void);
 void nino_eye_surprised(void);
 void nino_eye_listening(void);
 void nino_eye_recalling(void);
+/** Static slanted red/white capsule pill — shown while a medical reminder plays. */
+void nino_eye_med(void);
 
 #ifdef __cplusplus
 }

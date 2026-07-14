@@ -771,7 +771,11 @@ class AlarmService:
 
             spoken = alarm.spoken_fire_message(repeat=repeat)
             tts_wav = self._synthesize_alarm_wav_for_esp(spoken)
-            post_wav_to_esp(tts_wav, prompt_ack=alarm.requires_ack)
+            # Medical reminders show the "med" capsule eye while announcing.
+            fire_eye = "med" if alarm.is_medical() else None
+            post_wav_to_esp(
+                tts_wav, prompt_ack=alarm.requires_ack, eye_expression=fire_eye
+            )
 
             # Medical: TTS only (two long WAVs often exceed ESP limit). Normal: TTS + beep.
             if not alarm.requires_ack:

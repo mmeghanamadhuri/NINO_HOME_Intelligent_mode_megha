@@ -3,7 +3,7 @@
 Behavior (lowest priority on the device — see priority notes below):
   * Watch the primary (largest) face's emotion every frame.
   * When the same mapped emotion holds continuously for EMOTION_EYE_STABLE_SECONDS
-    (2.5-3 s), commit it to the eyes and LATCH the display for
+    (~1.5-2 s), commit it to the eyes and LATCH the display for
     EMOTION_EYE_DISPLAY_SECONDS (4-5 s). During the latch, new emotions are
     ignored — frames still flow, but the eyes hold the committed emotion.
   * When the stable reading is neutral / no clear emotion / no face, return the
@@ -67,7 +67,7 @@ class VisionEyeDriver:
         push_fn: Callable[[str], bool] | None = None,
     ) -> None:
         self._enabled = _env_flag("EMOTION_EYES_ENABLED", True)
-        self._stable_s = _env_float("EMOTION_EYE_STABLE_SECONDS", 3.0, minimum=0.5)
+        self._stable_s = _env_float("EMOTION_EYE_STABLE_SECONDS", 1.75, minimum=0.5)
         self._display_s = _env_float("EMOTION_EYE_DISPLAY_SECONDS", 4.5, minimum=1.0)
         self._idle_debounce_s = _env_float(
             "EMOTION_EYE_IDLE_DEBOUNCE_SECONDS", 1.5, minimum=0.0

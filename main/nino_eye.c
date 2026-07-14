@@ -1,6 +1,7 @@
 #include "nino_eye.h"
 
 #include <ctype.h>
+#include <math.h>
 #include <stdint.h>
 #include <string.h>
 #include "esp_log.h"
@@ -35,7 +36,15 @@ typedef enum {
     NINO_RENDER_BLINK,
     NINO_RENDER_STATIC,
     NINO_RENDER_HEART,
+    NINO_RENDER_MED_CAPSULE,
 } nino_render_mode_t;
+
+/* med capsule tilt: 45 deg from vertical, red cap pointing upper-right. */
+#define MED_CAPSULE_SLANT_DEG 45
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 typedef struct {
     nino_render_mode_t mode;
@@ -171,6 +180,15 @@ static const nino_state_profile_t s_profiles[NINO_EYE_STATE_COUNT] = {
         .gaze_count = 1,
         .eye_r = 0, .eye_g = 0, .eye_b = 0,
     },
+    /* med: static slanted capsule pill. rx = capsule radius, heart_max_scale =
+     * half-length along the axis. No animation — holds like happy. */
+    [NINO_EYE_MED] = {
+        .mode = NINO_RENDER_MED_CAPSULE,
+        .rx = 10,
+        .heart_max_scale = 17,
+        .state_ms = 900,
+        .eye_r = 0, .eye_g = 0, .eye_b = 0,
+    },
 };
 
 /* Background is white; eyes are black (per-state colour). */
@@ -189,6 +207,17 @@ static uint16_t color_eye(void)
 static uint16_t color_red(void)
 {
     return ssd1351_color(255, 0, 0);
+}
+
+/* med capsule palette: red cap, light-gray body, dark-gray outline. */
+static uint16_t color_capsule_body(void)
+{
+    return ssd1351_color(210, 210, 210);
+}
+
+static uint16_t color_capsule_outline(void)
+{
+    return ssd1351_color(40, 40, 40);
 }
 
 static void set_eye_color(const nino_state_profile_t *profile)
@@ -293,11 +322,12 @@ static void clear_screen(uint16_t color)
  * along its own outline (writing background over only the eye/heart pixels)
  * instead of erasing a white rectangle that would flash the held background.
  */
-typedef enum { PREV_NONE, PREV_ELLIPSE, PREV_HEART, PREV_BLOB } prev_kind_t;
+typedef enum { PREV_NONE, PREV_ELLIPSE, PREV_HEART, PREV_BLOB, PREV_CAPSULE } prev_kind_t;
 static prev_kind_t s_prev_kind = PREV_NONE;
 static int s_prev_cx, s_prev_rx, s_prev_ry, s_prev_top, s_prev_bottom;
 static int s_prev_blob_cy;
 static int s_prev_heart_cx, s_prev_heart_cy, s_prev_heart_scale;
+static int s_prev_cap_cx, s_prev_cap_cy, s_prev_cap_half, s_prev_cap_radius;
 
 /*
  * When true, the central blink transition has already drawn (and remembered)
@@ -322,6 +352,15 @@ static void remember_heart(int cx, int cy, int scale)
     s_prev_heart_cx = cx;
     s_prev_heart_cy = cy;
     s_prev_heart_scale = scale;
+}
+
+static void remember_capsule(int cx, int cy, int half_len, int radius)
+{
+    s_prev_kind = PREV_CAPSULE;
+    s_prev_cap_cx = cx;
+    s_prev_cap_cy = cy;
+    s_prev_cap_half = half_len;
+    s_prev_cap_radius = radius;
 }
 
 /* Blob = a solid eye drawn at an arbitrary center (cx, cy). */
@@ -476,6 +515,116 @@ static void draw_heart(int cx, int cy, int scale, uint16_t color)
     }
 }
 
+/* Capsule axis unit vector (cap points upper-right for a positive slant). */
+static void med_axis(float *ux, float *uy)
+{
+    float rad = (float)MED_CAPSULE_SLANT_DEG * (float)M_PI / 180.0f;
+    *ux = sinf(rad);
+    *uy = -cosf(rad);
+}
+
+/* Is a body pixel (given in local axis/perp coords) inside one of the red beads? */
+static bool med_in_bead(float lt, float ls, int half_len, int radius)
+{
+    static const float bead_t[3] = {-0.30f, -0.55f, -0.78f};
+    static const float bead_s[3] = {-0.28f, 0.26f, -0.08f};
+    float br = radius * 0.28f;
+    if (br < 1.2f) {
+        br = 1.2f;
+    }
+    for (int i = 0; i < 3; i++) {
+        float dt = lt - (bead_t[i] * half_len);
+        float ds = ls - (bead_s[i] * radius);
+        if ((dt * dt) + (ds * ds) <= br * br) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Classify a pixel: -1 outside, 0 outline, 1 red cap/bead, 2 gray body. */
+static int med_classify(int x, int y, int cx, int cy, float ux, float uy,
+                        int half_len, int radius)
+{
+    float dx = (float)(x - cx);
+    float dy = (float)(y - cy);
+    /* axis coord (t) and perpendicular coord (s); perp = (-uy, ux). */
+    float t = (dx * ux) + (dy * uy);
+    float s = (dx * -uy) + (dy * ux);
+
+    float tc = t;
+    if (tc > half_len) tc = half_len;
+    if (tc < -half_len) tc = -half_len;
+    float du = t - tc;
+    float dist2 = (du * du) + (s * s);
+    float r = (float)radius;
+    if (dist2 > r * r) {
+        return -1;
+    }
+    if (sqrtf(dist2) >= r - 1.0f) {
+        return 0; /* outline band */
+    }
+    if (t > 0.0f) {
+        return 1; /* red cap (upper-right half) */
+    }
+    if (med_in_bead(t, s, half_len, radius)) {
+        return 1; /* red bead inside the body */
+    }
+    return 2; /* light-gray body */
+}
+
+/* Draw (or erase) the slanted capsule pill centered at (cx, cy). */
+static void draw_med_capsule(int cx, int cy, int half_len, int radius, bool erase)
+{
+    float ux, uy;
+    med_axis(&ux, &uy);
+
+    int reach = half_len + radius + 2;
+    int x0 = cx - reach, x1 = cx + reach;
+    int y0 = cy - reach, y1 = cy + reach;
+    if (x0 < 0) x0 = 0;
+    if (x1 >= LOGICAL_WIDTH) x1 = LOGICAL_WIDTH - 1;
+    if (y0 < 0) y0 = 0;
+    if (y1 >= LOGICAL_HEIGHT) y1 = LOGICAL_HEIGHT - 1;
+
+    for (int y = y0; y <= y1; y++) {
+        int run_start = -1;
+        uint16_t run_color = 0;
+        int x;
+        for (x = x0; x <= x1; x++) {
+            int region = med_classify(x, y, cx, cy, ux, uy, half_len, radius);
+            if (region < 0) {
+                if (run_start >= 0) {
+                    draw_landscape_hline(run_start, y, x - run_start, run_color);
+                    run_start = -1;
+                }
+                continue;
+            }
+            uint16_t color;
+            if (erase) {
+                color = color_bg();
+            } else if (region == 0) {
+                color = color_capsule_outline();
+            } else if (region == 1) {
+                color = color_red();
+            } else {
+                color = color_capsule_body();
+            }
+            if (run_start < 0) {
+                run_start = x;
+                run_color = color;
+            } else if (color != run_color) {
+                draw_landscape_hline(run_start, y, x - run_start, run_color);
+                run_start = x;
+                run_color = color;
+            }
+        }
+        if (run_start >= 0) {
+            draw_landscape_hline(run_start, y, x1 - run_start + 1, run_color);
+        }
+    }
+}
+
 /*
  * Un-draw the previously painted shape by re-rendering it in the background
  * colour using the SAME geometry, so only the eye/heart pixels are flipped back.
@@ -488,6 +637,9 @@ static void erase_prev_eye(void)
         draw_heart(s_prev_heart_cx, s_prev_heart_cy, s_prev_heart_scale, color_bg());
     } else if (s_prev_kind == PREV_BLOB) {
         fill_ellipse(s_prev_cx, s_prev_blob_cy, s_prev_rx, s_prev_ry, color_bg());
+    } else if (s_prev_kind == PREV_CAPSULE) {
+        draw_med_capsule(s_prev_cap_cx, s_prev_cap_cy, s_prev_cap_half,
+                         s_prev_cap_radius, true);
     }
     s_prev_kind = PREV_NONE;
     dirty_reset();
@@ -526,7 +678,7 @@ static bool delay_ms_interruptible(int total_ms, nino_eye_state_t expected)
  * Every expression change is wrapped in a uniform blink: the shape currently on
  * screen blink-closes, the eye holds shut for a beat, then the new state's
  * initial shape blink-opens. This replaces the old hard cut (instant erase +
- * instant redraw) with a natural, consistent transition for all 9 states.
+ * instant redraw) with a natural, consistent transition for all states.
  */
 #define TRANS_STEP        4   /* rows revealed/hidden per frame */
 #define TRANS_FRAME_MS    14  /* per-frame delay during a sweep */
@@ -650,6 +802,13 @@ static bool transition_close(nino_eye_state_t target)
  * so the per-state renderer can continue its steady loop from here. */
 static bool transition_open(nino_eye_state_t target, const eye_shape_t *sh)
 {
+    if (sh->kind == PREV_CAPSULE) {
+        /* Static symbol: no blink-open animation, just draw it after the dwell. */
+        draw_med_capsule(sh->cx, sh->cy, sh->heart_scale, sh->rx, false);
+        remember_capsule(sh->cx, sh->cy, sh->heart_scale, sh->rx);
+        return current_state() == target;
+    }
+
     if (sh->kind == PREV_HEART) {
         const int cx = sh->cx, cy = sh->cy, full = sh->heart_scale;
         int prev = 0;
@@ -767,6 +926,12 @@ static eye_shape_t initial_shape_for(nino_eye_state_t st, const nino_state_profi
         s.kind = PREV_BLOB;
         s.cx = EYE_CX;
         s.cy = EYE_CY - 4;
+        break;
+    case NINO_EYE_MED:
+        /* Capsule: cx/cy = center, heart_scale = half-length, rx = radius. */
+        s.kind = PREV_CAPSULE;
+        s.cx = EYE_CX;
+        s.cy = EYE_CY;
         break;
     default:
         /* IDLE, SURPRISED, LISTENING: full ellipse centered. */
@@ -1189,6 +1354,18 @@ static void run_heart_profile_once(const nino_state_profile_t *profile, nino_eye
     }
 }
 
+static void run_med_profile_once(const nino_state_profile_t *profile, nino_eye_state_t expected)
+{
+    if (!s_skip_initial) {
+        erase_prev_eye();
+        draw_med_capsule(EYE_CX, EYE_CY, profile->heart_max_scale, profile->rx, false);
+        remember_capsule(EYE_CX, EYE_CY, profile->heart_max_scale, profile->rx);
+    }
+    while (delay_ms_interruptible(profile->state_ms, expected)) {
+        /* Static capsule: holds still until the state changes. */
+    }
+}
+
 void nino_eye_set_state(nino_eye_state_t state)
 {
     if (state >= NINO_EYE_STATE_COUNT) {
@@ -1217,6 +1394,7 @@ void nino_eye_sad(void)       { nino_eye_set_state(NINO_EYE_SAD); }
 void nino_eye_surprised(void) { nino_eye_set_state(NINO_EYE_SURPRISED); }
 void nino_eye_listening(void) { nino_eye_set_state(NINO_EYE_LISTENING); }
 void nino_eye_recalling(void) { nino_eye_set_state(NINO_EYE_RECALLING); }
+void nino_eye_med(void)       { nino_eye_set_state(NINO_EYE_MED); }
 
 nino_eye_state_t nino_eye_state_from_name(const char *name)
 {
@@ -1241,6 +1419,8 @@ nino_eye_state_t nino_eye_state_from_name(const char *name)
         return NINO_EYE_LISTENING;
     } else if (strcmp(name, "recalling") == 0) {
         return NINO_EYE_RECALLING;
+    } else if (strcmp(name, "med") == 0) {
+        return NINO_EYE_MED;
     }
     return NINO_EYE_STATE_COUNT;
 }
@@ -1340,6 +1520,9 @@ static void run_current_state_once(void)
         break;
     case NINO_EYE_RECALLING:
         run_recalling_eye(profile, state);
+        break;
+    case NINO_EYE_MED:
+        run_med_profile_once(profile, state);
         break;
     default:
         if (profile->mode == NINO_RENDER_STATIC) {
