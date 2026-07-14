@@ -31,6 +31,7 @@ from memory_service import get_memory_service, normalize_database_url
 from esp_playback import ensure_esp_play_wav_url_configured, esp_play_wav_url
 from emotion_service import EmotionService
 from tts_service import TTSService, synthesize_sapi_wav_bytes
+from vision_eye_driver import VisionEyeDriver
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +160,11 @@ face_registration = configure_face_registration(faces, camera.read)
 emotion = EmotionService()
 _tts_face_interval = float(os.environ.get("FACE_GREETING_INTERVAL_SECONDS", "600"))
 tts = TTSService(cooldown_seconds=0.0, face_greeting_interval_seconds=_tts_face_interval)
+# Camera emotion -> eyes (lowest priority; yields to voice queries + alarms/greetings).
+vision_eye = VisionEyeDriver(
+    voice_active_fn=voice_pipeline_active,
+    speaking_fn=tts.is_speaking,
+)
 latest_results: list[dict] = []
 # Update vision-driven TTS every frame so greetings start as soon as recognition succeeds
 # (throttling here added a noticeable delay before enqueue).
@@ -455,6 +461,7 @@ def _mjpeg_generator():
             frame = camera.read()
             if frame is None:
                 tts.update_face_state([])
+                vision_eye.update([])
                 time.sleep(0.02)
                 continue
 
@@ -476,6 +483,8 @@ def _mjpeg_generator():
             if now - last_tts_update_at >= TTS_UPDATE_INTERVAL_SECONDS:
                 _update_tts_face_state(results)
                 last_tts_update_at = now
+
+            vision_eye.update(results)
 
             ok, encoded = cv2.imencode(
                 ".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 70]

@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import struct
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -14,6 +18,79 @@ logger = logging.getLogger(__name__)
 
 # ESP32 main.c MAX_PLAY_WAV_BYTES — keep a little under for safety
 ESP_MAX_PLAY_WAV_BYTES = int(os.environ.get("ESP_MAX_PLAY_WAV_BYTES", str(380 * 1024)))
+
+# Extra seconds the device is considered "busy" after a WAV finishes (eye reverts to
+# idle, ack chime, etc.). Keeps the vision-emotion eye driver from stomping on speech.
+_EYE_BUSY_TAIL_SECONDS = float(os.environ.get("EYE_BUSY_TAIL_SECONDS", "1.5"))
+
+# Shared "device is speaking" window. post_wav_to_esp() extends it so lower-priority
+# eye updates (camera emotion) can yield to voice replies, alarms, and greetings.
+_busy_lock = threading.Lock()
+_device_busy_until = 0.0
+
+
+def _wav_duration_seconds(wav: bytes) -> float:
+    """Best-effort duration from a canonical PCM WAV header; 0.0 if unknown."""
+    try:
+        if len(wav) < 44 or wav[:4] != b"RIFF" or wav[8:12] != b"WAVE":
+            return 0.0
+        byte_rate = struct.unpack_from("<I", wav, 28)[0]
+        if byte_rate <= 0:
+            return 0.0
+        return max(0.0, (len(wav) - 44) / float(byte_rate))
+    except Exception:
+        return 0.0
+
+
+def mark_device_busy_for(seconds: float) -> None:
+    """Extend the 'device is speaking' window to at least now + seconds."""
+    global _device_busy_until
+    with _busy_lock:
+        _device_busy_until = max(_device_busy_until, time.time() + max(0.0, seconds))
+
+
+def device_busy_speaking() -> bool:
+    """True while the ESP is (estimated to be) playing audio, plus a short tail."""
+    with _busy_lock:
+        return time.time() < _device_busy_until
+
+
+def esp_eye_expression_url() -> str | None:
+    """Derive http://<esp-host>/eye/expression from the configured play_wav URL."""
+    url = esp_play_wav_url()
+    if not url:
+        return None
+    parsed = urllib.parse.urlparse(url)
+    if not (parsed.scheme and parsed.netloc):
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}/eye/expression"
+
+
+def post_eye_expression_to_esp(name: str, *, timeout: float = 3.0) -> bool:
+    """POST {"expression": name} to the ESP /eye/expression endpoint.
+
+    Never raises — returns True on success, False otherwise (called from the
+    camera frame loop where a failure must not break streaming).
+    """
+    expression = (name or "").strip().lower()
+    if not expression:
+        return False
+    url = esp_eye_expression_url()
+    if not url:
+        return False
+    body = json.dumps({"expression": expression}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status == 200
+    except (urllib.error.URLError, OSError) as exc:
+        logger.debug("eye/expression POST failed (%s): %s", expression, exc)
+        return False
 
 
 def derive_esp_base_url(camera_source: str) -> str | None:
@@ -84,6 +161,11 @@ def post_wav_to_esp(
             )
     if eye_expression:
         headers["X-Nino-Eye-Expression"] = eye_expression.strip().lower()
+
+    # Reserve the "speaking" window up front so the emotion eye driver yields
+    # immediately, even while this (blocking) POST is still in flight.
+    mark_device_busy_for(_wav_duration_seconds(wav) + _EYE_BUSY_TAIL_SECONDS)
+
     req = urllib.request.Request(
         url,
         data=wav,
