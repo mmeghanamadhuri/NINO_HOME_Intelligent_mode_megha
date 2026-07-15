@@ -551,7 +551,8 @@ class TTSService:
                 cleaned = str(viewer_name).strip()
                 if cleaned and cleaned.lower() not in {"unknown", "face"}:
                     self._known_seen_once.add(cleaned)
-                    self._startup_greeted.add(cleaned)
+                    # Do not mark _startup_greeted here — voice should not skip the
+                    # one-time yesterday-summary greeting for this server session.
                     self._last_spoken_at[cleaned] = now
                     self._active_name = cleaned
                     self._active_mode = "known"
@@ -602,11 +603,20 @@ class TTSService:
             self._present_known_names = current_known
 
             if now >= self._suppress_vision_until:
-                seen_before = primary in self._known_seen_once
-                if not seen_before:
-                    self._enqueue_known_greeting_locked(primary, now, welcome_back=False)
-                elif primary_re_entered:
-                    self._enqueue_known_greeting_locked(primary, now, welcome_back=True)
+                # First sight after boot: speak Phase C "Yesterday we discussed…" greeting.
+                # Regular welcome-back is used only after that startup greeting has run.
+                if primary not in self._startup_greeted:
+                    self._enqueue_startup_greeting_locked(primary, now)
+                else:
+                    seen_before = primary in self._known_seen_once
+                    if not seen_before:
+                        self._enqueue_known_greeting_locked(
+                            primary, now, welcome_back=False
+                        )
+                    elif primary_re_entered:
+                        self._enqueue_known_greeting_locked(
+                            primary, now, welcome_back=True
+                        )
 
             self._active_mode = "known"
             self._active_name = primary
@@ -875,8 +885,13 @@ class TTSService:
             self._last_error = str(exc)
 
     def _esp_play_wav_url(self) -> str | None:
-        u = os.environ.get("ESP_PLAY_WAV_URL", "").strip()
-        return u if u else None
+        from esp_playback import device_base_url
+
+        base = device_base_url(getattr(self, "_playback_device_id", None))
+        return f"{base}/play_wav" if base else None
+
+    def set_playback_device_id(self, device_id: str | None) -> None:
+        self._playback_device_id = (device_id or "").strip()
 
     def _synthesize_esp_wav(self, text: str, *, rate: int | None = None) -> bytes:
         wav, _ = synthesize_sapi_wav_bytes(
@@ -904,11 +919,16 @@ class TTSService:
         eye_expression: str | None = None,
     ) -> str:
         """Queue WAV clips on ESP at normal TTS rate (back-to-back playback)."""
-        from esp_playback import ESP_MAX_PLAY_WAV_BYTES, post_wav_to_esp
+        from esp_playback import ESP_MAX_PLAY_WAV_BYTES, deliver_wav_to_device
 
         spoken: list[str] = []
         valid = [c.strip() for c in chunks if c.strip()]
         total = len(valid)
+        device_id = getattr(self, "_playback_device_id", None)
+        if not device_id:
+            from device_registry import get_device_registry
+
+            device_id = get_device_registry().ui_device_id()
         for i, chunk in enumerate(valid):
             wav = self._synthesize_esp_wav(chunk, rate=self.rate)
             if len(wav) > ESP_MAX_PLAY_WAV_BYTES:
@@ -917,14 +937,16 @@ class TTSService:
                     f"({len(wav)} bytes; max {ESP_MAX_PLAY_WAV_BYTES}): {chunk[:100]}"
                 )
             logger.info(
-                "ESP play_wav %d/%d (%d bytes, rate=%d): %s",
+                "ESP play_wav %d/%d device=%s (%d bytes, rate=%d): %s",
                 i + 1,
                 total,
+                device_id,
                 len(wav),
                 self.rate,
                 chunk,
             )
-            post_wav_to_esp(
+            deliver_wav_to_device(
+                device_id,
                 wav,
                 eye_expression=eye_expression if i == total - 1 else None,
             )

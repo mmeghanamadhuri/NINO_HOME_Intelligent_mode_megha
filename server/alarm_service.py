@@ -30,7 +30,12 @@ from alarm_medical import (
     repeat_prompt_suffix,
 )
 from alarm_time import system_clock_info, system_now, system_now_iso
-from esp_playback import ESP_MAX_PLAY_WAV_BYTES, esp_play_wav_url, post_wav_to_esp
+from esp_playback import (
+    ESP_MAX_PLAY_WAV_BYTES,
+    deliver_wav_to_device,
+    device_base_url,
+    esp_play_wav_url,
+)
 from memory_service import SETTINGS, get_memory_service
 from tts_service import synthesize_sapi_wav_bytes
 from wav_resample import ESP_PCM_SAMPLE_RATE_HZ, resample_wav_bytes_to_mono_16bit
@@ -58,6 +63,7 @@ class Alarm:
     label: str = ""
     person_name: str = ""  # from face recognition when alarm was set
     user_id: int | None = None
+    device_id: str = ""  # robot that should play this alarm
     created_at: str = field(default_factory=system_now_iso)
     fired: bool = False
     priority: int = PRIORITY_NORMAL  # 0 = medical P0, 1 = normal
@@ -145,6 +151,7 @@ def _row_to_alarm(row: dict[str, Any]) -> Alarm:
     item["next_repeat_at"] = _parse_db_timestamp(item.get("next_repeat_at"))
     item.setdefault("person_name", "")
     item.setdefault("user_id", None)
+    item.setdefault("device_id", "")
     item.setdefault("priority", PRIORITY_NORMAL)
     item.setdefault("category", CATEGORY_GENERAL)
     item.setdefault("requires_ack", False)
@@ -157,7 +164,7 @@ def _row_to_alarm(row: dict[str, Any]) -> Alarm:
             item["priority"] = prio
             item["category"] = cat
             item["requires_ack"] = req
-    return Alarm(**item)
+    return Alarm(**{k: v for k, v in item.items() if k in Alarm.__dataclass_fields__})
 
 
 class AlarmService:
@@ -258,6 +265,7 @@ class AlarmService:
         label: str = "",
         person_name: str = "",
         user_id: int | None = None,
+        device_id: str = "",
         source_text: str = "",
         force_medical: bool = False,
     ) -> Alarm:
@@ -271,6 +279,7 @@ class AlarmService:
             label=label.strip(),
             person_name=person_name.strip()[:64],
             user_id=user_id,
+            device_id=(device_id or "").strip(),
             priority=priority,
             category=category,
             requires_ack=requires_ack,
@@ -279,12 +288,14 @@ class AlarmService:
             self._alarms.append(alarm)
             self._persist_alarm_locked(alarm)
         logger.info(
-            "Alarm set id=%s fire_at=%s label=%r person=%r user_id=%s priority=%s category=%s ack=%s",
+            "Alarm set id=%s fire_at=%s label=%r person=%r user_id=%s device_id=%s "
+            "priority=%s category=%s ack=%s",
             alarm.id,
             alarm.fire_at,
             alarm.label,
             alarm.person_name or "(none)",
             alarm.user_id if alarm.user_id is not None else "(anonymous)",
+            alarm.device_id or "(default)",
             alarm.priority,
             alarm.category,
             alarm.requires_ack,
@@ -485,6 +496,7 @@ class AlarmService:
     def _load(self) -> None:
         self._refresh_db_ready()
         if self._db_ready:
+            self._ensure_device_id_column()
             self._alarms = self._load_from_db()
             self._import_json_to_db_if_needed()
             return
@@ -498,7 +510,7 @@ class AlarmService:
                         """
                         SELECT id, user_id, fire_at, label, person_name, created_at,
                                fired, priority, category, requires_ack, ack_state,
-                               last_fired_at, next_repeat_at
+                               last_fired_at, next_repeat_at, device_id
                         FROM alarms
                         ORDER BY fire_at ASC
                         """
@@ -530,6 +542,7 @@ class AlarmService:
                     continue
                 item.setdefault("person_name", "")
                 item.setdefault("user_id", None)
+                item.setdefault("device_id", "")
                 item.setdefault("priority", PRIORITY_NORMAL)
                 item.setdefault("category", CATEGORY_GENERAL)
                 item.setdefault("requires_ack", False)
@@ -542,7 +555,9 @@ class AlarmService:
                         item["priority"] = prio
                         item["category"] = cat
                         item["requires_ack"] = req
-                alarm = Alarm(**item)
+                alarm = Alarm(
+                    **{k: v for k, v in item.items() if k in Alarm.__dataclass_fields__}
+                )
                 if alarm.fired and alarm.ack_state == ACK_NONE:
                     continue
                 loaded.append(alarm)
@@ -606,6 +621,7 @@ class AlarmService:
 
     def _upsert_alarm_db(self, alarm: Alarm) -> None:
         try:
+            self._ensure_device_id_column()
             with self._connect() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
@@ -613,11 +629,11 @@ class AlarmService:
                         INSERT INTO alarms (
                             id, user_id, fire_at, label, person_name, created_at,
                             fired, priority, category, requires_ack, ack_state,
-                            last_fired_at, next_repeat_at
+                            last_fired_at, next_repeat_at, device_id
                         ) VALUES (
                             %s, %s, %s, %s, %s, %s,
                             %s, %s, %s, %s, %s,
-                            %s, %s
+                            %s, %s, %s
                         )
                         ON CONFLICT (id) DO UPDATE SET
                             user_id = EXCLUDED.user_id,
@@ -630,7 +646,8 @@ class AlarmService:
                             requires_ack = EXCLUDED.requires_ack,
                             ack_state = EXCLUDED.ack_state,
                             last_fired_at = EXCLUDED.last_fired_at,
-                            next_repeat_at = EXCLUDED.next_repeat_at
+                            next_repeat_at = EXCLUDED.next_repeat_at,
+                            device_id = EXCLUDED.device_id
                         """,
                         (
                             alarm.id,
@@ -646,12 +663,42 @@ class AlarmService:
                             alarm.ack_state or ACK_NONE,
                             alarm.last_fired_at or None,
                             alarm.next_repeat_at or None,
+                            alarm.device_id or "",
                         ),
                     )
                 conn.commit()
         except Exception as exc:
             self._last_error = str(exc)
             logger.warning("Alarm DB upsert failed id=%s: %s", alarm.id, exc)
+
+    def _ensure_device_id_column(self) -> None:
+        """Best-effort ADD COLUMN for older Postgres schemas."""
+        if getattr(self, "_device_id_column_ready", False):
+            return
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        ALTER TABLE alarms
+                        ADD COLUMN IF NOT EXISTS device_id TEXT NOT NULL DEFAULT ''
+                        """
+                    )
+                conn.commit()
+            self._device_id_column_ready = True
+        except Exception as exc:
+            logger.debug("alarm device_id column ensure skipped: %s", exc)
+            # Older PG without IF NOT EXISTS — try plain add once.
+            try:
+                with self._connect() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "ALTER TABLE alarms ADD COLUMN device_id TEXT NOT NULL DEFAULT ''"
+                        )
+                    conn.commit()
+                self._device_id_column_ready = True
+            except Exception:
+                self._device_id_column_ready = True  # avoid hammering; SELECT may still fail
 
     def _delete_alarm_db(self, alarm_id: str) -> None:
         try:
@@ -757,31 +804,39 @@ class AlarmService:
 
     def _fire_alarm(self, alarm: Alarm, *, repeat: bool = False) -> None:
         logger.info(
-            "Alarm firing id=%s fire_at=%s priority=%s category=%s repeat=%s",
+            "Alarm firing id=%s fire_at=%s device_id=%s priority=%s category=%s repeat=%s",
             alarm.id,
             alarm.fire_at,
+            alarm.device_id or "(default)",
             alarm.priority,
             alarm.category,
             repeat,
         )
         now = system_now()
         try:
-            if esp_play_wav_url() is None:
-                raise RuntimeError("ESP_PLAY_WAV_URL is not set")
+            target_id = (alarm.device_id or "").strip()
+            if device_base_url(target_id or None) is None:
+                raise RuntimeError(
+                    "No ESP play URL for alarm "
+                    f"(device_id={target_id or 'default'}; set devices.json or ESP_PLAY_WAV_URL)"
+                )
 
             spoken = alarm.spoken_fire_message(repeat=repeat)
             tts_wav = self._synthesize_alarm_wav_for_esp(spoken)
             # Medical reminders show the "med" capsule eye while announcing.
             fire_eye = "med" if alarm.is_medical() else None
-            post_wav_to_esp(
-                tts_wav, prompt_ack=alarm.requires_ack, eye_expression=fire_eye
+            deliver_wav_to_device(
+                target_id or None,
+                tts_wav,
+                prompt_ack=alarm.requires_ack,
+                eye_expression=fire_eye,
             )
 
             # Medical: TTS only (two long WAVs often exceed ESP limit). Normal: TTS + beep.
             if not alarm.requires_ack:
                 alarm_wav = self._load_alarm_wav_bytes()
                 if alarm_wav:
-                    post_wav_to_esp(alarm_wav)
+                    deliver_wav_to_device(target_id or None, alarm_wav)
 
             if alarm.requires_ack:
                 self._mark_medical_awaiting_ack(alarm, now)

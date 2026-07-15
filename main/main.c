@@ -17,6 +17,7 @@
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -65,6 +66,8 @@
 #define NVS_KEY_STA_SSID "sta_ssid"
 #define NVS_KEY_STA_PASS "sta_pass"
 #define NVS_KEY_DEVICE_NAME "dev_name"
+#define NVS_KEY_DEVICE_ID "device_id"
+#define DEVICE_ID_MAX 32
 
 #define MULTICAST_ADDR "239.255.255.250"
 #define BROADCAST_ADDR "255.255.255.255"
@@ -163,11 +166,12 @@ static latest_frame_t s_latest_frame;
 
 static httpd_handle_t s_http_server;
 static esp_console_repl_t *s_repl;
-static char s_voice_ws_url[160];
+static char s_voice_ws_url[200];
 static bool s_voice_wake_started;
 static int64_t s_last_uvc_timeout_log_us;
 static char s_device_name[WIFI_PROV_BLE_DEVICE_NAME_MAX + 1] =
     DEVICE_NAME_DEFAULT;
+static char s_device_id[DEVICE_ID_MAX + 1] = "";
 
 extern const uint8_t wifi_wav_start[] asm("_binary_WIFI_wav_start");
 extern const uint8_t wifi_wav_end[] asm("_binary_WIFI_wav_end");
@@ -462,6 +466,103 @@ static bool is_valid_device_name(const char *name) {
     }
   }
   return true;
+}
+
+static bool is_valid_device_id(const char *id) {
+  if (id == NULL || id[0] == '\0') {
+    return false;
+  }
+  size_t len = strnlen(id, DEVICE_ID_MAX + 1);
+  if (len == 0 || len > DEVICE_ID_MAX) {
+    return false;
+  }
+  for (size_t i = 0; i < len; ++i) {
+    char c = id[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') || c == '-' || c == '_')) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static void make_default_device_id_from_mac(char *dst, size_t dst_size) {
+  uint8_t mac[6] = {0};
+  if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) {
+    (void)esp_wifi_get_mac(WIFI_IF_STA, mac);
+  }
+  snprintf(dst, dst_size, "nino-%02x%02x%02x", mac[3], mac[4], mac[5]);
+}
+
+static void copy_device_id(char *dst, size_t dst_size, const char *src) {
+  if (dst == NULL || dst_size == 0) {
+    return;
+  }
+  if (src == NULL || !is_valid_device_id(src)) {
+    make_default_device_id_from_mac(dst, dst_size);
+    return;
+  }
+  size_t len = strnlen(src, dst_size - 1);
+  memcpy(dst, src, len);
+  dst[len] = '\0';
+}
+
+static esp_err_t save_device_id_to_nvs(void) {
+  nvs_handle_t h;
+  esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+  if (err != ESP_OK) {
+    return err;
+  }
+  err = nvs_set_str(h, NVS_KEY_DEVICE_ID, s_device_id);
+  if (err == ESP_OK) {
+    err = nvs_commit(h);
+  }
+  nvs_close(h);
+  return err;
+}
+
+static void load_device_id_from_nvs(void) {
+  nvs_handle_t h;
+  char stored[DEVICE_ID_MAX + 1] = "";
+  if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+    size_t len = sizeof(stored);
+    if (nvs_get_str(h, NVS_KEY_DEVICE_ID, stored, &len) != ESP_OK ||
+        !is_valid_device_id(stored)) {
+      stored[0] = '\0';
+    }
+    nvs_close(h);
+  }
+  copy_device_id(s_device_id, sizeof(s_device_id), stored);
+  if (stored[0] == '\0') {
+    (void)save_device_id_to_nvs();
+  }
+  ESP_LOGI(TAG, "device_id=%s", s_device_id);
+}
+
+/** Ensure s_voice_ws_url carries ?device_id=<id> (strip any prior query). */
+static void ensure_voice_ws_url_has_device_id(void) {
+  if (s_voice_ws_url[0] == '\0' || s_device_id[0] == '\0') {
+    return;
+  }
+  char base[200];
+  strncpy(base, s_voice_ws_url, sizeof(base) - 1);
+  base[sizeof(base) - 1] = '\0';
+  char *q = strchr(base, '?');
+  if (q != NULL) {
+    *q = '\0';
+  }
+  char *hash = strchr(base, '#');
+  if (hash != NULL) {
+    *hash = '\0';
+  }
+  if (base[0] == '\0') {
+    return;
+  }
+  int n = snprintf(s_voice_ws_url, sizeof(s_voice_ws_url), "%s?device_id=%s",
+                   base, s_device_id);
+  if (n <= 0 || (size_t)n >= sizeof(s_voice_ws_url)) {
+    ESP_LOGW(TAG, "voice WS URL with device_id too long");
+  }
 }
 
 static void sta_reconnect_task(void *arg) {
@@ -795,6 +896,7 @@ static void wifi_cli_register(void) {
 }
 
 static void voice_cli_register(void);
+static void device_cli_register(void);
 static void servo_cli_register(void);
 static void track_cli_register(void);
 static void speaker_cli_register(void);
@@ -829,6 +931,7 @@ static void console_init(void) {
   esp_console_register_help_command();
   wifi_cli_register();
   voice_cli_register();
+  device_cli_register();
   servo_cli_register();
   track_cli_register();
   speaker_cli_register();
@@ -1920,13 +2023,14 @@ static int app_status_json(char *buf, size_t buf_sz) {
 
   return snprintf(
       buf, buf_sz,
-      "{\"ok\":true,\"device_name\":\"%s\",\"wifi_ssid\":\"%s\","
+      "{\"ok\":true,\"device_name\":\"%s\",\"device_id\":\"%s\","
+      "\"wifi_ssid\":\"%s\","
       "\"volume\":%d,\"firmware\":\"%s\",\"sta_connected\":%s,"
       "\"ip\":\"%s\",\"mdns_host\":\"%s.local\","
       "\"face_track\":{\"enabled\":%s,\"detector_ready\":%s,"
       "\"face_found\":%s}}",
-      s_device_name, s_sta_ssid, nino_audio_get_volume_percent(), fw_version,
-      s_sta_connected ? "true" : "false", sta_ip, s_device_name,
+      s_device_name, s_device_id, s_sta_ssid, nino_audio_get_volume_percent(),
+      fw_version, s_sta_connected ? "true" : "false", sta_ip, s_device_name,
       face_track.enabled ? "true" : "false",
       face_track.detector_ready ? "true" : "false",
       face_track.face_found ? "true" : "false");
@@ -2334,6 +2438,7 @@ static void load_voice_ws_from_nvs(void) {
   size_t sz = sizeof(s_voice_ws_url);
   (void)nvs_get_str(h, NVS_KEY_VOICE_WS, s_voice_ws_url, &sz);
   nvs_close(h);
+  ensure_voice_ws_url_has_device_id();
 }
 
 static void apply_voice_ws_url_from_server(const char *uri) {
@@ -2342,6 +2447,7 @@ static void apply_voice_ws_url_from_server(const char *uri) {
   }
   strncpy(s_voice_ws_url, uri, sizeof(s_voice_ws_url) - 1);
   s_voice_ws_url[sizeof(s_voice_ws_url) - 1] = '\0';
+  ensure_voice_ws_url_has_device_id();
   nvs_handle_t h;
   if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
     (void)nvs_set_str(h, NVS_KEY_VOICE_WS, s_voice_ws_url);
@@ -2357,7 +2463,7 @@ static int cmd_voice(int argc, char **argv) {
   if (argc >= 2 && strcmp(argv[1], "connect") == 0) {
     if (argc < 3) {
       printf("Usage: voice connect <IPv4> [port]   (default port 8000)\n"
-             "  Saves ws://<ip>:<port>/voice-query for \"Hi ESP\" wake flow\n");
+             "  Saves ws://<ip>:<port>/voice-query?device_id=... for \"Hi ESP\" wake flow\n");
       return 0;
     }
     int port = 8000;
@@ -2374,6 +2480,7 @@ static int cmd_voice(int argc, char **argv) {
       printf("Voice URL too long or invalid\n");
       return 1;
     }
+    ensure_voice_ws_url_has_device_id();
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
       (void)nvs_set_str(h, NVS_KEY_VOICE_WS, s_voice_ws_url);
@@ -2395,6 +2502,7 @@ static int cmd_voice(int argc, char **argv) {
     }
     strncpy(s_voice_ws_url, argv[2], sizeof(s_voice_ws_url) - 1);
     s_voice_ws_url[sizeof(s_voice_ws_url) - 1] = '\0';
+    ensure_voice_ws_url_has_device_id();
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
       nvs_set_str(h, NVS_KEY_VOICE_WS, s_voice_ws_url);
@@ -2414,6 +2522,7 @@ static int cmd_voice(int argc, char **argv) {
     printf("usb header mic: %s\n", usb_mic_ready() ? "streaming" : "not ready (check GPIO 24/25 wiring)");
     usb_mic_print_status();
     usb_mic_print_usb_devices();
+    printf("device_id: %s\n", s_device_id);
     printf("voice url: \"%s\"\n", s_voice_ws_url[0] ? s_voice_ws_url : "(not set)");
     printf("Tip: voice connect must use your PC LAN IP (where python app.py runs), not 192.168.x.x of the board.\n");
     return 0;
@@ -2438,12 +2547,59 @@ static int cmd_voice(int argc, char **argv) {
   return 0;
 }
 
+static int cmd_device(int argc, char **argv) {
+  if (argc >= 2 && strcmp(argv[1], "id") == 0) {
+    if (argc < 3) {
+      printf("device_id: %s\n", s_device_id);
+      return 0;
+    }
+    if (!is_valid_device_id(argv[2])) {
+      printf("Invalid device_id (use 1-%d chars: A-Z a-z 0-9 - _)\n", DEVICE_ID_MAX);
+      return 1;
+    }
+    copy_device_id(s_device_id, sizeof(s_device_id), argv[2]);
+    esp_err_t err = save_device_id_to_nvs();
+    if (err != ESP_OK) {
+      printf("NVS save failed: %s\n", esp_err_to_name(err));
+      return 1;
+    }
+    ensure_voice_ws_url_has_device_id();
+    if (s_voice_ws_url[0] != '\0') {
+      nvs_handle_t h;
+      if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        (void)nvs_set_str(h, NVS_KEY_VOICE_WS, s_voice_ws_url);
+        (void)nvs_commit(h);
+        nvs_close(h);
+      }
+      nino_voice_assist_set_ws_uri(s_voice_ws_url);
+    }
+    printf("device_id set to %s\n", s_device_id);
+    if (s_voice_ws_url[0] != '\0') {
+      printf("voice url updated: %s\n", s_voice_ws_url);
+    }
+    return 0;
+  }
+  printf("Usage: device id [<id>]\n");
+  return 0;
+}
+
 static void voice_cli_register(void) {
   const esp_console_cmd_t cmd = {
       .command = "voice",
       .help = "voice connect <PC_IP> [port] | voice status | voice wake [on|off]",
       .hint = NULL,
       .func = &cmd_voice,
+      .argtable = NULL,
+  };
+  ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+}
+
+static void device_cli_register(void) {
+  const esp_console_cmd_t cmd = {
+      .command = "device",
+      .help = "device id [<id>]  — print or set stable multi-robot device_id",
+      .hint = NULL,
+      .func = &cmd_device,
       .argtable = NULL,
   };
   ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
@@ -3154,6 +3310,7 @@ void app_main(void) {
   }
 
   ESP_ERROR_CHECK(nino_voice_assist_init_mutex());
+  load_device_id_from_nvs();
   load_voice_ws_from_nvs();
   nino_voice_assist_set_ws_uri(s_voice_ws_url);
   if (s_voice_ws_url[0] != '\0') {

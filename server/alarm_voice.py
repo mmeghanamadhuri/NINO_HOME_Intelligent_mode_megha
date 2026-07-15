@@ -178,6 +178,7 @@ def handle_alarm_voice(
     person_name: str = "",
     camera_identity_name: str | None = None,
     camera_identity_state: str = "no_face",
+    device_id: str = "",
 ) -> AlarmVoiceResult:
     text = user_text.strip()
     if not text:
@@ -210,20 +211,22 @@ def handle_alarm_voice(
     if is_medical_set_command(text):
         regex_set_attempted = True
         result = _handle_set_medical_alarm(
-            text, person_name=resolved_name, user_id=user_id
+            text, person_name=resolved_name, user_id=user_id, device_id=device_id
         )
         if result.handled:
             return result
     if is_reminder_command(text):
         regex_set_attempted = True
         result = _handle_set_reminder(
-            text, person_name=resolved_name, user_id=user_id
+            text, person_name=resolved_name, user_id=user_id, device_id=device_id
         )
         if result.handled:
             return result
     elif is_set_alarm_command(text):
         regex_set_attempted = True
-        result = _handle_set_alarm(text, person_name=resolved_name, user_id=user_id)
+        result = _handle_set_alarm(
+            text, person_name=resolved_name, user_id=user_id, device_id=device_id
+        )
         if result.handled:
             return result
 
@@ -235,7 +238,10 @@ def handle_alarm_voice(
         or looks_like_medicine_reminder_set(text)
     ):
         nlp_result = try_nlp_alarm(
-            text, person_name=resolved_name, user_id=user_id
+            text,
+            person_name=resolved_name,
+            user_id=user_id,
+            device_id=device_id,
         )
         if nlp_result.handled:
             logger.info("Alarm handled via Ollama NLP fallback | heard: %s", text[:120])
@@ -542,6 +548,7 @@ def _save_alarm(
     label: str = "",
     person_name: str = "",
     user_id: int | None = None,
+    device_id: str = "",
     source_text: str = "",
     force_medical: bool = False,
 ) -> AlarmVoiceResult:
@@ -552,6 +559,7 @@ def _save_alarm(
         label=label,
         person_name=person_name,
         user_id=user_id,
+        device_id=device_id,
         source_text=source_text or label,
         force_medical=force_medical,
     )
@@ -597,7 +605,11 @@ def _day_note_for(fire_at: datetime) -> str:
 
 
 def _handle_set_reminder(
-    user_text: str, *, person_name: str = "", user_id: int | None = None
+    user_text: str,
+    *,
+    person_name: str = "",
+    user_id: int | None = None,
+    device_id: str = "",
 ) -> AlarmVoiceResult:
     tail = _extract_reminder_tail(user_text)
     if not tail:
@@ -625,12 +637,17 @@ def _handle_set_reminder(
         label=label,
         person_name=person_name,
         user_id=user_id,
+        device_id=device_id,
         source_text=user_text,
     )
 
 
 def _handle_set_medical_alarm(
-    user_text: str, *, person_name: str = "", user_id: int | None = None
+    user_text: str,
+    *,
+    person_name: str = "",
+    user_id: int | None = None,
+    device_id: str = "",
 ) -> AlarmVoiceResult:
     from alarm_medical import _MEDICAL_SET_PATTERNS
 
@@ -665,13 +682,18 @@ def _handle_set_medical_alarm(
         label=label,
         person_name=person_name,
         user_id=user_id,
+        device_id=device_id,
         source_text=user_text,
         force_medical=True,
     )
 
 
 def _handle_set_alarm(
-    user_text: str, *, person_name: str = "", user_id: int | None = None
+    user_text: str,
+    *,
+    person_name: str = "",
+    user_id: int | None = None,
+    device_id: str = "",
 ) -> AlarmVoiceResult:
     phrase = _extract_time_phrase(user_text)
     if not phrase:
@@ -683,7 +705,12 @@ def _handle_set_alarm(
 
     logger.info("Voice alarm (regex) | person=%r time_phrase=%r", person_name or "(none)", phrase)
     return _save_alarm(
-        parsed.fire_at, parsed, person_name=person_name, user_id=user_id, source_text=user_text
+        parsed.fire_at,
+        parsed,
+        person_name=person_name,
+        user_id=user_id,
+        device_id=device_id,
+        source_text=user_text,
     )
 
 

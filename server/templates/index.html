@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>NiNO Camera Face Server</title>
-    <link rel="stylesheet" href="/static/styles.css?v=12" />
+    <link rel="stylesheet" href="/static/styles.css?v=13" />
   </head>
   <body>
     <header class="site-header">
@@ -24,10 +24,22 @@
       <section class="card stream-card">
         <div class="card-header">
           <h2>Live Feed</h2>
-          <a href="/snapshot.jpg" target="_blank" rel="noreferrer">Open snapshot</a>
+          <div class="device-picker">
+            <label for="deviceSelect">Robot</label>
+            <select id="deviceSelect">
+              {% for d in devices %}
+              <option value="{{ d.device_id }}" {% if d.device_id == device_id %}selected{% endif %}>
+                {{ d.display_name or d.device_id }}
+              </option>
+              {% else %}
+              <option value="{{ device_id }}" selected>{{ device_id }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <a id="snapshotLink" href="/snapshot.jpg?device_id={{ device_id }}" target="_blank" rel="noreferrer">Open snapshot</a>
         </div>
         <div class="stream-frame">
-          <img id="stream" src="/video_feed" alt="Annotated camera stream" />
+          <img id="stream" src="/video_feed?device_id={{ device_id }}" alt="Annotated camera stream" data-device-id="{{ device_id }}" />
         </div>
       </section>
 
@@ -87,6 +99,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js?v=2"></script>
+    <script src="/static/app.js?v=3"></script>
   </body>
 </html>

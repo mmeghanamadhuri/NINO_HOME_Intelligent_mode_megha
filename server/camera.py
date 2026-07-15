@@ -138,7 +138,11 @@ class CameraStream:
         self._rotation_code = parse_camera_rotation(os.getenv("CAMERA_ROTATION", ""))
 
         if self._thread and self._thread.is_alive():
-            return
+            # A prior stop() may still be draining (e.g. blocked in urlopen).
+            # Never return early while stop is requested — that leaves no worker.
+            if not self._stop_event.is_set():
+                return
+            self._join_worker(SNAPSHOT_HTTP_TIMEOUT_SECONDS + 1.0)
 
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run, name="camera-stream", daemon=True)
@@ -147,21 +151,24 @@ class CameraStream:
     def stop(self) -> None:
         self._stop_event.set()
         self._release_capture()
+        # Wait long enough for an in-flight snapshot HTTP call to time out.
+        self._join_worker(SNAPSHOT_HTTP_TIMEOUT_SECONDS + 1.0)
+        self._connected = False
+
+    def restart(self, source: str) -> None:
+        self.stop()
+        self.start(source)
+
+    def _join_worker(self, timeout: float) -> None:
         if (
             self._thread
             and self._thread.is_alive()
             and threading.current_thread() is not self._thread
         ):
             try:
-                # Keep shutdown responsive; this worker is daemonized.
-                self._thread.join(timeout=0.2)
+                self._thread.join(timeout=timeout)
             except BaseException:
                 pass
-        self._connected = False
-
-    def restart(self, source: str) -> None:
-        self.stop()
-        self.start(source)
 
     def read(self) -> np.ndarray | None:
         with self._lock:
@@ -266,6 +273,10 @@ class CameraStream:
                 self._last_error = str(exc)[:120]
                 if self._frames_received == 0:
                     self._connected = False
+            except Exception as exc:
+                # Keep the poller alive; a single decode/FD glitch must not freeze the UI.
+                self._connected = False
+                self._last_error = str(exc)[:240]
             time.sleep(SNAPSHOT_POLL_INTERVAL_SECONDS)
 
         self._connected = False
@@ -380,3 +391,99 @@ class CameraStream:
                 capture.release()
             except Exception as exc:
                 self._last_error = f"Could not release camera cleanly: {exc}"
+
+
+class CameraPool:
+    """Per-device CameraStream pool keyed by device_id."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._streams: dict[str, CameraStream] = {}
+
+    def configure_from_registry(self) -> None:
+        from device_registry import get_device_registry
+
+        registry = get_device_registry()
+        wanted: dict[str, str] = {}
+        for record in registry.list_devices():
+            cam = record.effective_camera_url()
+            if cam:
+                wanted[record.device_id] = cam
+        with self._lock:
+            for device_id in list(self._streams.keys()):
+                if device_id not in wanted:
+                    self._streams[device_id].stop()
+                    del self._streams[device_id]
+            for device_id, source in wanted.items():
+                existing = self._streams.get(device_id)
+                if existing is None:
+                    stream = CameraStream(source)
+                    stream.start()
+                    self._streams[device_id] = stream
+                elif existing.source != source:
+                    existing.restart(source)
+
+    def start_all(self) -> None:
+        self.configure_from_registry()
+
+    def stop_all(self) -> None:
+        with self._lock:
+            for stream in self._streams.values():
+                stream.stop()
+            self._streams.clear()
+
+    def ensure(self, device_id: str | None) -> CameraStream:
+        from device_registry import get_device_registry
+
+        record = get_device_registry().resolve_or_default(device_id)
+        source = record.effective_camera_url() or "auto"
+        with self._lock:
+            stream = self._streams.get(record.device_id)
+            if stream is None:
+                stream = CameraStream(source)
+                stream.start()
+                self._streams[record.device_id] = stream
+            elif stream.source != source and source:
+                stream.restart(source)
+            return stream
+
+    def read(self, device_id: str | None = None) -> np.ndarray | None:
+        return self.ensure(device_id).read()
+
+    def restart(self, device_id: str | None, source: str) -> CameraStream:
+        from device_registry import get_device_registry
+
+        record = get_device_registry().resolve_or_default(device_id)
+        with self._lock:
+            stream = self._streams.get(record.device_id)
+            if stream is None:
+                stream = CameraStream(source)
+                stream.start()
+                self._streams[record.device_id] = stream
+            else:
+                stream.restart(source)
+            return stream
+
+    def status(self, device_id: str | None = None) -> dict[str, Any]:
+        if device_id is not None:
+            stream = self.ensure(device_id)
+            payload = stream.status()
+            payload["device_id"] = get_device_registry_safe_id(device_id)
+            return payload
+        with self._lock:
+            return {
+                device_id: stream.status()
+                for device_id, stream in self._streams.items()
+            }
+
+    def frame_getter(self, device_id: str | None):
+        def _read() -> np.ndarray | None:
+            return self.read(device_id)
+
+        return _read
+
+
+def get_device_registry_safe_id(device_id: str | None) -> str:
+    from device_registry import resolve_device_id
+
+    return resolve_device_id(device_id)

@@ -11,7 +11,6 @@ import wave
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Literal
-from urllib.parse import urlparse
 
 import numpy as np
 import requests
@@ -112,6 +111,7 @@ class VoiceReplyMeta:
     eye_expression: str | None = None
     registered_face_name: str | None = None
     face_reg_relisten: bool = False
+    device_id: str = ""
     # Per-stage latency info for this query (stt/reply/tts seconds, heard text,
     # reply path, audio sizes). Filled by process_voice_wav; logged by app.py.
     timings: dict[str, Any] = field(default_factory=dict)
@@ -277,29 +277,27 @@ def is_servo_360_command(user_text: str) -> bool:
     return any(p.search(text) for p in _SERVO_360_PATTERNS)
 
 
-def esp_servo_360_url() -> str | None:
-    play_url = os.environ.get("ESP_PLAY_WAV_URL", "").strip()
-    if not play_url:
+def esp_servo_360_url(device_id: str | None = None) -> str | None:
+    from esp_playback import device_base_url
+
+    base = device_base_url(device_id)
+    if not base:
         return None
-    parsed = urlparse(play_url)
-    if not parsed.scheme or not parsed.netloc:
-        return None
-    return f"{parsed.scheme}://{parsed.netloc}/servo/360"
+    return f"{base}/servo/360"
 
 
-def esp_speaker_volume_url() -> str | None:
-    play_url = os.environ.get("ESP_PLAY_WAV_URL", "").strip()
-    if not play_url:
+def esp_speaker_volume_url(device_id: str | None = None) -> str | None:
+    from esp_playback import device_base_url
+
+    base = device_base_url(device_id)
+    if not base:
         return None
-    parsed = urlparse(play_url)
-    if not parsed.scheme or not parsed.netloc:
-        return None
-    return f"{parsed.scheme}://{parsed.netloc}/speaker/volume"
+    return f"{base}/speaker/volume"
 
 
-def trigger_esp_servo_360() -> tuple[bool, str | None]:
+def trigger_esp_servo_360(device_id: str | None = None) -> tuple[bool, str | None]:
     """POST /servo/360 on the ESP. Returns (ok, error_code)."""
-    url = esp_servo_360_url()
+    url = esp_servo_360_url(device_id)
     if not url:
         return False, "no_esp_url"
     try:
@@ -318,8 +316,8 @@ def trigger_esp_servo_360() -> tuple[bool, str | None]:
         return False, "request_failed"
 
 
-def get_esp_speaker_volume() -> tuple[int | None, str | None]:
-    url = esp_speaker_volume_url()
+def get_esp_speaker_volume(device_id: str | None = None) -> tuple[int | None, str | None]:
+    url = esp_speaker_volume_url(device_id)
     if not url:
         return None, "no_esp_url"
     try:
@@ -336,8 +334,10 @@ def get_esp_speaker_volume() -> tuple[int | None, str | None]:
         return None, "request_failed"
 
 
-def set_esp_speaker_volume(percent: int) -> tuple[int | None, str | None]:
-    url = esp_speaker_volume_url()
+def set_esp_speaker_volume(
+    percent: int, device_id: str | None = None
+) -> tuple[int | None, str | None]:
+    url = esp_speaker_volume_url(device_id)
     if not url:
         return None, "no_esp_url"
     pct = max(0, min(100, int(percent)))
@@ -432,27 +432,29 @@ def parse_volume_command(user_text: str) -> tuple[str, int | None] | None:
     return ("delta", sign * amount)
 
 
-def apply_volume_command(user_text: str) -> tuple[bool, str]:
+def apply_volume_command(
+    user_text: str, *, device_id: str | None = None
+) -> tuple[bool, str]:
     parsed = parse_volume_command(user_text)
     if parsed is None:
         return False, ""
 
     mode, value = parsed
     if mode == "set":
-        applied, err = set_esp_speaker_volume(value or 0)
+        applied, err = set_esp_speaker_volume(value or 0, device_id=device_id)
         if err:
             if err == "no_esp_url":
                 return True, "I cannot reach the robot speaker right now."
             return True, "I could not change the volume on the robot."
         return True, f"Okay, speaker volume set to {applied} percent."
 
-    current, err = get_esp_speaker_volume()
+    current, err = get_esp_speaker_volume(device_id=device_id)
     if err or current is None:
         if err == "no_esp_url":
             return True, "I cannot reach the robot speaker right now."
         return True, "I could not read the current speaker volume."
     target = max(0, min(100, current + (value or 0)))
-    applied, err = set_esp_speaker_volume(target)
+    applied, err = set_esp_speaker_volume(target, device_id=device_id)
     if err:
         return True, "I could not change the volume on the robot."
     return True, f"Okay, speaker volume set to {applied} percent."
@@ -568,8 +570,9 @@ def process_voice_wav(
     *,
     camera_identity_name: str | None = None,
     camera_identity_state: CameraIdentityState = "no_face",
+    device_id: str = "",
 ) -> tuple[bytes, VoiceReplyMeta]:
-    meta = VoiceReplyMeta()
+    meta = VoiceReplyMeta(device_id=device_id or "")
     if not wav_bytes:
         raise RuntimeError("Empty audio.")
     if len(wav_bytes) > SETTINGS.max_request_bytes:
@@ -581,7 +584,9 @@ def process_voice_wav(
     t_stt = time.perf_counter()
     reply_path = "llm"
 
-    handled_volume, volume_reply = apply_volume_command(user_text)
+    handled_volume, volume_reply = apply_volume_command(
+        user_text, device_id=device_id or None
+    )
     if handled_volume:
         reply_path = "volume"
         logger.info("Voice volume command | heard: %s", user_text[:120])
@@ -707,6 +712,7 @@ def process_voice_wav(
             person_name=alarm_person_name,
             camera_identity_name=camera_identity_name,
             camera_identity_state=camera_identity_state,
+            device_id=device_id,
         )
         if alarm_result.handled:
             reply_path = "alarm"
@@ -719,7 +725,7 @@ def process_voice_wav(
     if reply_path == "llm" and is_servo_360_command(user_text):
         reply_path = "servo_360"
         logger.info("Voice servo 360 command | heard: %s", user_text[:120])
-        if esp_servo_360_url() is None:
+        if esp_servo_360_url(device_id or None) is None:
             reply = reply_for_servo_360_command(error="no_esp_url")
         else:
             meta.trigger_servo_360 = True

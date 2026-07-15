@@ -65,6 +65,35 @@ class StartupGreetingTests(unittest.TestCase):
         finally:
             svc.stop()
 
+    def test_first_sight_queues_startup_summary_greeting(self) -> None:
+        svc = TTSService(cooldown_seconds=0.0, face_greeting_interval_seconds=999.0)
+        try:
+            with patch.object(svc, "_ollama_configured", return_value=True):
+                svc.update_face_state(["RecognizedUser"], primary_name="RecognizedUser")
+            with svc._lock:
+                self.assertEqual(len(svc._pending_jobs), 1)
+                job = svc._pending_jobs[0]
+                self.assertTrue(job.is_startup_greeting)
+                self.assertEqual(job.llm_name, "RecognizedUser")
+        finally:
+            svc.stop()
+
+    def test_voice_does_not_skip_startup_summary_greeting(self) -> None:
+        svc = TTSService(cooldown_seconds=0.0, face_greeting_interval_seconds=999.0)
+        try:
+            svc.notify_voice_interaction("RecognizedUser")
+            self.assertTrue(svc.needs_startup_summary_greeting("RecognizedUser"))
+            # Past voice suppress window
+            with svc._lock:
+                svc._suppress_vision_until = 0.0
+            with patch.object(svc, "_ollama_configured", return_value=True):
+                svc.update_face_state(["RecognizedUser"], primary_name="RecognizedUser")
+            with svc._lock:
+                self.assertTrue(svc._pending_jobs)
+                self.assertTrue(svc._pending_jobs[0].is_startup_greeting)
+        finally:
+            svc.stop()
+
     def test_startup_prompt_excludes_mood(self) -> None:
         prompt = build_greeting_prompt(
             _TEST_DISPLAY_NAME,

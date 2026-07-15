@@ -13,7 +13,7 @@ from typing import Any, Callable, Literal
 
 import numpy as np
 
-from esp_playback import esp_play_wav_url, post_wav_to_esp
+from esp_playback import deliver_wav_to_device, device_base_url
 from face_registration_voice import extract_registration_name
 from tts_service import synthesize_sapi_wav_bytes
 from wav_resample import resample_wav_bytes_to_mono_16bit
@@ -138,6 +138,9 @@ class FaceRegistrationService:
         self._no_speech_retries: int = 0
         self.apply_settings_from_environ()
 
+    def set_frame_getter(self, read_frame: Callable[[], np.ndarray | None]) -> None:
+        self._read_frame = read_frame
+
     def apply_settings_from_environ(self) -> None:
         self.enabled = os.environ.get("FACE_REG_ENABLED", "1").strip().lower() in {
             "1",
@@ -166,7 +169,7 @@ class FaceRegistrationService:
             0, int(os.environ.get("FACE_REG_MAX_NO_SPEECH_RETRIES", "2"))
         )
         self.unknown_confirm_frames = max(
-            5, int(os.environ.get("FACE_REG_UNKNOWN_CONFIRM_FRAMES", "30"))
+            3, int(os.environ.get("FACE_REG_UNKNOWN_CONFIRM_FRAMES", "8"))
         )
         self._unknown_streak = 0
 
@@ -378,8 +381,8 @@ class FaceRegistrationService:
         )
 
     def _try_prompt_registration(self) -> None:
-        if esp_play_wav_url() is None:
-            logger.debug("Face registration prompt skipped: ESP_PLAY_WAV_URL not set")
+        if device_base_url(None) is None:
+            logger.debug("Face registration prompt skipped: no ESP play URL")
             return
 
         with self._lock:
@@ -448,13 +451,16 @@ class FaceRegistrationService:
             return pcm_bytes / (rate_hz * 2)
 
     def _send_listen_prompt(self, text: str) -> bool:
-        if esp_play_wav_url() is None:
-            logger.debug("Face registration listen prompt skipped: ESP_PLAY_WAV_URL not set")
+        if device_base_url(None) is None:
+            logger.debug("Face registration listen prompt skipped: no ESP play URL")
             return False
 
+        from device_registry import get_device_registry
+
+        device_id = get_device_registry().ui_device_id()
         wav = self._synthesize_prompt_wav(text)
         try:
-            post_wav_to_esp(wav, prompt_ack=True, prompt_ack_chime=True)
+            deliver_wav_to_device(device_id, wav, prompt_ack=True, prompt_ack_chime=True)
         except Exception as exc:
             logger.warning("Face registration listen prompt failed: %s", exc)
             return False

@@ -60,7 +60,11 @@ def looks_alarm_related(user_text: str) -> bool:
 
 
 def try_nlp_alarm(
-    user_text: str, *, person_name: str = "", user_id: int | None = None
+    user_text: str,
+    *,
+    person_name: str = "",
+    user_id: int | None = None,
+    device_id: str = "",
 ) -> AlarmVoiceResult:
     """Call Ollama for structured intent; validate with parse_alarm_datetime before save."""
     if not nlp_fallback_enabled():
@@ -94,7 +98,11 @@ def try_nlp_alarm(
 
     if intent in {"set_alarm", "set_reminder", "reminder", "alarm"}:
         return _apply_set_intent(
-            payload, user_text, person_name=person_name, user_id=user_id
+            payload,
+            user_text,
+            person_name=person_name,
+            user_id=user_id,
+            device_id=device_id,
         )
 
     return AlarmVoiceResult(handled=False)
@@ -154,6 +162,7 @@ def _apply_set_intent(
     *,
     person_name: str = "",
     user_id: int | None = None,
+    device_id: str = "",
 ) -> AlarmVoiceResult:
     label = str(payload.get("label", "") or "").strip()
     time_phrase = _payload_to_time_phrase(payload)
@@ -189,6 +198,7 @@ def _apply_set_intent(
         label=label,
         person_name=person_name,
         user_id=user_id,
+        device_id=device_id,
         source_text=user_text,
     )
 

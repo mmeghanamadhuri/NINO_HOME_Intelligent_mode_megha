@@ -126,20 +126,16 @@ def esp_play_wav_url() -> str | None:
     return ensure_esp_play_wav_url_configured()
 
 
-def post_wav_to_esp(
+def _post_wav_to_url(
+    url: str,
     wav: bytes,
     *,
     timeout: float = 60.0,
     prompt_ack: bool = False,
     prompt_ack_chime: bool = True,
     eye_expression: str | None = None,
+    device_id: str | None = None,
 ) -> None:
-    """Queue raw WAV bytes on the board speaker via POST /play_wav."""
-    url = esp_play_wav_url()
-    if not url:
-        raise RuntimeError(
-            "ESP_PLAY_WAV_URL is not set (set it or use CAMERA_SOURCE=http://<ESP_IP>/stream)"
-        )
     if not wav:
         raise RuntimeError("WAV payload is empty")
     if len(wav) > ESP_MAX_PLAY_WAV_BYTES:
@@ -151,7 +147,7 @@ def post_wav_to_esp(
     if prompt_ack:
         headers["X-Nino-Prompt-Ack"] = "1"
         headers["X-Nino-Prompt-Ack-Chime"] = "1" if prompt_ack_chime else "0"
-        ws_url = voice_ws_url_for_esp()
+        ws_url = voice_ws_url_for_esp(device_id=device_id)
         if ws_url:
             headers["X-Nino-Voice-Ws-Url"] = ws_url
         else:
@@ -185,3 +181,73 @@ def post_wav_to_esp(
         raise RuntimeError(f"ESP HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"ESP URL error: {exc}") from exc
+
+
+def post_wav_to_esp(
+    wav: bytes,
+    *,
+    timeout: float = 60.0,
+    prompt_ack: bool = False,
+    prompt_ack_chime: bool = True,
+    eye_expression: str | None = None,
+) -> None:
+    """Queue raw WAV bytes on the board speaker via POST /play_wav (legacy global URL)."""
+    url = esp_play_wav_url()
+    if not url:
+        raise RuntimeError(
+            "ESP_PLAY_WAV_URL is not set (set it or use CAMERA_SOURCE=http://<ESP_IP>/stream)"
+        )
+    _post_wav_to_url(
+        url,
+        wav,
+        timeout=timeout,
+        prompt_ack=prompt_ack,
+        prompt_ack_chime=prompt_ack_chime,
+        eye_expression=eye_expression,
+    )
+
+
+def deliver_wav_to_device(
+    device_id: str | None,
+    wav: bytes,
+    *,
+    timeout: float = 60.0,
+    prompt_ack: bool = False,
+    prompt_ack_chime: bool = True,
+    eye_expression: str | None = None,
+) -> None:
+    """POST WAV to the play_wav URL for device_id (falls back to legacy env URL)."""
+    from device_registry import get_device_registry
+
+    record = get_device_registry().resolve_or_default(device_id)
+    url = record.effective_play_wav_url() or esp_play_wav_url()
+    if not url:
+        raise RuntimeError(
+            f"No play_wav URL for device_id={record.device_id!r} "
+            "(set devices.json or ESP_PLAY_WAV_URL / CAMERA_SOURCE)"
+        )
+    logger.debug("deliver_wav_to_device device_id=%s url=%s", record.device_id, url)
+    _post_wav_to_url(
+        url,
+        wav,
+        timeout=timeout,
+        prompt_ack=prompt_ack,
+        prompt_ack_chime=prompt_ack_chime,
+        eye_expression=eye_expression,
+        device_id=record.device_id,
+    )
+
+
+def device_base_url(device_id: str | None) -> str | None:
+    """HTTP base for volume/servo on a device."""
+    from device_registry import get_device_registry
+
+    base = get_device_registry().resolve_or_default(device_id).effective_base_url()
+    if base:
+        return base
+    play = esp_play_wav_url()
+    if play:
+        parsed = urllib.parse.urlparse(play)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}"
+    return None

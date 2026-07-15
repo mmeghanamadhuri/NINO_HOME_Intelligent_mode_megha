@@ -58,8 +58,8 @@ class FaceRegistrationServiceTests(unittest.TestCase):
             }
         ]
 
-    @patch("face_registration_service.post_wav_to_esp")
-    @patch("face_registration_service.esp_play_wav_url", return_value="http://esp/play_wav")
+    @patch("face_registration_service.deliver_wav_to_device")
+    @patch("face_registration_service.device_base_url", return_value="http://esp")
     @patch("face_registration_service.FaceRegistrationService._synthesize_prompt_wav")
     def test_on_frame_prompts_after_stable_unknown(
         self, _synth, _url, post_wav
@@ -115,8 +115,8 @@ class FaceRegistrationServiceTests(unittest.TestCase):
         result = self.svc.handle_voice("My name is Alex")
         self.assertFalse(result.handled)
 
-    @patch("face_registration_service.post_wav_to_esp")
-    @patch("face_registration_service.esp_play_wav_url", return_value="http://esp/play_wav")
+    @patch("face_registration_service.deliver_wav_to_device")
+    @patch("face_registration_service.device_base_url", return_value="http://esp")
     @patch("face_registration_service.FaceRegistrationService._synthesize_prompt_wav")
     def test_no_speech_retry_prompt(self, _synth, _url, post_wav) -> None:
         self.svc.no_speech_retry_seconds = 5.0
@@ -142,8 +142,8 @@ class FaceRegistrationServiceTests(unittest.TestCase):
         self.assertTrue(post_wav.call_args.kwargs.get("prompt_ack"))
         self.assertTrue(post_wav.call_args.kwargs.get("prompt_ack_chime"))
 
-    @patch("face_registration_service.post_wav_to_esp")
-    @patch("face_registration_service.esp_play_wav_url", return_value="http://esp/play_wav")
+    @patch("face_registration_service.deliver_wav_to_device")
+    @patch("face_registration_service.device_base_url", return_value="http://esp")
     @patch("face_registration_service.FaceRegistrationService._synthesize_prompt_wav")
     def test_no_speech_gives_up_after_max_retries(self, _synth, _url, post_wav) -> None:
         self.svc.no_speech_retry_seconds = 5.0
@@ -172,7 +172,7 @@ class FaceRegistrationServiceTests(unittest.TestCase):
         self.svc.on_voice_query_started()
 
         with patch("face_registration_service.time.time", return_value=106.0):
-            with patch("face_registration_service.post_wav_to_esp") as post_wav:
+            with patch("face_registration_service.deliver_wav_to_device") as post_wav:
                 self.svc.on_frame([], voice_active=False)
                 post_wav.assert_not_called()
 

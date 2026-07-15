@@ -102,10 +102,27 @@ h2 {
   justify-content: space-between;
   gap: 10px;
   margin-bottom: var(--space-2);
+  flex-wrap: wrap;
 }
 
 .card-header h2 {
   margin: 0;
+}
+
+.device-picker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.device-picker label {
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.device-picker select {
+  min-width: 10rem;
 }
 
 .status-label {

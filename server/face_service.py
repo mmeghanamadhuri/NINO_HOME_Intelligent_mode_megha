@@ -408,27 +408,17 @@ class FaceService:
         candidate_score: float | None,
         candidate_name: str | None,
     ) -> bool:
+        """True when the primary face is shown as Unknown and may be voice-registered.
+
+        Only block near soft-threshold matches (about to stabilize as known). Weaker
+        partial scores (e.g. 0.34 vs Dimple) still prompt — capture-time
+        validate_registration_name blocks renaming an already-enrolled face.
+        """
+        del candidate_name  # reserved for callers; soft-threshold score is enough
         if not detection_valid or recognized or stabilized:
             return False
-        if self._session_primary_hint():
-            return False
-        with self._lock:
-            has_registered = bool(self._embeddings)
-        if (
-            has_registered
-            and candidate_score is not None
-            and candidate_score >= 0.28
-        ):
-            # Partial match — likely a registered person at a bad angle, not a stranger.
-            return False
+        # Soft-threshold and above ≈ nearly identified; wait for recognition instead.
         if candidate_score is not None and candidate_score >= self.match_soft_threshold:
-            return False
-        if (
-            candidate_score is not None
-            and candidate_name
-            and self._is_known_name(candidate_name)
-            and candidate_score >= max(0.20, self.match_soft_threshold - 0.12)
-        ):
             return False
         return True
 

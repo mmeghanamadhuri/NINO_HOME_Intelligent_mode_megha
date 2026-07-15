@@ -78,7 +78,7 @@ class RegistrationEligibilityTests(unittest.TestCase):
         self.svc._lock = __import__("threading").Lock()
         self.svc._embeddings = {}
 
-    def test_blocks_when_session_primary_active(self) -> None:
+    def test_session_primary_does_not_block_unknown(self) -> None:
         import time
 
         self.svc._session_primary_name = "Chakri"
@@ -90,25 +90,37 @@ class RegistrationEligibilityTests(unittest.TestCase):
             candidate_score=0.26,
             candidate_name="Chakri",
         )
-        self.assertFalse(eligible)
+        self.assertTrue(eligible)
 
-    def test_blocks_partial_match_for_registered_db(self) -> None:
-        self.svc._embeddings = {"chakri": ("Chakri", np.zeros((1, 128), dtype=np.float32))}
+    def test_allows_partial_match_below_soft_threshold(self) -> None:
+        """Unknown @ 0.34 (e.g. vs Dimple) must still be voice-registration eligible."""
+        self.svc._embeddings = {"dimple": ("Dimple", np.zeros((1, 128), dtype=np.float32))}
+        self.svc.match_soft_threshold = 0.42
         eligible = self.svc._registration_eligible(
             detection_valid=True,
             recognized=False,
             stabilized=False,
-            candidate_score=0.30,
-            candidate_name="Chakri",
+            candidate_score=0.343,
+            candidate_name="Dimple",
         )
-        self.assertFalse(eligible)
+        self.assertTrue(eligible)
 
-    def test_blocks_near_match(self) -> None:
+    def test_blocks_near_soft_match(self) -> None:
         eligible = self.svc._registration_eligible(
             detection_valid=True,
             recognized=False,
             stabilized=False,
             candidate_score=0.40,
+            candidate_name="Alex",
+        )
+        self.assertFalse(eligible)
+
+    def test_blocks_recognized(self) -> None:
+        eligible = self.svc._registration_eligible(
+            detection_valid=True,
+            recognized=True,
+            stabilized=True,
+            candidate_score=0.80,
             candidate_name="Alex",
         )
         self.assertFalse(eligible)

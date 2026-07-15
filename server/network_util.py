@@ -22,27 +22,38 @@ def guess_lan_ipv4() -> str:
         return ""
 
 
-def voice_ws_url_for_esp(*, port: int | None = None) -> str | None:
+def voice_ws_url_for_esp(
+    *,
+    port: int | None = None,
+    device_id: str | None = None,
+) -> str | None:
     """
     WebSocket URL the ESP should use to reach this PC's voice pipeline.
 
     Prefer VOICE_WS_URL; else NINO_SERVER_LAN_HOST + port; else guessed LAN IP.
+    When device_id is set, appends ?device_id= (or replaces an existing one).
     """
     explicit = os.environ.get("VOICE_WS_URL", "").strip()
     if explicit:
-        return explicit
+        url = explicit
+    else:
+        host = os.environ.get("NINO_SERVER_LAN_HOST", "").strip()
+        if not host:
+            host = guess_lan_ipv4()
+        if not host:
+            return None
 
-    host = os.environ.get("NINO_SERVER_LAN_HOST", "").strip()
-    if not host:
-        host = guess_lan_ipv4()
-    if not host:
-        return None
+        if port is None:
+            port = int(os.environ.get("NINO_SERVER_PORT", "8000"))
+        path = os.environ.get("VOICE_WS_PATH", "/voice-query").strip() or "/voice-query"
+        if not path.startswith("/"):
+            path = "/" + path
+        url = f"ws://{host}:{port}{path}"
 
-    if port is None:
-        port = int(os.environ.get("NINO_SERVER_PORT", "8000"))
-    path = os.environ.get("VOICE_WS_PATH", "/voice-query").strip() or "/voice-query"
-    if not path.startswith("/"):
-        path = "/" + path
-    url = f"ws://{host}:{port}{path}"
+    cleaned = (device_id or "").strip()
+    if cleaned:
+        base, _, _ = url.partition("?")
+        url = f"{base}?device_id={cleaned}"
+
     logger.debug("Voice WS URL for ESP: %s", url)
     return url
