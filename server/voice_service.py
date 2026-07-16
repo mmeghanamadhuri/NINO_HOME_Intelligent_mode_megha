@@ -628,7 +628,9 @@ def process_voice_wav(
     from face_registration_service import get_face_registration_service
 
     face_reg = get_face_registration_service()
-    awaiting_face_reg = face_reg is not None and face_reg.is_awaiting_name()
+    awaiting_face_reg = (
+        face_reg is not None and face_reg.accepts_registration_voice(user_text)
+    )
 
     if (
         not awaiting_face_reg
@@ -678,7 +680,7 @@ def process_voice_wav(
     t_memory = time.perf_counter()
 
     face_reg = get_face_registration_service()
-    if face_reg is not None and face_reg.is_awaiting_name():
+    if face_reg is not None and face_reg.accepts_registration_voice(user_text):
         reg_result = face_reg.handle_voice(user_text)
         if reg_result.handled:
             reply_path = "face_registration"

@@ -182,6 +182,21 @@ class FaceRegistrationService:
         with self._lock:
             return self._state == "awaiting_name"
 
+    def accepts_registration_voice(self, user_text: str) -> bool:
+        """True when voice should be routed to face registration, not the LLM."""
+        if not self.enabled:
+            return False
+        with self._lock:
+            if self._state == "capturing":
+                return False
+            if self._state == "awaiting_name":
+                return True
+            if self._listen_prompt_at <= 0:
+                return False
+            if (time.time() - self._listen_prompt_at) > self.await_name_seconds:
+                return False
+        return extract_registration_name(user_text) is not None
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             return {
@@ -215,8 +230,14 @@ class FaceRegistrationService:
             with self._lock:
                 self._unknown_since = None
                 self._unknown_streak = 0
-                if self._state == "awaiting_name":
-                    logger.info("Face registration: cancelled — recognized face in frame")
+                if (
+                    self._state == "awaiting_name"
+                    and not self._voice_heard_since_listen
+                    and self._primary_confirmed_recognized(results)
+                ):
+                    logger.info(
+                        "Face registration: cancelled — confirmed recognized face in frame"
+                    )
                     self._reset_locked()
             return
 
@@ -289,6 +310,18 @@ class FaceRegistrationService:
         self.note_voice_received()
 
         with self._lock:
+            if self._state == "idle":
+                in_grace = (
+                    self._listen_prompt_at > 0
+                    and (time.time() - self._listen_prompt_at) <= self.await_name_seconds
+                    and extract_registration_name(user_text) is not None
+                )
+                if in_grace:
+                    logger.info(
+                        "Face registration: resuming awaiting_name after listen-window reset"
+                    )
+                    self._state = "awaiting_name"
+                    self._awaiting_since = time.time()
             if self._state != "awaiting_name":
                 return FaceRegVoiceResult(handled=False)
 
@@ -485,9 +518,13 @@ class FaceRegistrationService:
         return resample_wav_bytes_to_mono_16bit(wav, VOICE_REG_TTS_RATE_HZ)
 
     def _primary_recognized(self, results: list[dict[str, Any]]) -> bool:
-        soft_threshold = float(
-            getattr(self._faces, "match_soft_threshold", 0.42)
+        return (
+            self._primary_confirmed_recognized(results)
+            or self._primary_pending_recognized(results)
         )
+
+    @staticmethod
+    def _primary_confirmed_recognized(results: list[dict[str, Any]]) -> bool:
         for result in results:
             if not result.get("primary", True):
                 continue
@@ -495,6 +532,15 @@ class FaceRegistrationService:
                 name = str(result.get("name", "")).strip().lower()
                 if name and name not in {"unknown", "face"} and "[hold]" not in name:
                     return True
+        return False
+
+    def _primary_pending_recognized(self, results: list[dict[str, Any]]) -> bool:
+        soft_threshold = float(
+            getattr(self._faces, "match_soft_threshold", 0.42)
+        )
+        for result in results:
+            if not result.get("primary", True):
+                continue
             if result.get("pending"):
                 candidate = str(result.get("candidate_name") or "").strip()
                 score = float(result.get("candidate_score") or 0.0)

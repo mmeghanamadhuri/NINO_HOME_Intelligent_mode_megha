@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 from unittest.mock import MagicMock, patch
+import time
 
 from face_registration_voice import extract_registration_name
 from face_registration_service import FaceRegistrationService
@@ -231,6 +232,57 @@ class FaceRegistrationServiceTests(unittest.TestCase):
             }
         ]
         self.svc.on_frame(results)
+        self.assertEqual(self.svc.state, "idle")
+
+    def test_on_frame_keeps_awaiting_on_pending_match(self) -> None:
+        with self.svc._lock:
+            self.svc._state = "awaiting_name"
+        results = [
+            {
+                "primary": True,
+                "recognized": False,
+                "stabilized": False,
+                "pending": True,
+                "candidate_name": "Chakri",
+                "candidate_score": 0.43,
+                "name": "Unknown",
+                "box": {"x": 10, "y": 10, "w": 80, "h": 80},
+            }
+        ]
+        self.svc.on_frame(results)
+        self.assertEqual(self.svc.state, "awaiting_name")
+
+    def test_on_frame_keeps_awaiting_while_voice_heard(self) -> None:
+        with self.svc._lock:
+            self.svc._state = "awaiting_name"
+            self.svc._voice_heard_since_listen = True
+        results = [
+            {
+                "primary": True,
+                "recognized": True,
+                "stabilized": True,
+                "name": "Chakri",
+                "box": {"x": 10, "y": 10, "w": 80, "h": 80},
+            }
+        ]
+        self.svc.on_frame(results)
+        self.assertEqual(self.svc.state, "awaiting_name")
+
+    def test_handle_voice_resumes_after_listen_window_reset(self) -> None:
+        frame = MagicMock()
+        self.read_frame.return_value = frame
+        with self.svc._lock:
+            self.svc._state = "idle"
+            self.svc._listen_prompt_at = time.time() - 5.0
+
+        with patch(
+            "face_registration_service.capture_face_samples",
+            return_value=MagicMock(saved_samples=5, training={"people": 1}, errors=[]),
+        ):
+            result = self.svc.handle_voice("Hi, my name is Samira")
+
+        self.assertTrue(result.handled)
+        self.assertEqual(result.registered_name, "Samira")
         self.assertEqual(self.svc.state, "idle")
 
 
