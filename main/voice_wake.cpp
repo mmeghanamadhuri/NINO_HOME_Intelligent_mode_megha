@@ -8,9 +8,9 @@
 
 extern "C" {
 #include "audio_playback.h"
+#include "mic_input.h"
 #include "model_path.h"
 #include "nino_eye.h"
-#include "usb_mic.h"
 #include "voice_assist.h"
 }
 
@@ -37,8 +37,9 @@ static afe_config_t *configure_wake_afe(srmodel_list_t *models) {
   if (afe_cfg == NULL) {
     return NULL;
   }
-  /* USB mono mic: disable AFE front-end blocks meant for onboard multi-mic arrays.
-   * Matches ESP-P4-UK-Demo USB-4-mic-wake-word branch (voice_wake.c). */
+  /* Both microphone paths provide 16 kHz mono. Keep WakeNet's light-weight
+   * configuration: the USB array handles beamforming and the ES8311 fallback
+   * is a single onboard ADC channel. */
   afe_cfg->aec_init = false;
   afe_cfg->se_init = false;
   afe_cfg->ns_init = false;
@@ -93,7 +94,7 @@ static void after_wake_task(void *arg) {
   }
   ESP_LOGI(TAG, "Hi ESP → VAD → server");
   nino_eye_listening();
-  usb_mic_flush();
+  nino_mic_flush();
   esp_err_t e = nino_voice_assist_run_query_only();
   if (e != ESP_OK) {
     ESP_LOGW(TAG, "voice query failed: %s", esp_err_to_name(e));
@@ -118,17 +119,8 @@ static void wake_feed_task(void *arg) {
     return;
   }
 
-  ESP_LOGI(TAG, "wake feed (USB mic): chunksize=%d nch=%d sr=%d", feed_chunksize, feed_nch, sr);
-
-  int wait_ms = 0;
-  while (!usb_mic_ready()) {
-    if (wait_ms == 0 || (wait_ms % 5000) == 0) {
-      ESP_LOGW(TAG, "Waiting for USB mic on GPIO 24/25 — WakeNet idle until streaming");
-    }
-    wait_ms += 100;
-    vTaskDelay(pdMS_TO_TICKS(100));
-  }
-  ESP_LOGI(TAG, "USB mic streaming — say \"Hi ESP\"");
+  ESP_LOGI(TAG, "wake feed: chunksize=%d nch=%d sr=%d; USB 4-mic preferred, ES8311 fallback",
+           feed_chunksize, feed_nch, sr);
 
   while (true) {
     const bool armed = s_wake_enabled;
@@ -146,7 +138,7 @@ static void wake_feed_task(void *arg) {
       continue;
     }
 
-    if (usb_mic_read(buff, feed_chunksize) != ESP_OK) {
+    if (nino_mic_read(buff, feed_chunksize) != ESP_OK) {
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
     }
@@ -234,7 +226,7 @@ extern "C" void nino_voice_wake_init(void) {
   }
 
   s_wake_hw_ready = true;
-  ESP_LOGI(TAG, "Wake word ready (USB mic) — say \"Hi ESP\"");
+  ESP_LOGI(TAG, "Wake word ready (USB 4-mic preferred; ES8311 fallback) — say \"Hi ESP\"");
 }
 
 extern "C" void nino_voice_wake_drop_mic_locked(void) {
@@ -249,7 +241,7 @@ extern "C" void nino_voice_wake_release_after_wake(void) {
   if (!s_after_wake_busy) {
     return;
   }
-  usb_mic_flush();
+  nino_mic_flush();
   s_after_wake_busy = false;
   ESP_LOGI(TAG, "wake armed — say \"Hi ESP\"");
 }

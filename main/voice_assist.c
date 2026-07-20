@@ -7,13 +7,13 @@
 #include "audio_capture.h"
 #include "audio_playback.h"
 #include "audio_queue.h"
+#include "mic_input.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "usb_mic.h"
 
 #include "nino_eye.h"
 #include "voice_wake.h"
@@ -311,14 +311,14 @@ esp_err_t nino_voice_capture_vad_wav(int max_seconds, uint8_t **out_wav, size_t 
   cap.wav_capacity = wav_capacity;
   cap.noise_floor = VAD_NOISE_FLOOR_DEFAULT;
 
-  if (!usb_mic_ready()) {
-    ESP_LOGW(TAG, "USB mic not ready");
+  if (!nino_mic_available()) {
+    ESP_LOGW(TAG, "No microphone source is available");
     result = ESP_ERR_INVALID_STATE;
     goto cleanup;
   }
 
   nino_voice_wake_set_mic_capture_hold(true);
-  usb_mic_flush();
+  nino_mic_flush();
 
   /* Mic is live: show the listening face until this capture session ends. */
   nino_eye_listening();
@@ -326,9 +326,11 @@ esp_err_t nino_voice_capture_vad_wav(int max_seconds, uint8_t **out_wav, size_t 
   ESP_LOGI(TAG, "VAD armed (max %d s)", max_seconds);
 
   while (1) {
-    esp_err_t rr = usb_mic_read(cap.frame, VAD_FRAME_SAMPLES);
+    esp_err_t rr = nino_mic_read(cap.frame, VAD_FRAME_SAMPLES);
     if (rr != ESP_OK) {
-      ESP_LOGW(TAG, "USB mic read: %s", esp_err_to_name(rr));
+      ESP_LOGW(TAG, "%s microphone read: %s",
+               nino_mic_source_name(nino_mic_preferred_source()),
+               esp_err_to_name(rr));
       result = ESP_ERR_TIMEOUT;
       break;
     }

@@ -16,12 +16,12 @@ bool nino_voice_wake_is_enabled(void);
 bool nino_voice_wake_hw_ready(void);
 
 /**
- * Kept for API compatibility after switching to USB header mic.
+ * Kept for compatibility with the prior ES8311 capture path.
  * Wake feed pauses only while VAD holds the mic (mic_capture_hold).
  */
 void nino_voice_wake_drop_mic_locked(void);
 
-/** Pause wake_feed USB reads while VAD or other capture owns the mic ring. */
+/** Pause wake-feed reads while VAD or other capture owns the selected mic. */
 void nino_voice_wake_set_mic_capture_hold(bool hold);
 
 /** Clear after-wake busy so WakeNet can re-trigger (call before slow WS I/O). */

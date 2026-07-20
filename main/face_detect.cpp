@@ -2,6 +2,7 @@
 
 #include <list>
 
+#include "camera_orientation.h"
 #include "sdkconfig.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -11,6 +12,52 @@
 
 static const char *TAG = "face_detect";
 static HumanFaceDetect *s_detector = nullptr;
+
+/*
+ * ESP-DL's face models expect upright faces.  The USB camera is mounted 90°
+ * clockwise from upright, so rotate its decoded RGB frame before inference.
+ * The rotated dimensions are returned with the face coordinates, allowing
+ * face_tracker.c to calculate pan/tilt errors in the upright coordinate space.
+ */
+static esp_err_t rotate_rgb888_for_detection(dl::image::img_t *img) {
+#if NINO_CAMERA_ROTATION_DEG == 0
+  return ESP_OK;
+#elif NINO_CAMERA_ROTATION_DEG == 90
+  if (img == nullptr || img->data == nullptr || img->width <= 0 ||
+      img->height <= 0) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  const size_t pixel_count = (size_t)img->width * img->height;
+  uint8_t *rotated = (uint8_t *)heap_caps_malloc(
+      pixel_count * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (rotated == nullptr) {
+    return ESP_ERR_NO_MEM;
+  }
+
+  const int source_w = img->width;
+  const int source_h = img->height;
+  const uint8_t *source = static_cast<const uint8_t *>(img->data);
+  for (int src_y = 0; src_y < source_h; ++src_y) {
+    for (int src_x = 0; src_x < source_w; ++src_x) {
+      const size_t source_offset = ((size_t)src_y * source_w + src_x) * 3;
+      const size_t rotated_offset =
+          ((size_t)src_x * source_h + (source_h - 1 - src_y)) * 3;
+      rotated[rotated_offset] = source[source_offset];
+      rotated[rotated_offset + 1] = source[source_offset + 1];
+      rotated[rotated_offset + 2] = source[source_offset + 2];
+    }
+  }
+
+  heap_caps_free(img->data);
+  img->data = rotated;
+  img->width = source_h;
+  img->height = source_w;
+  return ESP_OK;
+#else
+#error "NINO_CAMERA_ROTATION_DEG must be 0 or 90"
+#endif
+}
 
 esp_err_t nino_face_detect_init(void) {
   if (s_detector != nullptr) {
@@ -69,6 +116,14 @@ esp_err_t nino_face_detect_process(const uint8_t *jpeg, size_t len,
 #endif
   if (img.data == nullptr) {
     return ESP_FAIL;
+  }
+
+  esp_err_t rotate_err = rotate_rgb888_for_detection(&img);
+  if (rotate_err != ESP_OK) {
+    ESP_LOGE(TAG, "Could not rotate camera frame for face detection: %s",
+             esp_err_to_name(rotate_err));
+    heap_caps_free(img.data);
+    return rotate_err;
   }
 
   out->frame_w = img.width;

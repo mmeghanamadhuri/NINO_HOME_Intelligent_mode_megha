@@ -7,7 +7,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "usb_mic.h"
+#include "mic_input.h"
 #include "voice_wake.h"
 
 static const char *TAG = "nino_cap";
@@ -40,8 +40,8 @@ esp_err_t nino_audio_capture_wav(uint8_t **out_wav, size_t *out_len,
   if (duration_ms == 0 || duration_ms > CAP_MAX_MS) {
     return ESP_ERR_INVALID_ARG;
   }
-  if (!usb_mic_ready()) {
-    ESP_LOGW(TAG, "USB mic not ready");
+  if (!nino_mic_available()) {
+    ESP_LOGW(TAG, "No microphone source is available");
     return ESP_ERR_INVALID_STATE;
   }
 
@@ -60,15 +60,17 @@ esp_err_t nino_audio_capture_wav(uint8_t **out_wav, size_t *out_len,
   }
 
   nino_voice_wake_set_mic_capture_hold(true);
-  usb_mic_flush();
+  nino_mic_flush();
 
   size_t got = 0;
   while (got < pcm_bytes) {
     const size_t chunk_samples = (pcm_bytes - got) / CAP_BYTES_PER_SAMPLE;
     const int to_read = (chunk_samples > 512) ? 512 : (int)chunk_samples;
-    esp_err_t rr = usb_mic_read((int16_t *)(pcm + got), to_read);
+    esp_err_t rr = nino_mic_read((int16_t *)(pcm + got), to_read);
     if (rr != ESP_OK) {
-      ESP_LOGE(TAG, "usb_mic_read failed: %s", esp_err_to_name(rr));
+      ESP_LOGE(TAG, "%s microphone read failed: %s",
+               nino_mic_source_name(nino_mic_preferred_source()),
+               esp_err_to_name(rr));
       free(pcm);
       pcm = NULL;
       err = ESP_FAIL;
@@ -110,8 +112,9 @@ esp_err_t nino_audio_capture_wav(uint8_t **out_wav, size_t *out_len,
 
   *out_wav = wav;
   *out_len = wav_size;
-  ESP_LOGI(TAG, "Captured WAV %u ms, %u bytes (USB mic)", (unsigned)duration_ms,
-           (unsigned)wav_size);
+  ESP_LOGI(TAG, "Captured WAV %u ms, %u bytes (%s)", (unsigned)duration_ms,
+           (unsigned)wav_size,
+           nino_mic_source_name(nino_mic_preferred_source()));
   err = ESP_OK;
 
 out:

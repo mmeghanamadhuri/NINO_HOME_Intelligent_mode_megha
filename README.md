@@ -25,6 +25,8 @@ NiNO is a smart-home demo built around the **ESP32-P4 Function EV Board**. The b
 
 ---
 
+
+
 ## Architecture
 
 ```text
@@ -42,6 +44,8 @@ Touch / eyes ── onboard only
                                             memories, summaries
 ```
 
+
+
 ### Voice query flow
 
 1. User says **"Hi ESP"** — detected on the **USB 4-mic** (GPIO header) via WakeNet.
@@ -58,34 +62,42 @@ Touch / eyes ── onboard only
 
 ---
 
+
+
 ## Features
 
-| Area | What NiNO does |
-| ---- | -------------- |
-| **Vision** | YuNet detection + SFace 128-D embeddings; web UI registration |
-| **Voice** | USB 4-mic wake word on GPIO header; ElevenLabs or Whisper STT; Ollama (Qwen) replies; cross-platform TTS |
-| **Memory** | PostgreSQL per-user conversation log; recap questions from recent history |
-| **Alarms** | Voice-set reminders; medical (P0) with yes/no auto-listen; web UI ack/delete |
-| **Servo** | Dynamixel AX head motion during TTS; ID2 full 360° via voice, HTTP, or CLI |
-| **Touch** | QT2120 capacitive sensor — warning audio **preempts** server playback, then resumes |
-| **Eyes** | Dual SSD1351 OLEDs — idle / listening / thinking / happy / sad / surprised / … |
-| **Observability** | `GET /api/status`, `GET /api/latency-log`, `server/data/latency_log.json` |
+
+| Area              | What NiNO does                                                                                           |
+| ----------------- | -------------------------------------------------------------------------------------------------------- |
+| **Vision**        | YuNet detection + SFace 128-D embeddings; web UI registration                                            |
+| **Voice**         | USB 4-mic wake word on GPIO header; ElevenLabs or Whisper STT; Ollama (Qwen) replies; cross-platform TTS |
+| **Memory**        | PostgreSQL per-user conversation log; recap questions from recent history                                |
+| **Alarms**        | Voice-set reminders; medical (P0) with yes/no auto-listen; web UI ack/delete                             |
+| **Servo**         | Dynamixel AX head motion during TTS; ID2 full 360° via voice, HTTP, or CLI                               |
+| **Touch**         | QT2120 capacitive sensor — warning audio **preempts** server playback, then resumes                      |
+| **Eyes**          | Dual SSD1351 OLEDs — idle / listening / thinking / happy / sad / surprised / …                           |
+| **Observability** | `GET /api/status`, `GET /api/latency-log`, `server/data/latency_log.json`                                |
+
 
 ---
 
+
+
 ## Hardware
 
-| Component | Details |
-| --------- | ------- |
-| **Board** | ESP32-P4 Function EV Board (16 MB flash recommended) |
-| **Camera** | USB UVC webcam on **J18** host hub (320×240 MJPEG stream) |
-| **USB mic** | **Seeed ReSpeaker 4-mic** (2886:0018) on **GPIO header** — 5V, GND, **D− GPIO 24**, **D+ GPIO 25** |
-| **Servos** | ROBOTIS Dynamixel AX — ID **1** tilt, ID **2** pan — via **U2D2** on J18 hub |
-| **Touch** | QT2120 on I2C — **SDA GPIO 7**, **SCL GPIO 8**, address `0x1C` (optional) |
-| **Eyes** | 2× Waveshare 1.27" SSD1351 OLED (128×96) — CLK 23, DIN 22, DC 21, RST 20, CS 26/27 |
-| **Audio out** | ES8311 codec + speaker — **playback only** (beep, TTS, touch WAV) |
-| **Network** | ESP and PC on the same LAN |
-| **LLM host** | PC with Ollama (`qwen2.5:1.5b` default) |
+
+| Component     | Details                                                                                            |
+| ------------- | -------------------------------------------------------------------------------------------------- |
+| **Board**     | ESP32-P4 Function EV Board (16 MB flash recommended)                                               |
+| **Camera**    | USB UVC webcam on **J18** host hub (320×240 MJPEG stream)                                          |
+| **USB mic**   | **Seeed ReSpeaker 4-mic** (2886:0018) on **GPIO header** — 5V, GND, **D− GPIO 24**, **D+ GPIO 25** |
+| **Servos**    | ROBOTIS Dynamixel AX — ID **1** tilt, ID **2** pan — via **U2D2** on J18 hub                       |
+| **Touch**     | QT2120 on I2C — **SDA GPIO 7**, **SCL GPIO 8**, address `0x1C` (optional)                          |
+| **Eyes**      | 2× Waveshare 1.27" SSD1351 OLED (128×96) — CLK 23, DIN 22, DC 21, RST 20, CS 26/27                 |
+| **Audio out** | ES8311 codec + speaker — **playback only** (beep, TTS, touch WAV)                                  |
+| **Network**   | ESP and PC on the same LAN                                                                         |
+| **LLM host**  | PC with Ollama (`qwen2.5:1.5b` default)                                                            |
+
 
 > **Dual USB host:** J18 (HS) = camera + U2D2; GPIO 24/25 (FS) = 4-mic. One `usb_host_install()` with `BIT0 | BIT1`. See [docs/USB-4MIC-INTEGRATION.md](docs/USB-4MIC-INTEGRATION.md).
 
@@ -93,19 +105,25 @@ Touch / eyes ── onboard only
 
 ---
 
+
+
 ## Requirements
+
+
 
 ### Firmware
 
 - ESP-IDF **5.5+**
 - Target: **esp32p4**
 
+
+
 ### Server
 
 - Python **3.10+**
 - **Windows** or **Linux** (Ubuntu / NVIDIA DGX tested)
 - [Ollama](https://ollama.com) for voice + alarm NLP replies
-- See [`server/requirements.txt`](server/requirements.txt) — includes `tensorflow`, `opencv-contrib-python`, `fastapi`, `faster-whisper`, `onnxruntime`, `psycopg2-binary`
+- See `[server/requirements.txt](server/requirements.txt)` — includes `tensorflow`, `opencv-contrib-python`, `fastapi`, `faster-whisper`, `onnxruntime`, `psycopg2-binary`
 - **PostgreSQL** (optional, for conversation memory)
 - **TTS** — one of: ElevenLabs API key, Windows SAPI, or Linux espeak-ng
 
@@ -113,7 +131,11 @@ Full server documentation: **[server/README.md](server/README.md)**
 
 ---
 
+
+
 ## Quick start
+
+
 
 ### 1. Build and flash firmware
 
@@ -124,6 +146,8 @@ idf.py set-target esp32p4
 idf.py build
 idf.py flash monitor
 ```
+
+
 
 ### 2. Connect Wi-Fi
 
@@ -141,6 +165,8 @@ After Wi-Fi is connected, mDNS discovery is available:
 
 - `NINO-HOME.local`
 - service `_nino._tcp` on port `443`
+
+
 
 ### 3. Set up the Python server
 
@@ -189,6 +215,8 @@ Use your **PC’s LAN IP** (where `python app.py` runs), not the board’s IP. `
 
 ---
 
+
+
 ## PostgreSQL conversation memory
 
 When `DATABASE_URL` is set, NiNO persists conversation history per recognized user.
@@ -204,12 +232,16 @@ Creates database `nino_memory`, user `nino`, and applies `scripts/memory_schema.
 
 ### Schema
 
-| Table | Purpose |
-| ----- | ------- |
-| `users` | One row per recognized person (`face_id`, `name`, first/last seen) |
-| `conversations` | Every logged Q&A (`user_text`, `assistant_text`, timestamp) |
-| `memories` | Long-term facts (Phase B — requires `MEMORY_EXTRACTION=1`) |
-| `summaries` | Daily rollups (Phase C — requires `MEMORY_SUMMARY_CRON=1`) |
+
+| Table           | Purpose                                                            |
+| --------------- | ------------------------------------------------------------------ |
+| `users`         | One row per recognized person (`face_id`, `name`, first/last seen) |
+| `conversations` | Every logged Q&A (`user_text`, `assistant_text`, timestamp)        |
+| `memories`      | Long-term facts (Phase B — requires `MEMORY_EXTRACTION=1`)         |
+| `summaries`     | Daily rollups (Phase C — requires `MEMORY_SUMMARY_CRON=1`)         |
+
+
+
 
 ### How it works
 
@@ -218,6 +250,8 @@ Creates database `nino_memory`, user `nino`, and applies `scripts/memory_schema.
 3. After a successful reply, the exchange is queued for insert into `conversations`.
 4. Recap questions use the LLM with a filtered context window from recent turns.
 5. Recap is live-face gated: without a currently recognized face, personal context is not retrieved.
+
+
 
 ### Check memory status
 
@@ -229,54 +263,72 @@ Look for `"memory": { "ready": true, ... }`.
 
 ---
 
+
+
 ## Voice assistant
+
+
 
 ### On-device voice path (firmware)
 
-| Stage | Module | Notes |
-| ----- | ------ | ----- |
-| Capture | `usb_mic.c` | ReSpeaker UAC iface **2**, **channel 0** (beamformed), 16 kHz mono ring buffer |
-| Wake word | `voice_wake.cpp` | WakeNet **"Hi ESP"**; AFE runs wake-only (no AEC/NS/AGC) |
-| Chime | `voice_assist.c` + `audio_playback.c` | `beep.wav` preloaded + ES8311 warmed at boot |
-| VAD | `voice_assist.c` | Energy VAD; **450 ms** trailing silence to end clip |
-| Server | `voice_ws_client.c` | Binary WAV in/out over WebSocket |
+
+| Stage     | Module                                | Notes                                                                          |
+| --------- | ------------------------------------- | ------------------------------------------------------------------------------ |
+| Capture   | `usb_mic.c`                           | ReSpeaker UAC iface **2**, **channel 0** (beamformed), 16 kHz mono ring buffer |
+| Wake word | `voice_wake.cpp`                      | WakeNet **"Hi ESP"**; AFE runs wake-only (no AEC/NS/AGC)                       |
+| Chime     | `voice_assist.c` + `audio_playback.c` | `beep.wav` preloaded + ES8311 warmed at boot                                   |
+| VAD       | `voice_assist.c`                      | Energy VAD; **450 ms** trailing silence to end clip                            |
+| Server    | `voice_ws_client.c`                   | Binary WAV in/out over WebSocket                                               |
+
 
 Full wiring, boot flow, and troubleshooting: **[docs/USB-4MIC-INTEGRATION.md](docs/USB-4MIC-INTEGRATION.md)**
 
 ### Speech-to-text (STT)
 
-| Provider | When used | Typical latency |
-| -------- | --------- | --------------- |
-| **ElevenLabs Scribe** | Default when `ELEVENLABS_API_KEY` is set | ~1–2 s |
-| **faster-whisper** | Fallback or `--stt-provider whisper` | 6–30 s on CPU |
+
+| Provider              | When used                                | Typical latency |
+| --------------------- | ---------------------------------------- | --------------- |
+| **ElevenLabs Scribe** | Default when `ELEVENLABS_API_KEY` is set | ~1–2 s          |
+| **faster-whisper**    | Fallback or `--stt-provider whisper`     | 6–30 s on CPU   |
+
 
 Force provider: `--stt-provider elevenlabs|whisper`
 
 ### LLM (Ollama)
 
-- Default model: **`qwen2.5:1.5b`**
-- Linux auto-prefers GPU Ollama on **`127.0.0.1:11435`** over CPU snap on `:11434`
+- Default model: `qwen2.5:1.5b`
+- Linux auto-prefers GPU Ollama on `127.0.0.1:11435` over CPU snap on `:11434`
 - Override: `--ollama-url`, `--ollama-model`
+
+
 
 ### Text-to-speech (TTS)
 
-| Provider | Platform | When used |
-| -------- | -------- | --------- |
-| `elevenlabs` | Any | Default when API key set |
-| `sapi` | Windows | Local fallback |
-| `local` | Linux | espeak-ng `en+f3` fallback |
+
+| Provider     | Platform | When used                  |
+| ------------ | -------- | -------------------------- |
+| `elevenlabs` | Any      | Default when API key set   |
+| `sapi`       | Windows  | Local fallback             |
+| `local`      | Linux    | espeak-ng `en+f3` fallback |
+
+
+
 
 ### Voice routing
 
-| Path | Trigger | Behavior |
-| ---- | ------- | -------- |
-| `alarm` | Set/list/cancel alarm phrases | Alarm voice handler |
-| `servo_360` | "Make a 360", "spin 360", … | Fixed TTS → `POST /servo/360` |
-| `recap` | "What did we talk about?", … | LLM recap from PostgreSQL |
-| `identity_llm` | "Who am I?", "What's my name?", … | Ollama + live camera identity |
-| `llm` | Everything else | Ollama with optional memory context |
+
+| Path           | Trigger                           | Behavior                            |
+| -------------- | --------------------------------- | ----------------------------------- |
+| `alarm`        | Set/list/cancel alarm phrases     | Alarm voice handler                 |
+| `servo_360`    | "Make a 360", "spin 360", …       | Fixed TTS → `POST /servo/360`       |
+| `recap`        | "What did we talk about?", …      | LLM recap from PostgreSQL           |
+| `identity_llm` | "Who am I?", "What's my name?", … | Ollama + live camera identity       |
+| `llm`          | Everything else                   | Ollama with optional memory context |
+
 
 ---
+
+
 
 ## Face recognition
 
@@ -290,6 +342,8 @@ Force provider: `--stt-provider elevenlabs|whisper`
 
 ---
 
+
+
 ## Alarms
 
 - Voice parsing via regex + **Ollama NLP fallback** (`ALARM_NLP_FALLBACK=1`)
@@ -302,7 +356,11 @@ Full details: **[docs/ALARM.md](docs/ALARM.md)**
 
 ---
 
+
+
 ## Firmware: touch, servo & eyes
+
+
 
 ### Touch-priority audio
 
@@ -317,31 +375,37 @@ Details: **[docs/SERVO.md](docs/SERVO.md)**
 
 ### OLED eyes
 
-| State | When |
-| ----- | ---- |
-| **Idle** | Boot, after reply finishes |
-| **Listening** | Wake word through end of user speech |
-| **Thinking** | Audio sent to server until reply received |
-| **happy / sad / surprised** | Voice reply text (`eye_expression.py`) |
+
+| State                       | When                                      |
+| --------------------------- | ----------------------------------------- |
+| **Idle**                    | Boot, after reply finishes                |
+| **Listening**               | Wake word through end of user speech      |
+| **Thinking**                | Audio sent to server until reply received |
+| **happy / sad / surprised** | Voice reply text (`eye_expression.py`)    |
+
 
 Serial test: `eye idle` / `eye listening` / `eye thinking`
 
 ### Key firmware files
 
-| File | Role |
-| ---- | ---- |
-| `main/main.c` | UVC, dual USB host, Wi-Fi, HTTP server, voice console |
-| `main/usb_mic.c` | USB 4-mic UAC capture on GPIO 24/25 |
-| `main/voice_wake.cpp` | WakeNet feed/fetch, post-wake beep + query task |
-| `main/voice_assist.c` | VAD, beep cache, medical ack listen |
-| `main/voice_ws_client.c` | WebSocket to PC |
-| `main/audio_playback.c` | ES8311 speaker (playback only) |
-| `main/audio_queue.c` | Touch-priority dual queues |
-| `main/servo_dxl.c` | Dynamixel + 360 spin |
-| `main/nino_eye.c` | Eye animation engine |
-| `main/ssd1351.c` | Dual OLED SPI driver |
+
+| File                     | Role                                                  |
+| ------------------------ | ----------------------------------------------------- |
+| `main/main.c`            | UVC, dual USB host, Wi-Fi, HTTP server, voice console |
+| `main/usb_mic.c`         | USB 4-mic UAC capture on GPIO 24/25                   |
+| `main/voice_wake.cpp`    | WakeNet feed/fetch, post-wake beep + query task       |
+| `main/voice_assist.c`    | VAD, beep cache, medical ack listen                   |
+| `main/voice_ws_client.c` | WebSocket to PC                                       |
+| `main/audio_playback.c`  | ES8311 speaker (playback only)                        |
+| `main/audio_queue.c`     | Touch-priority dual queues                            |
+| `main/servo_dxl.c`       | Dynamixel + 360 spin                                  |
+| `main/nino_eye.c`        | Eye animation engine                                  |
+| `main/ssd1351.c`         | Dual OLED SPI driver                                  |
+
 
 ---
+
+
 
 ## Server setup
 
@@ -352,6 +416,8 @@ See **[server/README.md](server/README.md)** for module map, configuration, and 
 1. CLI flags (`python app.py --…`)
 2. Environment variables / `server/.env`
 3. `server/server_config.json` (optional — keep API keys out of git)
+
+
 
 ### Run example
 
@@ -366,54 +432,72 @@ python app.py \
 
 ---
 
+
+
 ## HTTP & WebSocket API
+
+
 
 ### ESP firmware
 
-| Method | Path | Description |
-| ------ | ---- | ----------- |
-| GET | `/stream` | MJPEG live stream |
-| GET | `/snapshot.jpg` | Single JPEG frame |
-| POST | `/play_wav` | Queue WAV playback (+ optional `X-Nino-Eye-Expression`, `X-Nino-Prompt-Ack`) |
-| POST | `/servo/360` | ID2 full rotation |
+
+| Method | Path            | Description                                                                  |
+| ------ | --------------- | ---------------------------------------------------------------------------- |
+| GET    | `/stream`       | MJPEG live stream                                                            |
+| GET    | `/snapshot.jpg` | Single JPEG frame                                                            |
+| POST   | `/play_wav`     | Queue WAV playback (+ optional `X-Nino-Eye-Expression`, `X-Nino-Prompt-Ack`) |
+| POST   | `/servo/360`    | ID2 full rotation                                                            |
+
+
+
 
 ### Python server
 
-| Method | Path | Description |
-| ------ | ---- | ----------- |
-| GET | `/` | Web UI (faces, alarms) |
-| GET | `/video_feed` | Annotated MJPEG with face boxes |
-| GET | `/api/status` | Camera, faces, TTS, LLM, alarms, memory |
-| GET | `/api/latency-log?limit=50` | Recent voice timing events |
-| GET | `/api/memory/stats` | PostgreSQL row counts |
-| GET | `/api/alarms` | List alarms |
-| POST | `/api/alarms/{id}/ack` | Medical yes/no ack |
-| DELETE | `/api/alarms` | Cancel all |
-| DELETE | `/api/alarms/{id}` | Cancel one |
-| POST | `/api/register` | Register face samples |
-| POST | `/api/retrain` | Re-encode stored face crops |
-| POST | `/api/camera` | Change camera source |
-| WS | `/voice-query`, `/ws/voice` | Voice assistant (16 kHz WAV in/out) |
+
+| Method | Path                        | Description                             |
+| ------ | --------------------------- | --------------------------------------- |
+| GET    | `/`                         | Web UI (faces, alarms)                  |
+| GET    | `/video_feed`               | Annotated MJPEG with face boxes         |
+| GET    | `/api/status`               | Camera, faces, TTS, LLM, alarms, memory |
+| GET    | `/api/latency-log?limit=50` | Recent voice timing events              |
+| GET    | `/api/memory/stats`         | PostgreSQL row counts                   |
+| GET    | `/api/alarms`               | List alarms                             |
+| POST   | `/api/alarms/{id}/ack`      | Medical yes/no ack                      |
+| DELETE | `/api/alarms`               | Cancel all                              |
+| DELETE | `/api/alarms/{id}`          | Cancel one                              |
+| POST   | `/api/register`             | Register face samples                   |
+| POST   | `/api/retrain`              | Re-encode stored face crops             |
+| POST   | `/api/camera`               | Change camera source                    |
+| WS     | `/voice-query`, `/ws/voice` | Voice assistant (16 kHz WAV in/out)     |
+
 
 > `POST /play_wav` and `POST /servo/360` on the ESP have no authentication — use on a trusted LAN only.
 
 ---
 
+
+
 ## Environment variables
+
+
 
 ### Core server
 
-| Variable | Default | Purpose |
-| -------- | ------- | ------- |
-| `DATABASE_URL` | — | PostgreSQL URL for conversation memory |
-| `ESP_PLAY_WAV_URL` | CLI / config | TTS, alarms; derives servo host |
-| `OLLAMA_URL` | `auto` | Ollama API; `auto` prefers GPU `:11435` on Linux |
-| `OLLAMA_MODEL` | `qwen2.5:1.5b` | LLM model name |
-| `ELEVENLABS_API_KEY` | — | Cloud STT/TTS |
-| `STT_PROVIDER` | auto | `elevenlabs` or `whisper` |
-| `TTS_PROVIDER` | auto | `elevenlabs`, `sapi`, or `local` |
+
+| Variable             | Default        | Purpose                                          |
+| -------------------- | -------------- | ------------------------------------------------ |
+| `DATABASE_URL`       | —              | PostgreSQL URL for conversation memory           |
+| `ESP_PLAY_WAV_URL`   | CLI / config   | TTS, alarms; derives servo host                  |
+| `OLLAMA_URL`         | `auto`         | Ollama API; `auto` prefers GPU `:11435` on Linux |
+| `OLLAMA_MODEL`       | `qwen2.5:1.5b` | LLM model name                                   |
+| `ELEVENLABS_API_KEY` | —              | Cloud STT/TTS                                    |
+| `STT_PROVIDER`       | auto           | `elevenlabs` or `whisper`                        |
+| `TTS_PROVIDER`       | auto           | `elevenlabs`, `sapi`, or `local`                 |
+
 
 ---
+
+
 
 ## Repository layout
 
@@ -434,7 +518,11 @@ python app.py \
 
 ---
 
+
+
 ## Troubleshooting
+
+
 
 ### Camera & faces
 
@@ -442,6 +530,8 @@ python app.py \
 - Register varied samples (angles, lighting)
 - Too many false accepts → raise `FACE_MATCH_THRESHOLD` (e.g. `0.45`)
 - Too many rejects → lower it (e.g. `0.38`)
+
+
 
 ### Voice
 
@@ -453,9 +543,13 @@ python app.py \
 - Slow STT → set `ELEVENLABS_API_KEY` or use `--stt-provider whisper`
 - Slow LLM → start GPU Ollama: `bash server/scripts/start_ollama_gpu.sh`
 
+
+
 ### Memory
 
 - `"memory": { "ready": false }` → set valid `DATABASE_URL`; run `init_memory_db.sh`
+
+
 
 ### Hardware
 
@@ -464,26 +558,34 @@ python app.py \
 
 ---
 
+
+
 ## Related docs
 
-| Document | Contents |
-| -------- | -------- |
-| [server/README.md](server/README.md) | Server modules, setup, tests, API details |
-| [docs/VOICE_FACE_REGISTRATION.md](docs/VOICE_FACE_REGISTRATION.md) | Automatic unknown-face → voice name → register |
-| [docs/ALARM.md](docs/ALARM.md) | Voice alarm commands, medical flow |
-| [docs/SERVO.md](docs/SERVO.md) | Dynamixel wiring, 360 sequence |
-| [docs/WIFI_PROVISION.md](docs/WIFI_PROVISION.md) | BLE / soft-AP Wi-Fi setup |
-| [docs/Eye states.md](docs/Eye%20states.md) | OLED eye states and triggers |
-| [docs/USB-4MIC-INTEGRATION.md](docs/USB-4MIC-INTEGRATION.md) | USB 4-mic wiring, wake/VAD flow, dual USB host, troubleshooting |
-| [docs/Integrate-4mic.md](docs/Integrate-4mic.md) | Portable `usb_mic` module guide for other ESP-IDF projects |
-| [docs/TEST_QUESTIONS.md](docs/TEST_QUESTIONS.md) | Suggested demo questions |
+
+| Document                                                           | Contents                                                        |
+| ------------------------------------------------------------------ | --------------------------------------------------------------- |
+| [docs/SYSTEM_OVERVIEW.md](docs/SYSTEM_OVERVIEW.md)                 | Short feature map — voice, vision, emotion, apps, evolution     |
+| [server/README.md](server/README.md)                               | Server modules, setup, tests, API details                       |
+| [docs/VOICE_FACE_REGISTRATION.md](docs/VOICE_FACE_REGISTRATION.md) | Automatic unknown-face → voice name → register                  |
+| [docs/ALARM.md](docs/ALARM.md)                                     | Voice alarm commands, medical flow                              |
+| [docs/SERVO.md](docs/SERVO.md)                                     | Dynamixel wiring, 360 sequence                                  |
+| [docs/WIFI_PROVISION.md](docs/WIFI_PROVISION.md)                   | BLE / soft-AP Wi-Fi setup                                       |
+| [docs/Eye states.md](docs/Eye%20states.md)                         | OLED eye states and triggers                                    |
+| [docs/USB-4MIC-INTEGRATION.md](docs/USB-4MIC-INTEGRATION.md)       | USB 4-mic wiring, wake/VAD flow, dual USB host, troubleshooting |
+| [docs/Integrate-4mic.md](docs/Integrate-4mic.md)                   | Portable `usb_mic` module guide for other ESP-IDF projects      |
+| [docs/TEST_QUESTIONS.md](docs/TEST_QUESTIONS.md)                   | Suggested demo questions                                        |
+
 
 Reference USB wake-word demo: [ESP-P4-UK-Demo / USB-4-mic-wake-word](https://github.com/Sirena-Technologies/ESP-P4-UK-Demo/tree/USB-4-mic-wake-word)
 
 ---
+
+
 
 ## Notes
 
 - Touch audio **preempts** server/voice playback and resumes afterward.
 - Voice WebSocket replies derive eye expression from **reply text** via `eye_expression.py`.
 - Keep `server/server_config.json`, `.env`, and API keys **out of public commits**.
+

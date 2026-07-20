@@ -43,8 +43,10 @@
 #include "audio_playback.h"
 #include "audio_capture.h"
 #include "audio_queue.h"
+#include "camera_orientation.h"
 #include "face_detect.hpp"
 #include "face_tracker.h"
+#include "mic_input.h"
 #include "nino_eye.h"
 #include "ssd1351.h"
 #include "servo_dxl.h"
@@ -74,8 +76,9 @@
 #define DISCOVERY_PORT 1900
 #define MESSAGE_PORT 8888
 #define DISCOVERY_MSG "discover"
-#define DISCOVERY_BUF 192
+#define DISCOVERY_BUF 256
 #define MESSAGE_BUF 256
+#define MDNS_HOSTNAME_MAX DEVICE_ID_MAX
 
 #define STA_RECONNECT_DELAY_MS 5000
 static char s_sta_ssid[WIFI_CONFIG_STA_SSID_MAX] = "";
@@ -115,7 +118,7 @@ static bool s_mdns_started = false;
 #define HTTP_STREAM_BOUNDARY "frame"
 #define HTTP_SERVER_PORT 80
 #define HTTP_STREAM_POLL_MS 25
-#define HTTP_STREAM_ROTATE_DEG 90
+#define HTTP_STREAM_ROTATE_DEG NINO_CAMERA_ROTATION_DEG
 #define MAX_PLAY_WAV_BYTES (384 * 1024)
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
@@ -325,6 +328,36 @@ static void hello_home_task(void *arg) {
   vTaskDelete(NULL);
 }
 
+static bool is_valid_device_id(const char *id);
+
+/** DNS-safe mDNS hostname: prefer stable device_id (unique per robot on LAN). */
+static void mdns_hostname_for_device(char *dst, size_t dst_size) {
+  if (dst == NULL || dst_size == 0) {
+    return;
+  }
+  const char *src =
+      (s_device_id[0] != '\0' && is_valid_device_id(s_device_id)) ? s_device_id
+                                                                  : "nino";
+  size_t out = 0;
+  for (size_t i = 0; src[i] != '\0' && out + 1 < dst_size; ++i) {
+    char c = src[i];
+    if (c >= 'A' && c <= 'Z') {
+      c = (char)(c - 'A' + 'a');
+    }
+    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+      dst[out++] = c;
+    } else if (c == '_') {
+      dst[out++] = '-';
+    }
+  }
+  if (out == 0) {
+    strncpy(dst, "nino", dst_size - 1);
+    dst[dst_size - 1] = '\0';
+    return;
+  }
+  dst[out] = '\0';
+}
+
 #if NINO_HAS_MDNS
 static void mdns_stop_service(void) {
   if (!s_mdns_started) {
@@ -346,13 +379,17 @@ static void mdns_start_service(void) {
     return;
   }
 
-  err = mdns_hostname_set(s_device_name);
+  char hostname[MDNS_HOSTNAME_MAX + 1];
+  mdns_hostname_for_device(hostname, sizeof(hostname));
+
+  err = mdns_hostname_set(hostname);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "mDNS hostname set failed: %s", esp_err_to_name(err));
     mdns_free();
     return;
   }
 
+  /* Friendly display name for browsers; hostname stays unique via device_id. */
   err = mdns_instance_name_set(s_device_name);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "mDNS instance set failed: %s", esp_err_to_name(err));
@@ -370,8 +407,10 @@ static void mdns_start_service(void) {
 
   mdns_txt_item_t txt[] = {
       {"device", "nino"},
+      {"device_id", s_device_id},
       {"ble_name", s_device_name},
       {"transport", "http"},
+      {"path", "/status"},
   };
   err = mdns_service_txt_set(MDNS_SERVICE_TYPE, MDNS_SERVICE_PROTO, txt,
                              sizeof(txt) / sizeof(txt[0]));
@@ -382,8 +421,10 @@ static void mdns_start_service(void) {
   }
 
   s_mdns_started = true;
-  ESP_LOGI(TAG, "mDNS ready: %s.local service %s.%s port %d", s_device_name,
-           MDNS_SERVICE_TYPE, MDNS_SERVICE_PROTO, HTTP_SERVER_PORT);
+  ESP_LOGI(TAG,
+           "mDNS ready: %s.local (device_id=%s name=%s) service %s.%s port %d",
+           hostname, s_device_id, s_device_name, MDNS_SERVICE_TYPE,
+           MDNS_SERVICE_PROTO, HTTP_SERVER_PORT);
 }
 #else
 static void mdns_stop_service(void) {}
@@ -1396,19 +1437,20 @@ static void multicast_discovery_task(void *arg) {
           char response[DISCOVERY_BUF];
           int rlen;
 
+          /* Include device_id so PC discovery can upsert without guessing. */
           if (strcmp(ap_ip, "0.0.0.0") != 0 && strcmp(sta_ip, "0.0.0.0") != 0) {
             rlen = snprintf(response, sizeof(response),
-                            "hi\nmac=%s\nname=%s\n%s:%d\n%s:%d", mac_str,
-                            device_name, ap_ip, MESSAGE_PORT, sta_ip,
-                            MESSAGE_PORT);
+                            "hi\nmac=%s\nname=%s\ndevice_id=%s\n%s:%d\n%s:%d",
+                            mac_str, device_name, s_device_id, ap_ip,
+                            MESSAGE_PORT, sta_ip, MESSAGE_PORT);
           } else if (strcmp(ap_ip, "0.0.0.0") != 0) {
             rlen = snprintf(response, sizeof(response),
-                            "hi\nmac=%s\nname=%s\n%s:%d", mac_str, device_name,
-                            ap_ip, MESSAGE_PORT);
+                            "hi\nmac=%s\nname=%s\ndevice_id=%s\n%s:%d", mac_str,
+                            device_name, s_device_id, ap_ip, MESSAGE_PORT);
           } else {
             rlen = snprintf(response, sizeof(response),
-                            "hi\nmac=%s\nname=%s\n%s:%d", mac_str, device_name,
-                            sta_ip, MESSAGE_PORT);
+                            "hi\nmac=%s\nname=%s\ndevice_id=%s\n%s:%d", mac_str,
+                            device_name, s_device_id, sta_ip, MESSAGE_PORT);
           }
           if (rlen > 0 && rlen < (int)sizeof(response)) {
             sendto(sock, response, (size_t)rlen, 0, (struct sockaddr *)&raddr,
@@ -2025,6 +2067,8 @@ static int face_track_status_json(char *buf, size_t buf_sz) {
 static int app_status_json(char *buf, size_t buf_sz) {
   char sta_ip[16] = "0.0.0.0";
   wifi_config_get_sta_ip(sta_ip, sizeof(sta_ip));
+  char mdns_host[MDNS_HOSTNAME_MAX + 1];
+  mdns_hostname_for_device(mdns_host, sizeof(mdns_host));
   const char *fw_version = PROJECT_VER;
   nino_face_tracker_status_t face_track = {};
   nino_face_tracker_get_status(&face_track);
@@ -2038,7 +2082,7 @@ static int app_status_json(char *buf, size_t buf_sz) {
       "\"face_track\":{\"enabled\":%s,\"detector_ready\":%s,"
       "\"face_found\":%s}}",
       s_device_name, s_device_id, s_sta_ssid, nino_audio_get_volume_percent(),
-      fw_version, s_sta_connected ? "true" : "false", sta_ip, s_device_name,
+      fw_version, s_sta_connected ? "true" : "false", sta_ip, mdns_host,
       face_track.enabled ? "true" : "false",
       face_track.detector_ready ? "true" : "false",
       face_track.face_found ? "true" : "false");
@@ -2527,7 +2571,11 @@ static int cmd_voice(int argc, char **argv) {
   if (argc >= 2 && strcmp(argv[1], "status") == 0) {
     printf("voice wake hw: %s\n", nino_voice_wake_hw_ready() ? "ready" : "not loaded");
     printf("voice wake: %s\n", nino_voice_wake_is_enabled() ? "on" : "off");
-    printf("usb header mic: %s\n", usb_mic_ready() ? "streaming" : "not ready (check GPIO 24/25 wiring)");
+    printf("voice mic: %s\n",
+           nino_mic_source_name(nino_mic_preferred_source()));
+    printf("usb header mic: %s\n",
+           usb_mic_ready() ? "streaming (preferred)"
+                           : "not ready; using onboard ES8311 fallback");
     usb_mic_print_status();
     usb_mic_print_usb_devices();
     printf("device_id: %s\n", s_device_id);
@@ -2580,6 +2628,11 @@ static int cmd_device(int argc, char **argv) {
         nvs_close(h);
       }
       nino_voice_assist_set_ws_uri(s_voice_ws_url);
+    }
+    /* Hostname / TXT include device_id — refresh advertisement if online. */
+    if (s_mdns_started) {
+      mdns_stop_service();
+      mdns_start_service();
     }
     printf("device_id set to %s\n", s_device_id);
     if (s_voice_ws_url[0] != '\0') {

@@ -1065,10 +1065,14 @@ esp_err_t usb_mic_read(int16_t *samples, int sample_count) {
   const size_t need_bytes = (size_t)sample_count * sizeof(int16_t);
   size_t got = 0;
   esp_err_t result = ESP_OK;
+  if (!usb_mic_ready()) {
+    result = ESP_ERR_INVALID_STATE;
+    goto out;
+  }
   while (got < need_bytes) {
     if (!usb_mic_ready()) {
-      vTaskDelay(pdMS_TO_TICKS(20));
-      continue;
+      result = ESP_ERR_INVALID_STATE;
+      break;
     }
     const size_t n =
         xStreamBufferReceive(s_pcm_ring, ((uint8_t *)samples) + got, need_bytes - got,
@@ -1080,6 +1084,7 @@ esp_err_t usb_mic_read(int16_t *samples, int sample_count) {
     got += n;
   }
 
+out:
   xSemaphoreGive(s_read_mutex);
   return result;
 }
