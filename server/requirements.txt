@@ -33,3 +33,6 @@ psycopg2-binary>=2.9.9
 # --- HTTP / environment ---
 requests>=2.32.0
 python-dotenv>=1.0.0
+
+# --- LAN NiNO robot discovery ---
+zeroconf>=0.136.0

@@ -15,6 +15,9 @@ logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DEVICES_PATH = BASE_DIR / "data" / "devices.json"
 LEGACY_DEVICE_ID = "default"
+# Reserved by early multi-robot firmware builds on every board. New firmware
+# migrates it to a MAC-based value, so it must not remain as a stale route.
+LEGACY_PLACEHOLDER_DEVICE_ID = "nino-000000"
 
 
 @dataclass(frozen=True)
@@ -24,6 +27,7 @@ class DeviceRecord:
     camera_url: str = ""
     play_wav_url: str = ""
     base_url: str = ""
+    camera_rotation: str = "none"
 
     def effective_base_url(self) -> str:
         if self.base_url.strip():
@@ -55,6 +59,10 @@ class DeviceRegistry:
         self._path = path or DEFAULT_DEVICES_PATH
         self._lock = threading.RLock()
         self._devices: dict[str, DeviceRecord] = {}
+        # Tracks records loaded from / written to devices.json. This lets us
+        # discard the in-memory legacy fallback once real LAN devices appear,
+        # without accidentally deleting a manually configured "default" entry.
+        self._persisted_device_ids: set[str] = set()
         self._ui_device_id: str = LEGACY_DEVICE_ID
         self.reload()
 
@@ -70,6 +78,9 @@ class DeviceRegistry:
                 )
         with self._lock:
             self._devices = {d.device_id: d for d in loaded}
+            self._persisted_device_ids = {
+                d.device_id for d in self._load_from_file()
+            }
             if self._ui_device_id not in self._devices and self._devices:
                 self._ui_device_id = next(iter(self._devices))
             elif not self._devices:
@@ -79,6 +90,112 @@ class DeviceRegistry:
             len(self._devices),
             list(self._devices.keys()),
         )
+
+    def upsert_discovered(self, devices: list[DeviceRecord]) -> list[DeviceRecord]:
+        """Persist discovered LAN devices and update the live registry.
+
+        Discovery owns network endpoint fields because DHCP may change them.
+        An existing display name is retained as a simple manual override.
+        Returns the records that were added or changed.
+        """
+        cleaned = {
+            d.device_id.strip(): d
+            for d in devices
+            if d.device_id and d.device_id.strip() and d.effective_base_url()
+        }
+        if not cleaned:
+            return []
+
+        with self._lock:
+            merged = dict(self._devices)
+            removed = False
+            # The default entry synthesized from legacy environment variables
+            # must not become a permanent device merely because discovery ran.
+            if LEGACY_DEVICE_ID not in self._persisted_device_ids:
+                removed = merged.pop(LEGACY_DEVICE_ID, None) is not None
+            if any(device_id != LEGACY_PLACEHOLDER_DEVICE_ID for device_id in cleaned):
+                # Remove the stale route left by the placeholder ID once a
+                # migrated robot has been discovered.
+                removed = (
+                    merged.pop(LEGACY_PLACEHOLDER_DEVICE_ID, None) is not None
+                    or removed
+                )
+
+            changed: list[DeviceRecord] = []
+            for device_id, discovered in cleaned.items():
+                existing = merged.get(device_id)
+                record = DeviceRecord(
+                    device_id=device_id,
+                    display_name=(
+                        existing.display_name.strip()
+                        if existing and existing.display_name.strip()
+                        else discovered.display_name.strip()
+                    ),
+                    camera_url=discovered.effective_camera_url(),
+                    play_wav_url=discovered.effective_play_wav_url(),
+                    base_url=discovered.effective_base_url(),
+                    camera_rotation=(
+                        existing.camera_rotation if existing else "none"
+                    ),
+                )
+                if existing != record:
+                    merged[device_id] = record
+                    changed.append(record)
+
+            if not changed and not removed:
+                return []
+
+            self._write_devices_locked(merged.values())
+            self._devices = merged
+            self._persisted_device_ids = set(merged)
+            if self._ui_device_id not in self._devices:
+                self._ui_device_id = next(iter(self._devices), LEGACY_DEVICE_ID)
+            return changed
+
+    def set_camera_rotation(self, device_id: str, rotation: str) -> DeviceRecord:
+        """Persist a validated per-device camera orientation."""
+        key = (device_id or "").strip()
+        with self._lock:
+            existing = self._devices.get(key)
+            if existing is None:
+                raise KeyError(key)
+            record = DeviceRecord(
+                device_id=existing.device_id,
+                display_name=existing.display_name,
+                camera_url=existing.camera_url,
+                play_wav_url=existing.play_wav_url,
+                base_url=existing.base_url,
+                camera_rotation=rotation,
+            )
+            if existing == record:
+                return record
+            updated = dict(self._devices)
+            updated[key] = record
+            self._write_devices_locked(updated.values())
+            self._devices = updated
+            self._persisted_device_ids = set(updated)
+            return record
+
+    def _write_devices_locked(self, devices: object) -> None:
+        """Atomically write registry records. Caller must hold ``_lock``."""
+        records = sorted(devices, key=lambda d: d.device_id)
+        payload = {
+            "devices": [
+                {
+                    "device_id": d.device_id,
+                    "display_name": d.display_name,
+                    "camera_url": d.camera_url,
+                    "play_wav_url": d.play_wav_url,
+                    "base_url": d.base_url,
+                    "camera_rotation": d.camera_rotation,
+                }
+                for d in records
+            ]
+        }
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._path.with_suffix(f"{self._path.suffix}.tmp")
+        temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(self._path)
 
     def _load_from_file(self) -> list[DeviceRecord]:
         if not self._path.is_file():
@@ -105,6 +222,10 @@ class DeviceRegistry:
                     camera_url=str(item.get("camera_url") or "").strip(),
                     play_wav_url=str(item.get("play_wav_url") or "").strip(),
                     base_url=str(item.get("base_url") or "").strip(),
+                    camera_rotation=str(
+                        item.get("camera_rotation") or "none"
+                    ).strip()
+                    or "none",
                 )
             )
         return out
@@ -132,6 +253,7 @@ class DeviceRegistry:
                 camera_url=camera,
                 play_wav_url=play,
                 base_url=base,
+                camera_rotation="none",
             )
         ]
 
@@ -196,6 +318,7 @@ class DeviceRegistry:
                         "camera_url": d.effective_camera_url(),
                         "play_wav_url": d.effective_play_wav_url(),
                         "base_url": d.effective_base_url(),
+                        "camera_rotation": d.camera_rotation,
                     }
                     for d in self._devices.values()
                 ],

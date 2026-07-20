@@ -23,7 +23,13 @@ from starlette.requests import Request
 from starlette.staticfiles import StaticFiles as StarletteStaticFiles
 
 from alarm_service import get_alarm_service
-from camera import CameraPool
+from camera import CameraPool, normalize_camera_rotation
+from device_discovery import (
+    discover_once as discover_devices_once,
+    discovery_status,
+    start_discovery_loop,
+    stop_discovery_loop,
+)
 from device_registry import get_device_registry, resolve_device_id
 from eye_expression import normalize_eye_expression
 from face_registration_service import capture_face_samples, configure_face_registration
@@ -189,6 +195,11 @@ class CameraRequest(BaseModel):
     device_id: str = ""
 
 
+class CameraOrientationRequest(BaseModel):
+    rotation: str = Field(..., min_length=1, max_length=32)
+    device_id: str = ""
+
+
 class RegisterRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=64)
     samples: int = Field(15, ge=1, le=80)
@@ -215,6 +226,9 @@ def startup() -> None:
     ensure_esp_play_wav_url_configured()
     registry.reload()
     cameras.start_all()
+    # Discovery runs in its own daemon thread. Startup remains responsive when
+    # no robots or multicast-capable network are present.
+    start_discovery_loop(on_registry_updated=cameras.configure_from_registry)
     tts.set_playback_device_id(registry.ui_device_id())
     face_registration.set_frame_getter(cameras.frame_getter(registry.ui_device_id()))
     play_url = esp_play_wav_url()
@@ -300,6 +314,10 @@ def startup() -> None:
 @app.on_event("shutdown")
 def shutdown() -> None:
     try:
+        stop_discovery_loop()
+    except BaseException:
+        pass
+    try:
         get_memory_service().stop()
     except BaseException:
         pass
@@ -342,6 +360,26 @@ def set_camera(req: CameraRequest) -> dict:
     return {"ok": True, "device_id": device_id, "camera": stream.status()}
 
 
+@app.post("/api/camera/orientation")
+def set_camera_orientation(req: CameraOrientationRequest) -> dict:
+    device_id = resolve_device_id(req.device_id or None)
+    rotation = normalize_camera_rotation(req.rotation)
+    if rotation is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Rotation must be none, cw90, 180, or ccw90",
+        )
+    registry.set_camera_rotation(device_id, rotation)
+    stream = cameras.set_rotation(device_id, rotation)
+    logger.info("Camera orientation set device_id=%s rotation=%s", device_id, rotation)
+    return {
+        "ok": True,
+        "device_id": device_id,
+        "rotation": rotation,
+        "camera": stream.status(),
+    }
+
+
 @app.post("/api/device")
 def select_device(req: DeviceSelectRequest) -> dict:
     device_id = registry.set_ui_device_id(req.device_id)
@@ -352,7 +390,19 @@ def select_device(req: DeviceSelectRequest) -> dict:
 
 @app.get("/api/devices")
 def list_devices() -> dict:
-    return {"ok": True, **registry.status()}
+    return {"ok": True, **registry.status(), "discovery": discovery_status()}
+
+
+@app.post("/api/devices/discover")
+def discover_devices() -> dict:
+    """Force a LAN-only mDNS/UDP discovery scan."""
+    devices = discover_devices_once()
+    return {
+        "ok": True,
+        "found": [device.device_id for device in devices],
+        **registry.status(),
+        "discovery": discovery_status(),
+    }
 
 
 @app.get("/api/latency-log")
@@ -376,6 +426,7 @@ def status(device_id: str | None = None) -> dict:
     return {
         "device_id": active,
         "devices": registry.status(),
+        "discovery": discovery_status(),
         "camera": cameras.status(active),
         "cameras": cameras.status(),
         "faces": faces.stats(),

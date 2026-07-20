@@ -31,37 +31,31 @@ _JPEG_DECODE_LOCK = threading.Lock()
 
 def parse_camera_rotation(raw: str | None) -> int | None:
     """Map CAMERA_ROTATION env/CLI value to an OpenCV rotate code."""
-    if not raw or not str(raw).strip():
+    normalized = normalize_camera_rotation(raw)
+    if normalized in {None, "none"}:
         return None
+    if normalized == "cw90":
+        return cv2.ROTATE_90_CLOCKWISE
+    if normalized == "ccw90":
+        return cv2.ROTATE_90_COUNTERCLOCKWISE
+    if normalized == "180":
+        return cv2.ROTATE_180
+    return None
+
+
+def normalize_camera_rotation(raw: str | None) -> str | None:
+    """Return a persisted orientation label, or ``None`` for invalid input."""
+    if not raw or not str(raw).strip():
+        return "none"
     key = str(raw).strip().lower()
     if key in {"0", "none", "off", "normal"}:
-        return None
+        return "none"
     if key in {"90", "cw", "cw90", "clockwise", "right"}:
-        return cv2.ROTATE_90_CLOCKWISE
-    if key in {
-        "-90",
-        "270",
-        "ccw",
-        "ccw90",
-        "counterclockwise",
-        "counter-clockwise",
-        "left",
-    }:
-        return cv2.ROTATE_90_COUNTERCLOCKWISE
+        return "cw90"
+    if key in {"-90", "270", "ccw", "ccw90", "counterclockwise", "counter-clockwise", "left"}:
+        return "ccw90"
     if key in {"180", "flip"}:
-        return cv2.ROTATE_180
-    try:
-        deg = int(key)
-    except ValueError:
-        return None
-    if deg == 0:
-        return None
-    if deg == 90:
-        return cv2.ROTATE_90_CLOCKWISE
-    if deg == 180:
-        return cv2.ROTATE_180
-    if deg in {-90, 270}:
-        return cv2.ROTATE_90_COUNTERCLOCKWISE
+        return "180"
     return None
 
 
@@ -117,7 +111,7 @@ def _suppress_native_stderr() -> Any:
 class CameraStream:
     """Continuously pulls frames from a local camera index or stream URL."""
 
-    def __init__(self, default_source: str) -> None:
+    def __init__(self, default_source: str, rotation: str | None = None) -> None:
         self.source = default_source
         self.active_source: int | str | None = None
         self._capture: cv2.VideoCapture | None = None
@@ -131,11 +125,17 @@ class CameraStream:
         self._last_frame_at = 0.0
         self._frames_received = 0
         self._rotation_code: int | None = None
+        self._rotation_setting = rotation
 
     def start(self, source: str | None = None) -> None:
         if source:
             self.source = source
-        self._rotation_code = parse_camera_rotation(os.getenv("CAMERA_ROTATION", ""))
+        rotation = (
+            self._rotation_setting
+            if self._rotation_setting is not None
+            else os.getenv("CAMERA_ROTATION", "")
+        )
+        self._rotation_code = parse_camera_rotation(rotation)
 
         if self._thread and self._thread.is_alive():
             # A prior stop() may still be draining (e.g. blocked in urlopen).
@@ -158,6 +158,14 @@ class CameraStream:
     def restart(self, source: str) -> None:
         self.stop()
         self.start(source)
+
+    def set_rotation(self, rotation: str) -> str:
+        normalized = normalize_camera_rotation(rotation)
+        if normalized is None:
+            raise ValueError(f"Unsupported camera rotation: {rotation!r}")
+        self._rotation_setting = normalized
+        self._rotation_code = parse_camera_rotation(normalized)
+        return normalized
 
     def _join_worker(self, timeout: float) -> None:
         if (
@@ -417,11 +425,19 @@ class CameraPool:
             for device_id, source in wanted.items():
                 existing = self._streams.get(device_id)
                 if existing is None:
-                    stream = CameraStream(source)
+                    record = registry.get(device_id)
+                    stream = CameraStream(
+                        source,
+                        record.camera_rotation if record else "none",
+                    )
                     stream.start()
                     self._streams[device_id] = stream
-                elif existing.source != source:
-                    existing.restart(source)
+                else:
+                    record = registry.get(device_id)
+                    if record:
+                        existing.set_rotation(record.camera_rotation)
+                    if existing.source != source:
+                        existing.restart(source)
 
     def start_all(self) -> None:
         self.configure_from_registry()
@@ -440,11 +456,13 @@ class CameraPool:
         with self._lock:
             stream = self._streams.get(record.device_id)
             if stream is None:
-                stream = CameraStream(source)
+                stream = CameraStream(source, record.camera_rotation)
                 stream.start()
                 self._streams[record.device_id] = stream
-            elif stream.source != source and source:
-                stream.restart(source)
+            else:
+                stream.set_rotation(record.camera_rotation)
+                if stream.source != source and source:
+                    stream.restart(source)
             return stream
 
     def read(self, device_id: str | None = None) -> np.ndarray | None:
@@ -457,12 +475,17 @@ class CameraPool:
         with self._lock:
             stream = self._streams.get(record.device_id)
             if stream is None:
-                stream = CameraStream(source)
+                stream = CameraStream(source, record.camera_rotation)
                 stream.start()
                 self._streams[record.device_id] = stream
             else:
                 stream.restart(source)
             return stream
+
+    def set_rotation(self, device_id: str | None, rotation: str) -> CameraStream:
+        stream = self.ensure(device_id)
+        stream.set_rotation(rotation)
+        return stream
 
     def status(self, device_id: str | None = None) -> dict[str, Any]:
         if device_id is not None:

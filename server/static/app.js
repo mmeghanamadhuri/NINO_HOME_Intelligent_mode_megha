@@ -1,4 +1,5 @@
 const cameraSource = document.querySelector("#cameraSource");
+const cameraOrientation = document.querySelector("#cameraOrientation");
 const startCamera = document.querySelector("#startCamera");
 const personName = document.querySelector("#personName");
 const sampleCount = document.querySelector("#sampleCount");
@@ -154,6 +155,9 @@ async function refreshStatus() {
       populateDeviceSelect(data.devices.devices, data.device_id || id);
     }
     const connected = data.camera?.connected;
+    if (cameraOrientation && data.camera?.rotation) {
+      cameraOrientation.value = data.camera.rotation;
+    }
     connectionStatus.textContent = connected
       ? `Camera connected (${data.device_id || id})`
       : `Waiting for camera (${data.device_id || id})`;
@@ -200,6 +204,27 @@ startCamera.addEventListener("click", async () => {
     alert(error.message);
   } finally {
     startCamera.disabled = false;
+  }
+});
+
+cameraOrientation?.addEventListener("change", async () => {
+  const rotation = cameraOrientation.value;
+  cameraOrientation.disabled = true;
+  try {
+    await api("/api/camera/orientation", {
+      method: "POST",
+      body: JSON.stringify({
+        rotation,
+        device_id: currentDeviceId(),
+      }),
+    });
+    refreshStream();
+    await refreshStatus();
+  } catch (error) {
+    alert(error.message);
+    await refreshStatus();
+  } finally {
+    cameraOrientation.disabled = false;
   }
 });
 

@@ -10,6 +10,7 @@ import time
 import wave
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Literal
 
 import numpy as np
@@ -55,6 +56,17 @@ _IDENTITY_QUESTION_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"\bwhat(?:'s| is) my identity\b",
         r"^my name[.!?…]*\s*$",
     )
+)
+
+_LOCAL_TIME_QUESTION_PATTERN = re.compile(
+    r"\b(?:"
+    r"what(?:'s| is)? (?:the )?time(?: now)?"
+    r"|what time is it"
+    r"|tell me (?:the )?time"
+    r"|current time"
+    r"|time now"
+    r")\b",
+    re.IGNORECASE,
 )
 
 _SERVO_360_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
@@ -268,6 +280,17 @@ def is_identity_question(user_text: str) -> bool:
     if not text:
         return False
     return any(p.search(text) for p in _IDENTITY_QUESTION_PATTERNS)
+
+
+def is_local_time_question(user_text: str) -> bool:
+    return bool(_LOCAL_TIME_QUESTION_PATTERN.search(user_text.strip()))
+
+
+def local_server_time_reply() -> str:
+    """Speak the server's configured local wall-clock time, not an LLM guess."""
+    now = datetime.now().astimezone()
+    hour = now.strftime("%I").lstrip("0") or "0"
+    return f"It is {hour}:{now.strftime('%M %p')}, {now.strftime('%A, %B')} {now.day}."
 
 
 def is_servo_360_command(user_text: str) -> bool:
@@ -706,6 +729,11 @@ def process_voice_wav(
                     "stt_seconds": round(t_stt - t_start, 3),
                 }
                 return b"", meta
+
+    if reply_path == "llm" and is_local_time_question(user_text):
+        reply_path = "local_time"
+        reply = local_server_time_reply()
+        logger.info("Voice local-time query | heard: %s", user_text[:120])
 
     if reply_path == "llm":
         alarm_result = handle_alarm_voice(

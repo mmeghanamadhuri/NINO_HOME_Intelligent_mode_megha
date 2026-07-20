@@ -1,10 +1,14 @@
 # Multires — One Local Server, Many Robots
 
-Can today’s NiNO `server/` on a **PC (same Wi‑Fi)** be the main brain for **multiple ESP32 robots**?
+NiNO `server/` on a **PC (same Wi‑Fi)** can act as the main brain for multiple ESP32 robots.
 
-**Short answer:** Voice WebSockets can accept many clients, but the rest of the stack is built for **one bot**. Full multi-robot on LAN needs a **device registry** and **per-device routing** for camera, playback, identity, alarms, and volume/servo.
+**Current implementation:** device identity and per-device routing are implemented for camera, playback, alarms, volume/servo, and voice WebSockets. On startup and periodically thereafter, the server discovers LAN robots through `_nino._tcp` mDNS with the firmware UDP discovery protocol as fallback, calls each robot’s `/status`, and persists its current URLs in `server/data/devices.json`. Manual IP entry is therefore not required for normal LAN operation.
+
+Discovery is configurable with `NINO_DISCOVERY_ENABLED`, `NINO_DISCOVERY_INTERVAL_S` (default `45`), and `NINO_DISCOVERY_HTTP_TIMEOUT_S` (default `1.5`). It is LAN-only and never performs a subnet address sweep. If no robot is discovered, the legacy `CAMERA_SOURCE` / `ESP_PLAY_WAV_URL` single-device fallback remains active.
 
 This doc is **local / same-LAN only**. Do multi-robot here first; cloud migration is a later step and is out of scope.
+
+> Historical note: the implementation-plan sections below describe the original single-bot limitations and proposed work. Several of those items have since been implemented; use the code and this introduction for the current behavior.
 
 Pair with [SERVER_ARCHITECTURE.md](SERVER_ARCHITECTURE.md) for how the single-bot stack works today.
 

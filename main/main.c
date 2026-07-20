@@ -486,6 +486,12 @@ static bool is_valid_device_id(const char *id) {
   return true;
 }
 
+/* Early multi-robot builds stored this placeholder on every board. It is a
+ * syntactically valid ID, but cannot safely identify a robot on a shared LAN. */
+static bool is_legacy_placeholder_device_id(const char *id) {
+  return id != NULL && strcmp(id, "nino-000000") == 0;
+}
+
 static void make_default_device_id_from_mac(char *dst, size_t dst_size) {
   uint8_t mac[6] = {0};
   if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) {
@@ -527,7 +533,8 @@ static void load_device_id_from_nvs(void) {
   if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
     size_t len = sizeof(stored);
     if (nvs_get_str(h, NVS_KEY_DEVICE_ID, stored, &len) != ESP_OK ||
-        !is_valid_device_id(stored)) {
+        !is_valid_device_id(stored) ||
+        is_legacy_placeholder_device_id(stored)) {
       stored[0] = '\0';
     }
     nvs_close(h);
@@ -535,6 +542,7 @@ static void load_device_id_from_nvs(void) {
   copy_device_id(s_device_id, sizeof(s_device_id), stored);
   if (stored[0] == '\0') {
     (void)save_device_id_to_nvs();
+    ESP_LOGI(TAG, "Generated unique device_id from Wi-Fi MAC");
   }
   ESP_LOGI(TAG, "device_id=%s", s_device_id);
 }
