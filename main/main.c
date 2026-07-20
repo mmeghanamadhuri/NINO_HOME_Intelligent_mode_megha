@@ -541,6 +541,45 @@ static void make_default_device_id_from_mac(char *dst, size_t dst_size) {
   snprintf(dst, dst_size, "nino-%02x%02x%02x", mac[3], mac[4], mac[5]);
 }
 
+static bool make_device_id_from_name(char *dst, size_t dst_size) {
+  if (dst == NULL || dst_size < 2) {
+    return false;
+  }
+
+  char name[WIFI_PROV_BLE_DEVICE_NAME_MAX + 1] = "";
+  nvs_handle_t h;
+  if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+    size_t len = sizeof(name);
+    if (nvs_get_str(h, NVS_KEY_DEVICE_NAME, name, &len) != ESP_OK ||
+        !is_valid_device_name(name)) {
+      name[0] = '\0';
+    }
+    nvs_close(h);
+  }
+  if (name[0] == '\0') {
+    copy_device_name(name, sizeof(name), s_device_name);
+  }
+
+  size_t out = 0;
+  bool previous_dash = false;
+  for (size_t i = 0; name[i] != '\0' && out < dst_size - 1; ++i) {
+    char c = name[i];
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9')) {
+      dst[out++] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+      previous_dash = false;
+    } else if (out > 0 && !previous_dash) {
+      dst[out++] = '-';
+      previous_dash = true;
+    }
+  }
+  while (out > 0 && dst[out - 1] == '-') {
+    --out;
+  }
+  dst[out] = '\0';
+  return out > 0 && is_valid_device_id(dst);
+}
+
 static void copy_device_id(char *dst, size_t dst_size, const char *src) {
   if (dst == NULL || dst_size == 0) {
     return;
@@ -571,19 +610,29 @@ static esp_err_t save_device_id_to_nvs(void) {
 static void load_device_id_from_nvs(void) {
   nvs_handle_t h;
   char stored[DEVICE_ID_MAX + 1] = "";
+  bool migrate_placeholder = false;
   if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
     size_t len = sizeof(stored);
     if (nvs_get_str(h, NVS_KEY_DEVICE_ID, stored, &len) != ESP_OK ||
-        !is_valid_device_id(stored) ||
-        is_legacy_placeholder_device_id(stored)) {
+        !is_valid_device_id(stored)) {
       stored[0] = '\0';
+    } else if (is_legacy_placeholder_device_id(stored)) {
+      stored[0] = '\0';
+      migrate_placeholder = true;
     }
     nvs_close(h);
   }
-  copy_device_id(s_device_id, sizeof(s_device_id), stored);
+  if (migrate_placeholder &&
+      make_device_id_from_name(s_device_id, sizeof(s_device_id))) {
+    ESP_LOGI(TAG, "Migrated legacy device_id from device name");
+  } else {
+    copy_device_id(s_device_id, sizeof(s_device_id), stored);
+  }
   if (stored[0] == '\0') {
     (void)save_device_id_to_nvs();
-    ESP_LOGI(TAG, "Generated unique device_id from Wi-Fi MAC");
+    if (!migrate_placeholder) {
+      ESP_LOGI(TAG, "Generated device_id from Wi-Fi MAC");
+    }
   }
   ESP_LOGI(TAG, "device_id=%s", s_device_id);
 }

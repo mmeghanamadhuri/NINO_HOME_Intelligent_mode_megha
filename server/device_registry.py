@@ -16,7 +16,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DEVICES_PATH = BASE_DIR / "data" / "devices.json"
 LEGACY_DEVICE_ID = "default"
 # Reserved by early multi-robot firmware builds on every board. New firmware
-# migrates it to a MAC-based value, so it must not remain as a stale route.
+# migrates it to a sanitized device-name value, so it must not remain stale.
 LEGACY_PLACEHOLDER_DEVICE_ID = "nino-000000"
 
 
