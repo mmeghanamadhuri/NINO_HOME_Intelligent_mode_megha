@@ -33,6 +33,11 @@ class DeviceRecord:
     latitude: float | None = None
     longitude: float | None = None
     location_updated_at: str = ""
+    wifi_ssid: str = ""
+    wifi_bssid: str = ""
+    wifi_rssi: int | None = None
+    wifi_channel: int | None = None
+    wifi_updated_at: str = ""
 
     def effective_base_url(self) -> str:
         if self.base_url.strip():
@@ -147,6 +152,11 @@ class DeviceRegistry:
                     location_updated_at=(
                         existing.location_updated_at if existing else ""
                     ),
+                    wifi_ssid=existing.wifi_ssid if existing else "",
+                    wifi_bssid=existing.wifi_bssid if existing else "",
+                    wifi_rssi=existing.wifi_rssi if existing else None,
+                    wifi_channel=existing.wifi_channel if existing else None,
+                    wifi_updated_at=existing.wifi_updated_at if existing else "",
                 )
                 if existing != record:
                     merged[device_id] = record
@@ -179,6 +189,11 @@ class DeviceRegistry:
                 latitude=existing.latitude,
                 longitude=existing.longitude,
                 location_updated_at=existing.location_updated_at,
+                wifi_ssid=existing.wifi_ssid,
+                wifi_bssid=existing.wifi_bssid,
+                wifi_rssi=existing.wifi_rssi,
+                wifi_channel=existing.wifi_channel,
+                wifi_updated_at=existing.wifi_updated_at,
             )
             if existing == record:
                 return record
@@ -215,6 +230,60 @@ class DeviceRegistry:
                 latitude=latitude,
                 longitude=longitude,
                 location_updated_at=datetime.now(timezone.utc).isoformat(),
+                wifi_ssid=existing.wifi_ssid,
+                wifi_bssid=existing.wifi_bssid,
+                wifi_rssi=existing.wifi_rssi,
+                wifi_channel=existing.wifi_channel,
+                wifi_updated_at=existing.wifi_updated_at,
+            )
+            updated = dict(self._devices)
+            updated[key] = record
+            self._write_devices_locked(updated.values())
+            self._devices = updated
+            self._persisted_device_ids = set(updated)
+            return record
+
+    def set_wifi_network(
+        self,
+        device_id: str,
+        *,
+        ssid: str,
+        bssid: str,
+        rssi: int | None = None,
+        channel: int | None = None,
+    ) -> DeviceRecord:
+        """Persist the Wi-Fi network most recently reported by a known device."""
+        normalized_ssid = ssid.strip()
+        normalized_bssid = bssid.strip().upper()
+        if not normalized_ssid or len(normalized_ssid) > 32:
+            raise ValueError("Wi-Fi SSID must contain 1 to 32 characters")
+        if not _is_valid_bssid(normalized_bssid):
+            raise ValueError("Wi-Fi BSSID must be a MAC address such as AA:BB:CC:DD:EE:FF")
+        if rssi is not None and not -127 <= rssi <= 0:
+            raise ValueError("Wi-Fi RSSI must be between -127 and 0 dBm")
+        if channel is not None and not 1 <= channel <= 196:
+            raise ValueError("Wi-Fi channel must be between 1 and 196")
+
+        key = (device_id or "").strip()
+        with self._lock:
+            existing = self._devices.get(key)
+            if existing is None:
+                raise KeyError(key)
+            record = DeviceRecord(
+                device_id=existing.device_id,
+                display_name=existing.display_name,
+                camera_url=existing.camera_url,
+                play_wav_url=existing.play_wav_url,
+                base_url=existing.base_url,
+                camera_rotation=existing.camera_rotation,
+                latitude=existing.latitude,
+                longitude=existing.longitude,
+                location_updated_at=existing.location_updated_at,
+                wifi_ssid=normalized_ssid,
+                wifi_bssid=normalized_bssid,
+                wifi_rssi=rssi,
+                wifi_channel=channel,
+                wifi_updated_at=datetime.now(timezone.utc).isoformat(),
             )
             updated = dict(self._devices)
             updated[key] = record
@@ -238,6 +307,11 @@ class DeviceRegistry:
                     "latitude": d.latitude,
                     "longitude": d.longitude,
                     "location_updated_at": d.location_updated_at,
+                    "wifi_ssid": d.wifi_ssid,
+                    "wifi_bssid": d.wifi_bssid,
+                    "wifi_rssi": d.wifi_rssi,
+                    "wifi_channel": d.wifi_channel,
+                    "wifi_updated_at": d.wifi_updated_at,
                 }
                 for d in records
             ]
@@ -281,6 +355,11 @@ class DeviceRegistry:
                     location_updated_at=str(
                         item.get("location_updated_at") or ""
                     ).strip(),
+                    wifi_ssid=_parse_wifi_ssid(item.get("wifi_ssid")),
+                    wifi_bssid=_parse_bssid(item.get("wifi_bssid")),
+                    wifi_rssi=_parse_optional_int(item.get("wifi_rssi"), -127, 0),
+                    wifi_channel=_parse_optional_int(item.get("wifi_channel"), 1, 196),
+                    wifi_updated_at=str(item.get("wifi_updated_at") or "").strip(),
                 )
             )
         return out
@@ -379,6 +458,11 @@ class DeviceRegistry:
                         "latitude": d.latitude,
                         "longitude": d.longitude,
                         "location_updated_at": d.location_updated_at,
+                        "wifi_ssid": d.wifi_ssid,
+                        "wifi_bssid": d.wifi_bssid,
+                        "wifi_rssi": d.wifi_rssi,
+                        "wifi_channel": d.wifi_channel,
+                        "wifi_updated_at": d.wifi_updated_at,
                     }
                     for d in self._devices.values()
                 ],
@@ -413,3 +497,31 @@ def _parse_coordinate(value: object, minimum: float, maximum: float) -> float | 
     if not math.isfinite(coordinate) or not minimum <= coordinate <= maximum:
         return None
     return coordinate
+
+
+def _parse_wifi_ssid(value: object) -> str:
+    ssid = str(value or "").strip()
+    return ssid if 0 < len(ssid) <= 32 else ""
+
+
+def _is_valid_bssid(value: str) -> bool:
+    parts = value.split(":")
+    if len(parts) != 6:
+        return False
+    try:
+        return all(len(part) == 2 and 0 <= int(part, 16) <= 255 for part in parts)
+    except ValueError:
+        return False
+
+
+def _parse_bssid(value: object) -> str:
+    bssid = str(value or "").strip().upper()
+    return bssid if _is_valid_bssid(bssid) else ""
+
+
+def _parse_optional_int(value: object, minimum: int, maximum: int) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if minimum <= number <= maximum else None

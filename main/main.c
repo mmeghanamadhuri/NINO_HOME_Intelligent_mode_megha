@@ -15,6 +15,7 @@
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
+#include "esp_http_client.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -663,6 +664,170 @@ static void ensure_voice_ws_url_has_device_id(void) {
   }
 }
 
+static bool json_escape_string(char *dst, size_t dst_size, const char *src) {
+  if (dst == NULL || dst_size == 0 || src == NULL) {
+    return false;
+  }
+  size_t out = 0;
+  for (size_t i = 0; src[i] != '\0'; ++i) {
+    const unsigned char c = (unsigned char)src[i];
+    const char *escaped = NULL;
+    switch (c) {
+    case '"':
+      escaped = "\\\"";
+      break;
+    case '\\':
+      escaped = "\\\\";
+      break;
+    case '\b':
+      escaped = "\\b";
+      break;
+    case '\f':
+      escaped = "\\f";
+      break;
+    case '\n':
+      escaped = "\\n";
+      break;
+    case '\r':
+      escaped = "\\r";
+      break;
+    case '\t':
+      escaped = "\\t";
+      break;
+    default:
+      break;
+    }
+    if (escaped != NULL) {
+      size_t escaped_len = strlen(escaped);
+      if (out + escaped_len >= dst_size) {
+        return false;
+      }
+      memcpy(dst + out, escaped, escaped_len);
+      out += escaped_len;
+    } else if (c < 0x20) {
+      if (out + 6 >= dst_size) {
+        return false;
+      }
+      int written = snprintf(dst + out, dst_size - out, "\\u%04x", c);
+      if (written != 6) {
+        return false;
+      }
+      out += 6;
+    } else {
+      if (out + 1 >= dst_size) {
+        return false;
+      }
+      dst[out++] = (char)c;
+    }
+  }
+  dst[out] = '\0';
+  return true;
+}
+
+static bool wifi_report_url_from_voice_ws(char *dst, size_t dst_size) {
+  if (dst == NULL || dst_size == 0 || s_voice_ws_url[0] == '\0' ||
+      s_device_id[0] == '\0') {
+    return false;
+  }
+  const char *separator = strstr(s_voice_ws_url, "://");
+  if (separator == NULL ||
+      (strncmp(s_voice_ws_url, "ws://", 5) != 0 &&
+       strncmp(s_voice_ws_url, "wss://", 6) != 0)) {
+    return false;
+  }
+  const char *authority = separator + 3;
+  size_t authority_len = strcspn(authority, "/?#");
+  if (authority_len == 0 || authority_len > 180) {
+    return false;
+  }
+  const char *http_scheme =
+      strncmp(s_voice_ws_url, "wss://", 6) == 0 ? "https" : "http";
+  int written = snprintf(dst, dst_size, "%s://%.*s/api/devices/%s/network",
+                         http_scheme, (int)authority_len, authority, s_device_id);
+  return written > 0 && (size_t)written < dst_size;
+}
+
+static void report_wifi_network_task(void *arg) {
+  (void)arg;
+  /* The server may need a moment to rediscover the board after DHCP changes. */
+  vTaskDelay(pdMS_TO_TICKS(2000));
+
+  wifi_ap_record_t ap = {};
+  if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) {
+    ESP_LOGW(TAG, "Wi-Fi network report skipped: AP information unavailable");
+    vTaskDelete(NULL);
+    return;
+  }
+
+  char report_url[256] = "";
+  if (!wifi_report_url_from_voice_ws(report_url, sizeof(report_url))) {
+    ESP_LOGD(TAG, "Wi-Fi network report skipped: voice server URL unavailable");
+    vTaskDelete(NULL);
+    return;
+  }
+
+  char raw_ssid[WIFI_CONFIG_STA_SSID_MAX + 1] = "";
+  size_t raw_ssid_len =
+      strnlen((const char *)ap.ssid, WIFI_CONFIG_STA_SSID_MAX);
+  memcpy(raw_ssid, ap.ssid, raw_ssid_len);
+  char ssid[WIFI_CONFIG_STA_SSID_MAX * 2 + 1] = "";
+  if (!json_escape_string(ssid, sizeof(ssid), raw_ssid)) {
+    ESP_LOGW(TAG, "Wi-Fi network report skipped: SSID could not be encoded");
+    vTaskDelete(NULL);
+    return;
+  }
+  char bssid[18] = "";
+  snprintf(bssid, sizeof(bssid), MACSTR, MAC2STR(ap.bssid));
+  char payload[192] = "";
+  int payload_len = snprintf(
+      payload, sizeof(payload),
+      "{\"ssid\":\"%s\",\"bssid\":\"%s\",\"rssi\":%d,\"channel\":%u}",
+      ssid, bssid, ap.rssi, (unsigned)ap.primary);
+  if (payload_len <= 0 || (size_t)payload_len >= sizeof(payload)) {
+    ESP_LOGW(TAG, "Wi-Fi network report skipped: payload too large");
+    vTaskDelete(NULL);
+    return;
+  }
+
+  for (int attempt = 1; attempt <= 3; ++attempt) {
+    esp_http_client_config_t config = {
+        .url = report_url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 5000,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+      ESP_LOGW(TAG, "Wi-Fi network report: HTTP client allocation failed");
+      break;
+    }
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, payload, payload_len);
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    if (err == ESP_OK && status >= 200 && status < 300) {
+      ESP_LOGI(TAG, "Reported Wi-Fi network %s (%s) to server", ap.ssid, bssid);
+      break;
+    }
+    ESP_LOGW(TAG, "Wi-Fi network report attempt %d failed: %s (HTTP %d)", attempt,
+             esp_err_to_name(err), status);
+    if (attempt < 3) {
+      vTaskDelay(pdMS_TO_TICKS(3000));
+    }
+  }
+  vTaskDelete(NULL);
+}
+
+static void schedule_wifi_network_report(void) {
+  if (!s_sta_connected || s_voice_ws_url[0] == '\0') {
+    return;
+  }
+  if (xTaskCreatePinnedToCore(report_wifi_network_task, "wifi_report", 4096, NULL,
+                              5, NULL, APP_CORE_NET) != pdPASS) {
+    ESP_LOGW(TAG, "Could not schedule Wi-Fi network report");
+  }
+}
+
 static void sta_reconnect_task(void *arg) {
   (void)arg;
   vTaskDelay(pdMS_TO_TICKS(STA_RECONNECT_DELAY_MS));
@@ -1283,6 +1448,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     ESP_LOGI(TAG, "STA: Got IP " IPSTR, IP2STR(&event->ip_info.ip));
     mdns_start_service();
     wifi_prov_ble_on_sta_ip_changed(true);
+    schedule_wifi_network_report();
     if (s_wifi_connected_chime_pending) {
       if (play_wifi_connected_clip()) {
         s_wifi_connected_chime_pending = false;
@@ -2557,6 +2723,7 @@ static void apply_voice_ws_url_from_server(const char *uri) {
   }
   nino_voice_assist_set_ws_uri(s_voice_ws_url);
   nino_voice_wake_set_enabled(true);
+  schedule_wifi_network_report();
   ESP_LOGI(TAG, "Voice WS URL from server: %s", s_voice_ws_url);
 }
 
@@ -2593,6 +2760,7 @@ static int cmd_voice(int argc, char **argv) {
     }
     nino_voice_assist_set_ws_uri(s_voice_ws_url);
     nino_voice_wake_set_enabled(s_voice_ws_url[0] != '\0');
+    schedule_wifi_network_report();
     printf("Voice assistant: %s\n", s_voice_ws_url);
     return 0;
   }
@@ -2615,6 +2783,7 @@ static int cmd_voice(int argc, char **argv) {
     }
     nino_voice_assist_set_ws_uri(s_voice_ws_url);
     nino_voice_wake_set_enabled(s_voice_ws_url[0] != '\0');
+    schedule_wifi_network_report();
     return 0;
   }
   if (argc >= 2 && strcmp(argv[1], "status") == 0) {

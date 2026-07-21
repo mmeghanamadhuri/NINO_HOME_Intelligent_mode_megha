@@ -80,6 +80,30 @@ class WeatherServiceTests(unittest.TestCase):
         self.assertEqual(saved["devices"][0]["latitude"], 51.5072)
         self.assertEqual(saved["devices"][0]["longitude"], -0.1276)
 
+    def test_reported_wifi_network_is_persisted_in_device_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "devices.json"
+            path.write_text(
+                json.dumps({"devices": [{"device_id": "nino-test"}]}),
+                encoding="utf-8",
+            )
+            registry = DeviceRegistry(path)
+            updated = registry.set_wifi_network(
+                "nino-test",
+                ssid="NiNO Home",
+                bssid="aa:bb:cc:dd:ee:ff",
+                rssi=-54,
+                channel=6,
+            )
+            saved = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(updated.wifi_ssid, "NiNO Home")
+        self.assertEqual(updated.wifi_bssid, "AA:BB:CC:DD:EE:FF")
+        self.assertEqual(updated.wifi_rssi, -54)
+        self.assertEqual(updated.wifi_channel, 6)
+        self.assertTrue(updated.wifi_updated_at)
+        self.assertEqual(saved["devices"][0]["wifi_bssid"], "AA:BB:CC:DD:EE:FF")
+
 
 class WeatherVoiceRoutingTests(unittest.TestCase):
     def test_weather_questions_are_detected(self) -> None:

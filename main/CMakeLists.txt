@@ -1,4 +1,4 @@
-set(main_requires esp_psram esp_wifi esp_event esp_netif nvs_flash esp_http_server mdns
+set(main_requires esp_psram esp_wifi esp_event esp_netif nvs_flash esp_http_server esp_http_client mdns
     console esp32_p4_function_ev_board esp_websocket_client esp-sr driver usb
     esp_hosted)
 

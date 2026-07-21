@@ -230,6 +230,13 @@ class DeviceLocationRequest(BaseModel):
     longitude: float = Field(..., ge=-180, le=180)
 
 
+class DeviceWifiNetworkRequest(BaseModel):
+    ssid: str = Field(..., min_length=1, max_length=32)
+    bssid: str = Field(..., min_length=17, max_length=17)
+    rssi: int | None = Field(default=None, ge=-127, le=0)
+    channel: int | None = Field(default=None, ge=1, le=196)
+
+
 @app.on_event("startup")
 def startup() -> None:
     _load_env_file()
@@ -448,6 +455,34 @@ def update_device_location(
             "latitude": device.latitude,
             "longitude": device.longitude,
             "updated_at": device.location_updated_at,
+        },
+    }
+
+
+@app.post("/api/devices/{device_id}/network")
+def update_device_wifi_network(device_id: str, req: DeviceWifiNetworkRequest) -> dict:
+    """Record Wi-Fi identity reported after a registered device connects."""
+    if registry.get(device_id) is None:
+        raise HTTPException(status_code=404, detail="Unknown device_id")
+    try:
+        device = registry.set_wifi_network(
+            device_id,
+            ssid=req.ssid,
+            bssid=req.bssid,
+            rssi=req.rssi,
+            channel=req.channel,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "device_id": device.device_id,
+        "wifi": {
+            "ssid": device.wifi_ssid,
+            "bssid": device.wifi_bssid,
+            "rssi": device.wifi_rssi,
+            "channel": device.wifi_channel,
+            "updated_at": device.wifi_updated_at,
         },
     }
 

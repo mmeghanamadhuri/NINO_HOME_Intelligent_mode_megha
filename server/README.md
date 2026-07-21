@@ -406,15 +406,24 @@ See [../docs/ALARM.md](../docs/ALARM.md).
 ## Weather
 
 Weather is looked up by the robot's explicit latitude and longitude. The server
-does not infer physical position from a LAN IP address. The ESP may report a GPS
-fix, or you can add `latitude` and `longitude` to its entry in `data/devices.json`
-for a fixed installation.
+does not infer physical position from a LAN IP address or Wi-Fi name. The
+firmware reports its connected SSID, BSSID, signal level, and channel after it
+connects; the server persists this as the device's last known Wi-Fi network.
+This identifies the installation/network, but it does not produce coordinates.
+
+For a fixed installation, add `latitude` and `longitude` to the device's entry
+in `data/devices.json` (or send a GPS/location fix once). The saved coordinates
+are then used automatically for weather requests on that device.
 
 ```bash
 curl -X POST http://<SERVER_IP>:8000/api/devices/nino-home/location \
   -H 'Content-Type: application/json' \
   -H 'X-Nino-Location-Token: <optional NINO_LOCATION_TOKEN value>' \
   -d '{"latitude": 51.5072, "longitude": -0.1276}'
+
+curl -X POST http://<SERVER_IP>:8000/api/devices/nino-home/network \
+  -H 'Content-Type: application/json' \
+  -d '{"ssid":"NiNO Home","bssid":"AA:BB:CC:DD:EE:FF","rssi":-54,"channel":6}'
 
 curl 'http://<SERVER_IP>:8000/api/weather?device_id=nino-home'
 ```
@@ -441,6 +450,7 @@ device's location and return a direct current-conditions reply.
 | POST | `/api/retrain` | Re-encode all stored crops |
 | POST | `/api/camera` | Switch camera source JSON body |
 | POST | `/api/devices/{device_id}/location` | Store a device GPS/location fix |
+| POST | `/api/devices/{device_id}/network` | Store a device's connected Wi-Fi identity |
 | POST | `/api/alarms/{id}/ack` | Medical alarm confirmation |
 | DELETE | `/api/alarms` | Cancel all |
 | DELETE | `/api/alarms/{id}` | Cancel one |
