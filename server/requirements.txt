@@ -24,7 +24,9 @@ pillow
 faster-whisper>=1.1.0
 
 # --- TTS ---
-# Windows: pyttsx3 (SAPI). Linux: also install system espeak-ng for local TTS.
+# Neural local fallback: Piper. Linux: also install system espeak-ng as last fallback.
+piper-tts>=1.3.0
+# Windows: pyttsx3 (SAPI).
 pyttsx3>=2.90
 
 # --- PostgreSQL memory (optional; set DATABASE_URL) ---

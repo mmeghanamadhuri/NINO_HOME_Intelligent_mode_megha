@@ -156,11 +156,33 @@ voice wake on
 | -------- | ------- | ------- |
 | `ESP_PLAY_WAV_URL` | derived from `CAMERA_SOURCE` | ESP `POST /play_wav` endpoint |
 | `ESP_MAX_PLAY_WAV_BYTES` | `389120` | Max WAV size (~384 KiB firmware limit) |
-| `TTS_PROVIDER` | auto | `elevenlabs`, `sapi`, or `local` (espeak) |
+| `TTS_PROVIDER` | auto | `elevenlabs`, `piper`, `sapi`, or `local` (espeak) |
+| `PIPER_MODEL_PATH` | `server/models/en_GB-southern_english_female-low.onnx` | Piper female British voice model; auto fallback after ElevenLabs |
+| `PIPER_PRELOAD` | `1` | Load the Piper fallback at startup to avoid model-load latency on failure |
 | `LOCAL_TTS_RATE` | derived | espeak rate tweak (see `tts_service.py`) |
 | `VOICE_WS_URL` | — | Full WebSocket URL pushed to ESP on `prompt_ack` |
 | `NINO_SERVER_LAN_HOST` | auto-detect | PC LAN IP when building `VOICE_WS_URL` |
 | `NINO_SERVER_PORT` | `8000` | Port in auto-built `VOICE_WS_URL` |
+
+### Piper local TTS fallback
+
+Piper is used automatically after an ElevenLabs TTS failure when its Python runtime
+and voice model are available. The server preloads it by default so fallback requests
+do not pay the model-load cost. The included configuration expects the female British
+`en_GB-southern_english_female-low` voice:
+
+```bash
+python -m pip install --user --break-system-packages piper-tts
+mkdir -p models
+curl -L -o models/en_GB-southern_english_female-low.onnx \
+  https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/southern_english_female/low/en_GB-southern_english_female-low.onnx
+curl -L -o models/en_GB-southern_english_female-low.onnx.json \
+  https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/southern_english_female/low/en_GB-southern_english_female-low.onnx.json
+```
+
+Set `TTS_PROVIDER=elevenlabs` and `ELEVENLABS_TTS_MODEL=eleven_flash_v2_5` for a
+low-latency cloud primary with Piper fallback. Set `TTS_PROVIDER=piper` to use
+Piper as the primary provider, or `PIPER_MODEL_PATH` to use a different `.onnx` voice.
 
 ### Face registration variables
 

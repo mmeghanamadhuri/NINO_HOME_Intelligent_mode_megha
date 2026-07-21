@@ -13,6 +13,7 @@ import urllib.error
 import urllib.request
 import wave
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 import requests
@@ -64,13 +65,24 @@ def _clamp_spoken_words(
 
 
 DEFAULT_ELEVENLABS_TTS_VOICE_ID = "f1K8uOKtx0TAmtXBiLqx"
-DEFAULT_ELEVENLABS_TTS_MODEL = "eleven_multilingual_v2"
+DEFAULT_ELEVENLABS_TTS_MODEL = "eleven_flash_v2_5"
 DEFAULT_ELEVENLABS_TTS_OUTPUT_FORMAT = "pcm_16000"
 DEFAULT_ELEVENLABS_TTS_SAMPLE_RATE_HZ = 16000
+DEFAULT_PIPER_MODEL_PATH = (
+    Path(__file__).resolve().parent
+    / "models"
+    / "en_GB-southern_english_female-low.onnx"
+)
 
 _ESPEAK_LOCK = threading.Lock()
 _ESPEAK_READY = False
 _ESPEAK_SAMPLE_RATE_HZ = 22050
+_PIPER_LOCK = threading.RLock()
+_PIPER_VOICE: Any | None = None
+_PIPER_VOICE_MODEL_PATH: Path | None = None
+_SYNTHESIS_INFO = threading.local()
+_ELEVENLABS_FALLBACK_LOCK = threading.Lock()
+_ELEVENLABS_FALLBACK_UNTIL = 0.0
 # espeak-ng female variants (+f3 = soft British female). Use short names; gmw/en-gb+f3 fails.
 _PREFERRED_ESPEAK_VOICES = (
     "en+f3",
@@ -99,15 +111,161 @@ def _elevenlabs_api_key() -> str:
     return os.environ.get("ELEVENLABS_API_KEY", "").strip()
 
 
+def _elevenlabs_fallback_cooldown_seconds() -> float:
+    raw = os.environ.get("ELEVENLABS_TTS_FALLBACK_COOLDOWN_SECONDS", "60").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid ELEVENLABS_TTS_FALLBACK_COOLDOWN_SECONDS %r; using 60 seconds.",
+            raw,
+        )
+        return 60.0
+
+
+def _elevenlabs_fallback_active() -> bool:
+    with _ELEVENLABS_FALLBACK_LOCK:
+        return time.monotonic() < _ELEVENLABS_FALLBACK_UNTIL
+
+
+def _mark_elevenlabs_unavailable() -> None:
+    global _ELEVENLABS_FALLBACK_UNTIL
+
+    cooldown = _elevenlabs_fallback_cooldown_seconds()
+    with _ELEVENLABS_FALLBACK_LOCK:
+        _ELEVENLABS_FALLBACK_UNTIL = time.monotonic() + cooldown
+
+
 def _tts_provider() -> str:
     provider = os.environ.get("TTS_PROVIDER", "").strip().lower()
-    if provider in {"elevenlabs", "sapi", "local"}:
+    if provider in {"elevenlabs", "piper", "sapi", "local"}:
         return provider
     if _elevenlabs_api_key():
         return "elevenlabs"
+    if _piper_available():
+        return "piper"
     if _use_windows_sapi():
         return "sapi"
     return "local"
+
+
+def _piper_model_path() -> Path:
+    configured = os.environ.get("PIPER_MODEL_PATH", "").strip()
+    return Path(configured).expanduser() if configured else DEFAULT_PIPER_MODEL_PATH
+
+
+def _piper_available() -> bool:
+    model_path = _piper_model_path()
+    if not model_path.is_file() or not Path(f"{model_path}.json").is_file():
+        return False
+    try:
+        from piper import PiperVoice  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _load_piper_voice() -> Any:
+    """Return the cached Piper model, loading it once per configured voice."""
+    global _PIPER_VOICE, _PIPER_VOICE_MODEL_PATH
+
+    model_path = _piper_model_path().resolve()
+    config_path = Path(f"{model_path}.json")
+    if not model_path.is_file() or not config_path.is_file():
+        raise RuntimeError(
+            f"Piper voice model or config is missing: {model_path} (.onnx and .onnx.json required)."
+        )
+
+    with _PIPER_LOCK:
+        if _PIPER_VOICE is not None and _PIPER_VOICE_MODEL_PATH == model_path:
+            return _PIPER_VOICE
+        try:
+            from piper import PiperVoice
+        except ImportError as exc:
+            raise RuntimeError("Piper Python package is not installed.") from exc
+        logger.info("Loading Piper voice model: %s", model_path)
+        _PIPER_VOICE = PiperVoice.load(model_path, config_path)
+        _PIPER_VOICE_MODEL_PATH = model_path
+        return _PIPER_VOICE
+
+
+def preload_piper_voice() -> bool:
+    """Warm the local Piper fallback without changing the active TTS provider."""
+    enabled = os.environ.get("PIPER_PRELOAD", "1").strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
+        logger.info("Piper preload disabled by PIPER_PRELOAD.")
+        return False
+    if not _piper_available():
+        logger.warning("Piper fallback is unavailable; skipping preload.")
+        return False
+    try:
+        _load_piper_voice()
+        logger.info("Piper fallback preloaded: %s", _piper_model_path().stem)
+        return True
+    except Exception as exc:
+        logger.warning("Piper fallback preload failed: %s", exc)
+        return False
+
+
+def _set_tts_synthesis_info(provider: str, voice: str) -> None:
+    _SYNTHESIS_INFO.value = {"provider": provider, "voice": voice}
+
+
+def last_tts_synthesis_info() -> dict[str, str]:
+    """Provider and voice used by the current thread's latest synthesis."""
+    info = getattr(_SYNTHESIS_INFO, "value", {})
+    return {
+        "provider": str(info.get("provider", "")),
+        "voice": str(info.get("voice", "")),
+    }
+
+
+def _synthesize_piper_wav_bytes(
+    text: str, rate: int = 135, volume: float = 0.75
+) -> tuple[bytes, str]:
+    """Piper local neural TTS → WAV bytes using an in-memory model."""
+    del rate
+    model_path = _piper_model_path()
+    clean = _normalize_tts_text(text).strip()
+    if not clean:
+        raise RuntimeError("TTS text is empty.")
+
+    try:
+        from piper import SynthesisConfig
+    except ImportError as exc:
+        raise RuntimeError("Piper Python package is not installed.") from exc
+
+    voice = _load_piper_voice()
+    output = io.BytesIO()
+    with _PIPER_LOCK:
+        with wave.open(output, "wb") as wav_file:
+            voice.synthesize_wav(
+                clean,
+                wav_file,
+                SynthesisConfig(volume=max(0.0, min(1.0, volume))),
+            )
+    wav = output.getvalue()
+    if not wav:
+        raise RuntimeError("Piper produced no audio.")
+    return wav, model_path.stem
+
+
+def _synthesize_local_fallback_wav_bytes(
+    text: str, rate: int, volume: float
+) -> tuple[bytes, str, str]:
+    """Use the warm Piper fallback, then the platform's system TTS."""
+    try:
+        wav, voice = _synthesize_piper_wav_bytes(text, rate=rate, volume=volume)
+        return wav, voice, "piper"
+    except Exception as piper_exc:
+        logger.warning("Piper TTS fallback failed (%s); using system TTS.", piper_exc)
+    if _use_windows_sapi():
+        wav, voice = _synthesize_windows_sapi_wav_bytes(
+            text, rate=rate, volume=volume
+        )
+        return wav, voice, "sapi"
+    wav, voice = _synthesize_espeak_wav_bytes(text, rate=rate, volume=volume)
+    return wav, voice, "local"
 
 
 def _elevenlabs_voice_settings() -> dict[str, Any]:
@@ -385,28 +543,75 @@ $s.Dispose()
 def synthesize_sapi_wav_bytes(
     text: str, rate: int = 135, volume: float = 0.75
 ) -> tuple[bytes, str]:
-    """Synthesize speech to WAV bytes. Default: ElevenLabs when API key is set."""
+    """Synthesize speech to WAV bytes with Piper/espeak as offline fallbacks."""
+    _set_tts_synthesis_info("", "")
     provider = _tts_provider()
     if provider == "elevenlabs":
+        if _elevenlabs_fallback_active():
+            logger.info("ElevenLabs TTS fallback cooldown active; using local fallback.")
+            wav, voice, used_provider = _synthesize_local_fallback_wav_bytes(
+                text, rate, volume
+            )
+            _set_tts_synthesis_info(used_provider, voice)
+            return wav, voice
         try:
-            return _synthesize_elevenlabs_wav_bytes(text, rate=rate, volume=volume)
+            wav, voice = _synthesize_elevenlabs_wav_bytes(
+                text, rate=rate, volume=volume
+            )
+            _set_tts_synthesis_info("elevenlabs", voice)
+            return wav, voice
         except Exception as exc:
-            logger.warning("ElevenLabs TTS failed (%s); falling back to local TTS.", exc)
+            _mark_elevenlabs_unavailable()
+            logger.warning("ElevenLabs TTS failed (%s); falling back to Piper/local TTS.", exc)
+            wav, voice, used_provider = _synthesize_local_fallback_wav_bytes(
+                text, rate, volume
+            )
+            _set_tts_synthesis_info(used_provider, voice)
+            return wav, voice
+    if provider == "piper":
+        try:
+            wav, voice = _synthesize_piper_wav_bytes(
+                text, rate=rate, volume=volume
+            )
+            _set_tts_synthesis_info("piper", voice)
+            return wav, voice
+        except Exception as exc:
+            logger.warning("Piper TTS failed (%s); falling back to system TTS.", exc)
             if _use_windows_sapi():
-                return _synthesize_windows_sapi_wav_bytes(
+                wav, voice = _synthesize_windows_sapi_wav_bytes(
                     text, rate=rate, volume=volume
                 )
-            return _synthesize_espeak_wav_bytes(text, rate=rate, volume=volume)
+                _set_tts_synthesis_info("sapi", voice)
+                return wav, voice
+            wav, voice = _synthesize_espeak_wav_bytes(text, rate=rate, volume=volume)
+            _set_tts_synthesis_info("local", voice)
+            return wav, voice
     if provider == "sapi":
-        return _synthesize_windows_sapi_wav_bytes(text, rate=rate, volume=volume)
-    return _synthesize_espeak_wav_bytes(text, rate=rate, volume=volume)
+        wav, voice = _synthesize_windows_sapi_wav_bytes(
+            text, rate=rate, volume=volume
+        )
+        _set_tts_synthesis_info("sapi", voice)
+        return wav, voice
+    wav, voice = _synthesize_espeak_wav_bytes(text, rate=rate, volume=volume)
+    _set_tts_synthesis_info("local", voice)
+    return wav, voice
 
 
 def tts_status() -> dict[str, Any]:
     provider = _tts_provider()
+    model_path = _piper_model_path().resolve()
+    with _PIPER_LOCK:
+        piper_preloaded = (
+            _PIPER_VOICE is not None and _PIPER_VOICE_MODEL_PATH == model_path
+        )
     out: dict[str, Any] = {
         "provider": provider,
         "elevenlabs_configured": bool(_elevenlabs_api_key()),
+        "elevenlabs_fallback_active": _elevenlabs_fallback_active(),
+        "elevenlabs_fallback_cooldown_seconds": _elevenlabs_fallback_cooldown_seconds(),
+        "piper_available": _piper_available(),
+        "piper_model_path": str(model_path),
+        "piper_preloaded": piper_preloaded,
     }
     if provider == "elevenlabs":
         out.update(
@@ -424,6 +629,8 @@ def tts_status() -> dict[str, Any]:
                 "voice_settings": _elevenlabs_voice_settings(),
             }
         )
+    elif provider == "piper":
+        out["piper_voice"] = _piper_model_path().stem
     else:
         out.update(
             {
@@ -452,7 +659,7 @@ class TTSService:
         face_hold_seconds: float = 5.0,
         face_greeting_interval_seconds: float = 600.0,
         rate: int = 135,
-        volume: float = 0.75,
+        volume: float = 0.80,
         ollama_url: str = "",
         ollama_model: str = "",
     ) -> None:

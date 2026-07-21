@@ -38,7 +38,11 @@ from memory_service import configure_from_environ as configure_memory_from_envir
 from memory_service import get_memory_service, normalize_database_url
 from esp_playback import ensure_esp_play_wav_url_configured, esp_play_wav_url
 from emotion_service import EmotionService
-from tts_service import TTSService, synthesize_sapi_wav_bytes
+from tts_service import (
+    TTSService,
+    preload_piper_voice,
+    synthesize_sapi_wav_bytes,
+)
 from vision_eye_driver import VisionEyeDriver
 
 logger = logging.getLogger(__name__)
@@ -221,6 +225,7 @@ def startup() -> None:
     faces.apply_settings_from_environ()
     face_registration.apply_settings_from_environ()
     configure_memory_from_environ()
+    preload_piper_voice()
     get_memory_service().startup()
     get_alarm_service().start()
     ensure_esp_play_wav_url_configured()
@@ -1177,8 +1182,11 @@ def main() -> None:
     parser.add_argument(
         "--tts-provider",
         default=os.environ.get("TTS_PROVIDER", ""),
-        choices=["", "elevenlabs", "sapi", "local"],
-        help="TTS engine: elevenlabs (cloud, default when API key set), sapi (Windows), or local (espeak-ng)",
+        choices=["", "elevenlabs", "piper", "sapi", "local"],
+        help=(
+            "TTS engine: elevenlabs (cloud, default when API key set), "
+            "piper (local neural), sapi (Windows), or local (espeak-ng)."
+        ),
     )
     parser.add_argument(
         "--face-greeting-interval",

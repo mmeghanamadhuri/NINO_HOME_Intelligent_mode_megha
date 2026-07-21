@@ -33,7 +33,7 @@ from llm_service import (
 )
 from memory_filters import is_likely_tts_echo, is_unintelligible_stt
 from eye_expression import infer_eye_expression_for_response
-from tts_service import synthesize_sapi_wav_bytes
+from tts_service import last_tts_synthesis_info, synthesize_sapi_wav_bytes
 from wav_resample import resample_wav_bytes_to_mono_16bit
 
 # Voice assistant path uses 16 kHz on device (ESP-SR WakeNet + VAD); face TTS stays 22050 in tts_service.
@@ -616,6 +616,7 @@ def process_voice_wav(
         reply = volume_reply
         t_reply = time.perf_counter()
         wav, _voice = synthesize_sapi_wav_bytes(reply)
+        tts_info = last_tts_synthesis_info()
         wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
         t_tts = time.perf_counter()
 
@@ -630,6 +631,8 @@ def process_voice_wav(
             "audio_out_seconds": round(audio_out_seconds, 2),
             "audio_out_bytes": len(wav_out),
             "stt_engine": stt_engine,
+            "tts_provider": tts_info["provider"],
+            "tts_voice": tts_info["voice"],
             "stt_seconds": round(t_stt - t_start, 3),
             "reply_seconds": round(t_reply - t_stt, 3),
             "tts_seconds": round(t_tts - t_reply, 3),
@@ -664,6 +667,7 @@ def process_voice_wav(
         reply = "Sorry, I didn't catch that. Could you say that again?"
         t_reply = time.perf_counter()
         wav, _voice = synthesize_sapi_wav_bytes(reply)
+        tts_info = last_tts_synthesis_info()
         wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
         t_tts = time.perf_counter()
         audio_in_seconds = max(0, len(wav_bytes) - 44) / (16000 * 2)
@@ -677,6 +681,8 @@ def process_voice_wav(
             "audio_out_seconds": round(audio_out_seconds, 2),
             "audio_out_bytes": len(wav_out),
             "stt_engine": stt_engine,
+            "tts_provider": tts_info["provider"],
+            "tts_voice": tts_info["voice"],
             "stt_seconds": round(t_stt - t_start, 3),
             "reply_seconds": round(t_reply - t_stt, 3),
             "tts_seconds": round(t_tts - t_reply, 3),
@@ -954,6 +960,7 @@ def process_voice_wav(
     )
 
     wav, _voice = synthesize_sapi_wav_bytes(reply)
+    tts_info = last_tts_synthesis_info()
     wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
     t_tts = time.perf_counter()
 
@@ -969,6 +976,8 @@ def process_voice_wav(
         "audio_out_seconds": round(audio_out_seconds, 2),
         "audio_out_bytes": len(wav_out),
         "stt_engine": stt_engine,
+        "tts_provider": tts_info["provider"],
+        "tts_voice": tts_info["voice"],
         "stt_seconds": round(t_stt - t_start, 3),
         "memory_seconds": round(t_memory - t_stt, 3),
         "reply_seconds": round(t_reply - t_memory, 3),

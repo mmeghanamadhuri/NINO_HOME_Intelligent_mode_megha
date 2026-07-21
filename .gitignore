@@ -85,6 +85,7 @@ server/.env
 server.zip
 *.safetensors
 server/emotion-aws-local/drgm_convnextv2l_fer7/
+server/models/
 
 server/data/faces/**/*.jpg
 

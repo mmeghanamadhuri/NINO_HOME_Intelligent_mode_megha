@@ -1,12 +1,20 @@
 {
   "devices": [
     {
-      "device_id": "nino-000000",
+      "device_id": "nino-home",
       "display_name": "NINO - HOME",
-      "camera_url": "http://192.168.0.95/stream",
-      "play_wav_url": "http://192.168.0.95/play_wav",
-      "base_url": "http://192.168.0.95",
+      "camera_url": "http://192.168.0.91/stream",
+      "play_wav_url": "http://192.168.0.91/play_wav",
+      "base_url": "http://192.168.0.91",
       "camera_rotation": "cw90"
+    },
+    {
+      "device_id": "nino-home-2",
+      "display_name": "NINO - HOME - 2",
+      "camera_url": "http://192.168.0.211/stream",
+      "play_wav_url": "http://192.168.0.211/play_wav",
+      "base_url": "http://192.168.0.211",
+      "camera_rotation": "none"
     }
   ]
 }
