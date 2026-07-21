@@ -17,6 +17,7 @@ FastAPI server for the NiNO ESP32-P4 demo. It pulls camera frames from the board
 - [Startup summary greeting](#startup-summary-greeting)
 - [ESP TTS chunking](#esp-tts-chunking)
 - [Alarms](#alarms)
+- [Weather](#weather)
 - [HTTP & WebSocket API](#http--websocket-api)
 - [Data files](#data-files)
 - [Tests](#tests)
@@ -163,6 +164,7 @@ voice wake on
 | `VOICE_WS_URL` | — | Full WebSocket URL pushed to ESP on `prompt_ack` |
 | `NINO_SERVER_LAN_HOST` | auto-detect | PC LAN IP when building `VOICE_WS_URL` |
 | `NINO_SERVER_PORT` | `8000` | Port in auto-built `VOICE_WS_URL` |
+| `NINO_LOCATION_TOKEN` | — | Optional shared token required in `X-Nino-Location-Token` for location updates |
 
 ### Piper local TTS fallback
 
@@ -401,6 +403,28 @@ See [../docs/ALARM.md](../docs/ALARM.md).
 
 ---
 
+## Weather
+
+Weather is looked up by the robot's explicit latitude and longitude. The server
+does not infer physical position from a LAN IP address. The ESP may report a GPS
+fix, or you can add `latitude` and `longitude` to its entry in `data/devices.json`
+for a fixed installation.
+
+```bash
+curl -X POST http://<SERVER_IP>:8000/api/devices/nino-home/location \
+  -H 'Content-Type: application/json' \
+  -H 'X-Nino-Location-Token: <optional NINO_LOCATION_TOKEN value>' \
+  -d '{"latitude": 51.5072, "longitude": -0.1276}'
+
+curl 'http://<SERVER_IP>:8000/api/weather?device_id=nino-home'
+```
+
+The server uses Open-Meteo current conditions and caches a coordinate's result
+for 10 minutes. Voice requests such as “what is the weather?” use the speaking
+device's location and return a direct current-conditions reply.
+
+---
+
 ## HTTP & WebSocket API
 
 | Method | Path | Description |
@@ -410,11 +434,13 @@ See [../docs/ALARM.md](../docs/ALARM.md).
 | GET | `/snapshot.jpg` | Latest annotated JPEG |
 | GET | `/api/status` | Full system status |
 | GET | `/api/latency-log?limit=N` | Voice timing events |
+| GET | `/api/weather?device_id=…` | Cached current weather for device location |
 | GET | `/api/memory/stats` | DB row counts |
 | GET | `/api/alarms` | Alarm list + scheduler state |
 | POST | `/api/register` | Register face samples |
 | POST | `/api/retrain` | Re-encode all stored crops |
 | POST | `/api/camera` | Switch camera source JSON body |
+| POST | `/api/devices/{device_id}/location` | Store a device GPS/location fix |
 | POST | `/api/alarms/{id}/ack` | Medical alarm confirmation |
 | DELETE | `/api/alarms` | Cancel all |
 | DELETE | `/api/alarms/{id}` | Cancel one |
@@ -469,6 +495,7 @@ python -m unittest discover -v -p 'test_*.py'
 | `test_face_registration.py` | Name parsing, unknown-face prompt, no-speech retry |
 | `test_llm_memory_turn.py` | Memory prompt assembly |
 | `test_volume_command.py` | Volume voice command |
+| `test_weather_service.py` | Weather lookup/cache and voice routing |
 
 ---
 

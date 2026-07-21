@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -14,7 +15,7 @@ from typing import Literal
 os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
 
 import cv2
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
@@ -44,6 +45,11 @@ from tts_service import (
     synthesize_sapi_wav_bytes,
 )
 from vision_eye_driver import VisionEyeDriver
+from weather_service import (
+    DeviceLocationUnavailableError,
+    WeatherUnavailableError,
+    get_weather_service,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -217,6 +223,11 @@ class AlarmAckRequest(BaseModel):
 
 class DeviceSelectRequest(BaseModel):
     device_id: str = Field(..., min_length=1, max_length=64)
+
+
+class DeviceLocationRequest(BaseModel):
+    latitude: float = Field(..., ge=-90, le=90)
+    longitude: float = Field(..., ge=-180, le=180)
 
 
 @app.on_event("startup")
@@ -407,6 +418,67 @@ def discover_devices() -> dict:
         "found": [device.device_id for device in devices],
         **registry.status(),
         "discovery": discovery_status(),
+    }
+
+
+@app.post("/api/devices/{device_id}/location")
+def update_device_location(
+    device_id: str,
+    req: DeviceLocationRequest,
+    x_nino_location_token: str | None = Header(default=None),
+) -> dict:
+    """Record the latest GPS/location fix reported by a registered device."""
+    expected_token = os.environ.get("NINO_LOCATION_TOKEN", "").strip()
+    if expected_token and not hmac.compare_digest(
+        x_nino_location_token or "", expected_token
+    ):
+        raise HTTPException(status_code=401, detail="Invalid device location token")
+    if registry.get(device_id) is None:
+        raise HTTPException(status_code=404, detail="Unknown device_id")
+    try:
+        device = registry.set_location(
+            device_id, latitude=req.latitude, longitude=req.longitude
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "device_id": device.device_id,
+        "location": {
+            "latitude": device.latitude,
+            "longitude": device.longitude,
+            "updated_at": device.location_updated_at,
+        },
+    }
+
+
+@app.get("/api/weather")
+def current_weather(device_id: str | None = None) -> dict:
+    """Return cached current conditions for the named device's location."""
+    device = registry.resolve_or_default(device_id)
+    try:
+        weather = get_weather_service().current_for_device(device)
+    except DeviceLocationUnavailableError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "No location is configured for this device. "
+                "POST its latitude and longitude to /api/devices/{device_id}/location."
+            ),
+        ) from exc
+    except WeatherUnavailableError as exc:
+        raise HTTPException(
+            status_code=503, detail="Current weather is temporarily unavailable"
+        ) from exc
+    return {
+        "ok": True,
+        "device_id": device.device_id,
+        "location": {
+            "latitude": device.latitude,
+            "longitude": device.longitude,
+            "updated_at": device.location_updated_at,
+        },
+        "weather": weather,
     }
 
 

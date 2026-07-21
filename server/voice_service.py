@@ -69,6 +69,12 @@ _LOCAL_TIME_QUESTION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_WEATHER_QUESTION_PATTERN = re.compile(
+    r"\b(?:weather|forecast|temperature outside|will it rain|is it raining|"
+    r"rain(?:ing)? outside|wind(?:y)? outside|outside conditions)\b",
+    re.IGNORECASE,
+)
+
 _SERVO_360_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p, re.IGNORECASE)
     for p in (
@@ -284,6 +290,10 @@ def is_identity_question(user_text: str) -> bool:
 
 def is_local_time_question(user_text: str) -> bool:
     return bool(_LOCAL_TIME_QUESTION_PATTERN.search(user_text.strip()))
+
+
+def is_weather_question(user_text: str) -> bool:
+    return bool(_WEATHER_QUESTION_PATTERN.search(user_text.strip()))
 
 
 def local_server_time_reply() -> str:
@@ -740,6 +750,34 @@ def process_voice_wav(
         reply_path = "local_time"
         reply = local_server_time_reply()
         logger.info("Voice local-time query | heard: %s", user_text[:120])
+
+    if reply_path == "llm" and is_weather_question(user_text):
+        from device_registry import get_device_registry
+        from weather_service import (
+            DeviceLocationUnavailableError,
+            WeatherUnavailableError,
+            get_weather_service,
+            weather_voice_reply,
+        )
+
+        reply_path = "weather"
+        device = get_device_registry().resolve_or_default(device_id or None)
+        try:
+            reply = weather_voice_reply(
+                device, get_weather_service().current_for_device(device)
+            )
+            logger.info(
+                "Voice weather query | device=%s heard: %s",
+                device.device_id,
+                user_text[:120],
+            )
+        except DeviceLocationUnavailableError:
+            reply = (
+                f"I do not have a location configured for {device.display_name or device.device_id}. "
+                "Please set its location first."
+            )
+        except WeatherUnavailableError:
+            reply = "I cannot retrieve the current weather right now. Please try again soon."
 
     if reply_path == "llm":
         alarm_result = handle_alarm_voice(

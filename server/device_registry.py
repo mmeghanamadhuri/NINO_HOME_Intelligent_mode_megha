@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import urllib.parse
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,9 @@ class DeviceRecord:
     play_wav_url: str = ""
     base_url: str = ""
     camera_rotation: str = "none"
+    latitude: float | None = None
+    longitude: float | None = None
+    location_updated_at: str = ""
 
     def effective_base_url(self) -> str:
         if self.base_url.strip():
@@ -137,6 +142,11 @@ class DeviceRegistry:
                     camera_rotation=(
                         existing.camera_rotation if existing else "none"
                     ),
+                    latitude=existing.latitude if existing else None,
+                    longitude=existing.longitude if existing else None,
+                    location_updated_at=(
+                        existing.location_updated_at if existing else ""
+                    ),
                 )
                 if existing != record:
                     merged[device_id] = record
@@ -166,9 +176,46 @@ class DeviceRegistry:
                 play_wav_url=existing.play_wav_url,
                 base_url=existing.base_url,
                 camera_rotation=rotation,
+                latitude=existing.latitude,
+                longitude=existing.longitude,
+                location_updated_at=existing.location_updated_at,
             )
             if existing == record:
                 return record
+            updated = dict(self._devices)
+            updated[key] = record
+            self._write_devices_locked(updated.values())
+            self._devices = updated
+            self._persisted_device_ids = set(updated)
+            return record
+
+    def set_location(
+        self, device_id: str, *, latitude: float, longitude: float
+    ) -> DeviceRecord:
+        """Persist a GPS/location fix supplied by a known device."""
+        if not -90.0 <= latitude <= 90.0:
+            raise ValueError("Latitude must be between -90 and 90")
+        if not -180.0 <= longitude <= 180.0:
+            raise ValueError("Longitude must be between -180 and 180")
+        if not math.isfinite(latitude) or not math.isfinite(longitude):
+            raise ValueError("Location coordinates must be finite numbers")
+
+        key = (device_id or "").strip()
+        with self._lock:
+            existing = self._devices.get(key)
+            if existing is None:
+                raise KeyError(key)
+            record = DeviceRecord(
+                device_id=existing.device_id,
+                display_name=existing.display_name,
+                camera_url=existing.camera_url,
+                play_wav_url=existing.play_wav_url,
+                base_url=existing.base_url,
+                camera_rotation=existing.camera_rotation,
+                latitude=latitude,
+                longitude=longitude,
+                location_updated_at=datetime.now(timezone.utc).isoformat(),
+            )
             updated = dict(self._devices)
             updated[key] = record
             self._write_devices_locked(updated.values())
@@ -188,6 +235,9 @@ class DeviceRegistry:
                     "play_wav_url": d.play_wav_url,
                     "base_url": d.base_url,
                     "camera_rotation": d.camera_rotation,
+                    "latitude": d.latitude,
+                    "longitude": d.longitude,
+                    "location_updated_at": d.location_updated_at,
                 }
                 for d in records
             ]
@@ -226,6 +276,11 @@ class DeviceRegistry:
                         item.get("camera_rotation") or "none"
                     ).strip()
                     or "none",
+                    latitude=_parse_coordinate(item.get("latitude"), -90.0, 90.0),
+                    longitude=_parse_coordinate(item.get("longitude"), -180.0, 180.0),
+                    location_updated_at=str(
+                        item.get("location_updated_at") or ""
+                    ).strip(),
                 )
             )
         return out
@@ -254,6 +309,8 @@ class DeviceRegistry:
                 play_wav_url=play,
                 base_url=base,
                 camera_rotation="none",
+                latitude=None,
+                longitude=None,
             )
         ]
 
@@ -319,6 +376,9 @@ class DeviceRegistry:
                         "play_wav_url": d.effective_play_wav_url(),
                         "base_url": d.effective_base_url(),
                         "camera_rotation": d.camera_rotation,
+                        "latitude": d.latitude,
+                        "longitude": d.longitude,
+                        "location_updated_at": d.location_updated_at,
                     }
                     for d in self._devices.values()
                 ],
@@ -342,3 +402,14 @@ def resolve_device_id(raw: str | None) -> str:
     if not cleaned:
         return reg.default_device_id()
     return reg.resolve_or_default(cleaned).device_id
+
+
+def _parse_coordinate(value: object, minimum: float, maximum: float) -> float | None:
+    """Read an optional finite coordinate from manually edited device JSON."""
+    try:
+        coordinate = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(coordinate) or not minimum <= coordinate <= maximum:
+        return None
+    return coordinate
