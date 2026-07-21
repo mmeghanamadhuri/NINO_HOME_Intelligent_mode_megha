@@ -19,6 +19,12 @@ void nino_servo_dxl_go_neutral(void);
 /** Queue pan (ID 2) and tilt (ID 1) goal positions (0–1023). */
 void nino_servo_dxl_set_pan_tilt(int pan_goal, int tilt_goal);
 
+/**
+ * Set joint-mode moving speed for both servos (1–1023).
+ * The value is sent before the next queued goal positions.
+ */
+void nino_servo_dxl_set_position_speed(int speed);
+
 /** Queue a single servo goal by Dynamixel ID (1 or 2). */
 void nino_servo_dxl_set_servo_goal(uint8_t id, int goal);
 

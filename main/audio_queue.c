@@ -385,7 +385,9 @@ void nino_audio_queue_preempt_for_wake(void) {
     return;
   }
   s_stop_requested = true;
-  const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(600);
+  /* A wake acknowledgement must not feel delayed. Normal playback checks the
+   * stop flag between DMA writes, so a brief hand-off is sufficient here. */
+  const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(150);
   while (s_normal_playing && xTaskGetTickCount() < deadline) {
     vTaskDelay(pdMS_TO_TICKS(10));
   }

@@ -31,41 +31,21 @@ static const char *TAG = "voice_wake";
 #define WAKE_IDLE_DELAY_MS 50
 #define WAKE_FETCH_DELAY_MS 12
 #define WAKE_FETCH_FAIL_DELAY_MS 25
+#define WAKE_NET_THRESHOLD 0.50f
 
 static afe_config_t *configure_wake_afe(srmodel_list_t *models) {
   afe_config_t *afe_cfg = afe_config_init("M", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
   if (afe_cfg == NULL) {
     return NULL;
   }
-  /* Both microphone paths provide 16 kHz mono. Keep WakeNet's light-weight
-   * configuration: the USB array handles beamforming and the ES8311 fallback
-   * is a single onboard ADC channel. */
+  /* The USB array provides already-beamformed 16 kHz mono input. WakeNet
+   * needs only its recognition path, not a second AEC/NS/AGC pipeline. */
   afe_cfg->aec_init = false;
   afe_cfg->se_init = false;
   afe_cfg->ns_init = false;
   afe_cfg->vad_init = false;
   afe_cfg->agc_init = false;
-  if (afe_cfg->afe_ringbuf_size > 8) {
-    afe_cfg->afe_ringbuf_size = 8;
-  }
-#if CONFIG_SPIRAM
-  afe_cfg->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
-#else
-  afe_cfg->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_INTERNAL;
-#endif
-  afe_cfg = afe_config_check(afe_cfg);
-  if (afe_cfg == NULL) {
-    return NULL;
-  }
-  afe_cfg->aec_init = false;
-  afe_cfg->se_init = false;
-  afe_cfg->ns_init = false;
-  afe_cfg->vad_init = false;
-  afe_cfg->agc_init = false;
-  if (afe_cfg->afe_ringbuf_size > 8) {
-    afe_cfg->afe_ringbuf_size = 8;
-  }
-  return afe_cfg;
+  return afe_config_check(afe_cfg);
 }
 
 #if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
@@ -88,13 +68,15 @@ static int64_t s_last_wake_us = 0;
 
 static void after_wake_task(void *arg) {
   (void)arg;
+  const int64_t chime_started_us = esp_timer_get_time();
+  ESP_LOGI(TAG, "Wake acknowledged — playing chime now");
   esp_err_t beep_e = nino_voice_play_wake_chime();
   if (beep_e != ESP_OK) {
     ESP_LOGW(TAG, "wake chime failed: %s", esp_err_to_name(beep_e));
   }
-  ESP_LOGI(TAG, "Hi ESP → VAD → server");
+  ESP_LOGI(TAG, "Chime finished in %" PRId64 " ms; VAD recording now",
+           (esp_timer_get_time() - chime_started_us) / 1000LL);
   nino_eye_listening();
-  nino_mic_flush();
   esp_err_t e = nino_voice_assist_run_query_only();
   if (e != ESP_OK) {
     ESP_LOGW(TAG, "voice query failed: %s", esp_err_to_name(e));
@@ -108,8 +90,8 @@ static void wake_feed_task(void *arg) {
   esp_afe_sr_data_t *afe_data = (esp_afe_sr_data_t *)arg;
   const int feed_chunksize = s_afe->get_feed_chunksize(afe_data);
   const int feed_nch = s_afe->get_feed_channel_num(afe_data);
-  const int sr = s_afe->get_samp_rate(afe_data);
-  const int ms_chunk = (feed_chunksize * 1000) / (sr > 0 ? sr : 16000);
+  const int sample_rate_hz = s_afe->get_samp_rate(afe_data);
+  const int frame_ms = (feed_chunksize * 1000) / (sample_rate_hz > 0 ? sample_rate_hz : 16000);
   const size_t feed_bytes = (size_t)feed_chunksize * (size_t)feed_nch * sizeof(int16_t);
 
   int16_t *buff = (int16_t *)malloc(feed_bytes);
@@ -119,31 +101,47 @@ static void wake_feed_task(void *arg) {
     return;
   }
 
-  ESP_LOGI(TAG, "wake feed: chunksize=%d nch=%d sr=%d; USB 4-mic preferred, ES8311 fallback",
-           feed_chunksize, feed_nch, sr);
+  ESP_LOGI(TAG, "wake feed (USB 4-mic): chunksize=%d nch=%d sr=%d", feed_chunksize, feed_nch,
+           sample_rate_hz);
 
+  bool flush_before_feed = true;
   while (true) {
     const bool armed = s_wake_enabled;
-    /* Only pause feed while VAD owns the mic. Keep feeding during beep/WS so
-     * WakeNet stays armed if the PC voice server is slow or unreachable. */
     const bool mic_exclusive = s_mic_capture_hold;
 
     if (!armed && !mic_exclusive) {
+      flush_before_feed = true;
       vTaskDelay(pdMS_TO_TICKS(WAKE_IDLE_DELAY_MS));
       continue;
     }
 
     if (mic_exclusive) {
-      vTaskDelay(pdMS_TO_TICKS(ms_chunk > 0 ? ms_chunk : 1));
+      /* VAD owns the same USB stream. Flush once when it returns so WakeNet
+       * restarts from live microphone frames, not the completed query. */
+      flush_before_feed = true;
+      vTaskDelay(pdMS_TO_TICKS(frame_ms > 0 ? frame_ms : 1));
       continue;
     }
 
+    const int64_t cycle_started_us = esp_timer_get_time();
+    if (flush_before_feed) {
+      nino_mic_flush();
+      flush_before_feed = false;
+    }
     if (nino_mic_read(buff, feed_chunksize) != ESP_OK) {
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
     }
     s_afe->feed(afe_data, buff);
-    vTaskDelay(pdMS_TO_TICKS(ms_chunk > 0 ? ms_chunk : 1));
+
+    /* nino_mic_read blocks when the USB stream is live. If it returned a
+     * queued frame immediately, only wait for the remaining frame time so
+     * AFE is not overfed and the old USB ring delay cannot build up. */
+    const int64_t elapsed_us = esp_timer_get_time() - cycle_started_us;
+    const int64_t remaining_us = (int64_t)frame_ms * 1000LL - elapsed_us;
+    if (remaining_us > 0) {
+      vTaskDelay(pdMS_TO_TICKS((uint32_t)((remaining_us + 999LL) / 1000LL)));
+    }
   }
 }
 
@@ -152,6 +150,13 @@ static void wake_fetch_task(void *arg) {
   ESP_LOGI(TAG, "wake fetch started — say \"Hi ESP\"");
 
   while (true) {
+    /* VAD owns the microphone during a query. Feed is paused in that state,
+     * so fetching only produces empty-AFE errors and consumes stale state. */
+    if (s_mic_capture_hold) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+
     if (!s_wake_enabled && !s_after_wake_busy && !s_mic_capture_hold) {
       vTaskDelay(pdMS_TO_TICKS(WAKE_IDLE_DELAY_MS));
       continue;
@@ -160,7 +165,7 @@ static void wake_fetch_task(void *arg) {
     afe_fetch_result_t *res = s_afe->fetch(afe_data);
     TickType_t yield = pdMS_TO_TICKS(WAKE_FETCH_DELAY_MS);
 
-    if (s_after_wake_busy || s_mic_capture_hold) {
+    if (s_after_wake_busy) {
       yield = pdMS_TO_TICKS(1);
     } else if (res == NULL || res->ret_value == ESP_FAIL) {
       yield = pdMS_TO_TICKS(WAKE_FETCH_FAIL_DELAY_MS);
@@ -200,7 +205,7 @@ extern "C" void nino_voice_wake_init(void) {
   }
 
   if (afe_config->wakenet_model_name != NULL) {
-    ESP_LOGI(TAG, "WakeNet model: %s (AFE: wake-only, no AEC/NS/AGC)", afe_config->wakenet_model_name);
+    ESP_LOGI(TAG, "WakeNet model: %s (USB 4-mic wake source)", afe_config->wakenet_model_name);
   }
 
   s_afe = esp_afe_handle_from_config(afe_config);
@@ -214,6 +219,15 @@ extern "C" void nino_voice_wake_init(void) {
     s_afe = NULL;
     return;
   }
+  if (s_afe->set_wakenet_threshold != NULL) {
+    const int threshold_result =
+        s_afe->set_wakenet_threshold(s_afe_data, 1, WAKE_NET_THRESHOLD);
+    if (threshold_result > 0) {
+      ESP_LOGI(TAG, "WakeNet USB threshold set to %.2f", (double)WAKE_NET_THRESHOLD);
+    } else {
+      ESP_LOGW(TAG, "Could not set WakeNet USB threshold (result=%d)", threshold_result);
+    }
+  }
 
   BaseType_t fetch_ok = xTaskCreatePinnedToCore(wake_fetch_task, "wake_fetch", 10240, s_afe_data, WAKE_TASK_PRIO,
                                                 NULL, WAKE_FETCH_CORE);
@@ -226,7 +240,7 @@ extern "C" void nino_voice_wake_init(void) {
   }
 
   s_wake_hw_ready = true;
-  ESP_LOGI(TAG, "Wake word ready (USB 4-mic preferred; ES8311 fallback) — say \"Hi ESP\"");
+  ESP_LOGI(TAG, "Wake word ready (USB 4-mic) — say \"Hi ESP\"");
 }
 
 extern "C" void nino_voice_wake_drop_mic_locked(void) {
@@ -234,6 +248,12 @@ extern "C" void nino_voice_wake_drop_mic_locked(void) {
 }
 
 extern "C" void nino_voice_wake_set_mic_capture_hold(bool hold) {
+  if (!hold && s_mic_capture_hold && s_afe != NULL && s_afe_data != NULL &&
+      s_afe->reset_buffer != NULL) {
+    /* Feed and fetch are still paused here. Clear partial wake-word frames
+     * from the completed VAD session before accepting the next "Hi ESP". */
+    (void)s_afe->reset_buffer(s_afe_data);
+  }
   s_mic_capture_hold = hold;
 }
 
@@ -241,7 +261,6 @@ extern "C" void nino_voice_wake_release_after_wake(void) {
   if (!s_after_wake_busy) {
     return;
   }
-  nino_mic_flush();
   s_after_wake_busy = false;
   ESP_LOGI(TAG, "wake armed — say \"Hi ESP\"");
 }

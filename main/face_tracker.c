@@ -17,6 +17,10 @@ static const char *TAG = "face_tracker";
 #define FACE_TRACK_PAN_MAX 1023
 /** AX 0–1023 scale: 28 units ~ 8° (same as servo_motion.c DXL_POSE_DELTA). */
 #define FACE_TRACK_DXL_DEG_TO_UNITS(deg) (((deg) * 28 + 4) / 8)
+/** AX moving-speed value: ~47°/s, responsive without aggressive overshoot. */
+#define FACE_TRACK_POSITION_SPEED 70
+/** Restore the regular head-motion speed when face tracking is disabled. */
+#define FACE_TRACK_NORMAL_POSITION_SPEED 22
 /** Tilt ID1 on this head: higher goal = physical up, lower goal = physical down. */
 #define FACE_TRACK_TILT_UP_LIMIT_DEG 15
 #define FACE_TRACK_TILT_DOWN_LIMIT_DEG 10
@@ -124,11 +128,15 @@ void nino_face_tracker_set_enabled(bool enabled) {
   update_pause_flags();
 
   if (enabled) {
+    nino_servo_dxl_set_position_speed(FACE_TRACK_POSITION_SPEED);
     go_neutral_if_allowed();
-    ESP_LOGI(TAG, "Pan/tilt tracking enabled");
+    ESP_LOGI(TAG, "Pan/tilt tracking enabled (speed %d)",
+             FACE_TRACK_POSITION_SPEED);
   } else {
+    nino_servo_dxl_set_position_speed(FACE_TRACK_NORMAL_POSITION_SPEED);
     go_neutral_if_allowed();
-    ESP_LOGI(TAG, "Pan/tilt tracking disabled");
+    ESP_LOGI(TAG, "Pan/tilt tracking disabled (speed %d)",
+             FACE_TRACK_NORMAL_POSITION_SPEED);
   }
 }
 

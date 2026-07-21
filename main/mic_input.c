@@ -14,6 +14,7 @@ static const char *TAG = "mic_input";
 #define NINO_ES8311_MIC_GAIN_DB 30.0f
 
 static esp_codec_dev_handle_t s_es8311_mic;
+static volatile bool s_usb_mic_selected;
 
 static void close_es8311_mic_locked(void) {
   if (s_es8311_mic != NULL) {
@@ -27,6 +28,7 @@ static esp_err_t open_es8311_mic_locked(void) {
   if (s_es8311_mic != NULL) {
     return ESP_OK;
   }
+  s_usb_mic_selected = false;
 
   esp_err_t err = bsp_i2c_init();
   if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
@@ -87,14 +89,22 @@ esp_err_t nino_mic_read(int16_t *samples, int sample_count) {
   }
 
   if (usb_mic_ready()) {
-    nino_audio_bus_lock();
-    close_es8311_mic_locked();
-    nino_audio_bus_unlock();
+    /* Do not acquire the speaker/ES8311 mutex for every USB frame. Speaker
+     * playback holds that mutex for the clip duration; blocking here starves
+     * WakeNet, fills the USB ring, and makes "Hi ESP" arrive seconds late.
+     * The ES8311 input only needs closing once when USB becomes available. */
+    if (!s_usb_mic_selected) {
+      nino_audio_bus_lock();
+      close_es8311_mic_locked();
+      s_usb_mic_selected = true;
+      nino_audio_bus_unlock();
+    }
 
     const esp_err_t err = usb_mic_read(samples, sample_count);
     if (err == ESP_OK || usb_mic_ready()) {
       return err;
     }
+    s_usb_mic_selected = false;
     ESP_LOGW(TAG, "USB 4-mic disappeared during read; using ES8311 fallback");
   }
 

@@ -345,6 +345,24 @@ void nino_servo_dxl_set_pan_tilt(int pan_goal, int tilt_goal)
     }
 }
 
+void nino_servo_dxl_set_position_speed(int speed)
+{
+    if (speed < DXL_POSITION_SPEED_MIN) {
+        speed = DXL_POSITION_SPEED_MIN;
+    } else if (speed > DXL_POSITION_SPEED_MAX) {
+        speed = DXL_POSITION_SPEED_MAX;
+    }
+
+    if (s_goal_mutex != NULL) {
+        xSemaphoreTake(s_goal_mutex, portMAX_DELAY);
+    }
+    s_requested_position_speed = speed;
+    s_position_speed_pending = true;
+    if (s_goal_mutex != NULL) {
+        xSemaphoreGive(s_goal_mutex);
+    }
+}
+
 void nino_servo_dxl_set_servo_goal(uint8_t id, int goal)
 {
     const int idx = servo_index_for_id(id);
