@@ -706,7 +706,7 @@ def _mjpeg_generator(device_id: str):
             if frame is None:
                 if is_ui_device:
                     tts.update_face_state([])
-                    vision_eye.update([])
+                    vision_eye.update([], device_id=device_id)
                 time.sleep(0.02)
                 continue
 
@@ -734,7 +734,7 @@ def _mjpeg_generator(device_id: str):
                 last_tts_update_at = now
 
             if is_ui_device:
-                vision_eye.update(results)
+                vision_eye.update(results, device_id=device_id)
 
             ok, encoded = cv2.imencode(
                 ".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 70]

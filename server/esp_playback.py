@@ -55,18 +55,17 @@ def device_busy_speaking() -> bool:
         return time.time() < _device_busy_until
 
 
-def esp_eye_expression_url() -> str | None:
-    """Derive http://<esp-host>/eye/expression from the configured play_wav URL."""
-    url = esp_play_wav_url()
-    if not url:
+def esp_eye_expression_url(device_id: str | None = None) -> str | None:
+    """Return the eye-expression endpoint for one device."""
+    base = device_base_url(device_id)
+    if not base:
         return None
-    parsed = urllib.parse.urlparse(url)
-    if not (parsed.scheme and parsed.netloc):
-        return None
-    return f"{parsed.scheme}://{parsed.netloc}/eye/expression"
+    return f"{base.rstrip('/')}/eye/expression"
 
 
-def post_eye_expression_to_esp(name: str, *, timeout: float = 3.0) -> bool:
+def post_eye_expression_to_esp(
+    name: str, *, timeout: float = 3.0, device_id: str | None = None
+) -> bool:
     """POST {"expression": name} to the ESP /eye/expression endpoint.
 
     Never raises — returns True on success, False otherwise (called from the
@@ -75,8 +74,13 @@ def post_eye_expression_to_esp(name: str, *, timeout: float = 3.0) -> bool:
     expression = (name or "").strip().lower()
     if not expression:
         return False
-    url = esp_eye_expression_url()
+    url = esp_eye_expression_url(device_id)
     if not url:
+        logger.warning(
+            "eye/expression skipped (%s): no endpoint for device_id=%s",
+            expression,
+            device_id or "<default>",
+        )
         return False
     body = json.dumps({"expression": expression}).encode("utf-8")
     req = urllib.request.Request(
@@ -87,9 +91,22 @@ def post_eye_expression_to_esp(name: str, *, timeout: float = 3.0) -> bool:
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status == 200
+            if resp.status == 200:
+                return True
+            logger.warning(
+                "eye/expression rejected (%s) by device_id=%s: HTTP %s",
+                expression,
+                device_id or "<default>",
+                resp.status,
+            )
+            return False
     except (urllib.error.URLError, OSError) as exc:
-        logger.debug("eye/expression POST failed (%s): %s", expression, exc)
+        logger.warning(
+            "eye/expression POST failed (%s) for device_id=%s: %s",
+            expression,
+            device_id or "<default>",
+            exc,
+        )
         return False
 
 

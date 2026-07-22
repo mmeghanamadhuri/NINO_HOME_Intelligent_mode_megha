@@ -78,7 +78,8 @@ class VisionEyeDriver:
 
         self._voice_active_fn = voice_active_fn
         self._speaking_fn = speaking_fn
-        self._push_fn = push_fn or post_eye_expression_to_esp
+        self._push_fn = push_fn
+        self._device_id: str | None = None
 
         self._candidate: str | None = None
         self._candidate_since = 0.0
@@ -100,10 +101,17 @@ class VisionEyeDriver:
     def enabled(self) -> bool:
         return self._enabled
 
-    def update(self, results: list[dict[str, Any]] | None, *, now: float | None = None) -> None:
+    def update(
+        self,
+        results: list[dict[str, Any]] | None,
+        *,
+        device_id: str | None = None,
+        now: float | None = None,
+    ) -> None:
         """Feed one frame's face results. Safe to call every frame."""
         if not self._enabled:
             return
+        self._device_id = device_id
         now = time.time() if now is None else now
 
         # P0/P1: a voice query, alarm/medical reminder, or greeting owns the eyes.
@@ -176,9 +184,12 @@ class VisionEyeDriver:
         return best_label
 
     def _push(self, name: str) -> bool:
-        ok = self._push_fn(name)
-        if ok:
-            logger.info("Vision emotion -> eye %s", name)
+        if self._push_fn is not None:
+            ok = self._push_fn(name)
         else:
-            logger.debug("Vision eye push failed (%s)", name)
+            ok = post_eye_expression_to_esp(name, device_id=self._device_id)
+        if ok:
+            logger.info("Vision emotion -> eye %s (device=%s)", name, self._device_id)
+        else:
+            logger.warning("Vision eye push failed (%s, device=%s)", name, self._device_id)
         return ok

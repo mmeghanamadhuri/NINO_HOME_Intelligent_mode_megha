@@ -31,7 +31,11 @@ static const char *TAG = "usb_mic";
 #define USB_MIC_OUTPUT_RATE_HZ 16000
 #define USB_MIC_RING_SECONDS 2
 #define USB_MIC_RING_BYTES (USB_MIC_OUTPUT_RATE_HZ * USB_MIC_RING_SECONDS * (int)sizeof(int16_t))
-#define USB_MIC_SW_GAIN_NUM 16
+/*
+ * Reduce the original 16x boost to limit ambient-noise amplification while
+ * retaining enough level for normal-distance WakeNet detection.
+ */
+#define USB_MIC_SW_GAIN_NUM 8
 #define USB_MIC_SW_GAIN_DEN 1
 #define USB_MIC_UAC_TASK_PRIO 5
 #define USB_MIC_READ_TIMEOUT_MS 500

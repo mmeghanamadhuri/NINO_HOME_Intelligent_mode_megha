@@ -31,7 +31,12 @@ static const char *TAG = "voice_wake";
 #define WAKE_IDLE_DELAY_MS 50
 #define WAKE_FETCH_DELAY_MS 12
 #define WAKE_FETCH_FAIL_DELAY_MS 25
-#define WAKE_NET_THRESHOLD 0.50f
+/*
+ * The bundled "Hi ESP" model advertises approximately 0.635 as its operating
+ * threshold. Keep a small margin above it to reject weak speech-like matches
+ * without making normal-distance wake phrases unreliable.
+ */
+#define WAKE_NET_THRESHOLD 0.65f
 
 static afe_config_t *configure_wake_afe(srmodel_list_t *models) {
   afe_config_t *afe_cfg = afe_config_init("M", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
