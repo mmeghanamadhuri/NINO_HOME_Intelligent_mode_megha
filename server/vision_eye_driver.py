@@ -130,6 +130,16 @@ class VisionEyeDriver:
         if now < self._display_until:
             return
 
+        # A latched expression must explicitly return to idle when its display
+        # window ends. Reset the candidate timer too, so a continuing face must
+        # be stable again before it can claim the eyes for another window.
+        if self._display_until > 0.0:
+            self._display_until = 0.0
+            self._candidate = None
+            self._candidate_since = now
+            if self._last_pushed in _ACTIVE_EMOTIONS:
+                self._last_pushed = "idle" if self._push("idle") else None
+
         target = self._target_from_results(results)
         if target != self._candidate:
             self._candidate = target
