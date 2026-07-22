@@ -18,6 +18,7 @@ FastAPI server for the NiNO ESP32-P4 demo. It pulls camera frames from the board
 - [ESP TTS chunking](#esp-tts-chunking)
 - [Alarms](#alarms)
 - [Weather](#weather)
+- [Live football updates](#live-football-updates)
 - [HTTP & WebSocket API](#http--websocket-api)
 - [Data files](#data-files)
 - [Tests](#tests)
@@ -160,6 +161,7 @@ voice wake on
 | `TTS_PROVIDER` | auto | `elevenlabs`, `piper`, `sapi`, or `local` (espeak) |
 | `PIPER_MODEL_PATH` | `server/models/en_GB-southern_english_female-low.onnx` | Piper female British voice model; auto fallback after ElevenLabs |
 | `PIPER_PRELOAD` | `1` | Load the Piper fallback at startup to avoid model-load latency on failure |
+| `PIPER_LENGTH_SCALE` | `1.0` | Piper speech rate; `>1.0` is slower, `<1.0` is faster |
 | `LOCAL_TTS_RATE` | derived | espeak rate tweak (see `tts_service.py`) |
 | `VOICE_WS_URL` | — | Full WebSocket URL pushed to ESP on `prompt_ack` |
 | `NINO_SERVER_LAN_HOST` | auto-detect | PC LAN IP when building `VOICE_WS_URL` |
@@ -419,7 +421,7 @@ are then used automatically for weather requests on that device.
 curl -X POST http://<SERVER_IP>:8000/api/devices/nino-home/location \
   -H 'Content-Type: application/json' \
   -H 'X-Nino-Location-Token: <optional NINO_LOCATION_TOKEN value>' \
-  -d '{"latitude": 51.5072, "longitude": -0.1276}'
+  -d '{"latitude": 51.5072, "longitude": -0.1276, "location_name": "London, UK"}'
 
 curl -X POST http://<SERVER_IP>:8000/api/devices/nino-home/network \
   -H 'Content-Type: application/json' \
@@ -431,6 +433,27 @@ curl 'http://<SERVER_IP>:8000/api/weather?device_id=nino-home'
 The server uses Open-Meteo current conditions and caches a coordinate's result
 for 10 minutes. Voice requests such as “what is the weather?” use the speaking
 device's location and return a direct current-conditions reply.
+
+---
+
+## Live football updates
+
+Voice questions that mention football, soccer, FIFA, World Cup, Champions League,
+Premier League, or a live score bypass the LLM and retrieve the provider's live
+match feed. Replies are cached for 45 seconds to preserve the free-tier quota.
+
+1. Create a free API-Football account at
+   [api-football.com](https://www.api-football.com/pricing).
+2. Copy its API key into `server/.env`:
+
+```bash
+FOOTBALL_API_KEY=your-key-here
+```
+
+3. Restart `python app.py`.
+
+The API-Football free plan currently allows 100 requests per day, so this is
+intended for occasional voice questions rather than continuous score polling.
 
 ---
 

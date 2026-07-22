@@ -141,12 +141,11 @@ class WeatherService:
 
 
 def weather_voice_reply(device: DeviceRecord, weather: dict[str, Any]) -> str:
-    location = device.display_name or device.device_id
+    location = device.location_name or device.display_name or device.device_id
     return (
-        f"For {location}, it is {weather['temperature_c']:.0f} degrees Celsius, "
-        f"feels like {weather['apparent_temperature_c']:.0f}, with "
-        f"{weather['description']}. Wind speed is {weather['wind_speed_kph']:.0f} "
-        f"kilometres per hour."
+        f"Right now in {location}, it is {weather['temperature_c']:.0f} degrees "
+        f"Celsius, feels like {weather['apparent_temperature_c']:.0f}, with "
+        f"{weather['description']}."
     )
 
 

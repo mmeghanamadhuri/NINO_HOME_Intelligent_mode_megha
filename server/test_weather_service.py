@@ -24,6 +24,7 @@ class WeatherServiceTests(unittest.TestCase):
             display_name="Test NiNO",
             latitude=51.5072,
             longitude=-0.1276,
+            location_name="London, UK",
         )
 
     @patch("weather_service.requests.get")
@@ -53,8 +54,8 @@ class WeatherServiceTests(unittest.TestCase):
         self.assertEqual(get.call_count, 1)
         self.assertEqual(
             weather_voice_reply(self.device, first),
-            "For Test NiNO, it is 22 degrees Celsius, feels like 23, with "
-            "partly cloudy skies. Wind speed is 15 kilometres per hour.",
+            "Right now in London, UK, it is 22 degrees Celsius, feels like 23, "
+            "with partly cloudy skies.",
         )
 
     def test_device_without_coordinates_is_rejected(self) -> None:
@@ -70,15 +71,20 @@ class WeatherServiceTests(unittest.TestCase):
             )
             registry = DeviceRegistry(path)
             updated = registry.set_location(
-                "nino-test", latitude=51.5072, longitude=-0.1276
+                "nino-test",
+                latitude=51.5072,
+                longitude=-0.1276,
+                location_name="London, UK",
             )
             saved = json.loads(path.read_text(encoding="utf-8"))
 
         self.assertEqual(updated.latitude, 51.5072)
         self.assertEqual(updated.longitude, -0.1276)
+        self.assertEqual(updated.location_name, "London, UK")
         self.assertTrue(updated.location_updated_at)
         self.assertEqual(saved["devices"][0]["latitude"], 51.5072)
         self.assertEqual(saved["devices"][0]["longitude"], -0.1276)
+        self.assertEqual(saved["devices"][0]["location_name"], "London, UK")
 
     def test_reported_wifi_network_is_persisted_in_device_registry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

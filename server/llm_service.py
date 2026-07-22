@@ -996,6 +996,28 @@ def _anti_repetition_block(recent_assistant_replies: list[str] | None) -> str:
     )
 
 
+def _defers_to_recognized_speaker(reply: str, viewer_name: str | None) -> bool:
+    """Detect a reply that mistakenly treats the current speaker as someone else."""
+    name = (viewer_name or "").strip()
+    if not name:
+        return False
+
+    escaped_name = re.escape(name)
+    text = " ".join(reply.split())
+    return bool(
+        re.search(
+            rf"\b(?:ask|check with|talk to|consult)\s+{escaped_name}\b",
+            text,
+            re.IGNORECASE,
+        )
+        or re.search(
+            rf"\b{escaped_name}\s+(?:might|may|could|would|will)\s+know\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
 def is_conversation_recap_question(user_text: str) -> bool:
     text = user_text.strip()
     if not text:
@@ -1447,11 +1469,13 @@ def answer_voice_query(
         "- Sound natural and casual, not scripted or robotic.\n"
         "- If the topic came up before, vary wording and tone — do not repeat the same sentence.\n"
         "- Answer ONLY what the user asked; do not bring up unrelated stored facts.\n"
+        "- Answer general-knowledge questions yourself; do not tell the speaker to ask another person.\n"
+        "- The recognized speaker is the person you are addressing, never a third party to ask about the answer.\n"
         f"Rules: one short spoken reply under {max_words} words, plain sentences, "
         "no lists, no markdown, no stage directions, suitable to read aloud.\n"
         f"The user asked: {user_text}"
     )
-    return ollama_generate(
+    reply = ollama_generate(
         prompt,
         model=model,
         api_url=api_url,
@@ -1460,6 +1484,35 @@ def answer_voice_query(
         temperature=_voice_reply_temperature(),
         top_p=_voice_reply_top_p(),
     )
+    if not _defers_to_recognized_speaker(reply, viewer_name):
+        return reply
+
+    logger.warning(
+        "Discarding voice reply that defers to recognized speaker | viewer=%s question=%s",
+        viewer_name,
+        user_text[:120],
+    )
+    retry_prompt = (
+        "Rewrite the assistant reply below for a voice assistant.\n"
+        "Answer the user's question directly using your own knowledge. Do not tell the "
+        "user to ask, check with, or consult any person. The named viewer is the person "
+        "speaking to you, not a third party.\n"
+        f"Question: {user_text}\n"
+        f"Invalid reply: {reply}\n"
+        f"Return one plain spoken answer under {max_words} words."
+    )
+    retried_reply = ollama_generate(
+        retry_prompt,
+        model=model,
+        api_url=api_url,
+        num_predict=96,
+        timeout_s=VOICE_QUERY_TIMEOUT_S,
+        temperature=_voice_reply_temperature(),
+        top_p=_voice_reply_top_p(),
+    )
+    if not _defers_to_recognized_speaker(retried_reply, viewer_name):
+        return retried_reply
+    return "I am sorry, I cannot answer that reliably right now."
 
 
 # ---------------------------------------------------------------------------

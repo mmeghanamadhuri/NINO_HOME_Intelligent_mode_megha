@@ -32,6 +32,7 @@ class DeviceRecord:
     camera_rotation: str = "none"
     latitude: float | None = None
     longitude: float | None = None
+    location_name: str = ""
     location_updated_at: str = ""
     wifi_ssid: str = ""
     wifi_bssid: str = ""
@@ -149,6 +150,7 @@ class DeviceRegistry:
                     ),
                     latitude=existing.latitude if existing else None,
                     longitude=existing.longitude if existing else None,
+                    location_name=existing.location_name if existing else "",
                     location_updated_at=(
                         existing.location_updated_at if existing else ""
                     ),
@@ -188,6 +190,7 @@ class DeviceRegistry:
                 camera_rotation=rotation,
                 latitude=existing.latitude,
                 longitude=existing.longitude,
+                location_name=existing.location_name,
                 location_updated_at=existing.location_updated_at,
                 wifi_ssid=existing.wifi_ssid,
                 wifi_bssid=existing.wifi_bssid,
@@ -205,7 +208,12 @@ class DeviceRegistry:
             return record
 
     def set_location(
-        self, device_id: str, *, latitude: float, longitude: float
+        self,
+        device_id: str,
+        *,
+        latitude: float,
+        longitude: float,
+        location_name: str | None = None,
     ) -> DeviceRecord:
         """Persist a GPS/location fix supplied by a known device."""
         if not -90.0 <= latitude <= 90.0:
@@ -214,6 +222,8 @@ class DeviceRegistry:
             raise ValueError("Longitude must be between -180 and 180")
         if not math.isfinite(latitude) or not math.isfinite(longitude):
             raise ValueError("Location coordinates must be finite numbers")
+        if location_name is not None and len(location_name.strip()) > 100:
+            raise ValueError("Location name must contain at most 100 characters")
 
         key = (device_id or "").strip()
         with self._lock:
@@ -229,6 +239,11 @@ class DeviceRegistry:
                 camera_rotation=existing.camera_rotation,
                 latitude=latitude,
                 longitude=longitude,
+                location_name=(
+                    location_name.strip()
+                    if location_name is not None
+                    else existing.location_name
+                ),
                 location_updated_at=datetime.now(timezone.utc).isoformat(),
                 wifi_ssid=existing.wifi_ssid,
                 wifi_bssid=existing.wifi_bssid,
@@ -278,6 +293,7 @@ class DeviceRegistry:
                 camera_rotation=existing.camera_rotation,
                 latitude=existing.latitude,
                 longitude=existing.longitude,
+                location_name=existing.location_name,
                 location_updated_at=existing.location_updated_at,
                 wifi_ssid=normalized_ssid,
                 wifi_bssid=normalized_bssid,
@@ -306,6 +322,7 @@ class DeviceRegistry:
                     "camera_rotation": d.camera_rotation,
                     "latitude": d.latitude,
                     "longitude": d.longitude,
+                    "location_name": d.location_name,
                     "location_updated_at": d.location_updated_at,
                     "wifi_ssid": d.wifi_ssid,
                     "wifi_bssid": d.wifi_bssid,
@@ -352,6 +369,7 @@ class DeviceRegistry:
                     or "none",
                     latitude=_parse_coordinate(item.get("latitude"), -90.0, 90.0),
                     longitude=_parse_coordinate(item.get("longitude"), -180.0, 180.0),
+                    location_name=_parse_location_name(item.get("location_name")),
                     location_updated_at=str(
                         item.get("location_updated_at") or ""
                     ).strip(),
@@ -390,6 +408,7 @@ class DeviceRegistry:
                 camera_rotation="none",
                 latitude=None,
                 longitude=None,
+                location_name="",
             )
         ]
 
@@ -457,6 +476,7 @@ class DeviceRegistry:
                         "camera_rotation": d.camera_rotation,
                         "latitude": d.latitude,
                         "longitude": d.longitude,
+                        "location_name": d.location_name,
                         "location_updated_at": d.location_updated_at,
                         "wifi_ssid": d.wifi_ssid,
                         "wifi_bssid": d.wifi_bssid,
@@ -497,6 +517,11 @@ def _parse_coordinate(value: object, minimum: float, maximum: float) -> float | 
     if not math.isfinite(coordinate) or not minimum <= coordinate <= maximum:
         return None
     return coordinate
+
+
+def _parse_location_name(value: object) -> str:
+    name = str(value or "").strip()
+    return name if len(name) <= 100 else ""
 
 
 def _parse_wifi_ssid(value: object) -> str:

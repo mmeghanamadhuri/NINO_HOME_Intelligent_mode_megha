@@ -75,6 +75,13 @@ _WEATHER_QUESTION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_FOOTBALL_QUESTION_PATTERN = re.compile(
+    r"\b(?:fifa|football|soccer|world cup|champions league|premier league|"
+    r"la liga|bundesliga|serie a|live score|match score|score update|"
+    r"football update)\b",
+    re.IGNORECASE,
+)
+
 _SERVO_360_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p, re.IGNORECASE)
     for p in (
@@ -294,6 +301,49 @@ def is_local_time_question(user_text: str) -> bool:
 
 def is_weather_question(user_text: str) -> bool:
     return bool(_WEATHER_QUESTION_PATTERN.search(user_text.strip()))
+
+
+def is_football_question(user_text: str) -> bool:
+    return bool(_FOOTBALL_QUESTION_PATTERN.search(user_text.strip()))
+
+
+def is_live_football_question(user_text: str) -> bool:
+    text = user_text.strip()
+    return is_football_question(text) and bool(
+        re.search(
+            r"\b(?:live|right now|currently|playing now|who(?:'s| is) winning|"
+            r"live score|scores now)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def fifa_world_cup_winner_year(user_text: str) -> int | None:
+    """Return the requested year for explicit FIFA World Cup winner questions."""
+    text = user_text.strip()
+    if not text or not re.search(r"\b(?:fifa|world cup)\b", text, re.IGNORECASE):
+        return None
+    if not re.search(r"\b(?:who won|winner|champion|champions)\b", text, re.IGNORECASE):
+        return None
+    match = re.search(r"\b((?:19|20)\d{2})\b", text)
+    return int(match.group(1)) if match else None
+
+
+def fifa_world_cup_top_scorer_year(user_text: str) -> int | None:
+    """Return the requested year for FIFA World Cup top-scorer questions."""
+    text = user_text.strip()
+    if not text or not re.search(r"\b(?:fifa|world cup)\b", text, re.IGNORECASE):
+        return None
+    if not re.search(
+        r"\b(?:top scorer|most goals|highest points|highest scorer|golden boot|"
+        r"scored the most)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return None
+    match = re.search(r"\b((?:19|20)\d{2})\b", text)
+    return int(match.group(1)) if match else None
 
 
 def local_server_time_reply() -> str:
@@ -778,6 +828,86 @@ def process_voice_wav(
             )
         except WeatherUnavailableError:
             reply = "I cannot retrieve the current weather right now. Please try again soon."
+
+    top_scorer_year = fifa_world_cup_top_scorer_year(user_text)
+    if reply_path == "llm" and top_scorer_year is not None:
+        from football_service import (
+            TournamentResultUnavailableError,
+            get_fifa_tournament_service,
+        )
+
+        reply_path = "fifa_world_cup_top_scorer"
+        try:
+            player, goals = get_fifa_tournament_service().world_cup_top_scorer(
+                top_scorer_year
+            )
+            reply = (
+                f"{player} was the top scorer at the {top_scorer_year} FIFA World Cup "
+                f"with {goals} goals."
+            )
+            logger.info(
+                "Voice FIFA World Cup top-scorer query | year=%d heard: %s",
+                top_scorer_year,
+                user_text[:120],
+            )
+        except TournamentResultUnavailableError:
+            reply = (
+                f"I cannot confirm the top scorer at the {top_scorer_year} FIFA World "
+                "Cup right now."
+            )
+
+    winner_year = fifa_world_cup_winner_year(user_text)
+    if reply_path == "llm" and winner_year is not None:
+        from football_service import (
+            TournamentResultUnavailableError,
+            get_fifa_tournament_service,
+        )
+
+        reply_path = "fifa_world_cup_winner"
+        try:
+            winner = get_fifa_tournament_service().world_cup_winner(winner_year)
+            reply = f"{winner} won the {winner_year} FIFA World Cup."
+            logger.info(
+                "Voice FIFA World Cup winner query | year=%d heard: %s",
+                winner_year,
+                user_text[:120],
+            )
+        except TournamentResultUnavailableError:
+            reply = (
+                f"I cannot confirm the winner of the {winner_year} FIFA World Cup "
+                "right now."
+            )
+
+    if reply_path == "llm" and is_live_football_question(user_text):
+        from football_service import (
+            FootballNotConfiguredError,
+            FootballUnavailableError,
+            get_football_service,
+            live_football_voice_reply,
+        )
+
+        reply_path = "football_live"
+        try:
+            reply = live_football_voice_reply(get_football_service().live_matches())
+            logger.info("Voice live-football query | heard: %s", user_text[:120])
+        except FootballNotConfiguredError:
+            reply = (
+                "Live football updates are not configured yet. "
+                "Please add the football API key on the server."
+            )
+        except FootballUnavailableError:
+            reply = (
+                "I cannot retrieve live football updates right now. "
+                "Please try again soon."
+            )
+
+    if reply_path == "llm" and is_football_question(user_text):
+        reply_path = "football_query_needs_detail"
+        reply = (
+            "I can check live football scores, FIFA World Cup winners, and top scorers. "
+            "Try asking who won the World Cup, who scored the most goals, or which "
+            "match is live now."
+        )
 
     if reply_path == "llm":
         alarm_result = handle_alarm_voice(

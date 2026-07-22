@@ -154,6 +154,15 @@ def _piper_model_path() -> Path:
     return Path(configured).expanduser() if configured else DEFAULT_PIPER_MODEL_PATH
 
 
+def _piper_length_scale() -> float:
+    raw = os.environ.get("PIPER_LENGTH_SCALE", "1.0").strip()
+    try:
+        return max(0.5, min(2.0, float(raw)))
+    except ValueError:
+        logger.warning("Invalid PIPER_LENGTH_SCALE %r; using 1.0.", raw)
+        return 1.0
+
+
 def _piper_available() -> bool:
     model_path = _piper_model_path()
     if not model_path.is_file() or not Path(f"{model_path}.json").is_file():
@@ -242,7 +251,10 @@ def _synthesize_piper_wav_bytes(
             voice.synthesize_wav(
                 clean,
                 wav_file,
-                SynthesisConfig(volume=max(0.0, min(1.0, volume))),
+                SynthesisConfig(
+                    length_scale=_piper_length_scale(),
+                    volume=max(0.0, min(1.0, volume)),
+                ),
             )
     wav = output.getvalue()
     if not wav:
@@ -612,6 +624,7 @@ def tts_status() -> dict[str, Any]:
         "piper_available": _piper_available(),
         "piper_model_path": str(model_path),
         "piper_preloaded": piper_preloaded,
+        "piper_length_scale": _piper_length_scale(),
     }
     if provider == "elevenlabs":
         out.update(

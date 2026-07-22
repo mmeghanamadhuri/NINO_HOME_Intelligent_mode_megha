@@ -228,6 +228,7 @@ class DeviceSelectRequest(BaseModel):
 class DeviceLocationRequest(BaseModel):
     latitude: float = Field(..., ge=-90, le=90)
     longitude: float = Field(..., ge=-180, le=180)
+    location_name: str | None = Field(default=None, max_length=100)
 
 
 class DeviceWifiNetworkRequest(BaseModel):
@@ -444,7 +445,10 @@ def update_device_location(
         raise HTTPException(status_code=404, detail="Unknown device_id")
     try:
         device = registry.set_location(
-            device_id, latitude=req.latitude, longitude=req.longitude
+            device_id,
+            latitude=req.latitude,
+            longitude=req.longitude,
+            location_name=req.location_name,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -454,6 +458,7 @@ def update_device_location(
         "location": {
             "latitude": device.latitude,
             "longitude": device.longitude,
+            "name": device.location_name,
             "updated_at": device.location_updated_at,
         },
     }
@@ -511,6 +516,7 @@ def current_weather(device_id: str | None = None) -> dict:
         "location": {
             "latitude": device.latitude,
             "longitude": device.longitude,
+            "name": device.location_name,
             "updated_at": device.location_updated_at,
         },
         "weather": weather,
