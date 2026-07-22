@@ -706,7 +706,6 @@ def _mjpeg_generator(device_id: str):
             if frame is None:
                 if is_ui_device:
                     tts.update_face_state([])
-                    vision_eye.update([], device_id=device_id)
                 time.sleep(0.02)
                 continue
 
@@ -733,9 +732,6 @@ def _mjpeg_generator(device_id: str):
                 _update_tts_face_state(results, device_id=device_id)
                 last_tts_update_at = now
 
-            if is_ui_device:
-                vision_eye.update(results, device_id=device_id)
-
             ok, encoded = cv2.imencode(
                 ".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 70]
             )
@@ -758,9 +754,12 @@ def _mjpeg_generator(device_id: str):
 def _vision_tick_device(
     device_id: str, *, update_tts: bool = True, face_reg: bool = False
 ) -> None:
-    """One recognition/emotion pass for a device (used by voice identity helpers)."""
+    """One recognition/emotion pass for a device (used by the background vision loop)."""
+    is_ui_device = device_id == registry.ui_device_id()
     frame = cameras.read(device_id)
     if frame is None:
+        if is_ui_device:
+            vision_eye.update([], device_id=device_id)
         return
     results = faces.recognize(frame)
     try:
@@ -768,6 +767,11 @@ def _vision_tick_device(
     except Exception:
         logger.debug("Emotion tick failed for %s", device_id, exc_info=True)
     _latest_results_by_device[device_id] = results
+    if is_ui_device:
+        # The background loop is the normal source of emotion results. Without
+        # this call, eye expressions were sent only while a browser held an
+        # /video_feed stream open.
+        vision_eye.update(results, device_id=device_id)
     if update_tts:
         prev = getattr(tts, "_playback_device_id", None)
         tts.set_playback_device_id(device_id)
