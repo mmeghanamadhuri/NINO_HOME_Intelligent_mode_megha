@@ -11,7 +11,7 @@
     "PYTHONUTF8": "1",
     "PYTHONIOENCODING": "utf-8"
   },
-  "idf.portWin": "COM11",
+  "idf.portWin": "COM7",
   "idf.flashType": "JTAG",
   "idf.extensionActivationMode": "always",
   "idf.port": "/dev/ttyUSB0",

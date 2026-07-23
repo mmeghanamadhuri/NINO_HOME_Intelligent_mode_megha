@@ -249,6 +249,9 @@ def startup() -> None:
     get_alarm_service().start()
     ensure_esp_play_wav_url_configured()
     registry.reload()
+    # Start each server run from a fresh LAN inventory. This removes devices
+    # persisted by a previous run when they no longer answer mDNS/UDP discovery.
+    discover_devices_once(replace_registry=True)
     cameras.start_all()
     # Discovery runs in its own daemon thread. Startup remains responsive when
     # no robots or multicast-capable network are present.

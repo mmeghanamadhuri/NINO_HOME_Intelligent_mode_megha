@@ -109,11 +109,7 @@ class DeviceRegistry:
         An existing display name is retained as a simple manual override.
         Returns the records that were added or changed.
         """
-        cleaned = {
-            d.device_id.strip(): d
-            for d in devices
-            if d.device_id and d.device_id.strip() and d.effective_base_url()
-        }
+        cleaned = self._clean_discovered(devices)
         if not cleaned:
             return []
 
@@ -135,31 +131,7 @@ class DeviceRegistry:
             changed: list[DeviceRecord] = []
             for device_id, discovered in cleaned.items():
                 existing = merged.get(device_id)
-                record = DeviceRecord(
-                    device_id=device_id,
-                    display_name=(
-                        existing.display_name.strip()
-                        if existing and existing.display_name.strip()
-                        else discovered.display_name.strip()
-                    ),
-                    camera_url=discovered.effective_camera_url(),
-                    play_wav_url=discovered.effective_play_wav_url(),
-                    base_url=discovered.effective_base_url(),
-                    camera_rotation=(
-                        existing.camera_rotation if existing else "none"
-                    ),
-                    latitude=existing.latitude if existing else None,
-                    longitude=existing.longitude if existing else None,
-                    location_name=existing.location_name if existing else "",
-                    location_updated_at=(
-                        existing.location_updated_at if existing else ""
-                    ),
-                    wifi_ssid=existing.wifi_ssid if existing else "",
-                    wifi_bssid=existing.wifi_bssid if existing else "",
-                    wifi_rssi=existing.wifi_rssi if existing else None,
-                    wifi_channel=existing.wifi_channel if existing else None,
-                    wifi_updated_at=existing.wifi_updated_at if existing else "",
-                )
+                record = self._merge_discovered_record(existing, discovered)
                 if existing != record:
                     merged[device_id] = record
                     changed.append(record)
@@ -173,6 +145,73 @@ class DeviceRegistry:
             if self._ui_device_id not in self._devices:
                 self._ui_device_id = next(iter(self._devices), LEGACY_DEVICE_ID)
             return changed
+
+    def replace_with_discovered(self, devices: list[DeviceRecord]) -> list[DeviceRecord]:
+        """Replace persisted devices with those confirmed by the current LAN scan.
+
+        Used at server startup so offline devices from a prior server run do not
+        appear in the UI. Per-device settings are retained when the same device
+        is found again.
+        """
+        cleaned = self._clean_discovered(devices)
+        with self._lock:
+            replacement = {
+                device_id: self._merge_discovered_record(
+                    self._devices.get(device_id), discovered
+                )
+                for device_id, discovered in cleaned.items()
+            }
+            changed = [
+                record
+                for device_id, record in replacement.items()
+                if self._devices.get(device_id) != record
+            ]
+            removed = set(self._devices) - set(replacement)
+            if not changed and not removed:
+                return []
+
+            self._write_devices_locked(replacement.values())
+            self._devices = replacement
+            self._persisted_device_ids = set(replacement)
+            if self._ui_device_id not in self._devices:
+                self._ui_device_id = next(iter(self._devices), LEGACY_DEVICE_ID)
+            return changed
+
+    @staticmethod
+    def _clean_discovered(devices: list[DeviceRecord]) -> dict[str, DeviceRecord]:
+        return {
+            device.device_id.strip(): device
+            for device in devices
+            if device.device_id
+            and device.device_id.strip()
+            and device.effective_base_url()
+        }
+
+    @staticmethod
+    def _merge_discovered_record(
+        existing: DeviceRecord | None, discovered: DeviceRecord
+    ) -> DeviceRecord:
+        return DeviceRecord(
+            device_id=discovered.device_id.strip(),
+            display_name=(
+                existing.display_name.strip()
+                if existing and existing.display_name.strip()
+                else discovered.display_name.strip()
+            ),
+            camera_url=discovered.effective_camera_url(),
+            play_wav_url=discovered.effective_play_wav_url(),
+            base_url=discovered.effective_base_url(),
+            camera_rotation=existing.camera_rotation if existing else "none",
+            latitude=existing.latitude if existing else None,
+            longitude=existing.longitude if existing else None,
+            location_name=existing.location_name if existing else "",
+            location_updated_at=existing.location_updated_at if existing else "",
+            wifi_ssid=existing.wifi_ssid if existing else "",
+            wifi_bssid=existing.wifi_bssid if existing else "",
+            wifi_rssi=existing.wifi_rssi if existing else None,
+            wifi_channel=existing.wifi_channel if existing else None,
+            wifi_updated_at=existing.wifi_updated_at if existing else "",
+        )
 
     def set_camera_rotation(self, device_id: str, rotation: str) -> DeviceRecord:
         """Persist a validated per-device camera orientation."""

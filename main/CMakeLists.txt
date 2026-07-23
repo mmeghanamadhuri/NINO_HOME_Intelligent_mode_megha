@@ -9,6 +9,7 @@ idf_component_register(
            "touch_sensor.c" "bsp_qt2120.c" "nino_eye.c" "ssd1351.c"
     INCLUDE_DIRS "."
     EMBED_FILES "PDTM.wav" "beep.wav" "WIFI.wav" "Hello-home.wav" "WIFI-UNABLE.wav" "GO-APP.wav"
+                "schedule_dinnner.wav"
     REQUIRES ${main_requires}
     PRIV_REQUIRES ${main_priv_requires}
 )

@@ -386,6 +386,8 @@ Details: **[docs/SERVO.md](docs/SERVO.md)**
 
 Serial test: `eye idle` / `eye listening` / `eye thinking`
 
+Serial dinner test: `dinner` — plays `schedule_dinnner.wav` with L/R/U/D head motion.
+
 ### Key firmware files
 
 

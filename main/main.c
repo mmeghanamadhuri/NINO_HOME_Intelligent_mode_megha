@@ -189,6 +189,9 @@ extern const uint8_t wifi_unable_wav_end[] asm("_binary_WIFI_UNABLE_wav_end");
 extern const uint8_t go_app_wav_start[] asm("_binary_GO_APP_wav_start");
 extern const uint8_t go_app_wav_end[] asm("_binary_GO_APP_wav_end");
 
+extern const uint8_t schedule_dinnner_wav_start[] asm("_binary_schedule_dinnner_wav_start");
+extern const uint8_t schedule_dinnner_wav_end[] asm("_binary_schedule_dinnner_wav_end");
+
 /* Set once WIFI-UNABLE.wav has been played for the current connect attempt so
  * the prompt is not repeated on every reconnect retry. Reset on success and on
  * fresh credentials from GATT provisioning. */
@@ -1164,6 +1167,7 @@ static void servo_cli_register(void);
 static void track_cli_register(void);
 static void speaker_cli_register(void);
 static void hstop_cli_register(void);
+static void dinner_cli_register(void);
 
 static int cmd_eye(int argc, char **argv) {
   if (argc >= 2 && nino_eye_apply_command(argv[1])) {
@@ -1200,6 +1204,7 @@ static void console_init(void) {
   speaker_cli_register();
   eye_cli_register();
   hstop_cli_register();
+  dinner_cli_register();
 
   const esp_console_cmd_t cpu_dump_cmd = {
       .command = "cpu_dump",
@@ -3074,6 +3079,38 @@ static void hstop_cli_register(void) {
       .help = "Stop track hon loop, wait 2 seconds, then return ID2 to neutral (512)",
       .hint = NULL,
       .func = &cmd_hstop,
+      .argtable = NULL,
+  };
+  ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+}
+
+static int cmd_dinner(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+
+  const size_t wav_len = (size_t)(schedule_dinnner_wav_end - schedule_dinnner_wav_start);
+  if (wav_len < 44) {
+    printf("Embedded schedule_dinnner.wav is missing or invalid\n");
+    return 1;
+  }
+
+  esp_err_t err = nino_audio_queue_wav_copy(schedule_dinnner_wav_start, wav_len, false,
+                                            NINO_AUDIO_SERVO_FULL, false);
+  if (err != ESP_OK) {
+    printf("Could not queue dinner clip: %s\n", esp_err_to_name(err));
+    return 1;
+  }
+
+  printf("Dinner clip queued: speaker + L/R/U/D motion\n");
+  return 0;
+}
+
+static void dinner_cli_register(void) {
+  const esp_console_cmd_t cmd = {
+      .command = "dinner",
+      .help = "Play schedule_dinnner.wav with L/R/U/D servo motion",
+      .hint = NULL,
+      .func = &cmd_dinner,
       .argtable = NULL,
   };
   ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));

@@ -110,6 +110,46 @@ class WeatherServiceTests(unittest.TestCase):
         self.assertTrue(updated.wifi_updated_at)
         self.assertEqual(saved["devices"][0]["wifi_bssid"], "AA:BB:CC:DD:EE:FF")
 
+    def test_startup_discovery_replaces_unavailable_devices(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "devices.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "devices": [
+                            {
+                                "device_id": "online",
+                                "base_url": "http://192.168.1.10",
+                                "camera_rotation": "cw90",
+                                "latitude": 51.5072,
+                                "longitude": -0.1276,
+                            },
+                            {
+                                "device_id": "offline",
+                                "base_url": "http://192.168.1.11",
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registry = DeviceRegistry(path)
+            registry.replace_with_discovered(
+                [
+                    DeviceRecord(
+                        device_id="online",
+                        base_url="http://192.168.1.20",
+                    )
+                ]
+            )
+            saved = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual([record.device_id for record in registry.list_devices()], ["online"])
+        self.assertEqual(registry.get("online").base_url, "http://192.168.1.20")
+        self.assertEqual(registry.get("online").camera_rotation, "cw90")
+        self.assertEqual(registry.get("online").latitude, 51.5072)
+        self.assertEqual([item["device_id"] for item in saved["devices"]], ["online"])
+
 
 class WeatherVoiceRoutingTests(unittest.TestCase):
     def test_weather_questions_are_detected(self) -> None:

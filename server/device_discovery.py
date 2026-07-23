@@ -122,8 +122,12 @@ class DeviceDiscovery:
             self.discover_once()
             self._stop.wait(self.interval_s)
 
-    def discover_once(self) -> list[DeviceRecord]:
-        """Scan mDNS then UDP, query each candidate's ``/status``, and upsert."""
+    def discover_once(self, *, replace_registry: bool = False) -> list[DeviceRecord]:
+        """Scan mDNS/UDP, query each candidate's ``/status``, then update the registry.
+
+        ``replace_registry`` is used only at server startup to remove devices
+        that were persisted during a previous run but are no longer reachable.
+        """
         if not self.enabled:
             return []
         if not self._scan_lock.acquire(blocking=False):
@@ -134,7 +138,11 @@ class DeviceDiscovery:
             candidates = self._discover_mdns()
             candidates.update(self._discover_udp())
             records = self._records_from_status(candidates)
-            changed = self.registry.upsert_discovered(records)
+            changed = (
+                self.registry.replace_with_discovered(records)
+                if replace_registry
+                else self.registry.upsert_discovered(records)
+            )
             if changed:
                 logger.info(
                     "NiNO discovery updated %d device(s): %s",
@@ -316,9 +324,14 @@ def stop_discovery_loop() -> None:
         _discovery.stop()
 
 
-def discover_once() -> list[DeviceRecord]:
+def discover_once(*, replace_registry: bool = False) -> list[DeviceRecord]:
+    """Run an immediate discovery scan.
+
+    Set ``replace_registry`` during startup so only currently reachable LAN
+    devices remain in ``devices.json``.
+    """
     service = _discovery or DeviceDiscovery()
-    return service.discover_once()
+    return service.discover_once(replace_registry=replace_registry)
 
 
 def discovery_status() -> dict:
