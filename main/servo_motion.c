@@ -11,13 +11,17 @@ static const char *TAG = "servo_motion";
 
 #define POSE_HOLD_MS          700
 #define DXL_CENTER            512
-/** ~8° on AX-scale 0–1023; smaller sweep = less camera shake on the head. */
-#define DXL_POSE_DELTA        28
+/** ~12° on AX-scale 0–1023; clear but still controlled head movement. */
+#define DXL_POSE_DELTA        42
+/** ~15° for the deliberately wider leftward head movement. */
+#define DXL_LEFT_POSE_DELTA   53
+/** ~8° vertical tilt, keeping camera movement more stable. */
+#define DXL_TILT_POSE_DELTA   28
 
-#define PAN_LEFT              (DXL_CENTER - DXL_POSE_DELTA)
+#define PAN_LEFT              (DXL_CENTER - DXL_LEFT_POSE_DELTA)
 #define PAN_RIGHT             (DXL_CENTER + DXL_POSE_DELTA)
-#define TILT_UP               (DXL_CENTER - DXL_POSE_DELTA)
-#define TILT_DOWN             (DXL_CENTER + DXL_POSE_DELTA)
+#define TILT_UP               (DXL_CENTER - DXL_TILT_POSE_DELTA)
+#define TILT_DOWN             (DXL_CENTER + DXL_TILT_POSE_DELTA)
 
 #define MOTION_TASK_STACK     3072
 #define MOTION_TASK_PRIO      5
@@ -50,18 +54,32 @@ static void motion_task(void *arg) {
         nino_servo_dxl_set_pan_tilt(PAN_RIGHT, DXL_CENTER);
       }
     } else {
-      switch (step % 4U) {
+      /* Return to centre after each direction so every pose starts from neutral:
+       * right/up/down are ±12°, while left is deliberately wider at 15°. */
+      switch (step % 8U) {
       case 0U:
-        nino_servo_dxl_set_pan_tilt(PAN_LEFT, DXL_CENTER);
-        break;
-      case 1U:
         nino_servo_dxl_set_pan_tilt(PAN_RIGHT, DXL_CENTER);
         break;
+      case 1U:
+        nino_servo_dxl_set_pan_tilt(DXL_CENTER, DXL_CENTER);
+        break;
       case 2U:
+        nino_servo_dxl_set_pan_tilt(PAN_LEFT, DXL_CENTER);
+        break;
+      case 3U:
+        nino_servo_dxl_set_pan_tilt(DXL_CENTER, DXL_CENTER);
+        break;
+      case 4U:
         nino_servo_dxl_set_pan_tilt(DXL_CENTER, TILT_UP);
         break;
-      default:
+      case 5U:
+        nino_servo_dxl_set_pan_tilt(DXL_CENTER, DXL_CENTER);
+        break;
+      case 6U:
         nino_servo_dxl_set_pan_tilt(DXL_CENTER, TILT_DOWN);
+        break;
+      default:
+        nino_servo_dxl_set_pan_tilt(DXL_CENTER, DXL_CENTER);
         break;
       }
     }
