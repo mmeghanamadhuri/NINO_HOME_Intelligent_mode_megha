@@ -88,6 +88,15 @@ class MemoryFilterTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIsNone(conversation_log_skip_reason(text))
 
+    def test_vision_greeting_paths_are_logged(self) -> None:
+        for path in ("vision_greeting", "startup_greeting"):
+            with self.subTest(path=path):
+                self.assertIsNone(
+                    conversation_log_skip_reason(
+                        "[face recognized]", reply_path=path
+                    )
+                )
+
     def test_questions_not_extracted_as_long_term_memory(self) -> None:
         for text in (
             "Tell me how does a GPU works?",

@@ -621,12 +621,19 @@ def user_shares_personal_fact(user_text: str) -> bool:
     return user_explicitly_states_personal_fact(user_text)
 
 
+# Face welcome TTS — logged as assistant turns so sessions include the greeting.
+_VISION_GREETING_LOG_PATHS = frozenset({"vision_greeting", "startup_greeting"})
+
+
 def conversation_log_skip_reason(user_text: str, *, reply_path: str = "llm") -> str | None:
     """Deny-list: store all real chat unless it is noise (jokes, recap, alarms, echo, etc.)."""
     from memory_service import is_stt_fragment
 
     if reply_path in _SKIP_LOG_REPLY_PATHS:
         return f"skipped_{reply_path}"
+    # Synthetic "[face recognized]" user side — always keep the spoken welcome.
+    if reply_path in _VISION_GREETING_LOG_PATHS:
+        return None
     if reply_path not in {"llm", "recap_answer"}:
         return f"skipped_{reply_path}"
     if is_stt_fragment(user_text):

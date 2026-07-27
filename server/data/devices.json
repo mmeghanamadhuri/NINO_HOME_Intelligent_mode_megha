@@ -2,10 +2,10 @@
   "devices": [
     {
       "device_id": "nino-home",
-      "display_name": "NINO - HOME",
-      "camera_url": "http://192.168.0.86/stream",
-      "play_wav_url": "http://192.168.0.86/play_wav",
-      "base_url": "http://192.168.0.86",
+      "display_name": "NINO-P4",
+      "camera_url": "http://192.168.0.89/stream",
+      "play_wav_url": "http://192.168.0.89/play_wav",
+      "base_url": "http://192.168.0.89",
       "camera_rotation": "cw90",
       "latitude": null,
       "longitude": null,
@@ -13,9 +13,9 @@
       "location_updated_at": "",
       "wifi_ssid": "GOSPAZE Premium Connect",
       "wifi_bssid": "BC:07:1D:67:1B:60",
-      "wifi_rssi": -31,
+      "wifi_rssi": -26,
       "wifi_channel": 1,
-      "wifi_updated_at": "2026-07-27T09:29:53.645269+00:00"
+      "wifi_updated_at": "2026-07-27T17:58:11.596094+00:00"
     }
   ]
 }

@@ -144,6 +144,7 @@ SERVO_360_TRIGGER_DELAY_SECONDS = float(os.environ.get("SERVO_360_TRIGGER_DELAY_
 @dataclass
 class VoiceReplyMeta:
     trigger_servo_360: bool = False
+    # Reuses ESP prompt_ack path: after TTS, chime + open mic (no wake word).
     prompt_medical_ack: bool = False
     eye_expression: str | None = None
     registered_face_name: str | None = None
@@ -152,6 +153,56 @@ class VoiceReplyMeta:
     # Per-stage latency info for this query (stt/reply/tts seconds, heard text,
     # reply path, audio sizes). Filled by process_voice_wav; logged by app.py.
     timings: dict[str, Any] = field(default_factory=dict)
+
+
+# Conversational LLM / memory / recap replies — reopen mic after the bot speaks.
+CONTINUE_LISTEN_REPLY_PATHS = frozenset(
+    {
+        "llm",
+        "identity_llm",
+        "memory_llm_store",
+        "memory_llm_recall",
+        "recap",
+        "recap_answer",
+        "recap_not_found",
+        "recap_blocked_no_face",
+    }
+)
+
+_CONVERSATION_GOODBYE_RE = re.compile(
+    r"\b(?:"
+    r"good\s*bye|goodbye|bye[\s-]*bye|"
+    r"see\s+you(?:\s+(?:later|soon|tomorrow))?|"
+    r"talk\s+(?:to\s+you\s+)?later|"
+    r"that(?:'s| is)\s+all|"
+    r"i(?:'m| am)\s+done|"
+    r"stop\s+listening|"
+    r"end\s+(?:the\s+)?(?:conversation|chat)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def is_conversation_goodbye(user_text: str) -> bool:
+    """True when the user is ending the chat (do not reopen the mic)."""
+    return bool(_CONVERSATION_GOODBYE_RE.search(str(user_text or "").strip()))
+
+
+def should_continue_listen_after_reply(reply_path: str, user_text: str) -> bool:
+    """After an LLM chat reply, tell the ESP to listen again without wake word."""
+    enabled = os.environ.get("VOICE_CONTINUE_LISTEN", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    if not enabled:
+        return False
+    if reply_path not in CONTINUE_LISTEN_REPLY_PATHS:
+        return False
+    if is_conversation_goodbye(user_text):
+        return False
+    return True
 
 
 # Roughly 2–3 personalized voice replies per 10–20 (override with VOICE_PERSONALIZE_PROB).
@@ -1202,6 +1253,23 @@ def process_voice_wav(
         meta.timings["memory_user"] = memory_ctx.name
     if meta.eye_expression:
         meta.timings["eye_expression"] = meta.eye_expression
+
+    # LLM conversation loop: after the bot speaks, ESP chimes and opens the mic.
+    # Volume / alarm / servo / face-reg paths do not use this (they return earlier
+    # or are outside CONTINUE_LISTEN_REPLY_PATHS). Alarm medical-ack may already
+    # have set prompt_medical_ack.
+    if should_continue_listen_after_reply(reply_path, user_text):
+        meta.prompt_medical_ack = True
+        meta.timings["continue_listen"] = True
+        logger.info(
+            "Voice continue-listen after reply | path=%s heard: %s",
+            reply_path,
+            user_text[:80],
+        )
+    elif is_conversation_goodbye(user_text):
+        meta.timings["continue_listen"] = False
+        logger.info("Voice conversation ended (goodbye) | heard: %s", user_text[:80])
+
     logger.info(
         "Latency | stt(%s)=%.2fs reply(%s)=%.2fs tts=%.2fs total=%.2fs | in=%.1fs out=%.1fs%s",
         stt_engine,

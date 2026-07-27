@@ -258,6 +258,28 @@ def startup() -> None:
     start_discovery_loop(on_registry_updated=cameras.configure_from_registry)
     tts.set_playback_device_id(registry.ui_device_id())
     face_registration.set_frame_getter(cameras.frame_getter(registry.ui_device_id()))
+
+    def _on_vision_greeting_spoken(
+        person_name: str,
+        spoken_text: str,
+        reply_path: str,
+        memory_store: str,
+        continue_listen: bool,
+    ) -> None:
+        _append_latency_record(
+            _latency_log_record(
+                event="vision_greeting",
+                reply_path=reply_path,
+                heard="[face recognized]",
+                reply_text=(spoken_text or "")[:200],
+                voice_viewer=person_name,
+                memory_viewer=person_name,
+                memory_store=memory_store,
+                continue_listen=continue_listen,
+            )
+        )
+
+    tts.set_on_greeting_spoken(_on_vision_greeting_spoken)
     play_url = esp_play_wav_url()
     if play_url:
         logger.info("ESP speaker/eyes playback URL (legacy): %s", play_url)
