@@ -905,7 +905,7 @@ def answer_identity_question(
         f"{rules}\n"
         f"{_memory_context_block(memory_context)}"
         f"Rules: one short spoken reply under {max_words} words, plain sentences, "
-        "no lists, no markdown, no stage directions, suitable to read aloud. "
+        "no lists, no markdown, no emojis, no stage directions, suitable to read aloud. "
         "Use fresh casual wording; do not sound like a fixed template.\n"
         f"The user asked: {user_text}"
     )
@@ -1317,7 +1317,7 @@ def answer_recap_contextual_question(
         "- Ground in session history when it helps; you may add brief factual detail to answer well.\n"
         "- Do not invent things that were never said in the history.\n"
         "- If they confirm the topic ('we are talking about X right?'), acknowledge briefly then answer.\n"
-        f"- One spoken reply under {max_words} words. Plain sentences, no lists or markdown.\n"
+        f"- One spoken reply under {max_words} words. Plain sentences, no lists, markdown, or emojis.\n"
     )
     return ollama_generate(
         prompt,
@@ -1411,7 +1411,7 @@ def answer_conversation_recap(
         "- Never use bullet points, numbering, or list formatting.\n"
         "- Avoid echoing exact lines from history unless necessary.\n"
         f"Rules: one concise spoken reply under {max_words} words, plain sentences, "
-        "no lists, no markdown, no stage directions, suitable to read aloud.\n"
+        "no lists, no markdown, no emojis, no stage directions, suitable to read aloud.\n"
         f"The user asked: {user_text}"
     )
     reply = ollama_generate(
@@ -1438,7 +1438,7 @@ def answer_conversation_recap(
         rewrite_prompt = (
             "Rewrite this context recap for voice playback.\n"
             f"Strict rules: 2-3 short sentences, max {max_words} words, no lists or bullets, "
-            "no markdown, and natural spoken style.\n"
+            "no markdown, no emojis, and natural spoken style.\n"
             "Cover key points from recent turns (aim for 3-5 when available), not just one point.\n"
             "Use different wording from previous recap responses.\n"
             "Do not begin with 'You asked about'.\n\n"
@@ -1510,7 +1510,7 @@ def answer_voice_query(
         "- Answer general-knowledge questions yourself; do not tell the speaker to ask another person.\n"
         "- The recognized speaker is the person you are addressing, never a third party to ask about the answer.\n"
         f"Rules: one short spoken reply under {max_words} words, plain sentences, "
-        "no lists, no markdown, no stage directions, suitable to read aloud.\n"
+        "no lists, no markdown, no emojis, no stage directions, suitable to read aloud.\n"
         f"The user asked: {user_text}"
     )
     reply = ollama_generate(
@@ -1689,7 +1689,7 @@ def answer_memory_store_ack(
         f"The user said: {user_text.strip()}\n"
         f"You saved these personal facts: {facts}\n"
         f"Give ONE short spoken acknowledgment under {max_words} words. "
-        "Confirm what you will remember. No lists, no markdown.\n"
+        "Confirm what you will remember. No lists, no markdown, no emojis.\n"
     )
     return ollama_generate(
         prompt,

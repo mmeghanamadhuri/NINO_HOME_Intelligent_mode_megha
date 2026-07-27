@@ -19,6 +19,7 @@ from face_registration_voice import (
     extract_registration_name,
     is_face_reg_prompt_echo,
     is_incomplete_name_phrase,
+    is_registration_cancel,
 )
 from tts_service import synthesize_sapi_wav_bytes
 from wav_resample import resample_wav_bytes_to_mono_16bit
@@ -54,6 +55,10 @@ INCOMPLETE_NAME_PROMPT = (
 
 NO_SPEECH_RETRY_PROMPT = (
     "I haven't heard anything. After the beep, please say your name."
+)
+
+REGISTRATION_CANCEL_REPLY = (
+    "Sorry — I won't register your face right now."
 )
 
 # Sentinel: reopen mic with beep only (no spoken prompt — avoids TTS echo loops).
@@ -376,6 +381,21 @@ class FaceRegistrationService:
                 handled=True,
                 reply=INCOMPLETE_NAME_PROMPT,
                 relisten_after_reply=True,
+            )
+
+        if is_registration_cancel(user_text):
+            logger.info(
+                "Face registration: cancelled by user | heard: %s",
+                user_text[:80],
+            )
+            with self._lock:
+                # Keep cooldown from the original prompt so we don't re-ask immediately.
+                self._last_prompt_at = time.time()
+                self._reset_locked()
+            return FaceRegVoiceResult(
+                handled=True,
+                reply=REGISTRATION_CANCEL_REPLY,
+                relisten_after_reply=False,
             )
 
         name = extract_registration_name(user_text)

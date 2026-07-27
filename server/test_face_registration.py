@@ -10,12 +10,14 @@ from face_registration_voice import (
     extract_registration_name,
     is_face_reg_prompt_echo,
     is_incomplete_name_phrase,
+    is_registration_cancel,
 )
 from face_registration_service import (
     FaceRegistrationService,
     INCOMPLETE_NAME_PROMPT,
     NAME_RETRY_PROMPT,
     NO_SPEECH_RETRY_PROMPT,
+    REGISTRATION_CANCEL_REPLY,
     REGISTRATION_PROMPTS,
     pick_registration_prompt,
 )
@@ -92,6 +94,26 @@ class ExtractRegistrationNameTests(unittest.TestCase):
         picked = {pick_registration_prompt() for _ in range(40)}
         self.assertTrue(picked.issubset(set(REGISTRATION_PROMPTS)))
         self.assertGreater(len(picked), 1)
+
+    def test_detects_registration_cancel(self) -> None:
+        for heard in (
+            "no",
+            "Nope",
+            "cancel",
+            "shut up",
+            "stop",
+            "never mind",
+            "no thanks",
+            "I don't want to",
+            "leave me alone",
+            "forget it",
+        ):
+            self.assertTrue(is_registration_cancel(heard), heard)
+            self.assertIsNone(extract_registration_name(heard), heard)
+
+    def test_cancel_does_not_override_framed_name(self) -> None:
+        self.assertFalse(is_registration_cancel("My name is Nora"))
+        self.assertEqual(extract_registration_name("My name is Nora"), "Nora")
 
 
 class FaceRegistrationServiceTests(unittest.TestCase):
@@ -248,6 +270,27 @@ class FaceRegistrationServiceTests(unittest.TestCase):
         self.assertTrue(result.handled)
         self.assertTrue(result.relisten_after_reply)
         self.assertEqual(self.svc.state, "awaiting_name")
+
+    def test_handle_voice_cancel_stops_registration(self) -> None:
+        with self.svc._lock:
+            self.svc._state = "awaiting_name"
+            self.svc._last_prompt_at = 0.0
+        result = self.svc.handle_voice("cancel")
+        self.assertTrue(result.handled)
+        self.assertFalse(result.relisten_after_reply)
+        self.assertEqual(result.reply, REGISTRATION_CANCEL_REPLY)
+        self.assertEqual(self.svc.state, "idle")
+        self.assertIsNone(result.registered_name)
+        self.assertGreater(self.svc._last_prompt_at, 0.0)
+        self.faces.register_sample.assert_not_called()
+
+    def test_handle_voice_no_stops_registration(self) -> None:
+        with self.svc._lock:
+            self.svc._state = "awaiting_name"
+        result = self.svc.handle_voice("no")
+        self.assertTrue(result.handled)
+        self.assertEqual(result.reply, REGISTRATION_CANCEL_REPLY)
+        self.assertEqual(self.svc.state, "idle")
 
     def test_handle_voice_incomplete_name_phrase(self) -> None:
         with self.svc._lock:

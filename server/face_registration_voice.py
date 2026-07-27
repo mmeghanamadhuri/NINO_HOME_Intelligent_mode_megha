@@ -298,6 +298,39 @@ _COMMANDISH = re.compile(
     re.IGNORECASE,
 )
 
+# User declines face registration after the name prompt (whole utterance).
+_CANCEL_UTTERANCE = re.compile(
+    r"^\s*(?:"
+    r"no|nope|nah|"
+    r"cancel(?:\s+it)?|stop(?:\s+it)?|quit|abort|"
+    r"shut\s*up|be\s+quiet|"
+    r"never\s*mind|forget\s+it|"
+    r"no\s+thanks|no\s+thank\s+you|"
+    r"not\s+now|go\s+away|leave\s+me\s+alone|"
+    r"enough|"
+    r"don'?t(?:\s+want(?:\s+to)?)?|"
+    r"do\s+not(?:\s+want(?:\s+to)?)?|"
+    r"i\s+(?:don'?t|do\s+not)\s+want(?:\s+to(?:\s+register)?)?|"
+    r"please\s+(?:stop|cancel|don'?t)"
+    r")"
+    r"(?:\s+(?:please|it|this|registration|now))*"
+    r"\s*[.!?…]*\s*$",
+    re.IGNORECASE,
+)
+
+# Clear cancel intent inside a short refusal sentence.
+_CANCEL_IN_SENTENCE = re.compile(
+    r"\b(?:"
+    r"shut\s*up|"
+    r"cancel(?:\s+(?:it|this|registration))?|"
+    r"never\s*mind|forget\s+it|"
+    r"don'?t\s+(?:want\s+to\s+)?register|"
+    r"stop\s+(?:it|this|registration)|"
+    r"leave\s+me\s+alone"
+    r")\b",
+    re.IGNORECASE,
+)
+
 _MIN_ASCII_LETTERS = 3
 _MIN_ASCII_LETTERS_BARE = 4
 
@@ -396,6 +429,19 @@ def is_face_reg_prompt_echo(user_text: str) -> bool:
     if not text:
         return False
     return any(p.search(text) for p in _FACE_REG_ECHO_PATTERNS)
+
+
+def is_registration_cancel(user_text: str) -> bool:
+    """True when the user declines / cancels face registration."""
+    text = _strip_trailing_punct(user_text or "")
+    if not text or len(text) > 80:
+        return False
+    # Framed name answers win over cancel words inside them.
+    if any(p.search(text) for p in _FRAMED_NAME_PATTERNS):
+        return False
+    if _CANCEL_UTTERANCE.match(text):
+        return True
+    return bool(_CANCEL_IN_SENTENCE.search(text))
 
 
 def extract_registration_name(user_text: str) -> str | None:

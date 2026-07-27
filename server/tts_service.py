@@ -4,6 +4,7 @@ import io
 import logging
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -25,6 +26,34 @@ from wav_resample import ESP_PCM_SAMPLE_RATE_HZ, resample_wav_bytes_to_mono_16bi
 logger = logging.getLogger(__name__)
 
 _GREETING_MAX_WORDS = 40
+
+# Emoji / pictograph ranges + ZWJ / variation selectors used in emoji sequences.
+_TTS_EMOJI_RE = re.compile(
+    "["
+    "\U0001F1E0-\U0001F1FF"  # flags
+    "\U0001F300-\U0001F5FF"  # symbols & pictographs
+    "\U0001F600-\U0001F64F"  # emoticons
+    "\U0001F680-\U0001F6FF"  # transport & map
+    "\U0001F700-\U0001F77F"
+    "\U0001F780-\U0001F7FF"
+    "\U0001F800-\U0001F8FF"
+    "\U0001F900-\U0001F9FF"  # supplemental symbols
+    "\U0001FA00-\U0001FAFF"  # symbols extended-A
+    "\U00002600-\U000026FF"  # misc symbols
+    "\U00002700-\U000027BF"  # dingbats
+    "\U0000FE0E\U0000FE0F"  # variation selectors
+    "\U0000200D"  # zero-width joiner
+    "\U000020E3"  # combining enclosing keycap
+    "]+"
+)
+# LLM shortcodes like :smile: / :thumbs_up:
+_TTS_EMOJI_SHORTCODE_RE = re.compile(r":[a-z0-9_+-]+:", re.I)
+# Decorative bullets / stars / hearts that TTS would misread.
+_TTS_DECORATIVE_RE = re.compile(r"[•·▪▸►★☆✦✧♥♡❤✨]+")
+_TTS_MARKDOWN_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+_TTS_MARKDOWN_ITALIC_RE = re.compile(r"(?<!\w)\*([^*]+)\*(?!\w)")
+_TTS_MARKDOWN_UNDER_BOLD_RE = re.compile(r"__(.+?)__")
+_TTS_MARKDOWN_CODE_RE = re.compile(r"`([^`]+)`")
 
 
 def _split_invite_question(text: str) -> tuple[str, str | None]:
@@ -95,13 +124,26 @@ _PREFERRED_ESPEAK_VOICES = (
 
 
 def _normalize_tts_text(text: str) -> str:
-    return (
+    """Normalize LLM reply text for speech: quotes, strip emojis/markdown junk."""
+    if not text:
+        return ""
+    clean = (
         text.replace("\u2018", "'")
         .replace("\u2019", "'")
         .replace("\u201B", "'")
         .replace("\u201C", '"')
         .replace("\u201D", '"')
     )
+    clean = _TTS_MARKDOWN_BOLD_RE.sub(r"\1", clean)
+    clean = _TTS_MARKDOWN_UNDER_BOLD_RE.sub(r"\1", clean)
+    clean = _TTS_MARKDOWN_CODE_RE.sub(r"\1", clean)
+    clean = _TTS_MARKDOWN_ITALIC_RE.sub(r"\1", clean)
+    clean = _TTS_EMOJI_RE.sub("", clean)
+    clean = _TTS_EMOJI_SHORTCODE_RE.sub("", clean)
+    clean = _TTS_DECORATIVE_RE.sub("", clean)
+    clean = re.sub(r"[ \t]+", " ", clean)
+    clean = re.sub(r" ?\n ?", " ", clean)
+    return clean.strip()
 
 
 def _use_windows_sapi() -> bool:
@@ -1211,7 +1253,7 @@ class TTSService:
         eye_expression: str | None = None,
     ) -> str:
         """Play arbitrary text on ESP — auto-chunked by measured WAV size."""
-        text = text.strip()
+        text = _normalize_tts_text(text)
         if not text:
             return text
         chunks = self._chunk_text_for_esp(text)
