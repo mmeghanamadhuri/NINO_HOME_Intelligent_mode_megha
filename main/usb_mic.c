@@ -42,14 +42,12 @@ static const char *TAG = "usb_mic";
 
 #define USB_MIC_MAX_BLOCKED_ADDRS 8
 #define USB_MIC_OPEN_QUEUE_LEN 8
+#define USB_MIC_CLOSE_QUEUE_LEN 4
 #define USB_MIC_OPEN_WORKER_STACK 4096
 #define USB_MIC_OPEN_SETTLE_MS 120
 #define USB_MIC_RETRY_MS 5000
 #define USB_MIC_RX_POLL_MS 10
 #define USB_MIC_NO_RX_CLOSE_MS 8000
-#define USB_MIC_MAX_UAC_IFACES 4
-#define FTDI_VID 0x0403
-#define ROBOTIS_VID 0x16d0
 #define RESPEAKER_VID 0x2886
 #define RESPEAKER_PID 0x0018
 
@@ -69,6 +67,8 @@ static SemaphoreHandle_t s_read_mutex;
 static SemaphoreHandle_t s_ready_mutex;
 static SemaphoreHandle_t s_open_mutex;
 static QueueHandle_t s_connect_queue;
+static QueueHandle_t s_close_queue;
+static volatile uac_host_device_handle_t s_close_fallback;
 static usb_host_client_handle_t s_uac_client;
 static volatile bool s_mic_ready;
 static volatile bool s_uac_started;
@@ -90,6 +90,8 @@ static volatile int32_t s_last_peak;
 static volatile bool s_has_audio;
 static int64_t s_uac_open_us;
 static uint8_t s_active_iface;
+static uint8_t s_header_mic_addr;
+static uint8_t s_header_mic_iface;
 static usb_mic_fail_t s_failed_opens[8];
 static size_t s_failed_open_count;
 
@@ -167,36 +169,6 @@ static uint32_t get_fallback_sample_freq(const uac_host_dev_alt_param_t *alt_par
   return preferred;
 }
 
-static bool find_dev_alt_params_for_freq(uac_host_device_handle_t handle, uint32_t freq,
-                                         uac_host_dev_alt_param_t *out) {
-  uac_host_dev_info_t info;
-  if (uac_host_get_device_info(handle, &info) != ESP_OK) {
-    return false;
-  }
-  for (uint8_t alt = 1; alt <= info.iface_alt_num; alt++) {
-    uac_host_dev_alt_param_t p;
-    if (uac_host_get_device_alt_param(handle, alt, &p) != ESP_OK) {
-      continue;
-    }
-    bool match = false;
-    if (p.sample_freq_type > 0) {
-      for (int i = 0; i < p.sample_freq_type; i++) {
-        if (p.sample_freq[i] == freq) {
-          match = true;
-          break;
-        }
-      }
-    } else {
-      match = (freq >= p.sample_freq_lower && freq <= p.sample_freq_upper);
-    }
-    if (match) {
-      *out = p;
-      return true;
-    }
-  }
-  return false;
-}
-
 static bool addr_is_blocked(uint8_t addr) {
   for (size_t i = 0; i < s_blocked_addr_count; i++) {
     if (s_blocked_addrs[i] == addr) {
@@ -235,45 +207,6 @@ void usb_mic_block_dev_addr(uint8_t dev_addr) {
   }
 }
 
-static bool device_has_uvc_interface(uint8_t addr) {
-  if (s_uac_client == NULL) {
-    return false;
-  }
-  usb_device_handle_t dev_hdl = NULL;
-  if (usb_host_device_open(s_uac_client, addr, &dev_hdl) != ESP_OK) {
-    return false;
-  }
-
-  const usb_config_desc_t *cfg = NULL;
-  bool has_uvc = false;
-  if (usb_host_get_active_config_descriptor(dev_hdl, &cfg) == ESP_OK && cfg != NULL) {
-    const uint8_t *ptr = (const uint8_t *)cfg;
-    const uint8_t *end = ptr + cfg->wTotalLength;
-    ptr += cfg->bLength;
-    while (ptr < end) {
-      if (ptr + 1 >= end) {
-        break;
-      }
-      const uint8_t desc_len = ptr[0];
-      const uint8_t desc_type = ptr[1];
-      if (desc_len < 2 || ptr + desc_len > end) {
-        break;
-      }
-      if (desc_type == USB_B_DESCRIPTOR_TYPE_INTERFACE && desc_len >= 9) {
-        const usb_intf_desc_t *intf = (const usb_intf_desc_t *)ptr;
-        if (intf->bInterfaceClass == USB_CLASS_VIDEO) {
-          has_uvc = true;
-          break;
-        }
-      }
-      ptr += desc_len;
-    }
-  }
-
-  usb_host_device_close(s_uac_client, dev_hdl);
-  return has_uvc;
-}
-
 static bool read_usb_ids(usb_device_handle_t hdl, uint16_t *vid, uint16_t *pid,
                          uint8_t *dev_class) {
   if (hdl == NULL) {
@@ -295,49 +228,36 @@ static bool read_usb_ids(usb_device_handle_t hdl, uint16_t *vid, uint16_t *pid,
   return true;
 }
 
-static bool peek_usb_ids(uint8_t addr, uint16_t *vid, uint16_t *pid, uint8_t *dev_class) {
+static bool is_header_respeaker(uint8_t addr, uint16_t *vid_out, uint16_t *pid_out) {
   if (s_uac_client == NULL) {
     return false;
   }
   usb_device_handle_t hdl = NULL;
   if (usb_host_device_open(s_uac_client, addr, &hdl) != ESP_OK) {
+    ESP_LOGW(TAG, "Cannot inspect UAC addr=%u; waiting for a new connect event", addr);
     return false;
-  }
-  const bool ok = read_usb_ids(hdl, vid, pid, dev_class);
-  usb_host_device_close(s_uac_client, hdl);
-  return ok;
-}
-
-static bool device_is_known_non_mic(uint8_t addr) {
-  if (addr_is_blocked(addr)) {
-    return true;
   }
 
   uint16_t vid = 0;
   uint16_t pid = 0;
-  uint8_t dev_class = 0;
-  if (!peek_usb_ids(addr, &vid, &pid, &dev_class)) {
+  usb_device_info_t info = {};
+  const bool valid = read_usb_ids(hdl, &vid, &pid, NULL) &&
+                     usb_host_device_info(hdl, &info) == ESP_OK &&
+                     vid == RESPEAKER_VID && pid == RESPEAKER_PID &&
+                     info.parent.dev_hdl == NULL && info.speed == USB_SPEED_FULL;
+  usb_host_device_close(s_uac_client, hdl);
+  if (!valid) {
+    ESP_LOGW(TAG, "Ignore UAC addr=%u — expected root-port ReSpeaker %04x:%04x",
+             addr, RESPEAKER_VID, RESPEAKER_PID);
     return false;
   }
-
-  if (dev_class == USB_CLASS_HUB) {
-    ESP_LOGI(TAG, "Skip UAC addr=%u — USB hub (%04x:%04x)", addr, vid, pid);
-    return true;
+  if (vid_out != NULL) {
+    *vid_out = vid;
   }
-
-  /* J18 hub peripherals — not the GPIO-header mic. */
-  if (vid == FTDI_VID || vid == ROBOTIS_VID || vid == 0x046d || vid == 0x1a40 || vid == 0x05e3 ||
-      vid == 0x03eb) {
-    ESP_LOGI(TAG, "Skip UAC addr=%u — hub device %04x:%04x (not header mic)", addr, vid, pid);
-    return true;
+  if (pid_out != NULL) {
+    *pid_out = pid;
   }
-
-  if (device_has_uvc_interface(addr)) {
-    ESP_LOGI(TAG, "Skip UAC addr=%u — UVC camera %04x:%04x", addr, vid, pid);
-    return true;
-  }
-
-  return false;
+  return true;
 }
 
 static bool open_config_is_failed(uint8_t addr, uint8_t iface) {
@@ -358,68 +278,6 @@ static void mark_open_config_failed(uint8_t addr, uint8_t iface) {
   }
   s_failed_opens[s_failed_open_count++] = (usb_mic_fail_t){.addr = addr, .iface = iface};
   ESP_LOGW(TAG, "Mark UAC addr=%u iface=%u failed (will try other interfaces)", addr, iface);
-}
-
-static int list_uac_input_ifaces(uint8_t addr, uint8_t *ifaces, int max_ifaces) {
-  if (s_uac_client == NULL || ifaces == NULL || max_ifaces <= 0) {
-    return 0;
-  }
-  usb_device_handle_t dev_hdl = NULL;
-  if (usb_host_device_open(s_uac_client, addr, &dev_hdl) != ESP_OK) {
-    return 0;
-  }
-
-  int count = 0;
-  const usb_config_desc_t *cfg = NULL;
-  if (usb_host_get_active_config_descriptor(dev_hdl, &cfg) == ESP_OK && cfg != NULL) {
-    const uint8_t *ptr = (const uint8_t *)cfg;
-    const uint8_t *end = ptr + cfg->wTotalLength;
-    ptr += cfg->bLength;
-    while (ptr < end) {
-      if (ptr + 1 >= end) {
-        break;
-      }
-      const uint8_t desc_len = ptr[0];
-      const uint8_t desc_type = ptr[1];
-      if (desc_len < 2 || ptr + desc_len > end) {
-        break;
-      }
-      if (desc_type == USB_B_DESCRIPTOR_TYPE_INTERFACE && desc_len >= 9) {
-        const usb_intf_desc_t *intf = (const usb_intf_desc_t *)ptr;
-        if (intf->bInterfaceClass == USB_CLASS_AUDIO && intf->bInterfaceSubClass == 0x02) {
-          bool dup = false;
-          for (int i = 0; i < count; i++) {
-            if (ifaces[i] == intf->bInterfaceNumber) {
-              dup = true;
-              break;
-            }
-          }
-          if (!dup && count < max_ifaces) {
-            ifaces[count++] = intf->bInterfaceNumber;
-          }
-        }
-      }
-      ptr += desc_len;
-    }
-  }
-
-  usb_host_device_close(s_uac_client, dev_hdl);
-  return count;
-}
-
-static bool find_uac_input_iface(uint8_t addr, uint8_t *iface_out) {
-  uint8_t ifaces[USB_MIC_MAX_UAC_IFACES];
-  const int n = list_uac_input_ifaces(addr, ifaces, USB_MIC_MAX_UAC_IFACES);
-  if (n <= 0 || iface_out == NULL) {
-    return false;
-  }
-  for (int i = n - 1; i >= 0; i--) {
-    if (!open_config_is_failed(addr, ifaces[i])) {
-      *iface_out = ifaces[i];
-      return true;
-    }
-  }
-  return false;
 }
 
 static esp_err_t uac_client_init(void) {
@@ -446,6 +304,35 @@ static void close_mic_device(uac_host_device_handle_t mic) {
     ESP_LOGW(TAG, "uac_host_device_close: %s", esp_err_to_name(err));
   }
   vTaskDelay(pdMS_TO_TICKS(20));
+}
+
+/* Must not call uac_host_device_close() from the UAC/USB host callback stack —
+ * that re-enters _uac_host_device_disconnected and asserts (uac_device == NULL).
+ * Queue the handle and close from the worker task instead (Espressif example). */
+static void queue_mic_device_close(uac_host_device_handle_t mic) {
+  if (mic == NULL) {
+    return;
+  }
+  if (s_close_queue != NULL && xQueueSend(s_close_queue, &mic, 0) == pdTRUE) {
+    return;
+  }
+  /* Never close from the host callback. Worker/retry will pick this up. */
+  ESP_LOGW(TAG, "UAC close queue full/unavailable — stashing handle for worker");
+  s_close_fallback = mic;
+}
+
+static void drain_pending_mic_closes(void) {
+  if (s_close_queue != NULL) {
+    uac_host_device_handle_t mic = NULL;
+    while (xQueueReceive(s_close_queue, &mic, 0) == pdTRUE) {
+      close_mic_device(mic);
+    }
+  }
+  uac_host_device_handle_t fallback = s_close_fallback;
+  if (fallback != NULL) {
+    s_close_fallback = NULL;
+    close_mic_device(fallback);
+  }
 }
 
 static bool try_start_mic(uac_host_device_handle_t mic, uac_host_dev_alt_param_t *alt_out,
@@ -675,9 +562,14 @@ static void uac_device_callback(uac_host_device_handle_t uac_device_handle,
     if (uac_device_handle != s_mic_dev) {
       break;
     }
-    ESP_LOGW(TAG, "USB mic disconnected");
+    ESP_LOGW(TAG, "USB mic disconnected — deferring UAC close");
+    /* Host keeps the iface until the app closes it, but close must run outside
+     * this callback (see queue_mic_device_close). Keep s_header_mic_* so retry
+     * can reopen the GPIO-header ReSpeaker after a transient drop. */
+    uac_host_device_handle_t dev = s_mic_dev;
     s_mic_dev = NULL;
     reset_mic_stream_state();
+    queue_mic_device_close(dev);
     break;
   default:
     break;
@@ -713,32 +605,13 @@ static void process_uac_connect_request(const usb_mic_connect_req_t *req) {
     return;
   }
 
-  if (device_is_known_non_mic(req->addr)) {
-    return;
-  }
-
   uint16_t vid = 0;
   uint16_t pid = 0;
-  (void)peek_usb_ids(req->addr, &vid, &pid, NULL);
-
-  if (vid == RESPEAKER_VID && pid == RESPEAKER_PID && s_uac_client != NULL) {
-    usb_device_handle_t hdl = NULL;
-    if (usb_host_device_open(s_uac_client, req->addr, &hdl) == ESP_OK) {
-      usb_device_info_t info = {};
-      if (usb_host_device_info(hdl, &info) == ESP_OK) {
-        const char *spd = info.speed == USB_SPEED_FULL    ? "FS"
-                          : info.speed == USB_SPEED_HIGH ? "HS"
-                          : info.speed == USB_SPEED_LOW  ? "LS"
-                                                         : "?";
-        ESP_LOGI(TAG, "ReSpeaker 4-mic: addr=%u speed=%s parent=%s", req->addr, spd,
-                 info.parent.dev_hdl ? "hub (J18?)" : "root (GPIO header OK)");
-        if (info.parent.dev_hdl != NULL) {
-          ESP_LOGW(TAG, "ReSpeaker is on a USB hub — for GPIO wiring use 5V/GND + D-/D+ on pins 24/25 only");
-        }
-      }
-      usb_host_device_close(s_uac_client, hdl);
-    }
+  if (!is_header_respeaker(req->addr, &vid, &pid)) {
+    return;
   }
+  s_header_mic_addr = req->addr;
+  s_header_mic_iface = req->iface_num;
 
   if (s_open_mutex != NULL &&
       xSemaphoreTake(s_open_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
@@ -804,9 +677,12 @@ static void uac_connect_worker(void *arg) {
   usb_mic_connect_req_t req;
 
   for (;;) {
-    if (xQueueReceive(s_connect_queue, &req, portMAX_DELAY) != pdTRUE) {
+    /* Prefer completing deferred disconnect closes before opening again. */
+    drain_pending_mic_closes();
+    if (xQueueReceive(s_connect_queue, &req, pdMS_TO_TICKS(50)) != pdTRUE) {
       continue;
     }
+    drain_pending_mic_closes();
     vTaskDelay(pdMS_TO_TICKS(USB_MIC_OPEN_SETTLE_MS));
     process_uac_connect_request(&req);
   }
@@ -827,6 +703,7 @@ static void usb_mic_retry_task(void *arg) {
 
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(USB_MIC_RETRY_MS));
+    drain_pending_mic_closes();
     if (s_uac_client == NULL) {
       continue;
     }
@@ -849,53 +726,15 @@ static void usb_mic_retry_task(void *arg) {
       continue;
     }
 
-    uint8_t addrs[8];
-    int num = 0;
-    if (usb_host_device_addr_list_fill((int)sizeof(addrs), addrs, &num) != ESP_OK || num <= 0) {
-      continue;
-    }
-
-    ESP_LOGI(TAG, "USB mic scan: %d device(s)", num);
-    for (int i = 0; i < num && !usb_mic_ready(); i++) {
-      if (device_is_known_non_mic(addrs[i])) {
-        continue;
-      }
-      uint16_t vid = 0;
-      uint16_t pid = 0;
-      (void)peek_usb_ids(addrs[i], &vid, &pid, NULL);
-      /* Prefer ReSpeaker 4-mic when present. */
-      if (vid != RESPEAKER_VID || pid != RESPEAKER_PID) {
-        bool has_respeaker = false;
-        for (int j = 0; j < num; j++) {
-          uint16_t v2 = 0;
-          uint16_t p2 = 0;
-          (void)peek_usb_ids(addrs[j], &v2, &p2, NULL);
-          if (v2 == RESPEAKER_VID && p2 == RESPEAKER_PID) {
-            has_respeaker = true;
-            break;
-          }
-        }
-        if (has_respeaker) {
-          continue;
-        }
-      }
-      uint8_t iface = 0;
-      if (!find_uac_input_iface(addrs[i], &iface)) {
-        if (vid == RESPEAKER_VID && pid == RESPEAKER_PID) {
-          ESP_LOGW(TAG, "All ReSpeaker UAC interfaces failed — clearing retry list for addr=%u",
-                   addrs[i]);
-          for (size_t k = 0; k < s_failed_open_count;) {
-            if (s_failed_opens[k].addr == addrs[i]) {
-              s_failed_open_count--;
-              s_failed_opens[k] = s_failed_opens[s_failed_open_count];
-            } else {
-              k++;
-            }
-          }
-        }
-        continue;
-      }
-      const usb_mic_connect_req_t req = {.addr = addrs[i], .iface_num = iface};
+    /* A valid header mic can temporarily drop its UAC stream during heavy USB
+     * activity. Retry only that known device/interface; never probe arbitrary
+     * hub or stale addresses. */
+    if (s_header_mic_addr != 0 && s_header_mic_iface != 0 &&
+        s_mic_dev == NULL) {
+      const usb_mic_connect_req_t req = {
+          .addr = s_header_mic_addr,
+          .iface_num = s_header_mic_iface,
+      };
       process_uac_connect_request(&req);
     }
   }
@@ -985,6 +824,13 @@ esp_err_t usb_mic_start(void) {
   if (s_read_mutex == NULL) {
     s_read_mutex = xSemaphoreCreateMutex();
     if (s_read_mutex == NULL) {
+      return ESP_ERR_NO_MEM;
+    }
+  }
+
+  if (s_close_queue == NULL) {
+    s_close_queue = xQueueCreate(USB_MIC_CLOSE_QUEUE_LEN, sizeof(uac_host_device_handle_t));
+    if (s_close_queue == NULL) {
       return ESP_ERR_NO_MEM;
     }
   }

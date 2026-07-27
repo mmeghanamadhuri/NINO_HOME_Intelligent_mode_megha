@@ -35,6 +35,8 @@ void ble_store_config_init(void);
 static const char *TAG = "wifi_prov_ble";
 
 #define PROV_CMD_APPLY 0x01
+#define HOSTED_BT_SETUP_MAX_ATTEMPTS 8
+#define HOSTED_BT_SETUP_RETRY_MS 1000
 
 /* 4facb001-5a2e-4b7c-9e1f-a8d3e6f20401 */
 #define WIFI_PROV_SVC_UUID128 \
@@ -89,9 +91,15 @@ static esp_err_t hosted_bt_setup_with_retry(void) {
   if (s_bt_ctrl_ready) {
     return ESP_OK;
   }
-  for (int attempt = 0; attempt < 8; ++attempt) {
+  for (int attempt = 0; attempt < HOSTED_BT_SETUP_MAX_ATTEMPTS; ++attempt) {
+    /* BLE is only needed while the robot has no saved network. Do not keep
+     * issuing long Hosted RPCs after provisioning has succeeded. */
+    if (wifi_config_is_provisioned()) {
+      ESP_LOGI(TAG, "Wi-Fi credentials received — stopping BLE controller setup");
+      return ESP_ERR_INVALID_STATE;
+    }
     if (attempt > 0) {
-      vTaskDelay(pdMS_TO_TICKS(1000));
+      vTaskDelay(pdMS_TO_TICKS(HOSTED_BT_SETUP_RETRY_MS));
     }
     esp_err_t err = esp_hosted_connect_to_slave();
     if (err != ESP_OK) {
@@ -193,11 +201,8 @@ void wifi_prov_ble_on_sta_ip_changed(bool connected) {
   if (!s_ble_started) {
     return;
   }
-  if (connected) {
-    (void)hosted_bt_setup_with_retry();
-    if (s_bt_ctrl_ready) {
-      prov_advertise();
-    }
+  if (connected && s_bt_ctrl_ready) {
+    prov_advertise();
   }
   prov_update_status_json(connected ? 2 : 1, connected ? "done" : "connecting");
   prov_notify_status();
@@ -448,6 +453,8 @@ esp_err_t wifi_prov_ble_start(void) {
   s_pending_pass[0] = '\0';
   prov_update_status_json(0, "idle");
 
+  /* Start the NimBLE host even when the controller setup is still settling.
+   * ESP-Hosted can complete its controller handshake asynchronously. */
   (void)hosted_bt_setup_with_retry();
 
   esp_err_t err = nimble_port_init();

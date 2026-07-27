@@ -167,6 +167,11 @@ static void wake_fetch_task(void *arg) {
       continue;
     }
 
+    if (!nino_mic_available()) {
+      vTaskDelay(pdMS_TO_TICKS(WAKE_IDLE_DELAY_MS));
+      continue;
+    }
+
     afe_fetch_result_t *res = s_afe->fetch(afe_data);
     TickType_t yield = pdMS_TO_TICKS(WAKE_FETCH_DELAY_MS);
 

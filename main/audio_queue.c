@@ -113,10 +113,18 @@ static bool play_touch_job(audio_play_job_t *job) {
   job->data = NULL;
 
   s_normal_playing = true;
+  /* Queuing this priority job set the stop flag to interrupt the previous
+   * playback. It must not interrupt this newly selected job. */
+  s_stop_requested = false;
   size_t offset = 0;
   const nino_audio_servo_mode_t servo_mode = effective_servo_mode(job->servo_mode);
-  (void)play_decoded_job(&decoded, &offset, servo_mode, false);
+  const bool completed = play_decoded_job(&decoded, &offset, servo_mode, true);
   s_normal_playing = false;
+  if (!completed) {
+    /* Higher-priority prompts (including WIFI.wav) replace the current
+     * priority prompt instead of waiting for it to finish. */
+    s_stop_requested = false;
+  }
   nino_decoded_wav_free(&decoded);
   rewarm_wake_chime_path();
   return true;
@@ -396,5 +404,10 @@ void nino_audio_queue_preempt_for_wake(void) {
   const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(150);
   while (s_normal_playing && xTaskGetTickCount() < deadline) {
     vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  /* If there was no queued audio to interrupt, do not leave a stale stop
+   * request that would cancel the next server reply at byte zero. */
+  if (!s_normal_playing) {
+    s_stop_requested = false;
   }
 }

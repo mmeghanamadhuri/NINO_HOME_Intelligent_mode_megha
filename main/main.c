@@ -88,6 +88,10 @@ static char s_sta_pass[WIFI_CONFIG_STA_PASS_MAX] = "";
 static wifi_mode_t s_wifi_mode = WIFI_MODE_AP;
 static bool s_sta_connected = false;
 static bool s_wifi_connected_chime_pending = false;
+static bool s_audio_queue_ready = false;
+static volatile bool s_wifi_connected_chime_task_running = false;
+static bool s_boot_unprovisioned = false;
+static volatile bool s_provisioned_welcome_scheduled = false;
 static bool s_boot_greeting_done = false;
 static bool s_mdns_started = false;
 
@@ -219,6 +223,39 @@ static bool play_wifi_connected_clip(void) {
   return true;
 }
 
+/* The IP event can happen before the audio task is ready. Keep the connection
+ * chime pending and retry its queue operation instead of losing it. */
+static void wifi_connected_chime_task(void *arg) {
+  (void)arg;
+  for (int attempt = 0; attempt < 120 && s_sta_connected &&
+                        s_wifi_connected_chime_pending;
+       ++attempt) {
+    if (s_audio_queue_ready && play_wifi_connected_clip()) {
+      s_wifi_connected_chime_pending = false;
+      break;
+    }
+    vTaskDelay(pdMS_TO_TICKS(250));
+  }
+  if (s_wifi_connected_chime_pending && s_sta_connected) {
+    ESP_LOGW(TAG, "WIFI.wav was not queued after STA connection");
+  }
+  s_wifi_connected_chime_task_running = false;
+  vTaskDelete(NULL);
+}
+
+static void schedule_wifi_connected_chime(void) {
+  if (!s_sta_connected || !s_wifi_connected_chime_pending ||
+      s_wifi_connected_chime_task_running) {
+    return;
+  }
+  s_wifi_connected_chime_task_running = true;
+  if (xTaskCreate(wifi_connected_chime_task, "wifi_chime", 3072, NULL, 5,
+                  NULL) != pdPASS) {
+    s_wifi_connected_chime_task_running = false;
+    ESP_LOGW(TAG, "WIFI.wav task not started");
+  }
+}
+
 static bool play_hello_home_clip(void) {
   const size_t wav_len = (size_t)(hello_home_wav_end - hello_home_wav_start);
   if (wav_len < 44) {
@@ -227,7 +264,7 @@ static bool play_hello_home_clip(void) {
   }
 
   esp_err_t err = nino_audio_queue_wav_copy(hello_home_wav_start, wav_len, false,
-                                            NINO_AUDIO_SERVO_PRIORITY_NONE, false);
+                                            NINO_AUDIO_SERVO_NONE, false);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "Failed to queue Hello-home.wav: %s", esp_err_to_name(err));
     return false;
@@ -236,6 +273,33 @@ static bool play_hello_home_clip(void) {
   ESP_LOGI(TAG, "Queued Hello-home.wav (%u bytes) after boot",
            (unsigned)wav_len);
   return true;
+}
+
+/* A boot that began without credentials finishes its GO-APP greeting before
+ * BLE provisioning completes. Add the normal welcome after the Wi-Fi chime. */
+static void provisioned_welcome_task(void *arg) {
+  (void)arg;
+  for (int waited_ms = 0;
+       waited_ms < 30000 && s_sta_connected && s_wifi_connected_chime_pending;
+       waited_ms += 100) {
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+  if (s_sta_connected && !s_wifi_connected_chime_pending) {
+    (void)play_hello_home_clip();
+  }
+  vTaskDelete(NULL);
+}
+
+static void schedule_provisioned_welcome(void) {
+  if (!s_boot_unprovisioned || s_provisioned_welcome_scheduled) {
+    return;
+  }
+  s_provisioned_welcome_scheduled = true;
+  if (xTaskCreate(provisioned_welcome_task, "prov_welcome", 3072, NULL, 4,
+                  NULL) != pdPASS) {
+    s_provisioned_welcome_scheduled = false;
+    ESP_LOGW(TAG, "Hello-home task not started after provisioning");
+  }
 }
 
 static bool play_wifi_unable_clip(void) {
@@ -315,7 +379,7 @@ static void finish_boot_greeting_and_enable_wake(void) {
 static void hello_home_task(void *arg) {
   (void)arg;
   if (s_sta_ssid[0] == '\0') {
-    play_go_app_clip();
+    /* GO-APP.wav is queued immediately after audio setup during boot. */
     finish_boot_greeting_and_enable_wake();
     vTaskDelete(NULL);
     return;
@@ -1064,6 +1128,9 @@ esp_err_t wifi_config_set_sta_credentials(const char *ssid, const char *pass) {
   /* New credentials: allow the "unable to connect" prompt to play again if
    * this attempt also fails. */
   s_wifi_unable_chimed = false;
+  /* Each new connection attempt should announce success only after it receives
+   * an IP address. */
+  s_wifi_connected_chime_pending = true;
   return ESP_OK;
 }
 
@@ -1459,11 +1526,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     mdns_start_service();
     wifi_prov_ble_on_sta_ip_changed(true);
     schedule_wifi_network_report();
-    if (s_wifi_connected_chime_pending) {
-      if (play_wifi_connected_clip()) {
-        s_wifi_connected_chime_pending = false;
-      }
-    }
+    schedule_wifi_connected_chime();
+    schedule_provisioned_welcome();
   }
 }
 
@@ -1568,6 +1632,20 @@ static void wifi_init_all(void) {
 
   wifi_mode_t saved_mode = wifi_load_from_nvs();
   ESP_ERROR_CHECK(wifi_switch_mode(saved_mode));
+}
+
+/* Start BLE provisioning as soon as NVS has told us that no STA credentials
+ * exist. The Hosted controller can take several retries to come up, so run it
+ * independently of the remaining boot peripherals. */
+static void wifi_provisioning_task(void *arg) {
+  (void)arg;
+  esp_err_t err = wifi_prov_ble_start_if_needed();
+  if (err != ESP_OK && err != ESP_ERR_NOT_SUPPORTED &&
+      err != ESP_ERR_INVALID_STATE) {
+    ESP_LOGW(TAG, "BLE Wi-Fi provisioning not started: %s",
+             esp_err_to_name(err));
+  }
+  vTaskDelete(NULL);
 }
 
 static bool is_discovery_request(const char *msg, size_t len) {
@@ -2802,8 +2880,7 @@ static int cmd_voice(int argc, char **argv) {
     printf("voice mic: %s\n",
            nino_mic_source_name(nino_mic_preferred_source()));
     printf("usb header mic: %s\n",
-           usb_mic_ready() ? "streaming (preferred)"
-                           : "not ready; using onboard ES8311 fallback");
+           usb_mic_ready() ? "streaming" : "not ready (USB 4-mic required)");
     usb_mic_print_status();
     usb_mic_print_usb_devices();
     printf("device_id: %s\n", s_device_id);
@@ -3677,6 +3754,12 @@ void app_main(void) {
   nino_face_tracker_init();
 
   wifi_init_all();
+  s_boot_unprovisioned = !wifi_config_is_provisioned();
+  BaseType_t ble_task_ok = xTaskCreatePinnedToCore(
+      wifi_provisioning_task, "wifi_prov", 4096, NULL, 5, NULL, APP_CORE_NET);
+  if (ble_task_ok != pdPASS) {
+    ESP_LOGW(TAG, "BLE Wi-Fi provisioning task not started");
+  }
 
   if (nino_audio_init() != ESP_OK) {
     ESP_LOGW(TAG,
@@ -3687,10 +3770,12 @@ void app_main(void) {
     ESP_LOGW(TAG, "Wake chime preload failed — first beep may be slower");
   }
   ESP_ERROR_CHECK(nino_audio_queue_start());
-  if (s_sta_connected && s_wifi_connected_chime_pending) {
-    if (play_wifi_connected_clip()) {
-      s_wifi_connected_chime_pending = false;
-    }
+  s_audio_queue_ready = true;
+  schedule_wifi_connected_chime();
+  if (!wifi_config_is_provisioned()) {
+    /* No saved network: tell the user to open the app while BLE provisioning
+     * is coming up, without waiting for USB/camera startup. */
+    (void)play_go_app_clip();
   }
   if (nino_touch_sensor_start() != ESP_OK) {
     ESP_LOGW(TAG, "QT2120 touch sensor task not started");
@@ -3766,12 +3851,6 @@ void app_main(void) {
       .user_ctx = NULL,
   };
   ESP_ERROR_CHECK(uvc_host_install(&uvc_driver_config));
-
-  esp_err_t ble_err = wifi_prov_ble_start_if_needed();
-  if (ble_err != ESP_OK && ble_err != ESP_ERR_NOT_SUPPORTED) {
-    ESP_LOGW(TAG, "BLE Wi-Fi provisioning not started: %s",
-             esp_err_to_name(ble_err));
-  }
 
   /* If no camera plugs in, still start wake after USB/SDIO settle (HP WDT on boot). */
   (void)xTaskCreatePinnedToCore(delayed_voice_wake_task, "wake_delay", 4096, NULL, 3, NULL,

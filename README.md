@@ -32,6 +32,7 @@ NiNO is a smart-home demo built around the **ESP32-P4 Function EV Board**. The b
 ```text
 ESP32-P4 (firmware)                         PC — FastAPI server
 ─────────────────────                       ────────────────────
+BLE Wi‑Fi provision ──► NVS STA + boot WAVs
 UVC camera ──► GET /stream ───────────────► CameraStream + YuNet/SFace face ID
 Wake word + USB mic ──► WS /voice-query ───────► STT → LLM → TTS → WAV reply
 Speaker ◄──── POST /play_wav ◄───────────── greetings, alarms, voice replies
@@ -44,19 +45,27 @@ Touch / eyes ── onboard only
                                             memories, summaries
 ```
 
+### Boot & Wi‑Fi audio cues
 
+| Condition | Clip | When |
+| --------- | ---- | ---- |
+| No Wi‑Fi credentials in NVS | `GO-APP.wav` | Soon after audio starts — use the phone app / BLE |
+| STA connects (new credentials or reconnect) | `WIFI.wav` | After IP / connect path |
+| First boot that finished BLE provisioning | `Hello-home.wav` | After `WIFI.wav` on that provisioned session |
+
+BLE advertising (**NINO - HOME**) starts early when unprovisioned so setup is available before UVC finishes. Details: [docs/WIFI_PROVISION.md](docs/WIFI_PROVISION.md).
 
 ### Voice query flow
 
-1. User says **"Hi ESP"** — detected on the **USB 4-mic** (GPIO header) via WakeNet.
+1. User says **"Hi ESP"** — detected on the **USB 4-mic only** (GPIO header) via WakeNet. The ES8311 is **speaker playback only** (no onboard-mic fallback).
 2. Board plays **beep.wav** on the ES8311 speaker (preloaded at boot), then **VAD** captures speech.
-3. Captured audio is sent over **WebSocket** to the PC.
+3. Captured audio is sent over **WebSocket** to the PC (`voice connect` / NVS / `X-Nino-Voice-Ws-Url` on `/play_wav`).
 4. Server transcribes audio (ElevenLabs Scribe or local Whisper).
 5. Camera resolves who is speaking from **live face recognition**.
 6. If memory is enabled, recent conversation history is loaded from PostgreSQL.
 7. Request is routed: volume / alarm / servo / identity / recap / general LLM.
 8. Reply is synthesized to 16 kHz WAV and streamed back over the WebSocket.
-9. Exchange is logged to PostgreSQL (when ready) and to `server/data/latency_log.json`.
+9. Wake is re-armed while the reply plays; exchange is logged to PostgreSQL (when ready) and to `server/data/latency_log.json`.
 
 **VAD:** recording ends after **450 ms** of trailing silence once speech has started (`VAD_TRAILING_SILENCE_MS` in `voice_assist.c`).
 
@@ -70,7 +79,8 @@ Touch / eyes ── onboard only
 | Area              | What NiNO does                                                                                           |
 | ----------------- | -------------------------------------------------------------------------------------------------------- |
 | **Vision**        | YuNet detection + SFace 128-D embeddings; web UI registration                                            |
-| **Voice**         | USB 4-mic wake word on GPIO header; ElevenLabs or Whisper STT; Ollama (Qwen) replies; cross-platform TTS |
+| **Voice**         | USB 4-mic wake word only (GPIO 24/25); ElevenLabs or Whisper STT; Ollama (Qwen) replies; TTS             |
+| **Wi‑Fi**         | BLE GATT provisioning (`NINO - HOME`); NVS STA reconnect; `GO-APP` / `WIFI` / `Hello-home` boot cues     |
 | **Memory**        | PostgreSQL per-user conversation log; recap questions from recent history                                |
 | **Alarms**        | Voice-set reminders; medical (P0) with yes/no auto-listen; web UI ack/delete                             |
 | **Servo**         | Dynamixel AX head motion during TTS; ID2 full 360° via voice, HTTP, or CLI                               |
@@ -151,15 +161,19 @@ idf.py flash monitor
 
 ### 2. Connect Wi-Fi
 
-**Serial console:**
+**Preferred — BLE (phone app):**
+
+1. Power the board with **no** saved Wi‑Fi in NVS → you should hear **`GO-APP.wav`** and see BLE **NINO - HOME**.
+2. Write SSID / password / apply via the GATT service (see [docs/WIFI_PROVISION.md](docs/WIFI_PROVISION.md)).
+3. On connect you should hear **`WIFI.wav`**, then **`Hello-home.wav`** on that first provisioned session.
+
+**Serial console (alternative):**
 
 ```text
 wifi mode sta
 wifi connect <SSID> <PASSWORD>
 wifi status
 ```
-
-Or use BLE provisioning — see [docs/WIFI_PROVISION.md](docs/WIFI_PROVISION.md).
 
 After Wi-Fi is connected, mDNS discovery is available:
 
@@ -203,15 +217,19 @@ Open the web UI at **[http://localhost:8000](http://localhost:8000)** — regist
 
 ### 4. Connect voice on the ESP console
 
+WakeNet stays off until a voice WebSocket URL is set. Use the PC’s **LAN IP** (where `python app.py` runs), not the board’s IP:
+
 ```text
 voice connect <PC_IP> 8000
 voice wake on
 voice status
 ```
 
+`voice status` should show a non-empty `voice url` and USB mic streaming (`addr=… iface=2`, `rx_chunks` increasing, `peak` when you speak).
+
 Say **"Hi ESP"** — you should hear a **beep**, then speak your question. Eyes animate: **listening** → **thinking** → reply expression → **idle**.
 
-Use your **PC’s LAN IP** (where `python app.py` runs), not the board’s IP. `voice status` shows USB mic streaming (`rx_chunks`, `peak` when you speak).
+The URL is saved to NVS. The server can also push it via the `X-Nino-Voice-Ws-Url` header on `POST /play_wav`.
 
 ---
 
@@ -274,11 +292,11 @@ Look for `"memory": { "ready": true, ... }`.
 
 | Stage     | Module                                | Notes                                                                          |
 | --------- | ------------------------------------- | ------------------------------------------------------------------------------ |
-| Capture   | `usb_mic.c`                           | ReSpeaker UAC iface **2**, **channel 0** (beamformed), 16 kHz mono ring buffer |
-| Wake word | `voice_wake.cpp`                      | WakeNet **"Hi ESP"**; AFE runs wake-only (no AEC/NS/AGC)                       |
+| Capture   | `usb_mic.c` + `mic_input.c`           | ReSpeaker UAC only; iface **2**, ch **0**, 16 kHz mono; no ES8311 mic fallback |
+| Wake word | `voice_wake.cpp`                      | WakeNet **"Hi ESP"**; skipped when mic unavailable or voice URL unset          |
 | Chime     | `voice_assist.c` + `audio_playback.c` | `beep.wav` preloaded + ES8311 warmed at boot                                   |
 | VAD       | `voice_assist.c`                      | Energy VAD; **450 ms** trailing silence to end clip                            |
-| Server    | `voice_ws_client.c`                   | Binary WAV in/out over WebSocket                                               |
+| Server    | `voice_ws_client.c`                   | Binary WAV in/out over WebSocket; wake re-armed before reply finishes          |
 
 
 Full wiring, boot flow, and troubleshooting: **[docs/USB-4MIC-INTEGRATION.md](docs/USB-4MIC-INTEGRATION.md)**
@@ -391,18 +409,20 @@ Serial dinner test: `dinner` — plays `schedule_dinnner.wav` with L/R/U/D head 
 ### Key firmware files
 
 
-| File                     | Role                                                  |
-| ------------------------ | ----------------------------------------------------- |
-| `main/main.c`            | UVC, dual USB host, Wi-Fi, HTTP server, voice console |
-| `main/usb_mic.c`         | USB 4-mic UAC capture on GPIO 24/25                   |
-| `main/voice_wake.cpp`    | WakeNet feed/fetch, post-wake beep + query task       |
-| `main/voice_assist.c`    | VAD, beep cache, medical ack listen                   |
-| `main/voice_ws_client.c` | WebSocket to PC                                       |
-| `main/audio_playback.c`  | ES8311 speaker (playback only)                        |
-| `main/audio_queue.c`     | Touch-priority dual queues                            |
-| `main/servo_dxl.c`       | Dynamixel + 360 spin                                  |
-| `main/nino_eye.c`        | Eye animation engine                                  |
-| `main/ssd1351.c`         | Dual OLED SPI driver                                  |
+| File                     | Role                                                              |
+| ------------------------ | ----------------------------------------------------------------- |
+| `main/main.c`            | UVC, dual USB host, Wi-Fi, boot WAVs, HTTP server, voice console  |
+| `main/wifi_prov_ble.c`   | BLE GATT Wi‑Fi provisioning (ESP-Hosted + NimBLE)                 |
+| `main/usb_mic.c`         | USB 4-mic UAC on GPIO 24/25; deferred close on disconnect         |
+| `main/mic_input.c`       | Mic façade — USB 4-mic only                                       |
+| `main/voice_wake.cpp`    | WakeNet feed/fetch, post-wake beep + query task                   |
+| `main/voice_assist.c`    | VAD, beep cache, medical ack listen                               |
+| `main/voice_ws_client.c` | WebSocket to PC                                                   |
+| `main/audio_playback.c`  | ES8311 speaker (playback only)                                    |
+| `main/audio_queue.c`     | Priority / touch queues (boot clips can preempt)                  |
+| `main/servo_dxl.c`       | Dynamixel + 360 spin                                              |
+| `main/nino_eye.c`        | Eye animation engine                                              |
+| `main/ssd1351.c`         | Dual OLED SPI driver                                              |
 
 
 ---
@@ -537,13 +557,24 @@ python app.py \
 
 ### Voice
 
-- ESP cannot reach PC → `voice connect <PC_LAN_IP> 8000` (PC IP, not board IP) and confirm firewall
+- `voice url: "(not set)"` → wake stays disarmed; run `voice connect <PC_LAN_IP> 8000` (PC IP, not board IP)
+- ESP cannot reach PC → confirm firewall allows TCP **8000**; use LAN IP, not a public/unreachable host
 - No wake / weak wake → `voice status`; ReSpeaker should show `addr=… iface=2`, `rx_chunks` increasing, `peak` when speaking
+- `USB 4-mic not ready` → wait for UAC reopen (retry task); confirm GPIO 24/25 + 5V/GND wiring
+- Mic drop during servo + camera → heavy USB load can suspend UAC briefly; firmware defers `uac_host_device_close` off the host callback so the mic can reopen without panic
 - Slow beep after wake → flash latest firmware (beep must not block WakeNet `fetch()`); see USB-4MIC doc
 - `PCM ring full — dropped N bytes` → USB mic still streaming while wake/VAD paused briefly; occasional drops are OK
 - `AFE: Ringbuffer of AFE(FEED) is full` → usually fixed in current firmware (feed paused during beep/VAD)
 - Slow STT → set `ELEVENLABS_API_KEY` or use `--stt-provider whisper`
 - Slow LLM → start GPU Ollama: `bash server/scripts/start_ollama_gpu.sh`
+
+
+
+### Wi‑Fi / BLE
+
+- No BLE when already provisioned → expected; credentials are in NVS and STA reconnects silently
+- Hear `GO-APP.wav` but no BLE → check ESP-Hosted C6 BT logs (`C6 BLE controller ready`, `NimBLE host started`); see [docs/WIFI_PROVISION.md](docs/WIFI_PROVISION.md)
+- Connected but no `WIFI.wav` / `Hello-home.wav` → flash latest firmware (priority audio stop-flag + provisioned-welcome path)
 
 
 
@@ -557,6 +588,7 @@ python app.py \
 
 - Touch fails → check QT2120 on I2C GPIO 7/8
 - Eyes black → verify SSD1351 wiring; boot log should show `SSD1351 ready: 2 panel(s)`
+- U2D2 / camera `ESP_ERR_INVALID_STATE` at boot → often benign while J18 hub enumerates
 
 ---
 
@@ -587,7 +619,8 @@ Reference USB wake-word demo: [ESP-P4-UK-Demo / USB-4-mic-wake-word](https://git
 
 ## Notes
 
-- Touch audio **preempts** server/voice playback and resumes afterward.
+- Touch and priority boot clips (**preempt** / resume) use `audio_queue.c`; server/voice WAV resumes after touch.
+- Voice input is **USB 4-mic only**; ES8311 is speaker output only.
 - Voice WebSocket replies derive eye expression from **reply text** via `eye_expression.py`.
 - Keep `server/server_config.json`, `.env`, and API keys **out of public commits**.
 
