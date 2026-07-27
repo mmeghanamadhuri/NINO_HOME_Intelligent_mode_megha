@@ -75,6 +75,9 @@ class DeviceRegistry:
         # without accidentally deleting a manually configured "default" entry.
         self._persisted_device_ids: set[str] = set()
         self._ui_device_id: str = LEGACY_DEVICE_ID
+        # Clients may repeatedly send a stale device ID while reconnecting.
+        # Warn once per ID so the fallback remains visible without flooding logs.
+        self._warned_unknown_device_ids: set[str] = set()
         self.reload()
 
     def reload(self) -> None:
@@ -479,11 +482,13 @@ class DeviceRegistry:
             if not key:
                 pass
             elif key not in self._devices:
-                logger.warning(
-                    "Unknown device_id=%r — falling back to %s",
-                    key,
-                    self.default_device_id(),
-                )
+                if key not in self._warned_unknown_device_ids:
+                    logger.warning(
+                        "Unknown device_id=%r — falling back to %s",
+                        key,
+                        self.default_device_id(),
+                    )
+                    self._warned_unknown_device_ids.add(key)
             fallback_id = self.default_device_id()
             if fallback_id in self._devices:
                 return self._devices[fallback_id]

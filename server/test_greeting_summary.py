@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import unittest
 from unittest.mock import patch
 
@@ -69,12 +70,61 @@ class StartupGreetingTests(unittest.TestCase):
         svc = TTSService(cooldown_seconds=0.0, face_greeting_interval_seconds=999.0)
         try:
             with patch.object(svc, "_ollama_configured", return_value=True):
-                svc.update_face_state(["RecognizedUser"], primary_name="RecognizedUser")
+                with patch("tts_service._pick_include_db_context", return_value=True):
+                    svc.update_face_state(
+                        ["RecognizedUser"], primary_name="RecognizedUser"
+                    )
             with svc._lock:
                 self.assertEqual(len(svc._pending_jobs), 1)
                 job = svc._pending_jobs[0]
                 self.assertTrue(job.is_startup_greeting)
+                self.assertTrue(job.include_db_context)
                 self.assertEqual(job.llm_name, "RecognizedUser")
+        finally:
+            svc.stop()
+
+    def test_first_sight_can_queue_plain_greeting(self) -> None:
+        svc = TTSService(cooldown_seconds=0.0, face_greeting_interval_seconds=999.0)
+        try:
+            with patch.object(svc, "_ollama_configured", return_value=True):
+                with patch("tts_service._pick_include_db_context", return_value=False):
+                    svc.update_face_state(
+                        ["RecognizedUser"], primary_name="RecognizedUser"
+                    )
+            with svc._lock:
+                self.assertEqual(len(svc._pending_jobs), 1)
+                job = svc._pending_jobs[0]
+                self.assertTrue(job.is_startup_greeting)
+                self.assertFalse(job.include_db_context)
+        finally:
+            svc.stop()
+
+    def test_reentry_greeting_randomizes_db_mode(self) -> None:
+        svc = TTSService(cooldown_seconds=0.0, face_greeting_interval_seconds=1.0)
+        try:
+            with patch.object(svc, "_ollama_configured", return_value=True):
+                with patch("tts_service._pick_include_db_context", return_value=False):
+                    svc.update_face_state(
+                        ["RecognizedUser"], primary_name="RecognizedUser"
+                    )
+                with svc._lock:
+                    svc._startup_greeted.add("RecognizedUser")
+                    svc._known_seen_once.add("RecognizedUser")
+                    svc._pending_jobs.clear()
+                    svc._vision_queued.clear()
+                    svc._present_known_names.clear()
+                    # Welcome-back needs a prior speak older than the interval.
+                    svc._last_spoken_at["RecognizedUser"] = time.time() - 10.0
+                with patch("tts_service._pick_include_db_context", return_value=True):
+                    svc.update_face_state(
+                        ["RecognizedUser"], primary_name="RecognizedUser"
+                    )
+            with svc._lock:
+                self.assertEqual(len(svc._pending_jobs), 1)
+                job = svc._pending_jobs[0]
+                self.assertFalse(job.is_startup_greeting)
+                self.assertTrue(job.include_db_context)
+                self.assertTrue(job.llm_return_visitor)
         finally:
             svc.stop()
 
@@ -87,7 +137,10 @@ class StartupGreetingTests(unittest.TestCase):
             with svc._lock:
                 svc._suppress_vision_until = 0.0
             with patch.object(svc, "_ollama_configured", return_value=True):
-                svc.update_face_state(["RecognizedUser"], primary_name="RecognizedUser")
+                with patch("tts_service._pick_include_db_context", return_value=True):
+                    svc.update_face_state(
+                        ["RecognizedUser"], primary_name="RecognizedUser"
+                    )
             with svc._lock:
                 self.assertTrue(svc._pending_jobs)
                 self.assertTrue(svc._pending_jobs[0].is_startup_greeting)

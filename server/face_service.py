@@ -6,6 +6,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -1138,7 +1139,9 @@ class FaceService:
     # ------------------------------------------------------------------- names
 
     def _person_id(self, name: str) -> str:
-        cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "_", name.strip().lower())
+        # Keep letters from any script (e.g. Devanagari); slug the rest.
+        cleaned = unicodedata.normalize("NFKC", (name or "").strip().lower())
+        cleaned = re.sub(r"[^\w\-]+", "_", cleaned, flags=re.UNICODE)
         return cleaned.strip("_")
 
     def same_person(self, name_a: str, name_b: str) -> bool:

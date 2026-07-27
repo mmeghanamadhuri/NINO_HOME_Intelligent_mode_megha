@@ -6,8 +6,19 @@ import unittest
 from unittest.mock import MagicMock, patch
 import time
 
-from face_registration_voice import extract_registration_name
-from face_registration_service import FaceRegistrationService
+from face_registration_voice import (
+    extract_registration_name,
+    is_face_reg_prompt_echo,
+    is_incomplete_name_phrase,
+)
+from face_registration_service import (
+    FaceRegistrationService,
+    INCOMPLETE_NAME_PROMPT,
+    NAME_RETRY_PROMPT,
+    NO_SPEECH_RETRY_PROMPT,
+    REGISTRATION_PROMPTS,
+    pick_registration_prompt,
+)
 
 
 class ExtractRegistrationNameTests(unittest.TestCase):
@@ -23,11 +34,64 @@ class ExtractRegistrationNameTests(unittest.TestCase):
     def test_single_name(self) -> None:
         self.assertEqual(extract_registration_name("Sameera"), "Sameera")
 
+    def test_framed_short_real_name(self) -> None:
+        self.assertEqual(extract_registration_name("My name is Sam"), "Sam")
+
     def test_rejects_greeting(self) -> None:
         self.assertIsNone(extract_registration_name("Hello there"))
 
     def test_rejects_register_command(self) -> None:
         self.assertIsNone(extract_registration_name("Register my face"))
+
+    def test_incomplete_my_name_is(self) -> None:
+        self.assertTrue(is_incomplete_name_phrase("My name is"))
+        self.assertTrue(is_incomplete_name_phrase("My name is."))
+        self.assertIsNone(extract_registration_name("My name is"))
+
+    def test_accepts_devanagari_name(self) -> None:
+        self.assertEqual(extract_registration_name("दयानंद"), "दयानंद")
+
+    def test_rejects_latency_junk_names(self) -> None:
+        for heard in (
+            "Enough",
+            "turn off",
+            "C",
+            "Cha",
+            "Greek",
+            "Agree",
+            "See you soon again.",
+            "Tell me a joke",
+            "My name is Cha",
+            "My name is Agree",
+            "Not anything after the beep. Please tell your name.",
+            "After the date, peace in your name.",
+        ):
+            self.assertIsNone(extract_registration_name(heard), heard)
+
+    def test_rejects_too_short_bare_name(self) -> None:
+        self.assertIsNone(extract_registration_name("Sam"))
+        self.assertIsNone(extract_registration_name("Ali"))
+
+    def test_detects_prompt_echo(self) -> None:
+        echo = "I don't quite catch your name, please say it again."
+        self.assertTrue(is_face_reg_prompt_echo(echo))
+        self.assertIsNone(extract_registration_name(echo))
+
+    def test_entertaining_prompts_are_echo_safe(self) -> None:
+        self.assertGreaterEqual(len(REGISTRATION_PROMPTS), 6)
+        for prompt in REGISTRATION_PROMPTS:
+            self.assertIn("After the beep", prompt)
+            self.assertIn("say your name", prompt.lower())
+            self.assertTrue(is_face_reg_prompt_echo(prompt), prompt)
+            self.assertIsNone(extract_registration_name(prompt), prompt)
+        for prompt in (NAME_RETRY_PROMPT, INCOMPLETE_NAME_PROMPT, NO_SPEECH_RETRY_PROMPT):
+            self.assertTrue(is_face_reg_prompt_echo(prompt), prompt)
+            self.assertIsNone(extract_registration_name(prompt), prompt)
+
+    def test_pick_registration_prompt_from_pool(self) -> None:
+        picked = {pick_registration_prompt() for _ in range(40)}
+        self.assertTrue(picked.issubset(set(REGISTRATION_PROMPTS)))
+        self.assertGreater(len(picked), 1)
 
 
 class FaceRegistrationServiceTests(unittest.TestCase):
@@ -184,6 +248,30 @@ class FaceRegistrationServiceTests(unittest.TestCase):
         self.assertTrue(result.handled)
         self.assertTrue(result.relisten_after_reply)
         self.assertEqual(self.svc.state, "awaiting_name")
+
+    def test_handle_voice_incomplete_name_phrase(self) -> None:
+        with self.svc._lock:
+            self.svc._state = "awaiting_name"
+        result = self.svc.handle_voice("My name is")
+        self.assertTrue(result.handled)
+        self.assertTrue(result.relisten_after_reply)
+        self.assertEqual(result.reply, INCOMPLETE_NAME_PROMPT)
+        self.assertEqual(self.svc._pending_relisten_prompt, INCOMPLETE_NAME_PROMPT)
+
+    @patch("face_registration_service.deliver_wav_to_device")
+    @patch("face_registration_service.device_base_url", return_value="http://esp")
+    def test_handle_voice_prompt_echo_silent_relisten(self, _url, post_wav) -> None:
+        with self.svc._lock:
+            self.svc._state = "awaiting_name"
+        result = self.svc.handle_voice(
+            "I don't quite catch your name, please say it again."
+        )
+        self.assertTrue(result.handled)
+        self.assertTrue(result.relisten_after_reply)
+        self.assertEqual(result.reply, "")
+        self.svc.relisten_after_missed_name()
+        post_wav.assert_called_once()
+        self.assertTrue(post_wav.call_args.kwargs.get("prompt_ack_chime"))
 
     def test_handle_voice_blocks_duplicate_name_for_known_face(self) -> None:
         frame = MagicMock()

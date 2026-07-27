@@ -81,6 +81,18 @@ _FOOTBALL_QUESTION_PATTERN = re.compile(
     r"football update)\b",
     re.IGNORECASE,
 )
+_FOOTBALL_JOKE_PATTERN = re.compile(
+    r"\b(?:football|soccer)\s+joke\b|\b(?:tell|say|give|share)\b.{0,24}\b"
+    r"(?:joke|funny one)\b",
+    re.IGNORECASE,
+)
+_WORLD_CUP_FAVOURITE_PATTERN = re.compile(
+    r"\b(?:fifa\s+)?world\s+cup\b.{0,80}\b(?:favo(?:u)?rite|rooting for|"
+    r"supporting)\b|\b(?:favo(?:u)?rite|rooting for|supporting)\b.{0,80}\b"
+    r"(?:fifa\s+)?world\s+cup\b",
+    re.IGNORECASE,
+)
+NINO_FAVOURITE_WORLD_CUP_TEAM = "Brazil"
 
 _SERVO_360_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p, re.IGNORECASE)
@@ -307,6 +319,19 @@ def is_football_question(user_text: str) -> bool:
     return bool(_FOOTBALL_QUESTION_PATTERN.search(user_text.strip()))
 
 
+def is_football_joke_request(user_text: str) -> bool:
+    """Return whether the user has asked for a football joke."""
+    text = user_text.strip()
+    return bool(text) and bool(_FOOTBALL_JOKE_PATTERN.search(text)) and bool(
+        re.search(r"\b(?:football|soccer)\b", text, re.IGNORECASE)
+    )
+
+
+def is_world_cup_favourite_question(user_text: str) -> bool:
+    """Return whether the user asks who NiNO supports in the World Cup."""
+    return bool(_WORLD_CUP_FAVOURITE_PATTERN.search(user_text.strip()))
+
+
 def is_live_football_question(user_text: str) -> bool:
     text = user_text.strip()
     return is_football_question(text) and bool(
@@ -344,6 +369,11 @@ def fifa_world_cup_top_scorer_year(user_text: str) -> int | None:
         return None
     match = re.search(r"\b((?:19|20)\d{2})\b", text)
     return int(match.group(1)) if match else None
+
+
+def world_cup_favourite_reply() -> str:
+    """State NiNO's favourite World Cup team without requesting live scores."""
+    return f"My favourite is {NINO_FAVOURITE_WORLD_CUP_TEAM}."
 
 
 def local_server_time_reply() -> str:
@@ -877,6 +907,16 @@ def process_voice_wav(
                 f"I cannot confirm the winner of the {winner_year} FIFA World Cup "
                 "right now."
             )
+
+    if reply_path == "llm" and is_world_cup_favourite_question(user_text):
+        reply_path = "world_cup_favourite"
+        reply = world_cup_favourite_reply()
+        logger.info("Voice World Cup favourite query | heard: %s", user_text[:120])
+
+    if reply_path == "llm" and is_football_joke_request(user_text):
+        reply_path = "football_joke"
+        reply = "I was going to tell you an offside joke, but you probably wouldn't get it."
+        logger.info("Voice football joke query | heard: %s", user_text[:120])
 
     if reply_path == "llm" and is_live_football_question(user_text):
         from football_service import (

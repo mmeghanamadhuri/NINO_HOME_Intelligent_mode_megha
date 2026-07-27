@@ -14,8 +14,11 @@ from football_service import (
 from voice_service import (
     fifa_world_cup_top_scorer_year,
     fifa_world_cup_winner_year,
+    is_football_joke_request,
     is_football_question,
     is_live_football_question,
+    is_world_cup_favourite_question,
+    world_cup_favourite_reply,
 )
 
 
@@ -120,6 +123,25 @@ class FootballVoiceRoutingTests(unittest.TestCase):
         self.assertFalse(
             is_live_football_question("Who scored the highest points in FIFA 2026?")
         )
+
+    def test_football_joke_request_is_detected(self) -> None:
+        self.assertTrue(is_football_joke_request("Tell me a football joke."))
+        self.assertTrue(is_football_joke_request("Can you share a soccer joke?"))
+        self.assertFalse(is_football_joke_request("Tell me a joke about weather."))
+
+    def test_world_cup_favourite_question_is_detected(self) -> None:
+        self.assertTrue(
+            is_world_cup_favourite_question(
+                "Since the World Cup is on, who's your favourite?"
+            )
+        )
+        self.assertTrue(
+            is_world_cup_favourite_question("Who are you rooting for at the FIFA World Cup?")
+        )
+        self.assertFalse(is_world_cup_favourite_question("Who won the World Cup?"))
+
+    def test_world_cup_favourite_reply_does_not_request_live_scores(self) -> None:
+        self.assertEqual(world_cup_favourite_reply(), "My favourite is Brazil.")
 
     def test_world_cup_winner_year_is_detected(self) -> None:
         self.assertEqual(fifa_world_cup_winner_year("Who won FIFA 2026?"), 2026)

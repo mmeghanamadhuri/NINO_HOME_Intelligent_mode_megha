@@ -5,10 +5,30 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from llm_service import _defers_to_recognized_speaker, answer_voice_query
+from llm_service import (
+    _defers_to_recognized_speaker,
+    answer_voice_query,
+    resolve_ollama_api_url,
+)
 
 
 class VoiceReplyTests(unittest.TestCase):
+    @patch("llm_service.ollama_model_available", side_effect=[False, True])
+    def test_stale_explicit_endpoint_falls_back_to_gpu_model(
+        self, model_available
+    ) -> None:
+        cpu_url = "http://127.0.0.1:11434/api/generate"
+        gpu_url = "http://127.0.0.1:11435/api/generate"
+
+        with patch.dict("os.environ", {"OLLAMA_GPU_URL": gpu_url}, clear=False):
+            resolved = resolve_ollama_api_url(
+                model="qwen2.5:1.5b",
+                preferred=cpu_url,
+            )
+
+        self.assertEqual(resolved, gpu_url)
+        self.assertEqual(model_available.call_count, 2)
+
     def test_detects_reply_that_defers_to_recognized_speaker(self) -> None:
         self.assertTrue(
             _defers_to_recognized_speaker(

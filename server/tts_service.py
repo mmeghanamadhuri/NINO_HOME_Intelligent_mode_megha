@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -654,6 +655,20 @@ def tts_status() -> dict[str, Any]:
     return out
 
 
+def _face_greeting_db_probability() -> float:
+    """Chance a vision greeting includes yesterday DB summary (0–1)."""
+    raw = os.environ.get("FACE_GREETING_DB_PROBABILITY", "0.5").strip()
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except ValueError:
+        return 0.5
+
+
+def _pick_include_db_context() -> bool:
+    """Exclusive modes: plain greeting XOR greeting + DB context."""
+    return random.random() < _face_greeting_db_probability()
+
+
 @dataclass(frozen=True)
 class _SpeechJob:
     """TTS queue item: LLM greeting (Ollama → SAPI / ESP)."""
@@ -663,6 +678,8 @@ class _SpeechJob:
     #: If True, a successful job updates vision session state (first greet / last_spoken).
     track_vision_session: bool = True
     is_startup_greeting: bool = False
+    #: True → weave yesterday summary; False → warm greeting only (never both).
+    include_db_context: bool = False
 
 
 class TTSService:
@@ -886,12 +903,14 @@ class TTSService:
             if not self._ollama_configured():
                 self._last_error = "Ollama URL not set; cannot speak greeting."
                 return False
+            include_db = _pick_include_db_context()
             self._vision_queued.add(name)
             self._pending_jobs.append(
                 _SpeechJob(
                     llm_name=name,
                     llm_return_visitor=False,
                     track_vision_session=False,
+                    include_db_context=include_db,
                 )
             )
         return True
@@ -953,14 +972,25 @@ class TTSService:
                     from memory_service import get_memory_service
 
                     session_summary: str | None = None
-                    try:
-                        memory_svc = get_memory_service()
-                        if memory_svc.ready:
-                            session_summary = memory_svc.get_latest_summary_text(job.llm_name)
-                    except Exception:
-                        session_summary = None
+                    if job.include_db_context:
+                        try:
+                            memory_svc = get_memory_service()
+                            if memory_svc.ready:
+                                session_summary = memory_svc.get_latest_summary_text(
+                                    job.llm_name
+                                )
+                        except Exception:
+                            session_summary = None
 
-                    if job.is_startup_greeting:
+                    use_db = bool(job.include_db_context and (session_summary or "").strip())
+                    logger.info(
+                        "Vision greeting for %s (mode=%s, summary=%s)",
+                        job.llm_name,
+                        "db" if use_db else "plain",
+                        "yes" if session_summary else "no",
+                    )
+
+                    if job.is_startup_greeting and use_db:
                         from llm_service import (
                             startup_greeting_from_summary,
                             startup_greeting_parts_from_summary,
@@ -994,11 +1024,12 @@ class TTSService:
                             text,
                         )
                     else:
+                        # Plain greeting, or non-startup with optional DB summary.
                         text = greeting_for_face(
                             job.llm_name,
                             is_return_visitor=job.llm_return_visitor,
-                            session_summary=session_summary,
-                            is_startup_greeting=job.is_startup_greeting,
+                            session_summary=session_summary if use_db else None,
+                            is_startup_greeting=False,
                             model=self._ollama_model or None,
                             api_url=self._ollama_url or None,
                         )
@@ -1231,14 +1262,20 @@ class TTSService:
             self._startup_greeted.add(name)
             return
 
+        include_db = _pick_include_db_context()
         self._vision_queued.add(name)
-        logger.info("Queued startup summary greeting for %s", name)
+        logger.info(
+            "Queued startup greeting for %s (mode=%s)",
+            name,
+            "db" if include_db else "plain",
+        )
         self._pending_jobs.append(
             _SpeechJob(
                 llm_name=name,
                 llm_return_visitor=False,
                 track_vision_session=True,
                 is_startup_greeting=True,
+                include_db_context=include_db,
             )
         )
 
@@ -1263,12 +1300,20 @@ class TTSService:
             if last_spoken_at > 0.0 and (now - last_spoken_at) < 0.75:
                 return
 
+        include_db = _pick_include_db_context()
         self._vision_queued.add(name)
+        logger.info(
+            "Queued known greeting for %s (welcome_back=%s, mode=%s)",
+            name,
+            welcome_back,
+            "db" if include_db else "plain",
+        )
         self._pending_jobs.append(
             _SpeechJob(
                 llm_name=name,
                 llm_return_visitor=welcome_back,
                 track_vision_session=True,
+                include_db_context=include_db,
             )
         )
 

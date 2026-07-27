@@ -62,6 +62,25 @@ class WeatherServiceTests(unittest.TestCase):
         with self.assertRaises(DeviceLocationUnavailableError):
             WeatherService().current_for_device(DeviceRecord(device_id="no-location"))
 
+    @patch("device_registry.logger.warning")
+    def test_unknown_device_warning_is_logged_once(self, warning: MagicMock) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "devices.json"
+            path.write_text(
+                json.dumps({"devices": [{"device_id": "nino-test"}]}),
+                encoding="utf-8",
+            )
+            registry = DeviceRegistry(path)
+
+            for _ in range(3):
+                self.assertEqual(registry.resolve_or_default("default").device_id, "nino-test")
+
+        warning.assert_called_once_with(
+            "Unknown device_id=%r — falling back to %s",
+            "default",
+            "nino-test",
+        )
+
     def test_location_is_persisted_in_device_registry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "devices.json"

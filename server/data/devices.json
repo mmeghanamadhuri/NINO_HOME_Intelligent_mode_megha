@@ -1,21 +1,21 @@
 {
   "devices": [
     {
-      "device_id": "nino-home-gitam",
-      "display_name": "NINO - HOME Gitam",
-      "camera_url": "http://192.168.1.169/stream",
-      "play_wav_url": "http://192.168.1.169/play_wav",
-      "base_url": "http://192.168.1.169",
+      "device_id": "nino-home",
+      "display_name": "NINO - HOME",
+      "camera_url": "http://192.168.0.86/stream",
+      "play_wav_url": "http://192.168.0.86/play_wav",
+      "base_url": "http://192.168.0.86",
       "camera_rotation": "cw90",
       "latitude": null,
       "longitude": null,
       "location_name": "",
       "location_updated_at": "",
-      "wifi_ssid": "okgoogle",
-      "wifi_bssid": "30:23:03:C2:AD:5B",
-      "wifi_rssi": -48,
-      "wifi_channel": 13,
-      "wifi_updated_at": "2026-07-23T15:16:31.803052+00:00"
+      "wifi_ssid": "GOSPAZE Premium Connect",
+      "wifi_bssid": "BC:07:1D:67:1B:60",
+      "wifi_rssi": -31,
+      "wifi_channel": 1,
+      "wifi_updated_at": "2026-07-27T08:55:04.615150+00:00"
     }
   ]
 }

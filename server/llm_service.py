@@ -36,10 +36,24 @@ def resolve_ollama_api_url(
 ) -> str:
     """Pick the best Ollama endpoint, preferring the GPU instance on :11435."""
     explicit = (preferred or os.environ.get("OLLAMA_URL") or "").strip()
+    m = (model or os.environ.get("OLLAMA_MODEL") or DEFAULT_MODEL).strip()
     if explicit and explicit.lower() not in {"auto", "detect"}:
+        gpu_url = os.environ.get("OLLAMA_GPU_URL", DEFAULT_OLLAMA_GPU_URL).strip()
+        if (
+            gpu_url
+            and gpu_url != explicit
+            and not ollama_model_available(model=m, api_url=explicit)
+            and ollama_model_available(model=m, api_url=gpu_url)
+        ):
+            logger.warning(
+                "Configured Ollama endpoint %s does not provide model %s; using %s instead",
+                explicit,
+                m,
+                gpu_url,
+            )
+            return gpu_url
         return explicit
 
-    m = (model or os.environ.get("OLLAMA_MODEL") or DEFAULT_MODEL).strip()
     candidates = [
         os.environ.get("OLLAMA_GPU_URL", DEFAULT_OLLAMA_GPU_URL).strip(),
         DEFAULT_OLLAMA_CPU_URL,
@@ -122,6 +136,30 @@ def _ollama_base_url(api_url: str | None = None) -> str:
     if raw.endswith("/api/chat"):
         return raw[: -len("/api/chat")]
     return raw.rstrip("/")
+
+
+def ollama_model_available(*, model: str, api_url: str, timeout_s: int = 3) -> bool:
+    """Return whether an Ollama endpoint has the requested model installed."""
+    wanted = model.strip()
+    if not wanted:
+        return False
+    names = {wanted}
+    if ":" not in wanted:
+        names.add(f"{wanted}:latest")
+    try:
+        response = requests.get(
+            f"{_ollama_base_url(api_url)}/api/tags",
+            timeout=timeout_s,
+        )
+        response.raise_for_status()
+        models = response.json().get("models", [])
+        return any(
+            str(entry.get("name") or entry.get("model") or "").strip() in names
+            for entry in models
+            if isinstance(entry, dict)
+        )
+    except (requests.RequestException, TypeError, ValueError):
+        return False
 
 
 def _ollama_cli_binary() -> str:

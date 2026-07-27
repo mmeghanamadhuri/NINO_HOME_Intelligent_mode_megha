@@ -1420,9 +1420,10 @@ def main() -> None:
     from llm_service import resolve_ollama_api_url, try_start_gpu_ollama
 
     try_start_gpu_ollama()
-    ollama_url = args.ollama_url.strip()
-    if not ollama_url or ollama_url.lower() in {"auto", "detect"}:
-        ollama_url = resolve_ollama_api_url(model=args.ollama_model.strip())
+    ollama_url = resolve_ollama_api_url(
+        model=args.ollama_model.strip(),
+        preferred=args.ollama_url,
+    )
     os.environ["OLLAMA_URL"] = ollama_url
     os.environ["OLLAMA_MODEL"] = args.ollama_model.strip()
     os.environ["WHISPER_MODEL"] = args.whisper_model.strip()

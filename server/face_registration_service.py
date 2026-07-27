@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import threading
 import time
 import wave
@@ -14,7 +15,11 @@ from typing import Any, Callable, Literal
 import numpy as np
 
 from esp_playback import deliver_wav_to_device, device_base_url
-from face_registration_voice import extract_registration_name
+from face_registration_voice import (
+    extract_registration_name,
+    is_face_reg_prompt_echo,
+    is_incomplete_name_phrase,
+)
 from tts_service import synthesize_sapi_wav_bytes
 from wav_resample import resample_wav_bytes_to_mono_16bit
 
@@ -22,17 +27,37 @@ logger = logging.getLogger(__name__)
 
 FaceRegState = Literal["idle", "awaiting_name", "capturing"]
 
-REGISTRATION_PROMPT = (
-    "I haven't registered your face yet. After the beep, please tell me your name."
+REGISTRATION_PROMPTS: tuple[str, ...] = (
+    "I don't think we have met before. After the beep, please say your name.",
+    "Ooh, a mystery guest! After the beep, please say your name.",
+    "Fresh face alert! After the beep, please say your name.",
+    "Hold up… who are you? After the beep, please say your name.",
+    "I sense a new friend. After the beep, please say your name.",
+    "Welcome to the show! After the beep, please say your name so I can remember you.",
 )
+
+# Back-compat alias (first variant); prefer pick_registration_prompt().
+REGISTRATION_PROMPT = REGISTRATION_PROMPTS[0]
+
+
+def pick_registration_prompt() -> str:
+    """Random entertaining prompt for an unknown face."""
+    return random.choice(REGISTRATION_PROMPTS)
 
 NAME_RETRY_PROMPT = (
     "I didn't catch your name. After the beep, please say your name again."
 )
 
-NO_SPEECH_RETRY_PROMPT = (
-    "I haven't heard anything. After the beep, please say your name again."
+INCOMPLETE_NAME_PROMPT = (
+    "I only heard part of that. After the beep, please say your name again."
 )
+
+NO_SPEECH_RETRY_PROMPT = (
+    "I haven't heard anything. After the beep, please say your name."
+)
+
+# Sentinel: reopen mic with beep only (no spoken prompt — avoids TTS echo loops).
+_SILENT_RELISTEN = ""
 
 VOICE_REG_TTS_RATE_HZ = 16000
 
@@ -136,6 +161,7 @@ class FaceRegistrationService:
         self._last_prompt_playback_seconds: float = 0.0
         self._voice_heard_since_listen: bool = False
         self._no_speech_retries: int = 0
+        self._pending_relisten_prompt: str | None = NAME_RETRY_PROMPT
         self.apply_settings_from_environ()
 
     def set_frame_getter(self, read_frame: Callable[[], np.ndarray | None]) -> None:
@@ -325,8 +351,37 @@ class FaceRegistrationService:
             if self._state != "awaiting_name":
                 return FaceRegVoiceResult(handled=False)
 
+        # Mic often captures our own TTS; reopen quietly instead of re-prompting.
+        if is_face_reg_prompt_echo(user_text):
+            logger.info(
+                "Face registration: ignoring prompt echo | heard: %s",
+                user_text[:80],
+            )
+            with self._lock:
+                self._pending_relisten_prompt = _SILENT_RELISTEN
+            return FaceRegVoiceResult(
+                handled=True,
+                reply="",
+                relisten_after_reply=True,
+            )
+
+        if is_incomplete_name_phrase(user_text):
+            logger.info(
+                "Face registration: incomplete name phrase | heard: %s",
+                user_text[:80],
+            )
+            with self._lock:
+                self._pending_relisten_prompt = INCOMPLETE_NAME_PROMPT
+            return FaceRegVoiceResult(
+                handled=True,
+                reply=INCOMPLETE_NAME_PROMPT,
+                relisten_after_reply=True,
+            )
+
         name = extract_registration_name(user_text)
         if not name:
+            with self._lock:
+                self._pending_relisten_prompt = NAME_RETRY_PROMPT
             return FaceRegVoiceResult(
                 handled=True,
                 reply=NAME_RETRY_PROMPT,
@@ -429,16 +484,21 @@ class FaceRegistrationService:
             self._unknown_since = None
             self._no_speech_retries = 0
 
-        if not self._send_listen_prompt(REGISTRATION_PROMPT):
+        if not self._send_listen_prompt(pick_registration_prompt()):
             with self._lock:
                 self._reset_locked()
 
     def relisten_after_missed_name(self) -> None:
-        """Play beep + open mic again when the name was not understood."""
+        """Play beep (+ optional retry TTS) and open mic when the name was missed."""
         with self._lock:
             if self._state != "awaiting_name":
                 return
-        self._send_listen_prompt(NAME_RETRY_PROMPT)
+            prompt = self._pending_relisten_prompt
+            self._pending_relisten_prompt = NAME_RETRY_PROMPT
+        if prompt == _SILENT_RELISTEN:
+            self._send_silent_listen()
+            return
+        self._send_listen_prompt(prompt or NAME_RETRY_PROMPT)
 
     def _no_speech_check_after_locked(self) -> float:
         """Earliest time we may treat the listen window as silent. Holds lock."""
@@ -512,6 +572,33 @@ class FaceRegistrationService:
         )
         return True
 
+    def _send_silent_listen(self) -> bool:
+        """Reopen the mic with beep only — used when STT heard our own prompt."""
+        if device_base_url(None) is None:
+            logger.debug("Face registration silent listen skipped: no ESP play URL")
+            return False
+
+        from device_registry import get_device_registry
+        from voice_service import minimal_voice_reply_wav
+
+        device_id = get_device_registry().ui_device_id()
+        wav = minimal_voice_reply_wav()
+        try:
+            deliver_wav_to_device(device_id, wav, prompt_ack=True, prompt_ack_chime=True)
+        except Exception as exc:
+            logger.warning("Face registration silent listen failed: %s", exc)
+            return False
+
+        now = time.time()
+        playback_s = self._wav_playback_seconds(wav)
+        with self._lock:
+            self._listen_prompt_at = now
+            self._last_prompt_playback_seconds = playback_s
+            self._voice_heard_since_listen = False
+            self._awaiting_since = now
+        logger.info("Face registration silent listen opened (beep only)")
+        return True
+
     @staticmethod
     def _synthesize_prompt_wav(text: str) -> bytes:
         wav, _ = synthesize_sapi_wav_bytes(text.strip())
@@ -579,6 +666,7 @@ class FaceRegistrationService:
         self._last_prompt_playback_seconds = 0.0
         self._voice_heard_since_listen = False
         self._no_speech_retries = 0
+        self._pending_relisten_prompt = NAME_RETRY_PROMPT
 
 
 def get_face_registration_service() -> FaceRegistrationService | None:
