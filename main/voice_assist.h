@@ -44,7 +44,11 @@ esp_err_t nino_voice_assist_run_query_only(void);
 /** After a medical alarm WAV from the PC: chime + listen for yes/no (needs voice connect). */
 void nino_voice_assist_prompt_medical_ack(void);
 
-/** Next POST /play_wav prompt_ack listen: play wake chime before VAD (default true). */
+/**
+ * Next prompt_ack listen: play wake chime before VAD (default true).
+ * /play_wav uses X-Nino-Prompt-Ack-Chime. WS continue-listen after a done
+ * chime sets this false so only one beep plays before the mic opens.
+ */
 void nino_voice_assist_set_next_prompt_ack_chime(bool play_chime);
 
 #ifdef __cplusplus
