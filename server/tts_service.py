@@ -54,6 +54,11 @@ _TTS_MARKDOWN_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 _TTS_MARKDOWN_ITALIC_RE = re.compile(r"(?<!\w)\*([^*]+)\*(?!\w)")
 _TTS_MARKDOWN_UNDER_BOLD_RE = re.compile(r"__(.+?)__")
 _TTS_MARKDOWN_CODE_RE = re.compile(r"`([^`]+)`")
+# Chat-style speaker labels the LLM sometimes leaks into spoken text.
+_TTS_SPEAKER_LABEL_RE = re.compile(
+    r"^\s*(?:ni\s*no|nino)\s*(?:says|said)?\s*[:\-–—]\s*",
+    re.IGNORECASE,
+)
 
 
 def _split_invite_question(text: str) -> tuple[str, str | None]:
@@ -123,6 +128,21 @@ _PREFERRED_ESPEAK_VOICES = (
 )
 
 
+def _unwrap_leading_dialogue_quotes(text: str) -> str:
+    """Unwrap a leading \"spoken bit\" dialogue quote; keep any trailing sentence."""
+    text = text.strip()
+    if len(text) < 2 or text[0] != '"':
+        return text
+    close = text.find('"', 1)
+    if close < 0:
+        return text[1:].lstrip()
+    inner = text[1:close].strip()
+    rest = text[close + 1 :].strip()
+    if rest:
+        return f"{inner} {rest}".strip()
+    return inner
+
+
 def _normalize_tts_text(text: str) -> str:
     """Normalize LLM reply text for speech: quotes, strip emojis/markdown junk."""
     if not text:
@@ -143,7 +163,13 @@ def _normalize_tts_text(text: str) -> str:
     clean = _TTS_DECORATIVE_RE.sub("", clean)
     clean = re.sub(r"[ \t]+", " ", clean)
     clean = re.sub(r" ?\n ?", " ", clean)
-    return clean.strip()
+    clean = clean.strip()
+    # Drop leaked "NiNO:" / "NiNO says:" labels and dialogue quote wrappers.
+    clean = _TTS_SPEAKER_LABEL_RE.sub("", clean).strip()
+    clean = _unwrap_leading_dialogue_quotes(clean)
+    if len(clean) >= 2 and clean[0] == '"' and clean[-1] == '"':
+        clean = clean[1:-1].strip()
+    return clean
 
 
 def _use_windows_sapi() -> bool:
@@ -1101,7 +1127,7 @@ class TTSService:
                             api_url=self._ollama_url or None,
                         )
                         if text:
-                            text = _clamp_spoken_words(text)
+                            text = _clamp_spoken_words(_normalize_tts_text(text))
                 except Exception as exc:
                     greeting_error = exc
                     self._last_error = f"LLM greeting: {exc}"

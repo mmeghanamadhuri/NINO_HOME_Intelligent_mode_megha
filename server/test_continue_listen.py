@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from voice_service import (
+    conversation_goodbye_reply,
     is_conversation_goodbye,
     should_continue_listen_after_reply,
 )
@@ -17,6 +18,10 @@ class ConversationGoodbyeTests(unittest.TestCase):
         for text in (
             "goodbye",
             "Good bye",
+            "bye",
+            "Bye",
+            "Bye.",
+            "ok bye",
             "bye bye",
             "see you later",
             "talk to you later",
@@ -34,9 +39,18 @@ class ConversationGoodbyeTests(unittest.TestCase):
             "tell me a joke",
             "who am I",
             "continue",
+            "nearby shops",
         ):
             with self.subTest(text=text):
                 self.assertFalse(is_conversation_goodbye(text))
+
+    def test_goodbye_reply_has_no_follow_up(self) -> None:
+        reply = conversation_goodbye_reply()
+        self.assertTrue(reply.strip())
+        lower = reply.lower()
+        self.assertFalse("?" in reply)
+        self.assertNotIn("what's", lower)
+        self.assertNotIn("how can i", lower)
 
 
 class ContinueListenGateTests(unittest.TestCase):
@@ -49,6 +63,7 @@ class ContinueListenGateTests(unittest.TestCase):
             "recap",
             "recap_answer",
             "recap_not_found",
+            "joke",
         ):
             with self.subTest(path=path):
                 self.assertTrue(
@@ -64,6 +79,8 @@ class ContinueListenGateTests(unittest.TestCase):
 
     def test_goodbye_stops_listen(self) -> None:
         self.assertFalse(should_continue_listen_after_reply("llm", "goodbye"))
+        self.assertFalse(should_continue_listen_after_reply("llm", "Bye"))
+        self.assertFalse(should_continue_listen_after_reply("goodbye", "bye"))
 
     def test_env_disable(self) -> None:
         with patch.dict(os.environ, {"VOICE_CONTINUE_LISTEN": "0"}):

@@ -86,6 +86,63 @@ _FOOTBALL_JOKE_PATTERN = re.compile(
     r"(?:joke|funny one)\b",
     re.IGNORECASE,
 )
+_JOKE_REQUEST_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\b(?:tell|give|say|send|share|crack)(?:\s+me)?\s+(?:a |an |another |some )?(?:joke|jokes)\b",
+        r"\b(?:got|have|know)\s+(?:a |an |another |any )?(?:joke|jokes)\b",
+        r"\bmake me laugh\b",
+        r"\bcheer me up\b",
+        r"\bsomething funny\b",
+        r"\bfunny (?:story|joke)\b",
+        r"^(?:a |an |another )?joke\??[.!…]*\s*$",
+        r"^jokes?\??[.!…]*\s*$",
+    )
+)
+_JOKE_NEGATIVE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bit(?:'s| is) (?:a |only a |just a )?joke\b",
+        r"\bjust (?:a joke|kidding|joking)\b",
+        r"\bi(?:'m| am) (?:just )?joking\b",
+        r"\byou(?:'re| are) a joke\b",
+        r"\bnot a joke\b",
+    )
+)
+JOKES: tuple[str, ...] = (
+    "Why don't skeletons fight each other? They don't have the guts.",
+    "Why did the scarecrow win an award? Because he was outstanding in his field.",
+    'I told my computer I needed a break. It said, "No problem, I\'ll go to sleep."',
+    "Why don't eggs tell jokes? They'd crack each other up.",
+    "Parallel lines have so much in common. It's a shame they'll never meet.",
+    "Why did the math book look sad? Because it had too many problems.",
+    "Why did the coffee file a police report? It got mugged.",
+    "What do you call fake spaghetti? An impasta.",
+    "Why can't your nose be 12 inches long? Because then it would be a foot.",
+    "Why did the bicycle fall over? Because it was two-tired.",
+    "I only know 25 letters of the alphabet. I don't know Y.",
+    "What do you call cheese that isn't yours? Nacho cheese.",
+    "Why did the tomato blush? Because it saw the salad dressing.",
+    "Why don't scientists trust atoms? Because they make up everything.",
+    "What's orange and sounds like a parrot? A carrot.",
+    "Why was the computer cold? It left its Windows open.",
+    "Why did the golfer bring an extra pair of pants? In case he got a hole in one.",
+    "I used to play piano by ear. Now I use my hands.",
+    "Why did the cookie go to the hospital? Because it felt crummy.",
+    "Why don't programmers like nature? It has too many bugs.",
+    "Debugging: being the detective in a crime movie where you're also the murderer.",
+    'My password is "incorrect." So whenever I forget it, the computer reminds me, "Your password is incorrect."',
+    "Why did the Wi-Fi break up with the router? There was no connection.",
+    'I asked the librarian if the library had books on paranoia. She whispered, "They\'re right behind you."',
+    "Why did the student eat his homework? Because the teacher said it was a piece of cake.",
+    'I told my boss I was late because of traffic. He said, "You work from home."',
+    "Why did the keyboard break up with the mouse? It felt like it was being clicked with everyone.",
+    "My phone battery lasts longer than my motivation.",
+    "I finally cleaned my room. Now I can't find anything.",
+    "Why was the calendar so popular? Because it had so many dates.",
+)
+_joke_deck: list[str] = []
+_last_joke: str | None = None
 _WORLD_CUP_FAVOURITE_PATTERN = re.compile(
     r"\b(?:fifa\s+)?world\s+cup\b.{0,80}\b(?:favo(?:u)?rite|rooting for|"
     r"supporting)\b|\b(?:favo(?:u)?rite|rooting for|supporting)\b.{0,80}\b"
@@ -166,12 +223,13 @@ CONTINUE_LISTEN_REPLY_PATHS = frozenset(
         "recap_answer",
         "recap_not_found",
         "recap_blocked_no_face",
+        "joke",
     }
 )
 
 _CONVERSATION_GOODBYE_RE = re.compile(
     r"\b(?:"
-    r"good\s*bye|goodbye|bye[\s-]*bye|"
+    r"good\s*bye|goodbye|bye[\s-]*bye|bye|"
     r"see\s+you(?:\s+(?:later|soon|tomorrow))?|"
     r"talk\s+(?:to\s+you\s+)?later|"
     r"that(?:'s| is)\s+all|"
@@ -182,10 +240,21 @@ _CONVERSATION_GOODBYE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_GOODBYE_REPLIES = (
+    "Goodbye! See you later.",
+    "Bye! See you soon.",
+    "Take care! Talk soon.",
+)
+
 
 def is_conversation_goodbye(user_text: str) -> bool:
     """True when the user is ending the chat (do not reopen the mic)."""
     return bool(_CONVERSATION_GOODBYE_RE.search(str(user_text or "").strip()))
+
+
+def conversation_goodbye_reply() -> str:
+    """Short farewell only — no follow-up question (conversation ends after this)."""
+    return random.choice(_GOODBYE_REPLIES)
 
 
 def should_continue_listen_after_reply(reply_path: str, user_text: str) -> bool:
@@ -376,6 +445,31 @@ def is_football_joke_request(user_text: str) -> bool:
     return bool(text) and bool(_FOOTBALL_JOKE_PATTERN.search(text)) and bool(
         re.search(r"\b(?:football|soccer)\b", text, re.IGNORECASE)
     )
+
+
+def is_joke_request(user_text: str) -> bool:
+    """Return whether the user asked for a general joke (not football-specific)."""
+    text = user_text.strip()
+    if not text:
+        return False
+    if is_football_joke_request(text):
+        return False
+    if any(p.search(text) for p in _JOKE_NEGATIVE_PATTERNS):
+        return False
+    return any(p.search(text) for p in _JOKE_REQUEST_PATTERNS)
+
+
+def random_joke_reply() -> str:
+    """Return a randomized joke, cycling a shuffled deck to avoid repeats."""
+    global _joke_deck, _last_joke
+    if not _joke_deck:
+        _joke_deck = list(JOKES)
+        random.shuffle(_joke_deck)
+        if _last_joke and len(_joke_deck) > 1 and _joke_deck[-1] == _last_joke:
+            _joke_deck[0], _joke_deck[-1] = _joke_deck[-1], _joke_deck[0]
+    joke = _joke_deck.pop()
+    _last_joke = joke
+    return f"Sure! {joke}"
 
 
 def is_world_cup_favourite_question(user_text: str) -> bool:
@@ -877,6 +971,11 @@ def process_voice_wav(
                 }
                 return b"", meta
 
+    if reply_path == "llm" and is_conversation_goodbye(user_text):
+        reply_path = "goodbye"
+        reply = conversation_goodbye_reply()
+        logger.info("Voice conversation goodbye | heard: %s", user_text[:120])
+
     if reply_path == "llm" and is_local_time_question(user_text):
         reply_path = "local_time"
         reply = local_server_time_reply()
@@ -968,6 +1067,11 @@ def process_voice_wav(
         reply_path = "football_joke"
         reply = "I was going to tell you an offside joke, but you probably wouldn't get it."
         logger.info("Voice football joke query | heard: %s", user_text[:120])
+
+    if reply_path == "llm" and is_joke_request(user_text):
+        reply_path = "joke"
+        reply = random_joke_reply()
+        logger.info("Voice joke query | heard: %s", user_text[:120])
 
     if reply_path == "llm" and is_live_football_question(user_text):
         from football_service import (

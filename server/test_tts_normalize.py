@@ -38,6 +38,31 @@ class NormalizeTtsTextTests(unittest.TestCase):
             "Hi Yugandhar, the weather looks clear.",
         )
 
+    def test_strips_nino_speaker_label_and_quotes(self) -> None:
+        raw = (
+            'NiNO: "Chakri! It\'s nice seeing you again! '
+            'Let\'s dive into something you\'re curious about..." '
+            "Do you want to chat more about Chakri?"
+        )
+        self.assertEqual(
+            _normalize_tts_text(raw),
+            "Chakri! It's nice seeing you again! "
+            "Let's dive into something you're curious about... "
+            "Do you want to chat more about Chakri?",
+        )
+
+    def test_strips_nino_says_label(self) -> None:
+        self.assertEqual(
+            _normalize_tts_text('NiNO says: "Hello Chakri!"'),
+            "Hello Chakri!",
+        )
+
+    def test_leaves_nino_in_sentence(self) -> None:
+        self.assertEqual(
+            _normalize_tts_text("I'm NiNO, your home assistant."),
+            "I'm NiNO, your home assistant.",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

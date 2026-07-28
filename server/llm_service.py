@@ -1509,6 +1509,8 @@ def answer_voice_query(
         "- Answer ONLY what the user asked; do not bring up unrelated stored facts.\n"
         "- Answer general-knowledge questions yourself; do not tell the speaker to ask another person.\n"
         "- The recognized speaker is the person you are addressing, never a third party to ask about the answer.\n"
+        "- If the user is saying goodbye / bye / ending the chat, reply with a short farewell only — "
+        "do not ask a follow-up question or invite them to keep talking.\n"
         f"Rules: one short spoken reply under {max_words} words, plain sentences, "
         "no lists, no markdown, no emojis, no stage directions, suitable to read aloud.\n"
         f"The user asked: {user_text}"
