@@ -372,7 +372,7 @@ static void finish_boot_greeting_and_enable_wake(void) {
   s_boot_greeting_done = true;
   if (nino_voice_wake_hw_ready()) {
     nino_voice_wake_set_enabled(true);
-    ESP_LOGI(TAG, "Wake word on — say \"Hi ESP\"");
+    ESP_LOGI(TAG, "Wake word on — say \"Hi ESP\" or \"Jarvis\"");
   }
 }
 
@@ -2819,7 +2819,7 @@ static int cmd_voice(int argc, char **argv) {
   if (argc >= 2 && strcmp(argv[1], "connect") == 0) {
     if (argc < 3) {
       printf("Usage: voice connect <IPv4> [port]   (default port 8000)\n"
-             "  Saves ws://<ip>:<port>/voice-query?device_id=... for \"Hi ESP\" wake flow\n");
+             "  Saves ws://<ip>:<port>/voice-query?device_id=... for Hi ESP / Jarvis wake flow\n");
       return 0;
     }
     int port = 8000;

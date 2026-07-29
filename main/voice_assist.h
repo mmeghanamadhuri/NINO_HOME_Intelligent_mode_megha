@@ -21,7 +21,7 @@ void nino_voice_assist_set_ws_uri(const char *uri);
 /** Create WS-URI mutex (call once from app_main before console). */
 esp_err_t nino_voice_assist_init_mutex(void);
 
-/** Embedded main/beep.wav — played on "Hi ESP" wake. */
+/** Embedded main/beep.wav — played on wake ("Hi ESP" or "Jarvis"). */
 esp_err_t nino_voice_play_wake_chime(void);
 
 /** Decode beep + warm ES8311 at 16 kHz — call once after nino_audio_init(). */

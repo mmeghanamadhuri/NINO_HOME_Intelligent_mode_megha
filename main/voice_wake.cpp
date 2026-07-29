@@ -32,11 +32,13 @@ static const char *TAG = "voice_wake";
 #define WAKE_FETCH_DELAY_MS 12
 #define WAKE_FETCH_FAIL_DELAY_MS 25
 /*
- * The bundled "Hi ESP" model advertises approximately 0.635 as its operating
- * threshold. Keep a small margin above it to reject weak speech-like matches
- * without making normal-distance wake phrases unreliable.
+ * WakeNet9 models typically advertise ~0.5–0.65 as their operating threshold.
+ * Keep a small margin above the default to reject weak speech-like matches
+ * without making normal-distance "Hi ESP" / "Jarvis" wakes unreliable.
+ * Index 1 = first model, index 2 = second (when both are enabled in menuconfig).
  */
 #define WAKE_NET_THRESHOLD 0.65f
+#define WAKE_PHRASE_HINT "\"Hi ESP\" or \"Jarvis\""
 
 static afe_config_t *configure_wake_afe(srmodel_list_t *models) {
   afe_config_t *afe_cfg = afe_config_init("M", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
@@ -152,7 +154,7 @@ static void wake_feed_task(void *arg) {
 
 static void wake_fetch_task(void *arg) {
   esp_afe_sr_data_t *afe_data = (esp_afe_sr_data_t *)arg;
-  ESP_LOGI(TAG, "wake fetch started — say \"Hi ESP\"");
+  ESP_LOGI(TAG, "wake fetch started — say " WAKE_PHRASE_HINT);
 
   while (true) {
     /* VAD owns the microphone during a query. Feed is paused in that state,
@@ -183,7 +185,7 @@ static void wake_fetch_task(void *arg) {
                nino_voice_assist_has_ws_uri() && !s_after_wake_busy) {
       const int64_t now = esp_timer_get_time();
       if (s_last_wake_us == 0 || (now - s_last_wake_us) >= (int64_t)WAKE_COOLDOWN_MS * 1000LL) {
-        ESP_LOGI(TAG, "WakeNet detected \"Hi ESP\"");
+        ESP_LOGI(TAG, "WakeNet detected (" WAKE_PHRASE_HINT ")");
         s_last_wake_us = now;
         s_after_wake_busy = true;
         BaseType_t ok = xTaskCreatePinnedToCore(after_wake_task, "voice_wake_q", AFTER_WAKE_TASK_STACK, NULL,
@@ -215,7 +217,10 @@ extern "C" void nino_voice_wake_init(void) {
   }
 
   if (afe_config->wakenet_model_name != NULL) {
-    ESP_LOGI(TAG, "WakeNet model: %s (USB 4-mic wake source)", afe_config->wakenet_model_name);
+    ESP_LOGI(TAG, "WakeNet model 1: %s (USB 4-mic)", afe_config->wakenet_model_name);
+  }
+  if (afe_config->wakenet_model_name_2 != NULL) {
+    ESP_LOGI(TAG, "WakeNet model 2: %s (USB 4-mic)", afe_config->wakenet_model_name_2);
   }
 
   s_afe = esp_afe_handle_from_config(afe_config);
@@ -230,12 +235,14 @@ extern "C" void nino_voice_wake_init(void) {
     return;
   }
   if (s_afe->set_wakenet_threshold != NULL) {
-    const int threshold_result =
-        s_afe->set_wakenet_threshold(s_afe_data, 1, WAKE_NET_THRESHOLD);
-    if (threshold_result > 0) {
-      ESP_LOGI(TAG, "WakeNet USB threshold set to %.2f", (double)WAKE_NET_THRESHOLD);
-    } else {
-      ESP_LOGW(TAG, "Could not set WakeNet USB threshold (result=%d)", threshold_result);
+    for (int wn_idx = 1; wn_idx <= 2; ++wn_idx) {
+      const int threshold_result =
+          s_afe->set_wakenet_threshold(s_afe_data, wn_idx, WAKE_NET_THRESHOLD);
+      if (threshold_result > 0) {
+        ESP_LOGI(TAG, "WakeNet USB threshold[%d] set to %.2f", wn_idx, (double)WAKE_NET_THRESHOLD);
+      } else if (wn_idx == 1) {
+        ESP_LOGW(TAG, "Could not set WakeNet USB threshold (result=%d)", threshold_result);
+      }
     }
   }
 
@@ -250,7 +257,7 @@ extern "C" void nino_voice_wake_init(void) {
   }
 
   s_wake_hw_ready = true;
-  ESP_LOGI(TAG, "Wake word ready (USB 4-mic) — say \"Hi ESP\"");
+  ESP_LOGI(TAG, "Wake word ready (USB 4-mic) — say " WAKE_PHRASE_HINT);
 }
 
 extern "C" void nino_voice_wake_drop_mic_locked(void) {
@@ -261,7 +268,7 @@ extern "C" void nino_voice_wake_set_mic_capture_hold(bool hold) {
   if (!hold && s_mic_capture_hold && s_afe != NULL && s_afe_data != NULL &&
       s_afe->reset_buffer != NULL) {
     /* Feed and fetch are still paused here. Clear partial wake-word frames
-     * from the completed VAD session before accepting the next "Hi ESP". */
+     * from the completed VAD session before accepting the next wake phrase. */
     (void)s_afe->reset_buffer(s_afe_data);
   }
   s_mic_capture_hold = hold;
@@ -272,7 +279,7 @@ extern "C" void nino_voice_wake_release_after_wake(void) {
     return;
   }
   s_after_wake_busy = false;
-  ESP_LOGI(TAG, "wake armed — say \"Hi ESP\"");
+  ESP_LOGI(TAG, "wake armed — say " WAKE_PHRASE_HINT);
 }
 
 extern "C" void nino_voice_wake_set_enabled(bool on) {
