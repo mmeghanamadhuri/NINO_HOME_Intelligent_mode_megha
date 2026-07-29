@@ -168,6 +168,28 @@ class StartupGreetingTests(unittest.TestCase):
         self.assertIn("topic beta", topics[1])
         self.assertEqual(len(topics), 2)
 
+    def test_parse_summary_skips_markdown_heading(self) -> None:
+        summary = (
+            "### Summary\n"
+            "- User learned about microcontrollers and GPIO.\n"
+            "- User asked about Wi-Fi latency.\n"
+        )
+        topics = parse_summary_topics_for_greeting(summary)
+        self.assertEqual(topics[0], "microcontrollers and GPIO")
+        self.assertNotIn("###", topics[0])
+        self.assertNotEqual(topics[0].lower(), "summary")
+
+    def test_parse_summary_skips_numbered_list_marker(self) -> None:
+        summary = (
+            "### Summary\n"
+            "1. User learned about microcontrollers and GPIO.\n"
+            "2. User asked about Wi-Fi latency.\n"
+        )
+        topics = parse_summary_topics_for_greeting(summary)
+        self.assertEqual(topics[0], "microcontrollers and GPIO")
+        self.assertNotEqual(topics[0], "1")
+        self.assertFalse(topics[0].isdigit())
+
     def test_startup_opener_format(self) -> None:
         hello = build_startup_greeting_hello(_TEST_DISPLAY_NAME)
         yesterday = build_startup_greeting_yesterday("topic alpha and their uses")

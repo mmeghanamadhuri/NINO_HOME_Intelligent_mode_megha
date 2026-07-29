@@ -1126,6 +1126,11 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                             "face",
                         }:
                             active_viewer = normalized_identity
+                    if not active_viewer:
+                        # Face can briefly drop during continue-listen; keep chat continuity.
+                        active_viewer = await run_in_threadpool(
+                            _recall_voice_viewer, device_id
+                        )
 
                     def _run_voice() -> tuple[bytes, VoiceReplyMeta]:
                         return process_voice_wav(

@@ -224,7 +224,20 @@ CONTINUE_LISTEN_REPLY_PATHS = frozenset(
         "recap_not_found",
         "recap_blocked_no_face",
         "joke",
+        "greeting",
+        "smalltalk",
     }
+)
+
+# Pure time-of-day / hello greetings — answered from the PC clock, not echoed from STT.
+_TIME_OF_DAY_GREETING_RE = re.compile(
+    r"^\s*(?:hey|hi|hello)"
+    r"(?:\s*,?\s*(?:there|everyone|all|folks|guys|team))?"
+    r"[.!?…]*\s*$"
+    r"|^\s*(?:good\s+)?(?:morning|afternoon|evening|night)"
+    r"(?:\s*,?\s*(?:everyone|all|there|folks|guys|team|[A-Za-z]{2,20}))?"
+    r"[.!?…]*\s*$",
+    re.IGNORECASE,
 )
 
 _CONVERSATION_GOODBYE_RE = re.compile(
@@ -526,6 +539,91 @@ def local_server_time_reply() -> str:
     now = datetime.now().astimezone()
     hour = now.strftime("%I").lstrip("0") or "0"
     return f"It is {hour}:{now.strftime('%M %p')}, {now.strftime('%A, %B')} {now.day}."
+
+
+def is_time_of_day_greeting(user_text: str) -> bool:
+    """True for short greetings like 'good morning' / 'hi' (not questions)."""
+    text = str(user_text or "").strip()
+    if not text or len(text) > 48:
+        return False
+    if "?" in text:
+        return False
+    return bool(_TIME_OF_DAY_GREETING_RE.match(text))
+
+
+def time_of_day_greeting_reply(viewer_name: str | None = None) -> str:
+    """Greet using the current local period — never echo a wrong 'good morning'."""
+    from alarm_time import day_part_greeting
+
+    greeting = day_part_greeting()
+    name = (viewer_name or "").strip()
+    if name:
+        return f"{greeting} {name}! How are you today?"
+    return f"{greeting}! How are you today?"
+
+
+_HOWAREYOU_RE = re.compile(
+    r"^\s*(?:hey[, ]+|hi[, ]+|hello[, ]+)?"
+    r"(?:how(?:'s| is| are) (?:it going|everything|things|your day|you(?: doing| feeling)?)|"
+    r"how are ya|how're you(?: doing)?)"
+    r"[.!?…]*\s*$",
+    re.IGNORECASE,
+)
+
+_WELLBEING_STATUS_RE = re.compile(
+    r"^\s*(?:i(?:'m| am)|we(?:'re| are)|doing|feeling)?\s*"
+    r"(?:great|good|fine|well|okay|ok|awesome|amazing|fantastic|excellent|"
+    r"not bad|pretty good|really good|so[- ]so|alright|all right|"
+    r"tired|busy|happy|excited)"
+    r"(?:\s*,?\s*(?:thanks|thank you|too))?"
+    r"[.!?…]*\s*$",
+    re.IGNORECASE,
+)
+
+_HOWAREYOU_REPLIES = (
+    "I'm doing well, thanks! How about you?",
+    "Pretty good over here! How's your day going?",
+    "I'm good — glad you asked. How are you feeling?",
+)
+
+_WELLBEING_STATUS_REPLIES = (
+    "That's lovely to hear! What's on your mind?",
+    "Glad you're doing well! Want to chat about something?",
+    "Awesome — I like that energy. What shall we talk about?",
+    "Nice! Anything you'd like to dig into together?",
+)
+
+
+def is_howareyou_question(user_text: str) -> bool:
+    text = str(user_text or "").strip()
+    if not text or len(text) > 64:
+        return False
+    return bool(_HOWAREYOU_RE.match(text))
+
+
+def is_wellbeing_status_reply(user_text: str) -> bool:
+    """Short mood replies like 'I am great' after NiNO asked how they are."""
+    text = str(user_text or "").strip()
+    if not text or len(text) > 48 or "?" in text:
+        return False
+    return bool(_WELLBEING_STATUS_RE.match(text))
+
+
+def howareyou_reply(viewer_name: str | None = None) -> str:
+    name = (viewer_name or "").strip()
+    base = random.choice(_HOWAREYOU_REPLIES)
+    if name and random.random() < 0.45:
+        return f"Hey {name}! {base}"
+    return base
+
+
+def wellbeing_status_reply(viewer_name: str | None = None) -> str:
+    """Warm acknowledgement — keep chatting, never 'how can I assist'."""
+    name = (viewer_name or "").strip()
+    base = random.choice(_WELLBEING_STATUS_REPLIES)
+    if name and random.random() < 0.35:
+        return f"Good to hear, {name}! {base.split('! ', 1)[-1]}"
+    return base
 
 
 def is_servo_360_command(user_text: str) -> bool:
@@ -934,6 +1032,11 @@ def process_voice_wav(
         camera_identity_name,
         camera_identity_state,
     )
+    if not memory_name and viewer_name:
+        # Continue-listen turns may lose the live face for a moment.
+        cleaned_viewer = viewer_name.strip()
+        if cleaned_viewer and cleaned_viewer.lower() not in {"unknown", "face"}:
+            memory_name = cleaned_viewer
     memory_ctx = None
     if memory_name:
         memory_ctx = memory_svc.load_context(memory_name, query_text=user_text)
@@ -975,6 +1078,28 @@ def process_voice_wav(
         reply_path = "goodbye"
         reply = conversation_goodbye_reply()
         logger.info("Voice conversation goodbye | heard: %s", user_text[:120])
+
+    if reply_path == "llm" and is_time_of_day_greeting(user_text):
+        reply_path = "greeting"
+        greet_name = memory_name or (
+            viewer_name.strip() if viewer_name else None
+        )
+        reply = time_of_day_greeting_reply(greet_name)
+        logger.info(
+            "Voice time-of-day greeting | reply=%s | heard: %s",
+            reply[:80],
+            user_text[:120],
+        )
+
+    if reply_path == "llm" and is_howareyou_question(user_text):
+        reply_path = "smalltalk"
+        reply = howareyou_reply(memory_name or viewer_name)
+        logger.info("Voice how-are-you | heard: %s", user_text[:120])
+
+    if reply_path == "llm" and is_wellbeing_status_reply(user_text):
+        reply_path = "smalltalk"
+        reply = wellbeing_status_reply(memory_name or viewer_name)
+        logger.info("Voice wellbeing status | heard: %s", user_text[:120])
 
     if reply_path == "llm" and is_local_time_question(user_text):
         reply_path = "local_time"

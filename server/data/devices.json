@@ -1,8 +1,8 @@
 {
   "devices": [
     {
-      "device_id": "12345",
-      "display_name": "NINO - gitam",
+      "device_id": "nino-000000",
+      "display_name": "NINO - HOME",
       "camera_url": "http://192.168.0.207/stream",
       "play_wav_url": "http://192.168.0.207/play_wav",
       "base_url": "http://192.168.0.207",
@@ -14,15 +14,15 @@
       "wifi_ssid": "GOSPAZE Premium Connect",
       "wifi_bssid": "BC:07:1D:67:1B:60",
       "wifi_rssi": -42,
-      "wifi_channel": 1,
-      "wifi_updated_at": "2026-07-28T10:46:59.941276+00:00"
+      "wifi_channel": 11,
+      "wifi_updated_at": "2026-07-29T15:06:32.943210+00:00"
     },
     {
       "device_id": "nino-home",
       "display_name": "NINO-P4",
-      "camera_url": "http://192.168.0.88/stream",
-      "play_wav_url": "http://192.168.0.88/play_wav",
-      "base_url": "http://192.168.0.88",
+      "camera_url": "http://192.168.0.87/stream",
+      "play_wav_url": "http://192.168.0.87/play_wav",
+      "base_url": "http://192.168.0.87",
       "camera_rotation": "cw90",
       "latitude": null,
       "longitude": null,
@@ -30,9 +30,9 @@
       "location_updated_at": "",
       "wifi_ssid": "GOSPAZE Premium Connect",
       "wifi_bssid": "BC:07:1D:67:1B:60",
-      "wifi_rssi": -36,
-      "wifi_channel": 1,
-      "wifi_updated_at": "2026-07-28T11:26:18.611993+00:00"
+      "wifi_rssi": -33,
+      "wifi_channel": 11,
+      "wifi_updated_at": "2026-07-29T14:02:54.385656+00:00"
     }
   ]
 }

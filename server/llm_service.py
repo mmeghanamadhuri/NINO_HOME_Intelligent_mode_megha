@@ -444,6 +444,21 @@ _SUMMARY_TOPIC_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Markdown headings / section labels are not speakable topics
+# (e.g. "### Summary" was spoken as "Yesterday we discussed ### Summary").
+_SUMMARY_HEADING_RE = re.compile(r"^#{1,6}\s*")
+_SUMMARY_SECTION_LABEL_RE = re.compile(
+    r"^(?:summary|overview|highlights?|topics?|notes?|recap|"
+    r"session\s+summary|daily\s+summary|key\s+points?)\s*$",
+    re.IGNORECASE,
+)
+# Strip "1." / "2)" / "(3)" before clause-splitting — otherwise "1. Mars" → topic "1".
+_SUMMARY_LIST_NUMBER_RE = re.compile(r"^(?:\(?\d+\)?[.)]\s+|\d+\s+[-–—]\s+)")
+_SUMMARY_JUNK_TOPIC_RE = re.compile(
+    r"^(?:\d+|topic\s*\d+|item\s*\d+|point\s*\d+)\s*$",
+    re.IGNORECASE,
+)
+
 
 def parse_summary_topics_for_greeting(
     summary_text: str, *, max_topics: int = 2
@@ -451,8 +466,13 @@ def parse_summary_topics_for_greeting(
     """Extract speakable topic phrases from a Phase C summary; skip personal prefs."""
     topics: list[str] = []
     for raw_line in summary_text.splitlines():
-        line = raw_line.strip().lstrip("-•*").strip()
-        if not line or _SUMMARY_PREFERENCE_RE.search(line):
+        line = raw_line.strip()
+        line = _SUMMARY_HEADING_RE.sub("", line)
+        line = line.lstrip("-•*").strip()
+        line = _SUMMARY_LIST_NUMBER_RE.sub("", line).strip()
+        if not line or _SUMMARY_SECTION_LABEL_RE.match(line):
+            continue
+        if _SUMMARY_PREFERENCE_RE.search(line):
             continue
         if re.search(r"\bshifted to discussing\b", line, re.I):
             line = re.sub(
@@ -466,10 +486,14 @@ def parse_summary_topics_for_greeting(
         # run-on with a second topic (which caused mixed greetings).
         line = re.split(r"[.;:]", line, maxsplit=1)[0].strip()
         line = line.rstrip(".")
-        if not line:
+        if not line or _SUMMARY_SECTION_LABEL_RE.match(line):
+            continue
+        if _SUMMARY_JUNK_TOPIC_RE.match(line) or len(line) < 3:
             continue
         if len(line) > 48:
             line = line[:45].rsplit(" ", 1)[0]
+        if _SUMMARY_JUNK_TOPIC_RE.match(line) or len(line) < 3:
+            continue
         topics.append(line)
         if len(topics) >= max_topics:
             break
@@ -1484,6 +1508,17 @@ def answer_voice_query(
         )
 
     style_hint = random.choice(_VOICE_STYLE_VARIANTS)
+    from alarm_time import day_part, day_part_greeting, system_now
+
+    now = system_now()
+    part = day_part(now)
+    tod_greeting = day_part_greeting(now)
+    clock_line = (
+        f"Current local time is {now.strftime('%I:%M %p').lstrip('0')} "
+        f"({part}). For greetings, say \"{tod_greeting}\" — "
+        "never echo a wrong time-of-day greeting from the user "
+        "(e.g. do not say good morning when it is evening).\n"
+    )
     memory_rules = ""
     if memory_context:
         name_hint = viewer_name.strip() if viewer_name else "them"
@@ -1500,11 +1535,15 @@ def answer_voice_query(
     prompt = (
         "You are NiNO, a concise voice assistant for a smart home with a camera.\n"
         f"{who}\n"
+        f"{clock_line}"
         f"{memory_rules}"
         f"{_memory_context_block(memory_context)}"
         "Style rules:\n"
         f"- {style_hint}\n"
-        "- Sound natural and casual, not scripted or robotic.\n"
+        "- Sound warm, human, and conversational — like a friendly housemate, not a helpdesk.\n"
+        "- Never say \"how can I assist you\", \"how may I help\", or similar service-desk phrases.\n"
+        "- If the user shares how they feel (e.g. \"I am great\"), acknowledge warmly and invite "
+        "them to keep chatting — do not restart with a greeting or offer of assistance.\n"
         "- If the topic came up before, vary wording and tone — do not repeat the same sentence.\n"
         "- Answer ONLY what the user asked; do not bring up unrelated stored facts.\n"
         "- Answer general-knowledge questions yourself; do not tell the speaker to ask another person.\n"
@@ -1513,7 +1552,7 @@ def answer_voice_query(
         "do not ask a follow-up question or invite them to keep talking.\n"
         f"Rules: one short spoken reply under {max_words} words, plain sentences, "
         "no lists, no markdown, no emojis, no stage directions, suitable to read aloud.\n"
-        f"The user asked: {user_text}"
+        f"The user said: {user_text}"
     )
     reply = ollama_generate(
         prompt,

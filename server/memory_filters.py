@@ -364,6 +364,16 @@ def parse_birthdate_update(user_text: str) -> str | None:
     return None
 
 
+def _is_latin_letter(ch: str) -> bool:
+    """Basic Latin + Latin Extended (covers English and common accented letters)."""
+    code = ord(ch)
+    return (
+        0x41 <= code <= 0x5A  # A-Z
+        or 0x61 <= code <= 0x7A  # a-z
+        or 0xC0 <= code <= 0x24F  # Latin-1 Supplement / Latin Extended-A/B
+    )
+
+
 def is_unintelligible_stt(user_text: str) -> bool:
     """Garbled or empty STT — do not send to the LLM."""
     text = user_text.strip()
@@ -371,9 +381,14 @@ def is_unintelligible_stt(user_text: str) -> bool:
         return True
     if re.fullmatch(r"[\s.*…\-!]+", text):
         return True
-    letters = sum(1 for c in text if c.isalpha())
-    if len(text) >= 4 and letters < 3:
+    letters = [c for c in text if c.isalpha()]
+    if len(text) >= 4 and len(letters) < 3:
         return True
+    # Short noise clips often get misheard as Telugu/Hindi/etc.; UK demo is English.
+    if letters:
+        latin = sum(1 for c in letters if _is_latin_letter(c))
+        if latin / len(letters) < 0.5:
+            return True
     return False
 
 
@@ -842,6 +857,17 @@ _ANAPHORA = re.compile(
 )
 
 
+_WELLBEING_FOLLOWUP_RE = re.compile(
+    r"^\s*(?:i(?:'m| am)|we(?:'re| are)|doing|feeling)?\s*"
+    r"(?:great|good|fine|well|okay|ok|awesome|amazing|fantastic|excellent|"
+    r"not bad|pretty good|really good|so[- ]so|alright|all right|"
+    r"tired|busy|happy|excited)"
+    r"(?:\s*,?\s*(?:thanks|thank you|too))?"
+    r"[.!?…]*\s*$",
+    re.IGNORECASE,
+)
+
+
 def query_needs_recent_context(user_text: str) -> bool:
     """True only when the query is a follow-up that references prior turns.
 
@@ -855,6 +881,9 @@ def query_needs_recent_context(user_text: str) -> bool:
     if _FOLLOWUP_CONNECTOR.search(text):
         return True
     if _FOLLOWUP_CONTINUATION.search(text):
+        return True
+    # Mood replies after "how are you?" need the prior turn.
+    if len(text) <= 48 and _WELLBEING_FOLLOWUP_RE.match(text):
         return True
     # Short anaphoric follow-ups ('what is it made of?', 'how does that work?').
     word_count = len(re.findall(r"[A-Za-z0-9']+", text))

@@ -464,6 +464,11 @@ class MemoryFilterTests(unittest.TestCase):
         self.assertTrue(is_likely_tts_echo("Your birthday is June 25th."))
         self.assertFalse(is_likely_tts_echo("Birthday is on 24th."))
         self.assertTrue(is_unintelligible_stt("***"))
+        # ElevenLabs often maps short noise to non-Latin script — reject for UK English demo.
+        self.assertTrue(is_unintelligible_stt("పాకుండాయి"))
+        self.assertTrue(is_unintelligible_stt("नमस्ते क्या हाल है"))
+        self.assertFalse(is_unintelligible_stt("What's the weather today?"))
+        self.assertFalse(is_unintelligible_stt("café"))
         self.assertTrue(is_preference_update_statement("My birthday is June 25th."))
 
     def test_llm_memory_enrichment_for_terse_extractions(self) -> None:
