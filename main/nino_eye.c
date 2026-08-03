@@ -37,7 +37,38 @@ typedef enum {
     NINO_RENDER_STATIC,
     NINO_RENDER_HEART,
     NINO_RENDER_MED_CAPSULE,
+    NINO_RENDER_SMILE,
+    NINO_RENDER_TWINKLE,
+    NINO_RENDER_GLYPH,
 } nino_render_mode_t;
+
+/* A scaled icon renderer: draws (or, when @p erase, wipes to background) a glyph
+ * centered at (cx, cy) at size @p scale in [0, SMILE_SCALE_FULL]. Used for all
+ * the object emoji (pencil/radio/tv/bulb/robot) so they share one transition. */
+typedef void (*nino_glyph_fn)(int cx, int cy, int scale, bool erase);
+
+/* Full ☺️ smiley face, drawn identically on both panels. Sizes below are at
+ * full scale; the grow-in / shrink-out animation scales them uniformly. The
+ * radius matches the normal eye height (idle ry=30) so the smiley reads at the
+ * same size as the other expressions. */
+#define FACE_R            30   /* face radius at full scale (≈ eye ry) */
+#define FACE_RIM          2    /* darker rim thickness around the disc */
+#define SMILE_SCALE_FULL  20   /* full-size scale (matches heart scale range) */
+#define SMILE_SCALE_STEP  4    /* scale change per grow/shrink frame */
+/* Centered like every other expression. */
+#define SMILE_CY          EYE_CY
+
+/* ✨ twinkle: a big four-point sparkle plus two small ones, sized to match the
+ * smiley footprint. Reuses SMILE_SCALE_FULL/STEP for the grow/shrink. Values
+ * are offsets/radii from the glyph center at full scale. */
+#define TWINKLE_BIG_R     21
+#define TWINKLE_BIG_DY    2
+#define TWINKLE_S1_R      9    /* upper-right small sparkle */
+#define TWINKLE_S1_DX     19
+#define TWINKLE_S1_DY     (-17)
+#define TWINKLE_S2_R      7    /* lower-left small sparkle */
+#define TWINKLE_S2_DX     (-18)
+#define TWINKLE_S2_DY     16
 
 /* med capsule tilt: 45 deg from vertical, red cap pointing upper-right. */
 #define MED_CAPSULE_SLANT_DEG 45
@@ -65,10 +96,19 @@ typedef struct {
     uint8_t eye_r;       /* emotion eye colour on white background */
     uint8_t eye_g;
     uint8_t eye_b;
+    nino_glyph_fn glyph_fn;  /* set for NINO_RENDER_GLYPH states, else NULL */
 } nino_state_profile_t;
 
 static volatile nino_eye_state_t s_state = NINO_EYE_IDLE;
 static volatile bool s_restart_requested = false;
+
+/* Object-emoji glyph renderers (defined lower down; referenced by the profile
+ * table so they need forward declarations here). */
+static void draw_pencil(int cx, int cy, int scale, bool erase);
+static void draw_radio(int cx, int cy, int scale, bool erase);
+static void draw_tv(int cx, int cy, int scale, bool erase);
+static void draw_bulb(int cx, int cy, int scale, bool erase);
+static void draw_robot(int cx, int cy, int scale, bool erase);
 
 static const nino_state_profile_t s_profiles[NINO_EYE_STATE_COUNT] = {
     /* idle: neutral / half-open, normal pupil, slow blink (~5 s). */
@@ -189,6 +229,42 @@ static const nino_state_profile_t s_profiles[NINO_EYE_STATE_COUNT] = {
         .state_ms = 900,
         .eye_r = 0, .eye_g = 0, .eye_b = 0,
     },
+    /* smile: full ☺️ smiley face (gold disc, black eyes + smile) held still.
+     * heart_max_scale carries the full glyph scale used by the grow/shrink. */
+    [NINO_EYE_SMILE] = {
+        .mode = NINO_RENDER_SMILE,
+        .state_ms = 1200,
+        .heart_max_scale = SMILE_SCALE_FULL,
+        .eye_r = 0, .eye_g = 0, .eye_b = 0,
+    },
+    /* twinkle: ✨ gold sparkles held still, sized to match the smiley. */
+    [NINO_EYE_TWINKLE] = {
+        .mode = NINO_RENDER_TWINKLE,
+        .state_ms = 1200,
+        .heart_max_scale = SMILE_SCALE_FULL,
+        .eye_r = 0, .eye_g = 0, .eye_b = 0,
+    },
+    /* object emoji: static icons, same size/hold/transition as the smiley. */
+    [NINO_EYE_PENCIL] = {
+        .mode = NINO_RENDER_GLYPH, .state_ms = 1200,
+        .heart_max_scale = SMILE_SCALE_FULL, .glyph_fn = draw_pencil,
+    },
+    [NINO_EYE_RADIO] = {
+        .mode = NINO_RENDER_GLYPH, .state_ms = 1200,
+        .heart_max_scale = SMILE_SCALE_FULL, .glyph_fn = draw_radio,
+    },
+    [NINO_EYE_TV] = {
+        .mode = NINO_RENDER_GLYPH, .state_ms = 1200,
+        .heart_max_scale = SMILE_SCALE_FULL, .glyph_fn = draw_tv,
+    },
+    [NINO_EYE_BULB] = {
+        .mode = NINO_RENDER_GLYPH, .state_ms = 1200,
+        .heart_max_scale = SMILE_SCALE_FULL, .glyph_fn = draw_bulb,
+    },
+    [NINO_EYE_ROBOT] = {
+        .mode = NINO_RENDER_GLYPH, .state_ms = 1200,
+        .heart_max_scale = SMILE_SCALE_FULL, .glyph_fn = draw_robot,
+    },
 };
 
 /* Background is white; eyes are black (per-state colour). */
@@ -207,6 +283,17 @@ static uint16_t color_eye(void)
 static uint16_t color_red(void)
 {
     return ssd1351_color(255, 0, 0);
+}
+
+/* ☺️ smiley palette: emoji-gold face with a slightly darker rim for definition. */
+static uint16_t color_smiley_face(void)
+{
+    return ssd1351_color(255, 209, 26);
+}
+
+static uint16_t color_smiley_rim(void)
+{
+    return ssd1351_color(196, 142, 0);
 }
 
 /* med capsule palette: red cap, light-gray body, dark-gray outline. */
@@ -322,12 +409,16 @@ static void clear_screen(uint16_t color)
  * along its own outline (writing background over only the eye/heart pixels)
  * instead of erasing a white rectangle that would flash the held background.
  */
-typedef enum { PREV_NONE, PREV_ELLIPSE, PREV_HEART, PREV_BLOB, PREV_CAPSULE } prev_kind_t;
+typedef enum { PREV_NONE, PREV_ELLIPSE, PREV_HEART, PREV_BLOB, PREV_CAPSULE, PREV_SMILE, PREV_TWINKLE, PREV_GLYPH } prev_kind_t;
 static prev_kind_t s_prev_kind = PREV_NONE;
 static int s_prev_cx, s_prev_rx, s_prev_ry, s_prev_top, s_prev_bottom;
 static int s_prev_blob_cy;
 static int s_prev_heart_cx, s_prev_heart_cy, s_prev_heart_scale;
 static int s_prev_cap_cx, s_prev_cap_cy, s_prev_cap_half, s_prev_cap_radius;
+static int s_prev_smile_cx, s_prev_smile_cy, s_prev_smile_scale;
+static int s_prev_twinkle_cx, s_prev_twinkle_cy, s_prev_twinkle_scale;
+static int s_prev_glyph_cx, s_prev_glyph_cy, s_prev_glyph_scale;
+static nino_glyph_fn s_prev_glyph_fn;
 
 /*
  * When true, the central blink transition has already drawn (and remembered)
@@ -371,6 +462,31 @@ static void remember_blob(int cx, int cy, int rx, int ry)
     s_prev_blob_cy = cy;
     s_prev_rx = rx;
     s_prev_ry = ry;
+}
+
+static void remember_smile(int cx, int cy, int scale)
+{
+    s_prev_kind = PREV_SMILE;
+    s_prev_smile_cx = cx;
+    s_prev_smile_cy = cy;
+    s_prev_smile_scale = scale;
+}
+
+static void remember_twinkle(int cx, int cy, int scale)
+{
+    s_prev_kind = PREV_TWINKLE;
+    s_prev_twinkle_cx = cx;
+    s_prev_twinkle_cy = cy;
+    s_prev_twinkle_scale = scale;
+}
+
+static void remember_glyph(int cx, int cy, int scale, nino_glyph_fn fn)
+{
+    s_prev_kind = PREV_GLYPH;
+    s_prev_glyph_cx = cx;
+    s_prev_glyph_cy = cy;
+    s_prev_glyph_scale = scale;
+    s_prev_glyph_fn = fn;
 }
 
 static void erase_eye_rows(int center_x, int rx, int ry, int top, int bottom)
@@ -515,6 +631,410 @@ static void draw_heart(int cx, int cy, int scale, uint16_t color)
     }
 }
 
+/*
+ * Upturned smile stroke "‿": belly dips at the center, ends sweep up, tapering
+ * to points. Used as the mouth of the smiley face. Centered vertically on cy.
+ */
+static void draw_smile_stroke(int cx, int cy, int half_w, int depth, int thick,
+                              uint16_t color)
+{
+    if (half_w < 1 || thick < 1) {
+        return;
+    }
+    int y_belly = cy + depth / 2;
+    for (int dx = -half_w; dx <= half_w; dx++) {
+        float u = (float)dx / (float)half_w;
+        float shape = 1.0f - (u * u);          /* 1 at center, 0 at the ends */
+        int yc = y_belly - (int)(depth * (1.0f - shape) + 0.5f);
+        int t = (int)(thick * shape + 0.5f);   /* taper the stroke to a point */
+        if (t < 1) {
+            continue;
+        }
+        int y_hi = yc - (t / 2);
+        for (int y = y_hi; y < y_hi + t; y++) {
+            draw_landscape_hline(cx + dx, y, 1, color);
+        }
+    }
+}
+
+/*
+ * Draw (or erase) the full ☺️ smiley face centered at (cx, cy): a gold disc
+ * with a darker rim, two black eyes, and a black upturned smile. @p scale
+ * (0..SMILE_SCALE_FULL) drives the smooth grow-in / shrink-out animation.
+ */
+static void draw_smiley_face(int cx, int cy, int scale, bool erase)
+{
+    if (scale <= 0) {
+        return;
+    }
+    if (scale > SMILE_SCALE_FULL) {
+        scale = SMILE_SCALE_FULL;
+    }
+    int r = FACE_R * scale / SMILE_SCALE_FULL;
+    if (r < 4) {
+        return;
+    }
+
+    if (erase) {
+        fill_ellipse(cx, cy, r + 1, r + 1, color_bg());
+        return;
+    }
+
+    const uint16_t black = ssd1351_color(0, 0, 0);
+
+    /* Face disc: darker rim, then the gold fill inside it. */
+    fill_ellipse(cx, cy, r, r, color_smiley_rim());
+    fill_ellipse(cx, cy, r - FACE_RIM, r - FACE_RIM, color_smiley_face());
+
+    /* Eyes: two upright black ovals in the upper third. */
+    int eye_dx = (r * 40) / 100;
+    int eye_cy = cy - (r * 26) / 100;
+    int eye_rx = (r * 13) / 100;
+    int eye_ry = (r * 19) / 100;
+    if (eye_rx < 2) eye_rx = 2;
+    if (eye_ry < 2) eye_ry = 2;
+    fill_ellipse(cx - eye_dx, eye_cy, eye_rx, eye_ry, black);
+    fill_ellipse(cx + eye_dx, eye_cy, eye_rx, eye_ry, black);
+
+    /* Mouth: black upturned smile in the lower half. */
+    int m_half = (r * 52) / 100;
+    int m_depth = (r * 26) / 100;
+    int m_thick = (r * 12) / 100;
+    if (m_thick < 2) m_thick = 2;
+    int m_cy = cy + (r * 24) / 100;
+    draw_smile_stroke(cx, m_cy, m_half, m_depth, m_thick, black);
+}
+
+/*
+ * One filled four-point sparkle (astroid) centered at (cx, cy). The astroid
+ * |dx|^(2/3) + |dy|^(2/3) <= radius^(2/3) gives the concave-sided star that
+ * reads as the ✨ shape. For each row the inside is a single x interval.
+ */
+static void draw_sparkle(int cx, int cy, int radius, uint16_t color)
+{
+    if (radius < 2) {
+        return;
+    }
+    float r23 = powf((float)radius, 2.0f / 3.0f);
+    for (int dy = -radius; dy <= radius; dy++) {
+        int ady = dy < 0 ? -dy : dy;
+        float t = r23 - powf((float)ady, 2.0f / 3.0f);
+        if (t < 0.0f) {
+            continue;
+        }
+        int xmax = (int)(powf(t, 1.5f) + 0.5f);
+        draw_landscape_hline(cx - xmax, cy + dy, (xmax * 2) + 1, color);
+    }
+}
+
+/*
+ * Draw (or erase) the ✨ twinkle centered at (cx, cy): one big gold sparkle
+ * plus two small ones. @p scale (0..SMILE_SCALE_FULL) drives the grow/shrink.
+ */
+static void draw_twinkle(int cx, int cy, int scale, bool erase)
+{
+    if (scale <= 0) {
+        return;
+    }
+    if (scale > SMILE_SCALE_FULL) {
+        scale = SMILE_SCALE_FULL;
+    }
+    int big = TWINKLE_BIG_R * scale / SMILE_SCALE_FULL;
+    if (big < 2) {
+        return;
+    }
+    const uint16_t color = erase ? color_bg() : color_smiley_face();
+    const int pad = erase ? 1 : 0;
+
+    draw_sparkle(cx, cy + (TWINKLE_BIG_DY * scale / SMILE_SCALE_FULL), big + pad,
+                 color);
+
+    int s1 = TWINKLE_S1_R * scale / SMILE_SCALE_FULL;
+    if (s1 >= 2) {
+        draw_sparkle(cx + (TWINKLE_S1_DX * scale / SMILE_SCALE_FULL),
+                     cy + (TWINKLE_S1_DY * scale / SMILE_SCALE_FULL), s1 + pad,
+                     color);
+    }
+    int s2 = TWINKLE_S2_R * scale / SMILE_SCALE_FULL;
+    if (s2 >= 2) {
+        draw_sparkle(cx + (TWINKLE_S2_DX * scale / SMILE_SCALE_FULL),
+                     cy + (TWINKLE_S2_DY * scale / SMILE_SCALE_FULL), s2 + pad,
+                     color);
+    }
+}
+
+/* ---- Object-emoji icons (pencil/radio/tv/bulb/robot) ----
+ *
+ * All axis-aligned and span-based (fast on SPI). Sizes are in "full-scale"
+ * units; gs() maps them through the shared grow/shrink scale so every icon
+ * animates and sizes exactly like the smiley face. */
+static inline int gs(int base, int scale)
+{
+    return base * scale / SMILE_SCALE_FULL;
+}
+
+/* Clipped, dirty-tracked filled rectangle (top-left x,y; w x h). */
+static void fill_rect_g(int x, int y, int w, int h, uint16_t color)
+{
+    for (int r = 0; r < h; r++) {
+        draw_landscape_hline(x, y + r, w, color);
+    }
+}
+
+/* Thick straight line via Bresenham, drawn as th x th blocks per step. */
+static void draw_line_g(int x0, int y0, int x1, int y1, int th, uint16_t color)
+{
+    int adx = x1 > x0 ? x1 - x0 : x0 - x1;
+    int ady = y1 > y0 ? y1 - y0 : y0 - y1;
+    int sx = x0 < x1 ? 1 : -1;
+    int sy = y0 < y1 ? 1 : -1;
+    int err = adx - ady;
+    int half = th / 2;
+    if (half < 0) {
+        half = 0;
+    }
+    while (1) {
+        fill_rect_g(x0 - half, y0 - half, th, th, color);
+        if (x0 == x1 && y0 == y1) {
+            break;
+        }
+        int e2 = 2 * err;
+        if (e2 > -ady) {
+            err -= ady;
+            x0 += sx;
+        }
+        if (e2 < adx) {
+            err += adx;
+            y0 += sy;
+        }
+    }
+}
+
+/* ✏️ pencil: upright, pink eraser on top, graphite tip at the bottom. */
+static void draw_pencil(int cx, int cy, int scale, bool erase)
+{
+    if (scale <= 0) {
+        return;
+    }
+    if (scale > SMILE_SCALE_FULL) {
+        scale = SMILE_SCALE_FULL;
+    }
+    int hw = gs(7, scale);
+    if (hw < 1) {
+        return;
+    }
+    if (erase) {
+        fill_rect_g(cx - gs(9, scale), cy - gs(28, scale), gs(18, scale),
+                    gs(56, scale), color_bg());
+        return;
+    }
+
+    const uint16_t pink = ssd1351_color(255, 120, 150);
+    const uint16_t silver = ssd1351_color(200, 200, 212);
+    const uint16_t yellow = ssd1351_color(250, 200, 20);
+    const uint16_t wood = ssd1351_color(214, 170, 110);
+    const uint16_t graphite = ssd1351_color(70, 70, 82);
+    const int wfull = hw * 2 + 1;
+
+    int y = cy - gs(26, scale);
+    int erh = gs(6, scale), frh = gs(4, scale), bdh = gs(26, scale);
+    int wdh = gs(10, scale), tph = gs(6, scale);
+    int tip_hw = gs(2, scale);
+
+    fill_rect_g(cx - hw, y, wfull, erh, pink);       y += erh;
+    fill_rect_g(cx - hw, y, wfull, frh, silver);     y += frh;
+    fill_rect_g(cx - hw, y, wfull, bdh, yellow);     y += bdh;
+    for (int r = 0; r < wdh; r++) {                  /* wood cone */
+        float f = wdh > 1 ? (float)r / (float)wdh : 1.0f;
+        int w = (int)(hw - (hw - tip_hw) * f + 0.5f);
+        fill_rect_g(cx - w, y + r, w * 2 + 1, 1, wood);
+    }
+    y += wdh;
+    for (int r = 0; r < tph; r++) {                  /* graphite point */
+        float f = tph > 1 ? (float)r / (float)tph : 1.0f;
+        int w = (int)(tip_hw * (1.0f - f) + 0.5f);
+        if (w < 0) {
+            w = 0;
+        }
+        fill_rect_g(cx - w, y + r, w * 2 + 1, 1, graphite);
+    }
+}
+
+/* 📻 radio: tan body, dark speaker, light tuner display, knob + antenna. */
+static void draw_radio(int cx, int cy, int scale, bool erase)
+{
+    if (scale <= 0) {
+        return;
+    }
+    if (scale > SMILE_SCALE_FULL) {
+        scale = SMILE_SCALE_FULL;
+    }
+    if (gs(26, scale) < 4) {
+        return;
+    }
+    if (erase) {
+        fill_rect_g(cx - gs(28, scale), cy - gs(28, scale), gs(56, scale),
+                    gs(54, scale), color_bg());
+        return;
+    }
+
+    const uint16_t body = ssd1351_color(216, 162, 92);
+    const uint16_t dark = ssd1351_color(74, 52, 30);
+    const uint16_t display = ssd1351_color(238, 234, 196);
+    const uint16_t metal = ssd1351_color(150, 150, 160);
+
+    /* antenna */
+    draw_line_g(cx + gs(16, scale), cy - gs(6, scale), cx + gs(24, scale),
+                cy - gs(26, scale), (gs(2, scale) > 1 ? gs(2, scale) : 2), metal);
+    /* body */
+    fill_rect_g(cx - gs(26, scale), cy - gs(6, scale), gs(52, scale),
+                gs(30, scale), body);
+    /* speaker grille (left) */
+    fill_ellipse(cx - gs(13, scale), cy + gs(9, scale), gs(8, scale),
+                 gs(8, scale), dark);
+    /* tuner display (right) */
+    fill_rect_g(cx + gs(2, scale), cy - gs(2, scale), gs(20, scale),
+                gs(9, scale), display);
+    /* tuning knob */
+    fill_ellipse(cx + gs(15, scale), cy + gs(12, scale), gs(4, scale),
+                 gs(4, scale), dark);
+}
+
+/* 📺 television: dark bezel, blue screen, rabbit-ear antenna, two feet. */
+static void draw_tv(int cx, int cy, int scale, bool erase)
+{
+    if (scale <= 0) {
+        return;
+    }
+    if (scale > SMILE_SCALE_FULL) {
+        scale = SMILE_SCALE_FULL;
+    }
+    if (gs(26, scale) < 4) {
+        return;
+    }
+    if (erase) {
+        fill_rect_g(cx - gs(28, scale), cy - gs(28, scale), gs(56, scale),
+                    gs(56, scale), color_bg());
+        return;
+    }
+
+    const uint16_t bezel = ssd1351_color(46, 46, 56);
+    const uint16_t screen = ssd1351_color(72, 152, 216);
+    const uint16_t shine = ssd1351_color(150, 200, 240);
+    int th = gs(2, scale) > 1 ? gs(2, scale) : 2;
+
+    /* rabbit-ear antenna */
+    draw_line_g(cx, cy - gs(14, scale), cx - gs(12, scale), cy - gs(27, scale),
+                th, bezel);
+    draw_line_g(cx, cy - gs(14, scale), cx + gs(12, scale), cy - gs(27, scale),
+                th, bezel);
+    /* bezel + screen */
+    fill_rect_g(cx - gs(26, scale), cy - gs(14, scale), gs(52, scale),
+                gs(34, scale), bezel);
+    fill_rect_g(cx - gs(21, scale), cy - gs(10, scale), gs(42, scale),
+                gs(26, scale), screen);
+    /* screen shine */
+    fill_rect_g(cx - gs(17, scale), cy - gs(6, scale), gs(5, scale),
+                gs(16, scale), shine);
+    /* feet */
+    fill_rect_g(cx - gs(16, scale), cy + gs(20, scale), gs(4, scale) + 1,
+                gs(5, scale), bezel);
+    fill_rect_g(cx + gs(12, scale), cy + gs(20, scale), gs(4, scale) + 1,
+                gs(5, scale), bezel);
+}
+
+/* 💡 bulb: gold glass globe, gray screw base, small contact tip. */
+static void draw_bulb(int cx, int cy, int scale, bool erase)
+{
+    if (scale <= 0) {
+        return;
+    }
+    if (scale > SMILE_SCALE_FULL) {
+        scale = SMILE_SCALE_FULL;
+    }
+    if (gs(16, scale) < 3) {
+        return;
+    }
+    if (erase) {
+        fill_rect_g(cx - gs(20, scale), cy - gs(26, scale), gs(40, scale),
+                    gs(54, scale), color_bg());
+        return;
+    }
+
+    const uint16_t glass = ssd1351_color(255, 224, 90);
+    const uint16_t glow = ssd1351_color(255, 245, 170);
+    const uint16_t base1 = ssd1351_color(175, 175, 185);
+    const uint16_t base2 = ssd1351_color(140, 140, 150);
+    const uint16_t base3 = ssd1351_color(110, 110, 122);
+
+    /* glass globe + inner glow */
+    fill_ellipse(cx, cy - gs(6, scale), gs(16, scale), gs(16, scale), glass);
+    fill_ellipse(cx - gs(4, scale), cy - gs(10, scale), gs(5, scale),
+                 gs(5, scale), glow);
+    /* screw base */
+    fill_rect_g(cx - gs(8, scale), cy + gs(9, scale), gs(16, scale),
+                gs(4, scale), base1);
+    fill_rect_g(cx - gs(7, scale), cy + gs(13, scale), gs(14, scale),
+                gs(3, scale), base2);
+    fill_rect_g(cx - gs(6, scale), cy + gs(16, scale), gs(12, scale),
+                gs(3, scale), base2);
+    fill_rect_g(cx - gs(3, scale), cy + gs(19, scale), gs(6, scale),
+                gs(3, scale), base3);
+}
+
+/* 🤖 robot: gray head, cyan eyes, grille mouth, antenna, side ears. */
+static void draw_robot(int cx, int cy, int scale, bool erase)
+{
+    if (scale <= 0) {
+        return;
+    }
+    if (scale > SMILE_SCALE_FULL) {
+        scale = SMILE_SCALE_FULL;
+    }
+    if (gs(22, scale) < 4) {
+        return;
+    }
+    if (erase) {
+        fill_rect_g(cx - gs(28, scale), cy - gs(28, scale), gs(56, scale),
+                    gs(52, scale), color_bg());
+        return;
+    }
+
+    const uint16_t metal = ssd1351_color(122, 122, 134);
+    const uint16_t head = ssd1351_color(162, 170, 180);
+    const uint16_t face = ssd1351_color(60, 66, 80);
+    const uint16_t eye = ssd1351_color(120, 220, 255);
+    const uint16_t teeth = ssd1351_color(205, 214, 224);
+    const uint16_t ball = ssd1351_color(255, 90, 90);
+    int aw = gs(2, scale) > 1 ? gs(2, scale) : 2;
+
+    /* antenna + tip */
+    fill_rect_g(cx - aw / 2, cy - gs(24, scale), aw, gs(9, scale), metal);
+    fill_ellipse(cx, cy - gs(24, scale), gs(3, scale), gs(3, scale), ball);
+    /* ears */
+    fill_rect_g(cx - gs(25, scale), cy - gs(4, scale), gs(3, scale) + 1,
+                gs(12, scale), metal);
+    fill_rect_g(cx + gs(22, scale), cy - gs(4, scale), gs(3, scale) + 1,
+                gs(12, scale), metal);
+    /* head + inset face */
+    fill_rect_g(cx - gs(22, scale), cy - gs(16, scale), gs(44, scale),
+                gs(34, scale), head);
+    fill_rect_g(cx - gs(18, scale), cy - gs(12, scale), gs(36, scale),
+                gs(26, scale), face);
+    /* eyes */
+    fill_ellipse(cx - gs(9, scale), cy - gs(2, scale), gs(4, scale),
+                 gs(4, scale), eye);
+    fill_ellipse(cx + gs(9, scale), cy - gs(2, scale), gs(4, scale),
+                 gs(4, scale), eye);
+    /* grille mouth */
+    fill_rect_g(cx - gs(10, scale), cy + gs(8, scale), gs(20, scale),
+                gs(4, scale), teeth);
+    for (int i = -2; i <= 2; i++) {
+        fill_rect_g(cx + i * gs(4, scale), cy + gs(8, scale), 1, gs(4, scale),
+                    face);
+    }
+}
+
 /* Capsule axis unit vector (cap points upper-right for a positive slant). */
 static void med_axis(float *ux, float *uy)
 {
@@ -640,6 +1160,12 @@ static void erase_prev_eye(void)
     } else if (s_prev_kind == PREV_CAPSULE) {
         draw_med_capsule(s_prev_cap_cx, s_prev_cap_cy, s_prev_cap_half,
                          s_prev_cap_radius, true);
+    } else if (s_prev_kind == PREV_SMILE) {
+        draw_smiley_face(s_prev_smile_cx, s_prev_smile_cy, s_prev_smile_scale, true);
+    } else if (s_prev_kind == PREV_TWINKLE) {
+        draw_twinkle(s_prev_twinkle_cx, s_prev_twinkle_cy, s_prev_twinkle_scale, true);
+    } else if (s_prev_kind == PREV_GLYPH && s_prev_glyph_fn != NULL) {
+        s_prev_glyph_fn(s_prev_glyph_cx, s_prev_glyph_cy, s_prev_glyph_scale, true);
     }
     s_prev_kind = PREV_NONE;
     dirty_reset();
@@ -691,6 +1217,7 @@ typedef struct {
     int rx, ry;
     int top, bottom;
     int heart_scale;
+    nino_glyph_fn glyph_fn;
 } eye_shape_t;
 
 /* Paint the whole drawable clip window back to background. Safe because the
@@ -789,6 +1316,58 @@ static bool transition_close(nino_eye_state_t target)
         }
         break;
     }
+    case PREV_SMILE: {
+        const int cx = s_prev_smile_cx, cy = s_prev_smile_cy;
+        for (int s = s_prev_smile_scale; s > 0; s -= SMILE_SCALE_STEP) {
+            if (current_state() != target) {
+                return false;
+            }
+            draw_smiley_face(cx, cy, s, true);
+            int ns = s - SMILE_SCALE_STEP;
+            if (ns > 0) {
+                draw_smiley_face(cx, cy, ns, false);
+            }
+            if (!delay_ms_interruptible(TRANS_FRAME_MS, target)) {
+                return false;
+            }
+        }
+        break;
+    }
+    case PREV_TWINKLE: {
+        const int cx = s_prev_twinkle_cx, cy = s_prev_twinkle_cy;
+        for (int s = s_prev_twinkle_scale; s > 0; s -= SMILE_SCALE_STEP) {
+            if (current_state() != target) {
+                return false;
+            }
+            draw_twinkle(cx, cy, s, true);
+            int ns = s - SMILE_SCALE_STEP;
+            if (ns > 0) {
+                draw_twinkle(cx, cy, ns, false);
+            }
+            if (!delay_ms_interruptible(TRANS_FRAME_MS, target)) {
+                return false;
+            }
+        }
+        break;
+    }
+    case PREV_GLYPH: {
+        const int cx = s_prev_glyph_cx, cy = s_prev_glyph_cy;
+        nino_glyph_fn fn = s_prev_glyph_fn;
+        for (int s = s_prev_glyph_scale; fn != NULL && s > 0; s -= SMILE_SCALE_STEP) {
+            if (current_state() != target) {
+                return false;
+            }
+            fn(cx, cy, s, true);
+            int ns = s - SMILE_SCALE_STEP;
+            if (ns > 0) {
+                fn(cx, cy, ns, false);
+            }
+            if (!delay_ms_interruptible(TRANS_FRAME_MS, target)) {
+                return false;
+            }
+        }
+        break;
+    }
     case PREV_NONE:
     default:
         break;
@@ -830,6 +1409,79 @@ static bool transition_open(nino_eye_state_t target, const eye_shape_t *sh)
             }
         }
         remember_heart(cx, cy, full);
+        return current_state() == target;
+    }
+
+    if (sh->kind == PREV_SMILE) {
+        const int cx = sh->cx, cy = sh->cy, full = sh->heart_scale;
+        int prev = 0;
+        for (int s = SMILE_SCALE_STEP;; s += SMILE_SCALE_STEP) {
+            if (current_state() != target) {
+                return false;
+            }
+            int cur = s > full ? full : s;
+            if (prev > 0) {
+                draw_smiley_face(cx, cy, prev, true);
+            }
+            draw_smiley_face(cx, cy, cur, false);
+            prev = cur;
+            if (!delay_ms_interruptible(TRANS_FRAME_MS, target)) {
+                return false;
+            }
+            if (cur >= full) {
+                break;
+            }
+        }
+        remember_smile(cx, cy, full);
+        return current_state() == target;
+    }
+
+    if (sh->kind == PREV_TWINKLE) {
+        const int cx = sh->cx, cy = sh->cy, full = sh->heart_scale;
+        int prev = 0;
+        for (int s = SMILE_SCALE_STEP;; s += SMILE_SCALE_STEP) {
+            if (current_state() != target) {
+                return false;
+            }
+            int cur = s > full ? full : s;
+            if (prev > 0) {
+                draw_twinkle(cx, cy, prev, true);
+            }
+            draw_twinkle(cx, cy, cur, false);
+            prev = cur;
+            if (!delay_ms_interruptible(TRANS_FRAME_MS, target)) {
+                return false;
+            }
+            if (cur >= full) {
+                break;
+            }
+        }
+        remember_twinkle(cx, cy, full);
+        return current_state() == target;
+    }
+
+    if (sh->kind == PREV_GLYPH && sh->glyph_fn != NULL) {
+        const int cx = sh->cx, cy = sh->cy, full = sh->heart_scale;
+        nino_glyph_fn fn = sh->glyph_fn;
+        int prev = 0;
+        for (int s = SMILE_SCALE_STEP;; s += SMILE_SCALE_STEP) {
+            if (current_state() != target) {
+                return false;
+            }
+            int cur = s > full ? full : s;
+            if (prev > 0) {
+                fn(cx, cy, prev, true);
+            }
+            fn(cx, cy, cur, false);
+            prev = cur;
+            if (!delay_ms_interruptible(TRANS_FRAME_MS, target)) {
+                return false;
+            }
+            if (cur >= full) {
+                break;
+            }
+        }
+        remember_glyph(cx, cy, full, fn);
         return current_state() == target;
     }
 
@@ -900,6 +1552,15 @@ static eye_shape_t initial_shape_for(nino_eye_state_t st, const nino_state_profi
         .heart_scale = p->heart_max_scale,
     };
 
+    /* All object-emoji glyphs share one center + grow/shrink entry. */
+    if (p->mode == NINO_RENDER_GLYPH) {
+        s.kind = PREV_GLYPH;
+        s.cx = EYE_CX;
+        s.cy = SMILE_CY;
+        s.glyph_fn = p->glyph_fn;
+        return s;
+    }
+
     switch (st) {
     case NINO_EYE_HAPPY:
         s.kind = PREV_HEART;
@@ -932,6 +1593,18 @@ static eye_shape_t initial_shape_for(nino_eye_state_t st, const nino_state_profi
         s.kind = PREV_CAPSULE;
         s.cx = EYE_CX;
         s.cy = EYE_CY;
+        break;
+    case NINO_EYE_SMILE:
+        /* Smiley face: cx/cy = disc center, heart_scale = full glyph scale. */
+        s.kind = PREV_SMILE;
+        s.cx = EYE_CX;
+        s.cy = SMILE_CY;
+        break;
+    case NINO_EYE_TWINKLE:
+        /* Twinkle: cx/cy = glyph center, heart_scale = full glyph scale. */
+        s.kind = PREV_TWINKLE;
+        s.cx = EYE_CX;
+        s.cy = SMILE_CY;
         break;
     default:
         /* IDLE, SURPRISED, LISTENING: full ellipse centered. */
@@ -1354,6 +2027,45 @@ static void run_heart_profile_once(const nino_state_profile_t *profile, nino_eye
     }
 }
 
+static void run_smile_profile_once(const nino_state_profile_t *profile, nino_eye_state_t expected)
+{
+    if (!s_skip_initial) {
+        erase_prev_eye();
+        draw_smiley_face(EYE_CX, SMILE_CY, profile->heart_max_scale, false);
+        remember_smile(EYE_CX, SMILE_CY, profile->heart_max_scale);
+    }
+    while (delay_ms_interruptible(profile->state_ms, expected)) {
+        /* Smiley holds still: one steady ☺️ face, no pulse or flicker. */
+    }
+}
+
+static void run_twinkle_profile_once(const nino_state_profile_t *profile, nino_eye_state_t expected)
+{
+    if (!s_skip_initial) {
+        erase_prev_eye();
+        draw_twinkle(EYE_CX, SMILE_CY, profile->heart_max_scale, false);
+        remember_twinkle(EYE_CX, SMILE_CY, profile->heart_max_scale);
+    }
+    while (delay_ms_interruptible(profile->state_ms, expected)) {
+        /* Twinkle holds still: steady ✨ sparkles, no flicker. */
+    }
+}
+
+static void run_glyph_profile_once(const nino_state_profile_t *profile, nino_eye_state_t expected)
+{
+    if (profile->glyph_fn == NULL) {
+        return;
+    }
+    if (!s_skip_initial) {
+        erase_prev_eye();
+        profile->glyph_fn(EYE_CX, SMILE_CY, profile->heart_max_scale, false);
+        remember_glyph(EYE_CX, SMILE_CY, profile->heart_max_scale, profile->glyph_fn);
+    }
+    while (delay_ms_interruptible(profile->state_ms, expected)) {
+        /* Object icons hold still until the state changes. */
+    }
+}
+
 static void run_med_profile_once(const nino_state_profile_t *profile, nino_eye_state_t expected)
 {
     if (!s_skip_initial) {
@@ -1395,6 +2107,13 @@ void nino_eye_surprised(void) { nino_eye_set_state(NINO_EYE_SURPRISED); }
 void nino_eye_listening(void) { nino_eye_set_state(NINO_EYE_LISTENING); }
 void nino_eye_recalling(void) { nino_eye_set_state(NINO_EYE_RECALLING); }
 void nino_eye_med(void)       { nino_eye_set_state(NINO_EYE_MED); }
+void nino_eye_smile(void)     { nino_eye_set_state(NINO_EYE_SMILE); }
+void nino_eye_twinkle(void)   { nino_eye_set_state(NINO_EYE_TWINKLE); }
+void nino_eye_pencil(void)    { nino_eye_set_state(NINO_EYE_PENCIL); }
+void nino_eye_radio(void)     { nino_eye_set_state(NINO_EYE_RADIO); }
+void nino_eye_tv(void)        { nino_eye_set_state(NINO_EYE_TV); }
+void nino_eye_bulb(void)      { nino_eye_set_state(NINO_EYE_BULB); }
+void nino_eye_robot(void)     { nino_eye_set_state(NINO_EYE_ROBOT); }
 
 nino_eye_state_t nino_eye_state_from_name(const char *name)
 {
@@ -1421,6 +2140,21 @@ nino_eye_state_t nino_eye_state_from_name(const char *name)
         return NINO_EYE_RECALLING;
     } else if (strcmp(name, "med") == 0) {
         return NINO_EYE_MED;
+    } else if (strcmp(name, "smile") == 0 || strcmp(name, "smiling") == 0) {
+        return NINO_EYE_SMILE;
+    } else if (strcmp(name, "twinkle") == 0 || strcmp(name, "sparkle") == 0 ||
+               strcmp(name, "sparkles") == 0) {
+        return NINO_EYE_TWINKLE;
+    } else if (strcmp(name, "pencil") == 0) {
+        return NINO_EYE_PENCIL;
+    } else if (strcmp(name, "radio") == 0) {
+        return NINO_EYE_RADIO;
+    } else if (strcmp(name, "tv") == 0 || strcmp(name, "television") == 0) {
+        return NINO_EYE_TV;
+    } else if (strcmp(name, "bulb") == 0 || strcmp(name, "light") == 0) {
+        return NINO_EYE_BULB;
+    } else if (strcmp(name, "robot") == 0 || strcmp(name, "bot") == 0) {
+        return NINO_EYE_ROBOT;
     }
     return NINO_EYE_STATE_COUNT;
 }
@@ -1523,6 +2257,19 @@ static void run_current_state_once(void)
         break;
     case NINO_EYE_MED:
         run_med_profile_once(profile, state);
+        break;
+    case NINO_EYE_SMILE:
+        run_smile_profile_once(profile, state);
+        break;
+    case NINO_EYE_TWINKLE:
+        run_twinkle_profile_once(profile, state);
+        break;
+    case NINO_EYE_PENCIL:
+    case NINO_EYE_RADIO:
+    case NINO_EYE_TV:
+    case NINO_EYE_BULB:
+    case NINO_EYE_ROBOT:
+        run_glyph_profile_once(profile, state);
         break;
     default:
         if (profile->mode == NINO_RENDER_STATIC) {

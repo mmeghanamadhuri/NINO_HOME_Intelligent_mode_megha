@@ -2340,6 +2340,55 @@ static esp_err_t servo_360_handler(httpd_req_t *req) {
   return httpd_resp_send(req, "{\"ok\":true,\"started\":true}", HTTPD_RESP_USE_STRLEN);
 }
 
+/* POST /demo  {"play": true}  → queue the embedded DEMO_main.wav clip. */
+static esp_err_t demo_handler(httpd_req_t *req) {
+  if (req->method != HTTP_POST) {
+    httpd_resp_set_status(req, "405 Method Not Allowed");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"POST only\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+
+  /* Body is optional; default to play. Only a literal false disables it. */
+  bool play = true;
+  char body[64];
+  int total = 0;
+  while (total < (int)sizeof(body) - 1) {
+    int r = httpd_req_recv(req, body + total, (int)sizeof(body) - 1 - total);
+    if (r <= 0) {
+      break;
+    }
+    total += r;
+  }
+  body[total] = '\0';
+  /* Drain any bytes beyond our small buffer so the socket stays healthy. */
+  char discard[64];
+  while (httpd_req_recv(req, discard, sizeof(discard)) > 0) {
+  }
+  if (strstr(body, "\"play\"") != NULL && strstr(body, "false") != NULL) {
+    play = false;
+  }
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+  if (!play) {
+    return httpd_resp_send(req, "{\"ok\":true,\"played\":false}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+
+  esp_err_t err = nino_push_buttons_trigger_demo();
+  if (err != ESP_OK) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"demo_unavailable\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+
+  ESP_LOGI(TAG, "HTTP /demo: play DEMO_main.wav");
+  return httpd_resp_send(req, "{\"ok\":true,\"played\":true}",
+                         HTTPD_RESP_USE_STRLEN);
+}
+
 #define WIFI_PROV_JSON_MAX 384
 
 static void wifi_http_set_cors(httpd_req_t *req) {
@@ -3373,6 +3422,12 @@ static void start_http_server(void) {
       .handler = eye_expression_handler,
       .user_ctx = NULL,
   };
+  const httpd_uri_t demo_uri = {
+      .uri = "/demo",
+      .method = HTTP_POST,
+      .handler = demo_handler,
+      .user_ctx = NULL,
+  };
   const httpd_uri_t speaker_volume_get_uri = {
       .uri = "/speaker/volume",
       .method = HTTP_GET,
@@ -3477,6 +3532,7 @@ static void start_http_server(void) {
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &play_wav_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &servo_360_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &eye_expression_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &demo_uri));
   ESP_ERROR_CHECK(
       httpd_register_uri_handler(s_http_server, &speaker_volume_get_uri));
   ESP_ERROR_CHECK(

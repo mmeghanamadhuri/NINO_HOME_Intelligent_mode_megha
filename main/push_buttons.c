@@ -15,7 +15,8 @@ static const char *TAG = "push_btn";
 
 /*
  * Wiring (ESP32-P4-Function-EV-Board J1, active-low to GND):
- *  - GPIO48 (J1 pin 33): short = DEMO_main.wav; hold ~3s = erase Wi-Fi + BLE setup
+ *  - GPIO48 (J1 pin 33): double press = DEMO_main.wav;
+ *    triple press = erase Wi-Fi + BLE setup
  *
  * Do NOT use:
  *  - GPIO7 / GPIO8  — BSP I2C SDA/SCL (ES8311 + QT2120). Pressing GPIO7
@@ -28,8 +29,10 @@ static const char *TAG = "push_btn";
 
 #define BTN_POLL_MS 20
 #define BTN_DEBOUNCE_MS 40
-#define BTN_LONG_PRESS_MS 3000
-#define BTN_COOLDOWN_MS 400
+/* Max quiet time after the last release before a click sequence is evaluated. */
+#define BTN_MULTI_GAP_MS 350
+#define BTN_CLICKS_DEMO 2
+#define BTN_CLICKS_SETUP 3
 #define BTN_TASK_STACK 3072
 #define BTN_WORKER_STACK 6144
 #define BTN_TASK_PRIO 5
@@ -53,10 +56,9 @@ typedef struct {
   const char *name;
   bool stable_pressed;
   bool armed;
-  bool long_fired;
   uint32_t debounce_ms;
-  uint32_t held_ms;
-  uint32_t cooldown_ms;
+  uint8_t click_count;
+  uint32_t gap_ms;
 } btn_state_t;
 
 static bool play_demo_clip(void) {
@@ -104,12 +106,22 @@ static void post_evt(btn_evt_t evt) {
     return;
   }
   if (evt == BTN_EVT_DEMO && s_demo_busy) {
-    ESP_LOGI(TAG, "Demo already playing — ignore extra short press");
+    ESP_LOGI(TAG, "Demo already playing — ignore extra double press");
     return;
   }
   if (xQueueSend(s_btn_evt_q, &evt, 0) != pdPASS) {
     ESP_LOGW(TAG, "Button event queue full (evt=%d)", (int)evt);
   }
+}
+
+esp_err_t nino_push_buttons_trigger_demo(void) {
+  if (s_btn_evt_q == NULL) {
+    ESP_LOGW(TAG, "trigger_demo before button subsystem started");
+    return ESP_ERR_INVALID_STATE;
+  }
+  ESP_LOGI(TAG, "App request → play DEMO_main.wav");
+  post_evt(BTN_EVT_DEMO);
+  return ESP_OK;
 }
 
 static void btn_worker_task(void *arg) {
@@ -152,42 +164,39 @@ static void btn_update(btn_state_t *btn) {
       ESP_LOGI(TAG, "GPIO%d (%s) %s (level=%d)", (int)btn->gpio, btn->name,
                raw_pressed ? "DOWN" : "UP", level);
 
-      if (!raw_pressed) {
-        if (was_pressed && btn->armed && !btn->long_fired &&
-            btn->cooldown_ms == 0) {
-          btn->cooldown_ms = BTN_COOLDOWN_MS;
-          post_evt(BTN_EVT_DEMO);
+      if (!raw_pressed && was_pressed) {
+        /* A press→release finishes one click. Skip the very first release
+         * after a boot-held press so it does not start a phantom sequence. */
+        if (!btn->armed) {
+          btn->armed = true;
+        } else if (btn->click_count < 200) {
+          btn->click_count++;
         }
-        btn->armed = true;
-        btn->long_fired = false;
-        btn->held_ms = 0;
-      } else {
-        btn->held_ms = 0;
-        btn->long_fired = false;
+        btn->gap_ms = 0;
       }
     }
   }
 
-  if (btn->stable_pressed) {
-    if (btn->held_ms < 60000) {
-      btn->held_ms += BTN_POLL_MS;
-    }
-    if (btn->armed && !btn->long_fired && btn->held_ms >= BTN_LONG_PRESS_MS &&
-        btn->cooldown_ms == 0) {
-      btn->long_fired = true;
-      btn->armed = false;
-      btn->cooldown_ms = BTN_COOLDOWN_MS;
-      ESP_LOGI(TAG, "GPIO%d (%s) LONG press → setup + BLE", (int)btn->gpio,
-               btn->name);
-      post_evt(BTN_EVT_SETUP);
-    }
-  }
-
-  if (btn->cooldown_ms > 0) {
-    if (btn->cooldown_ms > BTN_POLL_MS) {
-      btn->cooldown_ms -= BTN_POLL_MS;
-    } else {
-      btn->cooldown_ms = 0;
+  /* Evaluate the sequence once the button has been idle long enough that no
+   * further click is coming. Time only accrues while released. */
+  if (btn->armed && btn->click_count > 0 && !btn->stable_pressed) {
+    btn->gap_ms += BTN_POLL_MS;
+    if (btn->gap_ms >= BTN_MULTI_GAP_MS) {
+      const uint8_t clicks = btn->click_count;
+      btn->click_count = 0;
+      btn->gap_ms = 0;
+      if (clicks >= BTN_CLICKS_SETUP) {
+        ESP_LOGI(TAG, "GPIO%d (%s) triple press → setup + BLE", (int)btn->gpio,
+                 btn->name);
+        post_evt(BTN_EVT_SETUP);
+      } else if (clicks == BTN_CLICKS_DEMO) {
+        ESP_LOGI(TAG, "GPIO%d (%s) double press → demo audio", (int)btn->gpio,
+                 btn->name);
+        post_evt(BTN_EVT_DEMO);
+      } else {
+        ESP_LOGI(TAG, "GPIO%d (%s) %u press ignored (need 2=demo, 3=setup)",
+                 (int)btn->gpio, btn->name, (unsigned)clicks);
+      }
     }
   }
 }
@@ -197,13 +206,12 @@ static void push_buttons_task(void *arg) {
 
   btn_state_t demo = {
       .gpio = BTN_DEMO_GPIO,
-      .name = "demo/long-setup",
+      .name = "demo/setup",
       .stable_pressed = false,
       .armed = true,
-      .long_fired = false,
       .debounce_ms = 0,
-      .held_ms = 0,
-      .cooldown_ms = 0,
+      .click_count = 0,
+      .gap_ms = 0,
   };
 
   if (gpio_get_level(BTN_DEMO_GPIO) == BTN_ACTIVE_LEVEL) {
@@ -212,10 +220,9 @@ static void push_buttons_task(void *arg) {
   }
 
   ESP_LOGI(TAG,
-           "Button ready: GPIO%d short=Demo, hold %dms=erase Wi-Fi + BLE "
+           "Button ready: GPIO%d double=Demo, triple=erase Wi-Fi + BLE "
            "(level=%d, 0=pressed)",
-           (int)BTN_DEMO_GPIO, BTN_LONG_PRESS_MS,
-           gpio_get_level(BTN_DEMO_GPIO));
+           (int)BTN_DEMO_GPIO, gpio_get_level(BTN_DEMO_GPIO));
 
   while (true) {
     btn_update(&demo);
