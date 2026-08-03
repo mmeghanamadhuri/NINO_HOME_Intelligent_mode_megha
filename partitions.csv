@@ -1,5 +1,7 @@
 # Name,   Type, SubType, Offset,  Size, Flags
+# 16MB flash: larger factory for embedded WAVs (Demo + NiNO-Home_Wifi, etc.).
+# WakeNet srmodels.bin is ~0.6MB; 2MB model partition is enough with headroom.
 nvs,      data, nvs,     0x9000,  0x6000,
 phy_init, data, phy,     0xf000,  0x1000,
-factory,  app,  factory, 0x10000, 0x600000,
-model,    data, spiffs,  ,        0x600000,
+factory,  app,  factory, 0x10000, 0xA00000,
+model,    data, spiffs,  ,        0x500000,

@@ -35,8 +35,10 @@ void ble_store_config_init(void);
 static const char *TAG = "wifi_prov_ble";
 
 #define PROV_CMD_APPLY 0x01
-#define HOSTED_BT_SETUP_MAX_ATTEMPTS 8
-#define HOSTED_BT_SETUP_RETRY_MS 1000
+#define HOSTED_BT_SETUP_MAX_ATTEMPTS 12
+#define HOSTED_BT_SETUP_RETRY_MS 250
+#define HOSTED_BT_RETRY_TASK_STACK 4096
+#define HOSTED_BT_RETRY_TASK_PRIO 5
 
 /* 4facb001-5a2e-4b7c-9e1f-a8d3e6f20401 */
 #define WIFI_PROV_SVC_UUID128 \
@@ -73,6 +75,7 @@ static uint8_t s_own_addr_type;
 static bool s_ble_started;
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static bool s_bt_ctrl_ready;
+static bool s_bt_retry_running;
 static char s_prov_device_name[WIFI_PROV_BLE_DEVICE_NAME_MAX + 1] =
     WIFI_PROV_BLE_DEVICE_NAME_DEFAULT;
 
@@ -87,45 +90,82 @@ static void set_prov_device_name(const char *name) {
   s_prov_device_name[len] = '\0';
 }
 
-static esp_err_t hosted_bt_setup_with_retry(void) {
+static esp_err_t hosted_bt_try_once(int attempt) {
   if (s_bt_ctrl_ready) {
     return ESP_OK;
   }
-  for (int attempt = 0; attempt < HOSTED_BT_SETUP_MAX_ATTEMPTS; ++attempt) {
-    /* BLE is only needed while the robot has no saved network. Do not keep
-     * issuing long Hosted RPCs after provisioning has succeeded. */
+  if (wifi_config_is_provisioned()) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  /* Do NOT call esp_hosted_connect_to_slave() here — it reconfigures/resets
+   * the SDIO slave and races Hosted Wi-Fi bring-up (host reboot loop). */
+  esp_err_t err = esp_hosted_bt_controller_init();
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "bt_controller_init (attempt %d): %s", attempt,
+             esp_err_to_name(err));
+    return err;
+  }
+
+  err = esp_hosted_bt_controller_enable();
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "bt_controller_enable (attempt %d): %s", attempt,
+             esp_err_to_name(err));
+    return err;
+  }
+
+  s_bt_ctrl_ready = true;
+  ESP_LOGI(TAG, "C6 BLE controller ready (attempt %d)", attempt);
+  return ESP_OK;
+}
+
+static void hosted_bt_retry_task(void *arg) {
+  (void)arg;
+  for (int attempt = 1;
+       attempt <= HOSTED_BT_SETUP_MAX_ATTEMPTS && !s_bt_ctrl_ready; ++attempt) {
     if (wifi_config_is_provisioned()) {
       ESP_LOGI(TAG, "Wi-Fi credentials received — stopping BLE controller setup");
-      return ESP_ERR_INVALID_STATE;
+      break;
     }
-    if (attempt > 0) {
-      vTaskDelay(pdMS_TO_TICKS(HOSTED_BT_SETUP_RETRY_MS));
+
+    esp_err_t err = hosted_bt_try_once(attempt);
+    if (err == ESP_OK) {
+      if (s_ble_started) {
+        ble_svc_gap_device_name_set(s_prov_device_name);
+        prov_advertise();
+        ESP_LOGI(TAG, "BLE advertising started after C6 controller ready");
+      }
+      break;
     }
-    esp_err_t err = esp_hosted_connect_to_slave();
-    if (err != ESP_OK) {
-      ESP_LOGW(TAG, "connect_to_slave (attempt %d): %s", attempt + 1,
-               esp_err_to_name(err));
+    if (err == ESP_ERR_INVALID_STATE) {
+      break;
     }
-    err = esp_hosted_bt_controller_init();
-    if (err != ESP_OK) {
-      ESP_LOGW(TAG, "bt_controller_init (attempt %d): %s", attempt + 1,
-               esp_err_to_name(err));
-      continue;
-    }
-    err = esp_hosted_bt_controller_enable();
-    if (err != ESP_OK) {
-      ESP_LOGW(TAG, "bt_controller_enable (attempt %d): %s", attempt + 1,
-               esp_err_to_name(err));
-      continue;
-    }
-    s_bt_ctrl_ready = true;
-    ESP_LOGI(TAG, "C6 BLE controller ready");
-    return ESP_OK;
+    vTaskDelay(pdMS_TO_TICKS(HOSTED_BT_SETUP_RETRY_MS));
   }
-  ESP_LOGW(TAG,
-           "BLE controller on C6 not ready — flash ESP-Hosted firmware to the "
-           "C6 (see docs/WIFI_PROVISION.md). HTTP provisioning still works.");
-  return ESP_FAIL;
+
+  if (!s_bt_ctrl_ready && !wifi_config_is_provisioned()) {
+    ESP_LOGW(TAG,
+             "BLE controller on C6 not ready — flash ESP-Hosted firmware to the "
+             "C6 (see docs/WIFI_PROVISION.md). HTTP provisioning still works.");
+  }
+  s_bt_retry_running = false;
+  vTaskDelete(NULL);
+}
+
+/* C6 BT controller retries in background; NimBLE itself starts on the caller. */
+static void hosted_bt_setup_async(void) {
+  if (s_bt_ctrl_ready || s_bt_retry_running) {
+    return;
+  }
+  s_bt_retry_running = true;
+  BaseType_t ok =
+      xTaskCreate(hosted_bt_retry_task, "bt_ctrl", HOSTED_BT_RETRY_TASK_STACK,
+                  NULL, HOSTED_BT_RETRY_TASK_PRIO, NULL);
+  if (ok != pdPASS) {
+    s_bt_retry_running = false;
+    ESP_LOGW(TAG, "Could not start BT controller retry task — trying once");
+    (void)hosted_bt_try_once(1);
+  }
 }
 
 static int gatt_prov_access(uint16_t conn_handle, uint16_t attr_handle,
@@ -446,6 +486,7 @@ static int gatt_init(void) {
 
 esp_err_t wifi_prov_ble_start(void) {
   if (s_ble_started) {
+    hosted_bt_setup_async();
     return ESP_OK;
   }
 
@@ -453,10 +494,8 @@ esp_err_t wifi_prov_ble_start(void) {
   s_pending_pass[0] = '\0';
   prov_update_status_json(0, "idle");
 
-  /* Start the NimBLE host even when the controller setup is still settling.
-   * ESP-Hosted can complete its controller handshake asynchronously. */
-  (void)hosted_bt_setup_with_retry();
-
+  /* Bring up NimBLE/GATT first; C6 BT controller retries run in parallel.
+   * Waiting for all controller attempts used to delay advertising by ~50s. */
   esp_err_t err = nimble_port_init();
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "nimble_port_init: %s", esp_err_to_name(err));
@@ -479,7 +518,9 @@ esp_err_t wifi_prov_ble_start(void) {
 
   nimble_port_freertos_init(host_task);
   s_ble_started = true;
-  ESP_LOGI(TAG, "NimBLE host started");
+  ESP_LOGI(TAG, "NimBLE host started (C6 BT controller setup continuing)");
+
+  hosted_bt_setup_async();
   return ESP_OK;
 }
 
@@ -491,6 +532,31 @@ esp_err_t wifi_prov_ble_start_if_needed(void) {
   }
   ESP_LOGI(TAG, "No Wi-Fi credentials in NVS — starting BLE provisioning");
   return wifi_prov_ble_start();
+}
+
+esp_err_t wifi_prov_ble_enable_provisioning(void) {
+  s_pending_ssid[0] = '\0';
+  s_pending_pass[0] = '\0';
+  prov_update_status_json(0, "idle");
+
+  esp_err_t err = wifi_prov_ble_start();
+  if (err != ESP_OK && err != ESP_ERR_NOT_SUPPORTED) {
+    return err;
+  }
+
+  if (s_ble_started && s_bt_ctrl_ready) {
+    /* Restart advertising so the phone can discover NINO - HOME again. */
+    (void)ble_gap_adv_stop();
+    ble_svc_gap_device_name_set(s_prov_device_name);
+    prov_advertise();
+    prov_notify_status();
+    ESP_LOGI(TAG, "BLE provisioning advertising restarted (%s)",
+             s_prov_device_name);
+  } else if (s_ble_started) {
+    ESP_LOGI(TAG, "BLE host up — advertising will start when controller syncs");
+  }
+
+  return ESP_OK;
 }
 
 #else /* !CONFIG_BT_NIMBLE_ENABLED || !CONFIG_ESP_HOSTED_ENABLE_BT_NIMBLE */
@@ -515,6 +581,10 @@ esp_err_t wifi_prov_ble_start_if_needed(void) {
     return ESP_OK;
   }
   ESP_LOGI("wifi_prov_ble", "No Wi-Fi credentials in NVS — BLE not available");
+  return wifi_prov_ble_start();
+}
+
+esp_err_t wifi_prov_ble_enable_provisioning(void) {
   return wifi_prov_ble_start();
 }
 

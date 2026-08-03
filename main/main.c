@@ -53,6 +53,7 @@
 #include "servo_dxl.h"
 #include "servo_motion.h"
 #include "touch_sensor.h"
+#include "push_buttons.h"
 #include "usb_mic.h"
 #include "voice_assist.h"
 #include "voice_wake.h"
@@ -187,11 +188,11 @@ extern const uint8_t wifi_wav_end[] asm("_binary_WIFI_wav_end");
 extern const uint8_t hello_home_wav_start[] asm("_binary_Hello_home_wav_start");
 extern const uint8_t hello_home_wav_end[] asm("_binary_Hello_home_wav_end");
 
-extern const uint8_t wifi_unable_wav_start[] asm("_binary_WIFI_UNABLE_wav_start");
-extern const uint8_t wifi_unable_wav_end[] asm("_binary_WIFI_UNABLE_wav_end");
+extern const uint8_t wifi_unable_wav_start[] asm("_binary_Wifi_Unable_wav_start");
+extern const uint8_t wifi_unable_wav_end[] asm("_binary_Wifi_Unable_wav_end");
 
-extern const uint8_t go_app_wav_start[] asm("_binary_GO_APP_wav_start");
-extern const uint8_t go_app_wav_end[] asm("_binary_GO_APP_wav_end");
+extern const uint8_t go_app_wav_start[] asm("_binary_NiNO_Home_Wifi_wav_start");
+extern const uint8_t go_app_wav_end[] asm("_binary_NiNO_Home_Wifi_wav_end");
 
 extern const uint8_t schedule_dinnner_wav_start[] asm("_binary_schedule_dinnner_wav_start");
 extern const uint8_t schedule_dinnner_wav_end[] asm("_binary_schedule_dinnner_wav_end");
@@ -199,7 +200,7 @@ extern const uint8_t schedule_dinnner_wav_end[] asm("_binary_schedule_dinnner_wa
 extern const uint8_t bday_surprise_wav_start[] asm("_binary_Bday_Surprise_wav_start");
 extern const uint8_t bday_surprise_wav_end[] asm("_binary_Bday_Surprise_wav_end");
 
-/* Set once WIFI-UNABLE.wav has been played for the current connect attempt so
+/* Set once Wifi_Unable.wav has been played for the current connect attempt so
  * the prompt is not repeated on every reconnect retry. Reset on success and on
  * fresh credentials from GATT provisioning. */
 static volatile bool s_wifi_unable_chimed = false;
@@ -275,7 +276,7 @@ static bool play_hello_home_clip(void) {
   return true;
 }
 
-/* A boot that began without credentials finishes its GO-APP greeting before
+/* A boot that began without credentials finishes its NiNO-Home_Wifi greeting before
  * BLE provisioning completes. Add the normal welcome after the Wi-Fi chime. */
 static void provisioned_welcome_task(void *arg) {
   (void)arg;
@@ -305,18 +306,18 @@ static void schedule_provisioned_welcome(void) {
 static bool play_wifi_unable_clip(void) {
   const size_t wav_len = (size_t)(wifi_unable_wav_end - wifi_unable_wav_start);
   if (wav_len < 44) {
-    ESP_LOGW(TAG, "Embedded WIFI-UNABLE.wav missing or too small");
+    ESP_LOGW(TAG, "Embedded Wifi_Unable.wav missing or too small");
     return false;
   }
 
   esp_err_t err = nino_audio_queue_wav_copy(wifi_unable_wav_start, wav_len, false,
                                             NINO_AUDIO_SERVO_PRIORITY_NONE, false);
   if (err != ESP_OK) {
-    ESP_LOGW(TAG, "Failed to queue WIFI-UNABLE.wav: %s", esp_err_to_name(err));
+    ESP_LOGW(TAG, "Failed to queue Wifi_Unable.wav: %s", esp_err_to_name(err));
     return false;
   }
 
-  ESP_LOGI(TAG, "Queued WIFI-UNABLE.wav (%u bytes): STA connect failed",
+  ESP_LOGI(TAG, "Queued Wifi_Unable.wav (%u bytes): STA connect failed",
            (unsigned)wav_len);
   return true;
 }
@@ -324,18 +325,18 @@ static bool play_wifi_unable_clip(void) {
 static bool play_go_app_clip(void) {
   const size_t wav_len = (size_t)(go_app_wav_end - go_app_wav_start);
   if (wav_len < 44) {
-    ESP_LOGW(TAG, "Embedded GO-APP.wav missing or too small");
+    ESP_LOGW(TAG, "Embedded NiNO-Home_Wifi.wav missing or too small");
     return false;
   }
 
   esp_err_t err = nino_audio_queue_wav_copy(go_app_wav_start, wav_len, false,
                                             NINO_AUDIO_SERVO_PRIORITY_NONE, false);
   if (err != ESP_OK) {
-    ESP_LOGW(TAG, "Failed to queue GO-APP.wav: %s", esp_err_to_name(err));
+    ESP_LOGW(TAG, "Failed to queue NiNO-Home_Wifi.wav: %s", esp_err_to_name(err));
     return false;
   }
 
-  ESP_LOGI(TAG, "Queued GO-APP.wav (%u bytes): no saved Wi-Fi network",
+  ESP_LOGI(TAG, "Queued NiNO-Home_Wifi.wav (%u bytes): no saved Wi-Fi network",
            (unsigned)wav_len);
   return true;
 }
@@ -358,7 +359,7 @@ static bool wifi_disconnect_is_connect_failure(uint8_t reason) {
 }
 
 /* Boot greeting:
- *  - No saved Wi-Fi network in NVS -> prompt the user to use the app (GO-APP).
+ *  - No saved Wi-Fi network in NVS -> prompt with NiNO-Home_Wifi.wav.
  *  - Provisioned and connected -> greet with Hello-home after the WIFI.wav clip.
  *    Falls back to greeting anyway if Wi-Fi never connects within the timeout,
  *    unless we already played the "unable to connect" prompt. */
@@ -379,7 +380,7 @@ static void finish_boot_greeting_and_enable_wake(void) {
 static void hello_home_task(void *arg) {
   (void)arg;
   if (s_sta_ssid[0] == '\0') {
-    /* GO-APP.wav is queued immediately after audio setup during boot. */
+    /* NiNO-Home_Wifi.wav is queued immediately after audio setup during boot. */
     finish_boot_greeting_and_enable_wake();
     vTaskDelete(NULL);
     return;
@@ -1138,6 +1139,54 @@ bool wifi_config_sta_connected(void) { return s_sta_connected; }
 
 bool wifi_config_is_provisioned(void) { return s_sta_ssid[0] != '\0'; }
 
+esp_err_t wifi_config_enter_setup_mode(void) {
+  ESP_LOGI(TAG, "Entering setup mode — erasing Wi-Fi credentials");
+
+  memset(s_sta_ssid, 0, sizeof(s_sta_ssid));
+  memset(s_sta_pass, 0, sizeof(s_sta_pass));
+  s_sta_connected = false;
+  s_wifi_unable_chimed = false;
+  s_wifi_connected_chime_pending = false;
+  s_boot_unprovisioned = true;
+
+  nvs_handle_t h;
+  if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+    (void)nvs_erase_key(h, NVS_KEY_STA_SSID);
+    (void)nvs_erase_key(h, NVS_KEY_STA_PASS);
+    (void)nvs_set_str(h, NVS_KEY_STA_SSID, "");
+    (void)nvs_set_str(h, NVS_KEY_STA_PASS, "");
+    (void)nvs_set_u8(h, NVS_KEY_MODE, (uint8_t)WIFI_MODE_AP);
+    (void)nvs_commit(h);
+    nvs_close(h);
+    ESP_LOGI(TAG, "NVS Wi-Fi STA credentials erased (namespace %s)",
+             NVS_NAMESPACE);
+  } else {
+    ESP_LOGW(TAG, "Could not open NVS to erase Wi-Fi credentials");
+  }
+
+  (void)esp_wifi_disconnect();
+  wifi_config_t empty_sta = {0};
+  (void)esp_wifi_set_config(WIFI_IF_STA, &empty_sta);
+  wifi_prov_ble_on_sta_ip_changed(false);
+
+  esp_err_t err = wifi_switch_mode(WIFI_MODE_AP);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Setup mode: Wi-Fi AP switch failed: %s",
+             esp_err_to_name(err));
+  }
+
+  err = wifi_prov_ble_enable_provisioning();
+  if (err != ESP_OK && err != ESP_ERR_NOT_SUPPORTED &&
+      err != ESP_ERR_INVALID_STATE) {
+    ESP_LOGW(TAG, "Setup mode: BLE provisioning enable failed: %s",
+             esp_err_to_name(err));
+    return err;
+  }
+
+  ESP_LOGI(TAG, "Setup mode active — BLE advertising for provisioning");
+  return ESP_OK;
+}
+
 static int cmd_wifi_connect(int argc, char **argv) {
   if (argc < 2) {
     printf("Usage: wifi connect <ssid> [password]\n");
@@ -1634,11 +1683,11 @@ static void wifi_init_all(void) {
   ESP_ERROR_CHECK(wifi_switch_mode(saved_mode));
 }
 
-/* Start BLE provisioning as soon as NVS has told us that no STA credentials
- * exist. The Hosted controller can take several retries to come up, so run it
- * independently of the remaining boot peripherals. */
+/* Start BLE after wifi_init_all() has brought Hosted SDIO up. */
 static void wifi_provisioning_task(void *arg) {
   (void)arg;
+  /* Brief settle so SDIO TX path is stable before NimBLE/HCI traffic. */
+  vTaskDelay(pdMS_TO_TICKS(200));
   esp_err_t err = wifi_prov_ble_start_if_needed();
   if (err != ESP_OK && err != ESP_ERR_NOT_SUPPORTED &&
       err != ESP_ERR_INVALID_STATE) {
@@ -3753,10 +3802,12 @@ void app_main(void) {
   assert(s_frame_queue != NULL);
   nino_face_tracker_init();
 
+  /* Wi-Fi init brings Hosted SDIO transport up. BLE must start AFTER that —
+   * starting earlier races slave reset / SDIO and reboots the host. */
   wifi_init_all();
   s_boot_unprovisioned = !wifi_config_is_provisioned();
   BaseType_t ble_task_ok = xTaskCreatePinnedToCore(
-      wifi_provisioning_task, "wifi_prov", 4096, NULL, 5, NULL, APP_CORE_NET);
+      wifi_provisioning_task, "wifi_prov", 4096, NULL, 6, NULL, APP_CORE_NET);
   if (ble_task_ok != pdPASS) {
     ESP_LOGW(TAG, "BLE Wi-Fi provisioning task not started");
   }
@@ -3779,6 +3830,9 @@ void app_main(void) {
   }
   if (nino_touch_sensor_start() != ESP_OK) {
     ESP_LOGW(TAG, "QT2120 touch sensor task not started");
+  }
+  if (nino_push_buttons_start() != ESP_OK) {
+    ESP_LOGW(TAG, "GPIO push button task not started");
   }
 
   xTaskCreatePinnedToCore(multicast_discovery_task, "discovery", 4096, NULL, 5,

@@ -10,6 +10,12 @@ esp_err_t wifi_prov_ble_start(void);
 /** Start BLE provisioning only when no STA credentials are saved in NVS. */
 esp_err_t wifi_prov_ble_start_if_needed(void);
 
+/**
+ * Ensure BLE provisioning is active after credentials were erased:
+ * start NimBLE if needed, reset status, and (re)start advertising.
+ */
+esp_err_t wifi_prov_ble_enable_provisioning(void);
+
 /** Call when STA gets or loses IP (updates status characteristic notify). */
 void wifi_prov_ble_on_sta_ip_changed(bool connected);
 

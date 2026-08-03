@@ -19,3 +19,6 @@ void wifi_config_get_sta_ip(char *buf, size_t buf_size);
 void wifi_config_get_ap_ip(char *buf, size_t buf_size);
 int wifi_config_status_json(char *buf, size_t buf_sz);
 bool wifi_config_is_provisioned(void);
+
+/** Erase STA credentials from RAM + NVS, switch to AP, start BLE provisioning. */
+esp_err_t wifi_config_enter_setup_mode(void);
