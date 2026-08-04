@@ -491,9 +491,15 @@ static void voice_ws_job_task(void *pv) {
   if (eye_state < NINO_EYE_STATE_COUNT) {
     ESP_LOGI(TAG, "Reply eye_expression=%s -> state %d", eye_expr, (int)eye_state);
   }
-  nino_main_queue_audio_wav(resp, resp_len, true, prompt_after, eye_state);
+  /* If a prompt-ack listen follows, skip the done beep — that listen already
+   * plays one chime when it opens the mic. Avoids the double-chime. */
+  const bool play_done_chime = !prompt_after;
+  nino_main_queue_audio_wav(resp, resp_len, play_done_chime, prompt_after, eye_state);
   if (medical_ack && prompt_after) {
     ESP_LOGI(TAG, "Medical follow-up listen scheduled after reply");
+  }
+  if (prompt_after) {
+    ESP_LOGI(TAG, "Prompt-ack listen scheduled after reply (mic opens after chime)");
   }
   vTaskDelete(NULL);
 }

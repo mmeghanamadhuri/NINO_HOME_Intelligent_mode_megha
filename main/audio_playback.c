@@ -76,6 +76,9 @@ static esp_err_t spk_stream_open_locked(uint32_t sample_rate_hz, bool leave_open
   if (s_spk_stream_open && s_spk_stream_rate_hz == sample_rate_hz) {
     return ESP_OK;
   }
+  /* ES8311 mic + speaker share one duplex I2S. Drop the ADC before any
+   * rate change / reopen so wake_feed does not keep a stale mic handle. */
+  nino_voice_wake_drop_mic_locked();
   spk_stream_close_locked();
 
   esp_codec_dev_sample_info_t fs = {

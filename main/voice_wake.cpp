@@ -108,24 +108,27 @@ static void wake_feed_task(void *arg) {
     return;
   }
 
-  ESP_LOGI(TAG, "wake feed (USB 4-mic): chunksize=%d nch=%d sr=%d", feed_chunksize, feed_nch,
-           sample_rate_hz);
+  ESP_LOGI(TAG, "wake feed: chunksize=%d nch=%d sr=%d (USB preferred, ES8311 fallback)",
+           feed_chunksize, feed_nch, sample_rate_hz);
 
   bool flush_before_feed = true;
+  bool logged_mic_source = false;
   while (true) {
     const bool armed = s_wake_enabled;
     const bool mic_exclusive = s_mic_capture_hold;
 
     if (!armed && !mic_exclusive) {
       flush_before_feed = true;
+      logged_mic_source = false;
       vTaskDelay(pdMS_TO_TICKS(WAKE_IDLE_DELAY_MS));
       continue;
     }
 
     if (mic_exclusive) {
-      /* VAD owns the same USB stream. Flush once when it returns so WakeNet
-       * restarts from live microphone frames, not the completed query. */
+      /* VAD owns the mic. Flush once when it returns so WakeNet restarts from
+       * live frames, not the completed query. */
       flush_before_feed = true;
+      logged_mic_source = false;
       vTaskDelay(pdMS_TO_TICKS(frame_ms > 0 ? frame_ms : 1));
       continue;
     }
@@ -136,8 +139,16 @@ static void wake_feed_task(void *arg) {
       flush_before_feed = false;
     }
     if (nino_mic_read(buff, feed_chunksize) != ESP_OK) {
-      vTaskDelay(pdMS_TO_TICKS(10));
+      /* Speaker may have just reclaimed the shared ES8311 I2S; wait a beat
+       * and reopen on the next pass instead of spinning the AFE empty. */
+      logged_mic_source = false;
+      vTaskDelay(pdMS_TO_TICKS(frame_ms > 0 ? frame_ms : 20));
       continue;
+    }
+    if (!logged_mic_source) {
+      ESP_LOGI(TAG, "wake mic source: %s",
+               nino_mic_source_name(nino_mic_preferred_source()));
+      logged_mic_source = true;
     }
     s_afe->feed(afe_data, buff);
 
@@ -182,17 +193,25 @@ static void wake_fetch_task(void *arg) {
     } else if (res == NULL || res->ret_value == ESP_FAIL) {
       yield = pdMS_TO_TICKS(WAKE_FETCH_FAIL_DELAY_MS);
     } else if (res->wakeup_state == WAKENET_DETECTED && s_wake_enabled &&
-               nino_voice_assist_has_ws_uri() && !s_after_wake_busy) {
+               !s_after_wake_busy) {
       const int64_t now = esp_timer_get_time();
       if (s_last_wake_us == 0 || (now - s_last_wake_us) >= (int64_t)WAKE_COOLDOWN_MS * 1000LL) {
-        ESP_LOGI(TAG, "WakeNet detected (" WAKE_PHRASE_HINT ")");
         s_last_wake_us = now;
-        s_after_wake_busy = true;
-        BaseType_t ok = xTaskCreatePinnedToCore(after_wake_task, "voice_wake_q", AFTER_WAKE_TASK_STACK, NULL,
-                                                WAKE_TASK_PRIO + 1, NULL, WAKE_FEED_CORE);
-        if (ok != pdPASS) {
-          ESP_LOGW(TAG, "could not start voice_wake_q task");
-          s_after_wake_busy = false;
+        ESP_LOGI(TAG, "WakeNet detected (" WAKE_PHRASE_HINT ") via %s",
+                 nino_mic_source_name(nino_mic_preferred_source()));
+        if (!nino_voice_assist_has_ws_uri()) {
+          /* Mic/WakeNet worked; erase-flash clears NVS so the PC URL is gone. */
+          ESP_LOGW(TAG,
+                   "Wake heard, but voice PC URL not set — serial: "
+                   "voice connect <YOUR_PC_LAN_IP> 8000");
+        } else {
+          s_after_wake_busy = true;
+          BaseType_t ok = xTaskCreatePinnedToCore(after_wake_task, "voice_wake_q", AFTER_WAKE_TASK_STACK, NULL,
+                                                  WAKE_TASK_PRIO + 1, NULL, WAKE_FEED_CORE);
+          if (ok != pdPASS) {
+            ESP_LOGW(TAG, "could not start voice_wake_q task");
+            s_after_wake_busy = false;
+          }
         }
       }
     }
@@ -217,10 +236,12 @@ extern "C" void nino_voice_wake_init(void) {
   }
 
   if (afe_config->wakenet_model_name != NULL) {
-    ESP_LOGI(TAG, "WakeNet model 1: %s (USB 4-mic)", afe_config->wakenet_model_name);
+    ESP_LOGI(TAG, "WakeNet model 1: %s (USB preferred; ES8311 fallback)",
+             afe_config->wakenet_model_name);
   }
   if (afe_config->wakenet_model_name_2 != NULL) {
-    ESP_LOGI(TAG, "WakeNet model 2: %s (USB 4-mic)", afe_config->wakenet_model_name_2);
+    ESP_LOGI(TAG, "WakeNet model 2: %s (USB preferred; ES8311 fallback)",
+             afe_config->wakenet_model_name_2);
   }
 
   s_afe = esp_afe_handle_from_config(afe_config);
@@ -239,9 +260,9 @@ extern "C" void nino_voice_wake_init(void) {
       const int threshold_result =
           s_afe->set_wakenet_threshold(s_afe_data, wn_idx, WAKE_NET_THRESHOLD);
       if (threshold_result > 0) {
-        ESP_LOGI(TAG, "WakeNet USB threshold[%d] set to %.2f", wn_idx, (double)WAKE_NET_THRESHOLD);
+        ESP_LOGI(TAG, "WakeNet threshold[%d] set to %.2f", wn_idx, (double)WAKE_NET_THRESHOLD);
       } else if (wn_idx == 1) {
-        ESP_LOGW(TAG, "Could not set WakeNet USB threshold (result=%d)", threshold_result);
+        ESP_LOGW(TAG, "Could not set WakeNet threshold (result=%d)", threshold_result);
       }
     }
   }
@@ -257,11 +278,12 @@ extern "C" void nino_voice_wake_init(void) {
   }
 
   s_wake_hw_ready = true;
-  ESP_LOGI(TAG, "Wake word ready (USB 4-mic) — say " WAKE_PHRASE_HINT);
+  ESP_LOGI(TAG, "Wake word ready (USB preferred; ES8311 fallback) — say " WAKE_PHRASE_HINT);
 }
 
 extern "C" void nino_voice_wake_drop_mic_locked(void) {
-  (void)0;
+  /* Caller must hold nino_audio_bus_lock(); shared I2S with speaker / VAD. */
+  nino_mic_drop_es8311_locked();
 }
 
 extern "C" void nino_voice_wake_set_mic_capture_hold(bool hold) {

@@ -45,19 +45,6 @@ static esp_websocket_client_config_t make_ws_cfg(const char *uri) {
   return ws_cfg;
 }
 
-static bool chunk_contains(const char *hay, size_t hay_len, const char *needle) {
-  const size_t needle_len = strlen(needle);
-  if (needle_len == 0 || hay_len < needle_len) {
-    return false;
-  }
-  for (size_t i = 0; i + needle_len <= hay_len; ++i) {
-    if (memcmp(hay + i, needle, needle_len) == 0) {
-      return true;
-    }
-  }
-  return false;
-}
-
 static void parse_eye_expression(vws_ctx_t *ctx, const char *text, size_t len) {
   static const char key[] = "\"eye_expression\"";
   const size_t key_len = sizeof(key) - 1;
@@ -96,11 +83,32 @@ static void parse_metadata_text(vws_ctx_t *ctx, const char *text, size_t len) {
   if (ctx->eye_expr[0] != '\0') {
     nino_eye_apply_expression(ctx->eye_expr);
   }
-  if (!chunk_contains(text, len, "prompt_medical_ack")) {
-    return;
-  }
-  if (chunk_contains(text, len, "true")) {
-    ctx->prompt_medical_ack = true;
+
+  /* Require an explicit true value — a bare "true" anywhere in the JSON
+   * (or matching inside unrelated fields) used to force a second listen. */
+  static const char key[] = "\"prompt_medical_ack\"";
+  const size_t key_len = sizeof(key) - 1;
+  for (size_t i = 0; i + key_len < len; ++i) {
+    if (memcmp(text + i, key, key_len) != 0) {
+      continue;
+    }
+    size_t j = i + key_len;
+    while (j < len && (text[j] == ' ' || text[j] == '\t' || text[j] == '\n' ||
+                       text[j] == '\r')) {
+      ++j;
+    }
+    if (j >= len || text[j] != ':') {
+      continue;
+    }
+    ++j;
+    while (j < len && (text[j] == ' ' || text[j] == '\t' || text[j] == '\n' ||
+                       text[j] == '\r')) {
+      ++j;
+    }
+    if (j + 4 <= len && memcmp(text + j, "true", 4) == 0) {
+      ctx->prompt_medical_ack = true;
+    }
+    break;
   }
 }
 

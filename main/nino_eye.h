@@ -9,10 +9,8 @@ extern "C" {
 /*
  * NINO eye animation engine.
  *
- * States rendered on the dual SSD1351 OLEDs: idle + 6 emotions + the two
- * functional states listening/thinking + the med capsule for medical reminders
- * + a full ☺️ smiley face + a ✨ twinkle + object icons (pencil/radio/tv/bulb/
- * robot).
+ * States rendered on the dual SSD1351 OLEDs: idle + animated emotions + med
+ * capsule + static RGB565 emoji bitmaps (jai_bhalaiah … bigsmile).
  * State changes are instant and non-blocking: the running animation switches on
  * its next frame.
  *
@@ -31,16 +29,22 @@ typedef enum {
     NINO_EYE_SURPRISED,
     NINO_EYE_LISTENING,
     NINO_EYE_RECALLING,
+    NINO_EYE_MAD,
     NINO_EYE_MED,
+    NINO_EYE_JAI_BHALAIAH,
     NINO_EYE_SMILE,
-    NINO_EYE_TWINKLE,
+    NINO_EYE_SPARKLE,
     NINO_EYE_PENCIL,
     NINO_EYE_RADIO,
     NINO_EYE_TV,
     NINO_EYE_BULB,
     NINO_EYE_ROBOT,
+    NINO_EYE_BIGSMILE,
     NINO_EYE_STATE_COUNT,
 } nino_eye_state_t;
+
+/** Alias kept for older call sites / server tags. */
+#define NINO_EYE_TWINKLE NINO_EYE_SPARKLE
 
 void nino_eye_begin(void);
 
@@ -50,13 +54,13 @@ void nino_eye_restart_current(void);
 void nino_eye_set_state(nino_eye_state_t state);
 nino_eye_state_t nino_eye_get_state(void);
 
-/** Parse a console token: "0"-"9", or idle/happy/.../smile/twinkle/pencil/radio/tv/bulb/robot. Returns false if unknown. */
+/** Parse a console token / line: state names (prefer names over digits). */
 bool nino_eye_apply_command(const char *line);
 
 /**
  * Map a lowercase expression name (as sent by the PC server, e.g. "sad",
- * "happy", "curious", "recalling", ...) to a state. Returns NINO_EYE_STATE_COUNT
- * if the name is unknown / NULL / empty.
+ * "happy", "curious", "recalling", "sparkle", …) to a state. Returns
+ * NINO_EYE_STATE_COUNT if the name is unknown / NULL / empty.
  */
 nino_eye_state_t nino_eye_state_from_name(const char *name);
 
@@ -77,22 +81,29 @@ void nino_eye_sad(void);
 void nino_eye_surprised(void);
 void nino_eye_listening(void);
 void nino_eye_recalling(void);
+void nino_eye_mad(void);
 /** Static slanted red/white capsule pill — shown while a medical reminder plays. */
 void nino_eye_med(void);
-/** Full ☺️ smiley face (gold disc, black eyes + smile) on each panel. */
+/** 🔥 fire emoji bitmap (jai Bhalaiah). */
+void nino_eye_jai_bhalaiah(void);
+/** 😊 WhatsApp-style smile bitmap. */
 void nino_eye_smile(void);
-/** ✨ twinkle — a big gold four-point sparkle plus two small ones. */
+/** ✨ sparkle bitmap. */
+void nino_eye_sparkle(void);
+/** Alias for nino_eye_sparkle(). */
 void nino_eye_twinkle(void);
-/** ✏️ pencil icon. */
+/** ✏️ pencil emoji bitmap. */
 void nino_eye_pencil(void);
-/** 📻 radio icon. */
+/** 📻 radio emoji bitmap. */
 void nino_eye_radio(void);
-/** 📺 television icon. */
+/** 📺 TV emoji bitmap. */
 void nino_eye_tv(void);
-/** 💡 light-bulb icon. */
+/** 💡 bulb emoji bitmap. */
 void nino_eye_bulb(void);
-/** 🤖 robot-face icon. */
+/** 🤖 robot emoji bitmap. */
 void nino_eye_robot(void);
+/** 😄 open-mouth big smile bitmap. */
+void nino_eye_bigsmile(void);
 
 #ifdef __cplusplus
 }

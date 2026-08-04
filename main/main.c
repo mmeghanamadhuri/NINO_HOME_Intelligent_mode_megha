@@ -80,6 +80,7 @@
 #define DISCOVERY_MSG "discover"
 #define DISCOVERY_BUF 256
 #define MESSAGE_BUF 256
+#define DEFAULT_VOICE_SERVER_PORT 8000
 #define MDNS_HOSTNAME_MAX DEVICE_ID_MAX
 
 #define STA_RECONNECT_DELAY_MS 5000
@@ -1290,12 +1291,26 @@ static void dinner_cli_register(void);
 static void bday_cli_register(void);
 
 static int cmd_eye(int argc, char **argv) {
-  if (argc >= 2 && nino_eye_apply_command(argv[1])) {
-    printf("eye -> state %d\n", (int)nino_eye_get_state());
-    return 0;
+  if (argc >= 2) {
+    /* Join argv[1..] so "eye jai bhalaiah" / "eye big smile" work. */
+    char line[48];
+    size_t len = 0;
+    for (int i = 1; i < argc && len < sizeof(line) - 1; i++) {
+      if (i > 1 && len < sizeof(line) - 1) {
+        line[len++] = ' ';
+      }
+      for (const char *p = argv[i]; *p && len < sizeof(line) - 1; p++) {
+        line[len++] = *p;
+      }
+    }
+    line[len] = '\0';
+    if (nino_eye_apply_command(line)) {
+      printf("eye -> state %d\n", (int)nino_eye_get_state());
+      return 0;
+    }
   }
-  printf("Usage: eye <idle|happy|tired|thinking|curious|sad|surprised|listening|recalling>"
-         "   (current state: %d)\n",
+  printf("Usage: eye <name>  e.g. idle happy mad med fire smile sparkle pencil\n"
+         "              radio tv bulb robot bigsmile  (current: %d)\n",
          (int)nino_eye_get_state());
   return 0;
 }
@@ -1303,7 +1318,7 @@ static int cmd_eye(int argc, char **argv) {
 static void eye_cli_register(void) {
   const esp_console_cmd_t eye_cmd = {
       .command = "eye",
-      .help = "Set NINO eye state: eye <idle|happy|tired|thinking|curious|sad|surprised|listening|recalling>",
+      .help = "Set NINO eye state by name (idle/happy/.../fire/smile/sparkle/.../bigsmile)",
       .hint = NULL,
       .func = &cmd_eye,
       .argtable = NULL,
@@ -1705,6 +1720,37 @@ static bool is_discovery_request(const char *msg, size_t len) {
   return (strncmp(msg, DISCOVERY_MSG, strlen(DISCOVERY_MSG)) == 0);
 }
 
+static void apply_voice_ws_url_from_server(const char *uri);
+
+/** Pair voice WS to the PC that just discovered us (no manual voice connect). */
+static void auto_pair_voice_from_discovery_peer(const struct sockaddr_in *peer) {
+  if (peer == NULL || peer->sin_addr.s_addr == 0 ||
+      peer->sin_addr.s_addr == htonl(INADDR_NONE)) {
+    return;
+  }
+
+  char ip[16];
+  if (inet_ntoa_r(peer->sin_addr, ip, sizeof(ip)) == NULL) {
+    return;
+  }
+
+  char uri[160];
+  int n = snprintf(uri, sizeof(uri), "ws://%s:%d/voice-query", ip,
+                   DEFAULT_VOICE_SERVER_PORT);
+  if (n <= 0 || (size_t)n >= sizeof(uri)) {
+    return;
+  }
+
+  /* Skip NVS rewrite when already paired to this host:port. */
+  if (strncmp(s_voice_ws_url, uri, (size_t)n) == 0 &&
+      (s_voice_ws_url[n] == '\0' || s_voice_ws_url[n] == '?')) {
+    return;
+  }
+
+  ESP_LOGI(TAG, "Discovery: auto-pairing voice to %s", uri);
+  apply_voice_ws_url_from_server(uri);
+}
+
 static void multicast_discovery_task(void *arg) {
   (void)arg;
   vTaskDelay(pdMS_TO_TICKS(2000));
@@ -1809,6 +1855,7 @@ static void multicast_discovery_task(void *arg) {
                    raddr_len);
             ESP_LOGI(TAG, "Discovery: responded to %s",
                      inet_ntoa(raddr.sin_addr));
+            auto_pair_voice_from_discovery_peer(&raddr);
           }
         }
       }
@@ -1968,8 +2015,6 @@ static esp_err_t stream_route_handler(httpd_req_t *req) {
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   return httpd_resp_send(req, STREAM_VIEW_HTML, HTTPD_RESP_USE_STRLEN);
 }
-
-static void apply_voice_ws_url_from_server(const char *uri);
 
 static esp_err_t play_wav_handler(httpd_req_t *req) {
   if (req->method != HTTP_POST) {
@@ -2978,7 +3023,8 @@ static int cmd_voice(int argc, char **argv) {
     printf("voice mic: %s\n",
            nino_mic_source_name(nino_mic_preferred_source()));
     printf("usb header mic: %s\n",
-           usb_mic_ready() ? "streaming" : "not ready (USB 4-mic required)");
+           usb_mic_ready() ? "streaming (preferred)"
+                           : "not ready; using onboard ES8311 fallback");
     usb_mic_print_status();
     usb_mic_print_usb_devices();
     printf("device_id: %s\n", s_device_id);
