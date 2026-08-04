@@ -7,6 +7,7 @@
 
 #include "servo_dxl.h"
 #include "servo_motion.h"
+#include "servo_recplay.h"
 
 static const char *TAG = "face_tracker";
 
@@ -101,7 +102,8 @@ static void go_neutral_if_allowed(void) {
 static void update_pause_flags(void) {
   s_paused_for_motion = nino_servo_motion_is_active();
   s_paused_for_spin = nino_servo_dxl_spin_is_active() ||
-                      nino_servo_dxl_track_hon_is_active();
+                      nino_servo_dxl_track_hon_is_active() ||
+                      nino_servo_recplay_is_busy();
   s_paused_for_servo = !nino_servo_dxl_is_ready();
 }
 

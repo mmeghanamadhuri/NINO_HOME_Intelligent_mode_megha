@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NiNO Actions — Record &amp; Play</title>
+    <link rel="stylesheet" href="/static/styles.css?v=14" />
+    <link rel="stylesheet" href="/static/actions.css?v=1" />
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="site-header-inner">
+        <h1>NiNO Actions</h1>
+        <div class="header-actions">
+          <a class="header-link" href="/">Camera</a>
+          <div class="status-pill" id="connectionStatus">Connecting…</div>
+        </div>
+      </div>
+    </header>
+
+    <main class="page actions-page">
+      <p class="intro">
+        Build motor motions as editable <strong>frames</strong>. Move the head by
+        hand (torque off), capture poses, insert or delete frames, then play the
+        joined sequence on the bot.
+      </p>
+
+      <section class="controls-grid">
+        <div class="card">
+          <h2>Robot</h2>
+          <div class="field">
+            <label for="deviceSelect">Device</label>
+            <select id="deviceSelect">
+              {% for d in devices %}
+              <option value="{{ d.device_id }}" {% if d.device_id == device_id %}selected{% endif %}>
+                {{ d.display_name or d.device_id }}
+              </option>
+              {% else %}
+              <option value="{{ device_id }}" selected>{{ device_id }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <p class="hint" id="botBaseHint">Resolving bot URL…</p>
+          <p class="live-readout">
+            Tilt (ID1): <strong id="liveTilt">—</strong>
+            · Pan (ID2): <strong id="livePan">—</strong>
+            · Mode: <strong id="liveMode">idle</strong>
+          </p>
+        </div>
+
+        <div class="card">
+          <h2>Motors</h2>
+          <div class="motor-chips">
+            <label class="chip"><input type="checkbox" id="motorTilt" checked /> Tilt ID1</label>
+            <label class="chip"><input type="checkbox" id="motorPan" checked /> Pan ID2</label>
+          </div>
+          <div class="btn-row">
+            <button id="btnRecordStart" type="button">Start edit (torque off)</button>
+            <button class="secondary" id="btnRecordStop" type="button">Stop edit</button>
+          </div>
+          <p class="hint">Start edit, move the head by hand, then Add Frame.</p>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-header">
+          <h2>Action editor</h2>
+          <div class="name-row">
+            <input id="actionName" type="text" maxlength="40" placeholder="Action name" value="New action" />
+            <button class="secondary" id="btnRename" type="button">Rename</button>
+          </div>
+        </div>
+
+        <div class="btn-row wrap">
+          <button id="btnAddFrame" type="button">Add Frame</button>
+          <button class="secondary" id="btnInsertBefore" type="button">Insert Before</button>
+          <button class="secondary" id="btnInsertAfter" type="button">Insert After</button>
+          <button class="secondary" id="btnReplaceFrame" type="button">Replace</button>
+          <button class="danger" id="btnDeleteFrame" type="button">Delete Frame</button>
+        </div>
+
+        <div class="field hold-field">
+          <label for="defaultHold">Default hold (ms) for new frames</label>
+          <input id="defaultHold" type="number" min="0" max="60000" step="50" value="500" />
+        </div>
+
+        <div class="frame-strip" id="frameStrip" aria-label="Frames"></div>
+
+        <div class="frame-detail" id="frameDetail">
+          <p class="hint">Select a frame to edit hold time.</p>
+        </div>
+
+        <div class="btn-row wrap">
+          <button id="btnSaveAction" type="button">Save to Actions</button>
+          <button class="secondary" id="btnPlayAction" type="button">Play</button>
+          <button class="secondary" id="btnStopPlay" type="button">Stop play</button>
+          <button class="secondary" id="btnNewAction" type="button">New action</button>
+        </div>
+        <p class="hint" id="editorStatus"></p>
+      </section>
+
+      <section class="card">
+        <div class="card-header">
+          <h2>Actions</h2>
+          <span class="status-label">Saved locally in this browser</span>
+        </div>
+        <ul class="action-list" id="actionList"></ul>
+      </section>
+    </main>
+
+    <script src="/static/actions.js?v=1"></script>
+  </body>
+</html>

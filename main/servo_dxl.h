@@ -28,8 +28,22 @@ void nino_servo_dxl_set_position_speed(int speed);
 /** Queue a single servo goal by Dynamixel ID (1 or 2). */
 void nino_servo_dxl_set_servo_goal(uint8_t id, int goal);
 
-/** Read present position (0–1023) for one servo. Requires bus ready. */
+/** Read present position (0–1023) for one servo. Requires bus open (torque may be off). */
 esp_err_t nino_servo_dxl_get_present_position(uint8_t id, int *position);
+
+/**
+ * Enable/disable torque for one servo (ID 1 or 2).
+ * Torque-off allows hand teaching while present-position reads still work.
+ */
+esp_err_t nino_servo_dxl_set_torque(uint8_t id, bool enable);
+
+/** Last commanded torque state for one servo (true after joint-mode init). */
+bool nino_servo_dxl_torque_is_on(uint8_t id);
+
+/** Dynamixel IDs used by this firmware (tilt=1, pan=2). */
+#define NINO_SERVO_TILT_ID 1
+#define NINO_SERVO_PAN_ID 2
+#define NINO_SERVO_ID_COUNT 2
 
 /**
  * Broadcast PING on the Dynamixel bus and collect responding servo IDs.

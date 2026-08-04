@@ -15,6 +15,7 @@
 
 #include "servo_dxl.h"
 #include "servo_motion.h"
+#include "servo_recplay.h"
 
 #define USB_CLIENT_TASK_STACK_SIZE          8192
 #define USB_TASK_PRIORITY                   18
@@ -175,7 +176,10 @@ static const uint8_t s_servo_ids[] = {
     DXL_SECONDARY_ID,
 };
 static ftdi_device_t s_ftdi = {0};
-static bool s_torque_enabled = false;
+static bool s_torque_enabled = false; /* joint-mode initialized / bus usable */
+static bool s_servo_torque_on[DXL_SERVO_COUNT] = {false, false};
+static volatile bool s_torque_update_pending[DXL_SERVO_COUNT] = {false, false};
+static volatile bool s_requested_torque_on[DXL_SERVO_COUNT] = {true, true};
 static volatile bool s_goal_update_pending[DXL_SERVO_COUNT] = {false};
 static volatile int s_requested_goal[DXL_SERVO_COUNT] = {
     DXL_CENTER_POSITION,
@@ -320,7 +324,8 @@ void nino_servo_dxl_go_neutral(void)
     /* Audio-playback cleanup and head-motion stop call this; while a 360 spin
      * is running it must not yank ID2 back to center mid-rotation (the spin
      * ends at neutral anyway). */
-    if (nino_servo_dxl_spin_is_active() || nino_servo_dxl_track_hon_is_active()) {
+    if (nino_servo_dxl_spin_is_active() || nino_servo_dxl_track_hon_is_active() ||
+        nino_servo_recplay_is_busy()) {
         return;
     }
     dynamixel_queue_goal_all(DXL_CENTER_POSITION);
@@ -328,8 +333,11 @@ void nino_servo_dxl_go_neutral(void)
 
 void nino_servo_dxl_set_pan_tilt(int pan_goal, int tilt_goal)
 {
-    /* Head-motion poses must not override the spin waypoints. */
+    /* Head-motion poses must not override spin / hand-teach. Play mode is allowed. */
     if (nino_servo_dxl_spin_is_active() || nino_servo_dxl_track_hon_is_active()) {
+        return;
+    }
+    if (nino_servo_recplay_mode() == NINO_SERVO_MODE_RECORD) {
         return;
     }
     if (s_goal_mutex != NULL) {
@@ -398,6 +406,45 @@ esp_err_t nino_servo_dxl_get_present_position(uint8_t id, int *position)
     return ESP_OK;
 }
 
+bool nino_servo_dxl_torque_is_on(uint8_t id)
+{
+    const int idx = servo_index_for_id(id);
+    if (idx < 0) {
+        return false;
+    }
+    return s_servo_torque_on[idx];
+}
+
+esp_err_t nino_servo_dxl_set_torque(uint8_t id, bool enable)
+{
+    const int idx = servo_index_for_id(id);
+    if (idx < 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_ftdi.device_ready || s_ftdi.device_gone || !s_torque_enabled) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (s_goal_mutex != NULL) {
+        xSemaphoreTake(s_goal_mutex, portMAX_DELAY);
+    }
+    s_requested_torque_on[idx] = enable;
+    s_torque_update_pending[idx] = true;
+    if (s_goal_mutex != NULL) {
+        xSemaphoreGive(s_goal_mutex);
+    }
+
+    /* Wait briefly for the USB worker to apply the write. */
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(1500);
+    while (xTaskGetTickCount() < deadline) {
+        if (!s_torque_update_pending[idx] && s_servo_torque_on[idx] == enable) {
+            return ESP_OK;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return s_servo_torque_on[idx] == enable ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
 esp_err_t nino_servo_dxl_scan_chain(uint8_t *ids, size_t max_ids, size_t *out_count)
 {
     return dynamixel_scan_chain_blocking(ids, max_ids, out_count);
@@ -405,7 +452,7 @@ esp_err_t nino_servo_dxl_scan_chain(uint8_t *ids, size_t max_ids, size_t *out_co
 
 esp_err_t nino_servo_dxl_spin_360(void)
 {
-    if (s_spin360_task != NULL || s_track_hon_task != NULL) {
+    if (s_spin360_task != NULL || s_track_hon_task != NULL || nino_servo_recplay_is_busy()) {
         return ESP_ERR_INVALID_STATE;
     }
     if (!nino_servo_dxl_is_ready()) {
@@ -424,7 +471,7 @@ esp_err_t nino_servo_dxl_spin_360(void)
 
 esp_err_t nino_servo_dxl_track_hon(void)
 {
-    if (s_track_hon_task != NULL || s_spin360_task != NULL) {
+    if (s_track_hon_task != NULL || s_spin360_task != NULL || nino_servo_recplay_is_busy()) {
         return ESP_ERR_INVALID_STATE;
     }
     if (!nino_servo_dxl_is_ready()) {
@@ -757,7 +804,8 @@ static esp_err_t dynamixel_read_word_blocking(uint8_t id, uint8_t addr, uint16_t
     if (out == NULL || s_sync_mutex == NULL || s_read_done_sem == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (!s_ftdi.device_ready || !s_torque_enabled) {
+    /* Present-position reads must work with torque off (hand teach / record). */
+    if (!s_ftdi.device_ready || s_ftdi.device_gone) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -1313,6 +1361,11 @@ static esp_err_t dynamixel_set_joint_mode(ftdi_device_t *dev)
     err = dynamixel_send_write8_all(dev, DXL_TORQUE_ENABLE_ADDR, DXL_TORQUE_ON);
     if (err == ESP_OK) {
         s_torque_enabled = true;
+        for (size_t i = 0; i < DXL_SERVO_COUNT; i++) {
+            s_servo_torque_on[i] = true;
+            s_requested_torque_on[i] = true;
+            s_torque_update_pending[i] = false;
+        }
         ESP_LOGI(TAG, "Dynamixel joint (position) mode enabled");
     }
 
@@ -1624,6 +1677,9 @@ static void usb_client_task(void *arg)
                 esp_err_t err = ftdi_open_device(&s_ftdi);
                 if (err == ESP_OK) {
                     s_torque_enabled = false;
+                    for (size_t i = 0; i < DXL_SERVO_COUNT; i++) {
+                        s_servo_torque_on[i] = false;
+                    }
                     s_position_speed_pending = true;
                     dynamixel_queue_goal_all(DXL_CENTER_POSITION);
                     if (ftdi_start_rx(&s_ftdi) != ESP_OK) {
@@ -1645,6 +1701,10 @@ static void usb_client_task(void *arg)
             if (s_ftdi.dev_hdl != NULL) {
                 ftdi_close_device(&s_ftdi);
                 s_torque_enabled = false;
+                for (size_t i = 0; i < DXL_SERVO_COUNT; i++) {
+                    s_servo_torque_on[i] = false;
+                    s_torque_update_pending[i] = false;
+                }
                 s_ftdi.dev_addr = 0;
             }
             s_ping_fail_streak = 0;
@@ -1662,10 +1722,13 @@ static void usb_client_task(void *arg)
         if (s_ftdi.device_ready && !s_ftdi.device_gone) {
             TickType_t now = xTaskGetTickCount();
             bool has_goal_update_pending = false;
+            bool has_torque_update_pending = false;
             for (size_t i = 0; i < DXL_SERVO_COUNT; i++) {
                 if (s_goal_update_pending[i]) {
                     has_goal_update_pending = true;
-                    break;
+                }
+                if (s_torque_update_pending[i]) {
+                    has_torque_update_pending = true;
                 }
             }
             bool has_sync_read_pending = false;
@@ -1674,14 +1737,14 @@ static void usb_client_task(void *arg)
                 xSemaphoreGive(s_sync_mutex);
             }
             const TickType_t poll_ms =
-                (has_goal_update_pending || has_sync_read_pending)
+                (has_goal_update_pending || has_sync_read_pending || has_torque_update_pending)
                     ? pdMS_TO_TICKS(DXL_FAST_POLL_INTERVAL_MS)
                     : pdMS_TO_TICKS(DXL_APP_POLL_INTERVAL_MS);
             if ((now - last_poll_tick) >= poll_ms) {
                 esp_err_t err = ESP_OK;
 
                 if (s_sync_mutex != NULL && xSemaphoreTake(s_sync_mutex, 0) == pdTRUE) {
-                    if (s_sync.state == DXL_SYNC_READ_PENDING && s_torque_enabled) {
+                    if (s_sync.state == DXL_SYNC_READ_PENDING) {
                         err = dynamixel_send_read(&s_ftdi, s_sync.id, s_sync.addr, s_sync.length);
                         if (err == ESP_OK) {
                             s_sync.state = DXL_SYNC_READ_WAIT_RSP;
@@ -1732,6 +1795,28 @@ static void usb_client_task(void *arg)
                             dynamixel_queue_goal_all(DXL_CENTER_POSITION);
                         }
                     }
+                } else if (has_torque_update_pending) {
+                    for (size_t i = 0; i < DXL_SERVO_COUNT; i++) {
+                        if (!s_torque_update_pending[i]) {
+                            continue;
+                        }
+                        const bool want_on = s_requested_torque_on[i];
+                        s_torque_update_pending[i] = false;
+                        esp_err_t t_err = dynamixel_send_write8(
+                            &s_ftdi, s_servo_ids[i], DXL_TORQUE_ENABLE_ADDR,
+                            want_on ? DXL_TORQUE_ON : DXL_TORQUE_OFF);
+                        if (t_err == ESP_OK) {
+                            s_servo_torque_on[i] = want_on;
+                            ESP_LOGI(TAG, "Torque ID%u %s", s_servo_ids[i],
+                                     want_on ? "ON" : "OFF");
+                        } else {
+                            ESP_LOGW(TAG, "Torque ID%u write failed: %s", s_servo_ids[i],
+                                     esp_err_to_name(t_err));
+                            if (err == ESP_OK) {
+                                err = t_err;
+                            }
+                        }
+                    }
                 } else if (s_position_speed_pending) {
                     int speed = s_requested_position_speed;
                     s_position_speed_pending = false;
@@ -1756,6 +1841,9 @@ static void usb_client_task(void *arg)
                         }
                         int goal = s_requested_goal[i];
                         s_goal_update_pending[i] = false;
+                        if (!s_servo_torque_on[i]) {
+                            continue;
+                        }
                         esp_err_t goal_err =
                             dynamixel_send_write16(&s_ftdi, s_servo_ids[i], DXL_GOAL_POSITION_ADDR, (uint16_t)goal);
                         if (goal_err != ESP_OK && err == ESP_OK) {

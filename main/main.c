@@ -52,6 +52,7 @@
 #include "ssd1351.h"
 #include "servo_dxl.h"
 #include "servo_motion.h"
+#include "servo_recplay.h"
 #include "touch_sensor.h"
 #include "push_buttons.h"
 #include "usb_mic.h"
@@ -2363,6 +2364,16 @@ static esp_err_t servo_360_handler(httpd_req_t *req) {
 
   nino_servo_motion_stop();
 
+  if (nino_servo_recplay_is_busy()) {
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_status(req, "409 Conflict");
+    const char *err = nino_servo_recplay_mode() == NINO_SERVO_MODE_RECORD
+                          ? "{\"ok\":false,\"error\":\"busy_record\"}"
+                          : "{\"ok\":false,\"error\":\"busy_play\"}";
+    return httpd_resp_send(req, err, HTTPD_RESP_USE_STRLEN);
+  }
+
   esp_err_t err = nino_servo_dxl_spin_360();
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -2518,6 +2529,11 @@ static int app_status_json(char *buf, size_t buf_sz) {
   const char *fw_version = PROJECT_VER;
   nino_face_tracker_status_t face_track = {};
   nino_face_tracker_get_status(&face_track);
+  char servo_frag[128];
+  int sn = nino_servo_recplay_status_json(servo_frag, sizeof(servo_frag));
+  if (sn < 0 || sn >= (int)sizeof(servo_frag)) {
+    snprintf(servo_frag, sizeof(servo_frag), "\"ready\":false,\"mode\":\"idle\",\"ids_online\":[1,2]");
+  }
 
   return snprintf(
       buf, buf_sz,
@@ -2526,12 +2542,13 @@ static int app_status_json(char *buf, size_t buf_sz) {
       "\"volume\":%d,\"firmware\":\"%s\",\"sta_connected\":%s,"
       "\"ip\":\"%s\",\"mdns_host\":\"%s.local\","
       "\"face_track\":{\"enabled\":%s,\"detector_ready\":%s,"
-      "\"face_found\":%s}}",
+      "\"face_found\":%s},"
+      "\"servo\":{%s}}",
       s_device_name, s_device_id, s_sta_ssid, nino_audio_get_volume_percent(),
       fw_version, s_sta_connected ? "true" : "false", sta_ip, mdns_host,
       face_track.enabled ? "true" : "false",
       face_track.detector_ready ? "true" : "false",
-      face_track.face_found ? "true" : "false");
+      face_track.face_found ? "true" : "false", servo_frag);
 }
 
 int wifi_config_status_json(char *buf, size_t buf_sz) {
@@ -2657,7 +2674,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
                            HTTPD_RESP_USE_STRLEN);
   }
 
-  char body[512];
+  char body[640];
   int n = app_status_json(body, sizeof(body));
   if (n < 0 || n >= (int)sizeof(body)) {
     return httpd_resp_send_500(req);
@@ -2670,7 +2687,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
 
 #if CONFIG_HTTPD_WS_SUPPORT
 static esp_err_t status_ws_send(httpd_req_t *req) {
-  char body[512];
+  char body[640];
   int n = app_status_json(body, sizeof(body));
   if (n < 0 || n >= (int)sizeof(body)) {
     return ESP_FAIL;
@@ -3411,7 +3428,7 @@ static void start_http_server(void) {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = HTTP_SERVER_PORT;
   config.stack_size = 8192;
-  config.max_uri_handlers = 24;
+  config.max_uri_handlers = 40;
   config.max_open_sockets = 7; /* ESP-IDF max on this target (httpd reserves 3 internally) */
   config.lru_purge_enable = true;
   config.recv_wait_timeout = 45;
@@ -3577,6 +3594,7 @@ static void start_http_server(void) {
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &snapshot_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &play_wav_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &servo_360_uri));
+  ESP_ERROR_CHECK(nino_servo_recplay_register_http(s_http_server));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &eye_expression_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &demo_uri));
   ESP_ERROR_CHECK(
@@ -3903,6 +3921,7 @@ void app_main(void) {
   s_frame_queue = xQueueCreate(UVC_FRAME_QUEUE_LEN, sizeof(uvc_host_frame_t *));
   assert(s_frame_queue != NULL);
   nino_face_tracker_init();
+  nino_servo_recplay_init();
 
   /* Wi-Fi init brings Hosted SDIO transport up. BLE must start AFTER that —
    * starting earlier races slave reset / SDIO and reboots the host. */

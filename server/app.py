@@ -37,7 +37,11 @@ from face_registration_service import capture_face_samples, configure_face_regis
 from face_service import FaceService
 from memory_service import configure_from_environ as configure_memory_from_environ
 from memory_service import get_memory_service, normalize_database_url
-from esp_playback import ensure_esp_play_wav_url_configured, esp_play_wav_url
+from esp_playback import (
+    device_base_url,
+    ensure_esp_play_wav_url_configured,
+    esp_play_wav_url,
+)
 from emotion_service import EmotionService
 from tts_service import (
     TTSService,
@@ -400,6 +404,80 @@ def index(request: Request):
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     response.headers["Pragma"] = "no-cache"
     return response
+
+
+@app.get("/actions")
+def actions_page(request: Request):
+    device_id = resolve_device_id(request.query_params.get("device_id"))
+    response = templates.TemplateResponse(
+        request,
+        "actions.html",
+        {
+            "device_id": device_id,
+            "devices": registry.status().get("devices", []),
+        },
+    )
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
+def _servo_bot_base(device_id: str | None) -> str:
+    base = device_base_url(device_id)
+    if not base:
+        raise HTTPException(
+            status_code=503,
+            detail="No bot base URL (set devices.json or ESP_PLAY_WAV_URL)",
+        )
+    return base.rstrip("/")
+
+
+def _servo_forward(method: str, path: str, device_id: str | None, payload: dict | None = None) -> dict:
+    import requests
+
+    base = _servo_bot_base(device_id)
+    url = f"{base}{path}"
+    try:
+        if method == "GET":
+            resp = requests.get(url, timeout=5.0)
+        else:
+            resp = requests.post(url, json=payload or {}, timeout=8.0)
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Bot unreachable: {exc}") from exc
+
+    try:
+        data = resp.json()
+    except ValueError:
+        data = {"ok": False, "error": "invalid_json", "raw": resp.text[:200]}
+    if not resp.ok:
+        detail = data.get("error") if isinstance(data, dict) else resp.text
+        raise HTTPException(status_code=resp.status_code, detail=detail or "bot_error")
+    if isinstance(data, dict):
+        data["_base_url"] = base
+    return data
+
+
+@app.get("/api/servo/position")
+def api_servo_position(device_id: str | None = None) -> dict:
+    return _servo_forward("GET", "/servo/position", resolve_device_id(device_id))
+
+
+@app.post("/api/servo/record")
+async def api_servo_record(request: Request, device_id: str | None = None) -> dict:
+    body = await request.json()
+    return _servo_forward("POST", "/servo/record", resolve_device_id(device_id), body)
+
+
+@app.post("/api/servo/goal")
+async def api_servo_goal(request: Request, device_id: str | None = None) -> dict:
+    body = await request.json()
+    return _servo_forward("POST", "/servo/goal", resolve_device_id(device_id), body)
+
+
+@app.post("/api/servo/play")
+async def api_servo_play(request: Request, device_id: str | None = None) -> dict:
+    body = await request.json()
+    return _servo_forward("POST", "/servo/play", resolve_device_id(device_id), body)
 
 
 @app.post("/api/camera")

@@ -1,0 +1,142 @@
+:root {
+  --danger: #9b1c1c;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.header-link {
+  color: #fff;
+  text-decoration: none;
+  font-weight: 600;
+  opacity: 0.9;
+}
+
+.header-link:hover {
+  opacity: 1;
+  text-decoration: underline;
+}
+
+.actions-page .name-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.actions-page .name-row input {
+  min-width: 180px;
+}
+
+.motor-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.btn-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: nowrap;
+  margin-top: 10px;
+}
+
+.btn-row.wrap {
+  flex-wrap: wrap;
+}
+
+button.danger {
+  background: var(--danger);
+  color: #fff;
+  border-color: #000;
+}
+
+.live-readout {
+  margin: 12px 0 0;
+  font-size: 0.95rem;
+}
+
+.frame-strip {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 12px 0;
+  min-height: 64px;
+}
+
+.frame-chip {
+  flex: 0 0 auto;
+  min-width: 72px;
+  border: var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  background: #fff;
+  cursor: pointer;
+  text-align: center;
+  font-size: 0.85rem;
+}
+
+.frame-chip.selected {
+  background: var(--maroon);
+  color: #fff;
+}
+
+.frame-chip .idx {
+  font-weight: 700;
+  display: block;
+}
+
+.frame-detail {
+  border-top: 1px solid #ddd;
+  padding-top: 12px;
+  margin-top: 4px;
+}
+
+.action-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.action-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  border: var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  margin-bottom: 10px;
+}
+
+.action-item .meta {
+  display: block;
+  font-size: 0.85rem;
+  opacity: 0.75;
+  margin-top: 4px;
+}
+
+.action-item .row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.hold-field {
+  max-width: 220px;
+  margin-top: 12px;
+}
