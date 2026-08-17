@@ -5,10 +5,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "mic_input.h"
-#include "voice_wake.h"
 
 static const char *TAG = "nino_cap";
 
@@ -31,7 +28,7 @@ static void write_le16(uint8_t *p, uint16_t v) {
 void nino_audio_capture_free(uint8_t *wav) { free(wav); }
 
 esp_err_t nino_audio_capture_wav(uint8_t **out_wav, size_t *out_len,
-                                   uint32_t duration_ms) {
+                                 uint32_t duration_ms) {
   if (out_wav == NULL || out_len == NULL) {
     return ESP_ERR_INVALID_ARG;
   }
@@ -41,7 +38,7 @@ esp_err_t nino_audio_capture_wav(uint8_t **out_wav, size_t *out_len,
     return ESP_ERR_INVALID_ARG;
   }
   if (!nino_mic_available()) {
-    ESP_LOGW(TAG, "No microphone source is available");
+    ESP_LOGW(TAG, "ES8311 AUX IN is not available");
     return ESP_ERR_INVALID_STATE;
   }
 
@@ -59,7 +56,6 @@ esp_err_t nino_audio_capture_wav(uint8_t **out_wav, size_t *out_len,
     goto out;
   }
 
-  nino_voice_wake_set_mic_capture_hold(true);
   nino_mic_flush();
 
   size_t got = 0;
@@ -68,7 +64,7 @@ esp_err_t nino_audio_capture_wav(uint8_t **out_wav, size_t *out_len,
     const int to_read = (chunk_samples > 512) ? 512 : (int)chunk_samples;
     esp_err_t rr = nino_mic_read((int16_t *)(pcm + got), to_read);
     if (rr != ESP_OK) {
-      ESP_LOGE(TAG, "%s microphone read failed: %s",
+      ESP_LOGE(TAG, "%s read failed: %s",
                nino_mic_source_name(nino_mic_preferred_source()),
                esp_err_to_name(rr));
       free(pcm);
@@ -118,6 +114,6 @@ esp_err_t nino_audio_capture_wav(uint8_t **out_wav, size_t *out_len,
   err = ESP_OK;
 
 out:
-  nino_voice_wake_set_mic_capture_hold(false);
+  nino_mic_close();
   return err;
 }

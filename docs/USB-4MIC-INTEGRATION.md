@@ -95,7 +95,8 @@ Always-on background tasks after boot:
    → nino_voice_assist_run_query_only()
 
 3. VAD (voice_assist.c)
-   mic_capture_hold + usb_mic_read(); 450 ms trailing silence → WAV
+   mic_capture_hold + usb_mic_read(); adaptive EOU trailing silence
+   (default 750 ms, raised on mid-utterance pauses, clamped 500–1500 ms) → WAV
 
 4. WebSocket (voice_ws_client.c) → reply WAV + JSON metadata
 
@@ -144,7 +145,9 @@ There are two distinct moments.
 
 ### Moment 1 — User stops talking (local capture, nothing received yet)
 
-VAD detects **450 ms trailing silence** (`VAD_TRAILING_SILENCE_MS` in `voice_assist.c`) and ends recording.
+VAD detects **adaptive trailing silence** (EOU in `voice_assist.c`: default
+**750 ms**, raised when the user pauses mid-utterance then continues, clamped
+**500–1500 ms** — see [ADVA_PLAN.md](ADVA_PLAN.md)) and ends recording.
 
 The board is **not receiving data from the PC** yet. It **already built** a local buffer from the USB mic:
 
@@ -300,7 +303,7 @@ After changing Kconfig defaults, run `idf.py fullclean` once if menuconfig symbo
 | `usb header mic: not ready` | Mic not enumerated — wiring / power |
 | `uac-host: Control Transfer Timeout` | UAC tried J18 camera mic — use `usb_mic_block_dev_addr()` on UVC connect |
 | `usb_host_install failed` | `idf.py fullclean` + rebuild (`espressif/usb` ^1.3.0) |
-| Weak VAD | Retune `VAD_MIN_*_ENERGY` in `voice_assist.c`; trailing silence = **450 ms** |
+| Weak VAD | Retune `VAD_MIN_*_ENERGY` in `voice_assist.c`; EOU default **750 ms** (adaptive 500–1500) |
 | Medical ack crash | VAD + wake must not `usb_mic_read()` concurrently — `mic_capture_hold` mutex |
 
 ### Dual USB host note
@@ -356,4 +359,4 @@ If you still see `UAC mic start failed` without `USB mic ready`, the header mic 
 ## Date
 
 Integrated: 2026-07-08  
-Doc updated: 2026-07-08 (wake-only AFE, beep latency, feed/fetch pause, VAD 450 ms, ReSpeaker ch0, camera block fix, medical ack mic lock)
+Doc updated: 2026-08-13 (adaptive EOU 750 ms default / 500–1500 clamp; prior: wake-only AFE, beep latency, feed/fetch pause, ReSpeaker ch0, camera block fix, medical ack mic lock)

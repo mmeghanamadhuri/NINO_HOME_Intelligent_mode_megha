@@ -358,7 +358,7 @@ sequenceDiagram
 
 **Wake word:** esp-sr WakeNet on `srmodels` partition; feed task on CPU1, fetch on CPU0.
 
-**VAD parameters:** 20 ms frames, 200 ms pre-roll, 700 ms trailing silence, 3 s listen timeout.
+**VAD parameters:** 20 ms frames, 200 ms pre-roll, adaptive EOU trailing silence (default 750 ms, clamp 500–1500 ms), 6 s listen timeout.
 
 **PC URL:** Stored in NVS; set via `voice connect <PC_IP> 8000`.
 

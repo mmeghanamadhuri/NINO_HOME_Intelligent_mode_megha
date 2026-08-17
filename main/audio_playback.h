@@ -48,6 +48,12 @@ esp_err_t nino_audio_warm_chime_path(uint32_t sample_rate_hz);
 void nino_audio_bus_lock(void);
 void nino_audio_bus_unlock(void);
 
+/**
+ * Close the speaker I2S stream. Caller must hold nino_audio_bus_lock().
+ * Required before opening the ES8311 ADC — mic and speaker share one duplex.
+ */
+void nino_audio_drop_speaker_stream_locked(void);
+
 /** Set speaker output volume percent (0-100). Persisted to NVS. */
 esp_err_t nino_audio_set_volume_percent(int volume_percent);
 

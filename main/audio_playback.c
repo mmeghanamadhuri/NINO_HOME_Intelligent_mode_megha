@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "voice_wake.h"
+#include "mic_input.h"
 
 #include "bsp/esp32_p4_function_ev_board.h"
 #include "esp_codec_dev.h"
@@ -63,10 +63,10 @@ static void wait_pcm_pipeline_done(uint32_t sample_rate_hz, size_t pcm_bytes,
 
 static void spk_stream_close_locked(void) {
   if (s_spk != NULL && s_spk_stream_open) {
-    esp_codec_dev_close(s_spk);
-    s_spk_stream_open = false;
-    s_spk_stream_rate_hz = 0;
+    (void)esp_codec_dev_close(s_spk);
   }
+  s_spk_stream_open = false;
+  s_spk_stream_rate_hz = 0;
 }
 
 static esp_err_t spk_stream_open_locked(uint32_t sample_rate_hz, bool leave_open) {
@@ -76,9 +76,9 @@ static esp_err_t spk_stream_open_locked(uint32_t sample_rate_hz, bool leave_open
   if (s_spk_stream_open && s_spk_stream_rate_hz == sample_rate_hz) {
     return ESP_OK;
   }
-  /* ES8311 mic + speaker share one duplex I2S. Drop the ADC before any
-   * rate change / reopen so wake_feed does not keep a stale mic handle. */
-  nino_voice_wake_drop_mic_locked();
+  /* ES8311 AUX ADC + speaker share one duplex I2S. Drop the ADC before any
+   * rate change / reopen so capture does not keep a stale mic handle. */
+  nino_mic_drop_es8311_locked();
   spk_stream_close_locked();
 
   esp_codec_dev_sample_info_t fs = {
@@ -95,6 +95,7 @@ static esp_err_t spk_stream_open_locked(uint32_t sample_rate_hz, bool leave_open
   }
   s_spk_stream_open = true;
   s_spk_stream_rate_hz = sample_rate_hz;
+  (void)esp_codec_dev_set_out_vol(s_spk, s_volume_percent);
   (void)leave_open;
   return ESP_OK;
 }
@@ -341,7 +342,7 @@ esp_err_t nino_audio_play_chime_pcm16_mono(const int16_t *samples, size_t sample
     }
   }
 
-  nino_voice_wake_drop_mic_locked();
+  nino_mic_drop_es8311_locked();
   xSemaphoreGive(s_mutex);
   return (cr == ESP_CODEC_DEV_OK) ? ESP_OK : ESP_FAIL;
 }
@@ -391,7 +392,7 @@ esp_err_t nino_audio_play_pcm16_mono(const int16_t *samples, size_t sample_count
   }
 
   spk_stream_close_locked();
-  nino_voice_wake_drop_mic_locked();
+  nino_mic_drop_es8311_locked();
   xSemaphoreGive(s_mutex);
   return (cr == ESP_CODEC_DEV_OK) ? ESP_OK : ESP_FAIL;
 }
@@ -494,6 +495,9 @@ esp_err_t nino_audio_play_decoded(const nino_decoded_wav_t *decoded, size_t *pcm
     xSemaphoreGive(s_mutex);
     return open_err;
   }
+  ESP_LOGI(TAG, "Playing %u bytes @ %u Hz vol=%d%%",
+           (unsigned)(decoded->num_bytes - offset),
+           (unsigned)decoded->sample_rate_hz, s_volume_percent);
 
   const size_t session_start = offset;
   const TickType_t write_started = xTaskGetTickCount();
@@ -526,7 +530,7 @@ esp_err_t nino_audio_play_decoded(const nino_decoded_wav_t *decoded, size_t *pcm
   }
 
   spk_stream_close_locked();
-  nino_voice_wake_drop_mic_locked();
+  nino_mic_drop_es8311_locked();
   xSemaphoreGive(s_mutex);
 
   if (cr != ESP_CODEC_DEV_OK) {
@@ -565,4 +569,11 @@ void nino_audio_bus_unlock(void) {
   if (s_mutex != NULL) {
     xSemaphoreGive(s_mutex);
   }
+}
+
+void nino_audio_drop_speaker_stream_locked(void) {
+  if (s_spk_stream_open) {
+    ESP_LOGI(TAG, "Closing speaker I2S so AUX ADC can take the duplex");
+  }
+  spk_stream_close_locked();
 }
