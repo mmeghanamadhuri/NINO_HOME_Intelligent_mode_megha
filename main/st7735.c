@@ -1,6 +1,7 @@
 #include "st7735.h"
 
 #include <string.h>
+#include "sdkconfig.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_check.h"
@@ -187,7 +188,9 @@ static void hardware_reset(void)
 
 static void backlight_on(void)
 {
+#if !CONFIG_NINO_ST7735_BL_HARDCODED_3V3
     gpio_set_level(TFT_PIN_BL, 1);
+#endif
 }
 
 static void init_panel(void)
@@ -271,8 +274,12 @@ static void init_panel(void)
 
 esp_err_t st7735_init(void)
 {
+    uint64_t gpio_mask = (1ULL << TFT_PIN_DC) | (1ULL << TFT_PIN_RST);
+#if !CONFIG_NINO_ST7735_BL_HARDCODED_3V3
+    gpio_mask |= (1ULL << TFT_PIN_BL);
+#endif
     gpio_config_t io = {
-        .pin_bit_mask = (1ULL << TFT_PIN_DC) | (1ULL << TFT_PIN_RST) | (1ULL << TFT_PIN_BL),
+        .pin_bit_mask = gpio_mask,
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -282,7 +289,9 @@ esp_err_t st7735_init(void)
 
     gpio_set_level(TFT_PIN_DC, 1);
     gpio_set_level(TFT_PIN_RST, 1);
+#if !CONFIG_NINO_ST7735_BL_HARDCODED_3V3
     gpio_set_level(TFT_PIN_BL, 0);
+#endif
 
     ESP_RETURN_ON_ERROR(init_spi_bus(), TAG, "spi init failed");
 
@@ -301,8 +310,13 @@ esp_err_t st7735_init(void)
     s_target = ST7735_TARGET_ALL;
     st7735_fill_screen(0x0000);
 
+#if CONFIG_NINO_ST7735_BL_HARDCODED_3V3
+    ESP_LOGI(TAG, "ST7735 ready: %d panel(s) %dx%d (BL hardwired 3.3 V, GPIO%d free for SDIO)",
+             TFT_COUNT, TFT_WIDTH, TFT_HEIGHT, TFT_PIN_BL);
+#else
     ESP_LOGI(TAG, "ST7735 ready: %d panel(s) %dx%d (BL GPIO%d)",
              TFT_COUNT, TFT_WIDTH, TFT_HEIGHT, TFT_PIN_BL);
+#endif
     return ESP_OK;
 }
 
