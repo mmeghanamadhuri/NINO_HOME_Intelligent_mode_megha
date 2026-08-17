@@ -190,7 +190,11 @@ dependencies:
       type: service
     version: 1.2.1
   espressif/esp_lvgl_port:
+<<<<<<< HEAD
     component_hash: cca194347416db5f7fbe53e3bf788266061032c6b094d0186e9c988d6e8ff218
+=======
+    component_hash: d3c020b45c3dfc0d1706a83b63a1c34a6eb444a6e935f9afff79f92b7b94dcef
+>>>>>>> b63091e (Fixed the reply path from Ptron Mic source to P4 speaker out)
     dependencies:
     - name: idf
       require: private
@@ -202,7 +206,11 @@ dependencies:
     source:
       registry_url: https://components.espressif.com/
       type: service
+<<<<<<< HEAD
     version: 2.8.0
+=======
+    version: 2.9.0
+>>>>>>> b63091e (Fixed the reply path from Ptron Mic source to P4 speaker out)
   espressif/esp_new_jpeg:
     component_hash: e1e7e6991193c41ed6c9fc386702aa7821433319e7aa9c3147cd3236310cd69c
     dependencies: []
@@ -361,6 +369,10 @@ direct_dependencies:
 - espressif/usb
 - espressif/usb_host_uvc
 - idf
+<<<<<<< HEAD
 manifest_hash: 314a9b96a21225cee02d5d3ccca605c58b9fe72a419441eed92c39f962b0f90e
+=======
+manifest_hash: a9b75c10f0b8d380bd22a1a57aff8e5c65e528de67f1d6ae61c39841dade5abe
+>>>>>>> b63091e (Fixed the reply path from Ptron Mic source to P4 speaker out)
 target: esp32p4
 version: 2.0.0

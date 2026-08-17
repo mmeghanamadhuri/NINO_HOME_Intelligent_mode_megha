@@ -2,13 +2,21 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "mic_input.h"
+<<<<<<< HEAD
 #include "audio_loopback.h"
+=======
+#include "bsp/esp32_p4_function_ev_board.h"
+>>>>>>> b63091e (Fixed the reply path from Ptron Mic source to P4 speaker out)
 
 static const char *TAG = "nino_cap";
 
@@ -59,7 +67,10 @@ esp_err_t nino_audio_capture_wav(uint8_t **out_wav, size_t *out_len,
     goto out;
   }
 
+<<<<<<< HEAD
   nino_audio_loopback_pause();
+=======
+>>>>>>> b63091e (Fixed the reply path from Ptron Mic source to P4 speaker out)
   nino_mic_flush();
 
   size_t got = 0;
@@ -118,7 +129,52 @@ esp_err_t nino_audio_capture_wav(uint8_t **out_wav, size_t *out_len,
   err = ESP_OK;
 
 out:
+<<<<<<< HEAD
   nino_mic_close();
   nino_audio_loopback_resume();
+=======
+>>>>>>> b63091e (Fixed the reply path from Ptron Mic source to P4 speaker out)
   return err;
+}
+
+esp_err_t nino_audio_capture_save_to_sd(const uint8_t *wav, size_t wav_len,
+                                        char *path, size_t path_size) {
+  if (wav == NULL || wav_len < 44 || path == NULL || path_size == 0) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  esp_err_t err = bsp_sdcard_mount();
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    ESP_LOGE(TAG, "SD card mount failed: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  const char *dir = BSP_SD_MOUNT_POINT "/recordings";
+  if (mkdir(dir, 0775) != 0 && errno != EEXIST) {
+    ESP_LOGE(TAG, "Cannot create %s (errno=%d)", dir, errno);
+    return ESP_FAIL;
+  }
+
+  static uint32_t sequence;
+  const uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
+  int n = snprintf(path, path_size, "%s/voice_%llu_%03u.wav", dir,
+                   (unsigned long long)now_ms, (unsigned)++sequence);
+  if (n < 0 || (size_t)n >= path_size) {
+    return ESP_ERR_INVALID_SIZE;
+  }
+
+  FILE *file = fopen(path, "wb");
+  if (file == NULL) {
+    ESP_LOGE(TAG, "Cannot open %s for writing (errno=%d)", path, errno);
+    return ESP_FAIL;
+  }
+  const size_t written = fwrite(wav, 1, wav_len, file);
+  const int close_result = fclose(file);
+  if (written != wav_len || close_result != 0) {
+    ESP_LOGE(TAG, "SD write failed for %s (%u/%u bytes)", path,
+             (unsigned)written, (unsigned)wav_len);
+    return ESP_FAIL;
+  }
+  ESP_LOGI(TAG, "Saved captured WAV: %s (%u bytes)", path, (unsigned)wav_len);
+  return ESP_OK;
 }

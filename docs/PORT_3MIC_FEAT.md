@@ -455,6 +455,7 @@ Follow **[ADVA_PLAN.md](ADVA_PLAN.md)** exactly:
 ## 10. Suggested default roadmap for this repo
 
 
+<<<<<<< HEAD
 | Order | Work                          | Effort       | Depends on                              |
 | ----- | ----------------------------- | ------------ | --------------------------------------- |
 | 0     | Measure pause / noise / echo  | Hours        | —                                       |
@@ -464,6 +465,17 @@ Follow **[ADVA_PLAN.md](ADVA_PLAN.md)** exactly:
 | 4     | AEC if echo proven            | Large        | Ref path + delay                        |
 | 5     | Dual-mic SE                   | Large        | USB 2-ch + AFE layout                   |
 | 6     | VADNet hybrid                 | Medium       | EOU already done                        |
+=======
+| Order | Work                          | Effort       | Depends on                   |
+| ----- | ----------------------------- | ------------ | ---------------------------- |
+| 0     | Measure pause / noise / echo  | Hours        | —                            |
+| **2** | **Option A Adaptive EOU**     | Small        | **Done** — [ADVA_PLAN.md](ADVA_PLAN.md) |
+| 1     | **NS** on wake and/or capture | Small–medium | Next when noise hurts        |
+| 3     | AGC optional                  | Small        | Phase 1 stable               |
+| 4     | AEC if echo proven            | Large        | Ref path + delay             |
+| 5     | Dual-mic SE                   | Large        | USB 2-ch + AFE layout        |
+| 6     | VADNet hybrid                 | Medium       | EOU already done             |
+>>>>>>> b63091e (Fixed the reply path from Ptron Mic source to P4 speaker out)
 
 
 **Shipped first:** Option A (`voice_assist.c`). **Next when needed:** NS, then AEC / SE / AGC.
@@ -487,8 +499,11 @@ Follow **[ADVA_PLAN.md](ADVA_PLAN.md)** exactly:
 
 ---
 
+<<<<<<< HEAD
 
 
+=======
+>>>>>>> b63091e (Fixed the reply path from Ptron Mic source to P4 speaker out)
 ## 12. CPU / RAM guardrails
 
 Before enabling each block:

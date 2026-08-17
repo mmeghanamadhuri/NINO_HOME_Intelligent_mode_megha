@@ -585,12 +585,46 @@ static void voice_ws_job_task(void *pv) {
     vTaskDelete(NULL);
     return;
   }
+<<<<<<< HEAD
   const bool console_start = job->console_start;
   (void)send_wav_to_server(job->uri, job->cap, job->cap_len, job->medical_ack_session);
   free(job);
   nino_audio_loopback_resume();
   if (console_start) {
     s_console_start_busy = false;
+=======
+
+  uint8_t *resp = NULL;
+  size_t resp_len = 0;
+  bool prompt_after = false;
+  char eye_expr[16] = {0};
+  const int64_t t_ws = esp_timer_get_time();
+  esp_err_t e = nino_voice_ws_exchange(job->uri, job->cap, job->cap_len, &resp, &resp_len, 300000,
+                                       &prompt_after, eye_expr, sizeof(eye_expr));
+  ESP_LOGI(TAG, "latency: WS round-trip %" PRId64 " ms", (esp_timer_get_time() - t_ws) / 1000LL);
+  nino_audio_capture_free(job->cap);
+  (void)job->medical_ack_session;
+  free(job);
+
+  if (e != ESP_OK || resp == NULL || resp_len == 0) {
+    ESP_LOGE(TAG, "WS exchange failed: %s", esp_err_to_name(e));
+    free(resp);
+    nino_eye_idle();
+    vTaskDelete(NULL);
+    return;
+  }
+
+  nino_eye_state_t eye_state = nino_eye_state_from_name(eye_expr);
+  if (eye_state < NINO_EYE_STATE_COUNT) {
+    ESP_LOGI(TAG, "Reply eye_expression=%s -> state %d", eye_expr, (int)eye_state);
+  }
+  /* If a prompt-ack listen follows, skip the done beep — that listen already
+   * plays one chime when it opens the mic. Avoids the double-chime. */
+  const bool play_done_chime = !prompt_after;
+  nino_main_queue_audio_wav(resp, resp_len, play_done_chime, prompt_after, eye_state);
+  if (prompt_after) {
+    ESP_LOGI(TAG, "Conversation continues after reply");
+>>>>>>> b63091e (Fixed the reply path from Ptron Mic source to P4 speaker out)
   }
   vTaskDelete(NULL);
 }
@@ -750,6 +784,7 @@ static esp_err_t run_ws_and_queue(int max_seconds, bool medical_ack_session) {
   if (s_query_mu != NULL) {
     xSemaphoreTake(s_query_mu, portMAX_DELAY);
   }
+<<<<<<< HEAD
   esp_err_t e = capture_and_save_to_sd();
   if (s_query_mu != NULL) {
     xSemaphoreGive(s_query_mu);
@@ -759,6 +794,37 @@ static esp_err_t run_ws_and_queue(int max_seconds, bool medical_ack_session) {
     nino_eye_idle();
   }
   return e;
+=======
+  xSemaphoreTake(s_ws_uri_mutex, portMAX_DELAY);
+  strncpy(uri, s_ws_uri, sizeof(uri) - 1);
+  uri[sizeof(uri) - 1] = '\0';
+  xSemaphoreGive(s_ws_uri_mutex);
+
+  if (uri[0] == '\0') {
+    ESP_LOGW(TAG, "WS URI not set");
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  const int64_t t_query = esp_timer_get_time();
+
+  uint8_t *cap = NULL;
+  size_t cap_len = 0;
+  (void)max_seconds;
+  esp_err_t e = nino_audio_capture_wav(&cap, &cap_len, 5000);
+  ESP_LOGI(TAG, "latency: fixed 5 s capture %" PRId64 " ms", (esp_timer_get_time() - t_query) / 1000LL);
+  if (e != ESP_OK) {
+    ESP_LOGE(TAG, "Microphone capture failed: %s", esp_err_to_name(e));
+    nino_eye_idle();
+    return e;
+  }
+
+  char sd_path[128];
+  e = nino_audio_capture_save_to_sd(cap, cap_len, sd_path, sizeof(sd_path));
+  if (e != ESP_OK) {
+    ESP_LOGW(TAG, "WAV was not saved to SD; sending it to server anyway: %s", esp_err_to_name(e));
+  }
+  return spawn_voice_ws_job(cap, cap_len, uri, medical_ack_session);
+>>>>>>> b63091e (Fixed the reply path from Ptron Mic source to P4 speaker out)
 }
 
 esp_err_t nino_voice_assist_run_query_only(void) {
@@ -766,7 +832,15 @@ esp_err_t nino_voice_assist_run_query_only(void) {
 }
 
 void nino_voice_assist_prompt_medical_ack(void) {
+<<<<<<< HEAD
   ESP_LOGD(TAG, "Ignoring server mic prompt (fixed 5 s / 20 s schedule only)");
+=======
+  BaseType_t ok =
+      xTaskCreate(prompt_listen_task, "prompt_listen", MED_ACK_TASK_STACK, NULL, 3, NULL);
+  if (ok != pdPASS) {
+    ESP_LOGW(TAG, "Could not start conversation follow-up listen");
+  }
+>>>>>>> b63091e (Fixed the reply path from Ptron Mic source to P4 speaker out)
 }
 
 bool nino_voice_assist_has_ws_uri(void) {

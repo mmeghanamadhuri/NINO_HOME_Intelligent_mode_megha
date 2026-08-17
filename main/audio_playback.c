@@ -6,7 +6,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+<<<<<<< HEAD
 #include "audio_loopback.h"
+=======
+>>>>>>> b63091e (Fixed the reply path from Ptron Mic source to P4 speaker out)
 #include "mic_input.h"
 
 #include "bsp/esp32_p4_function_ev_board.h"
@@ -78,7 +81,11 @@ static esp_err_t spk_stream_open_locked(uint32_t sample_rate_hz, bool leave_open
     return ESP_OK;
   }
   /* ES8311 mic + speaker share one duplex I2S. Drop the ADC before any
+<<<<<<< HEAD
    * rate change / reopen so loopback does not keep a stale mic handle. */
+=======
+   * rate change / reopen so wake_feed does not keep a stale mic handle. */
+>>>>>>> b63091e (Fixed the reply path from Ptron Mic source to P4 speaker out)
   nino_mic_drop_es8311_locked();
   spk_stream_close_locked();
 

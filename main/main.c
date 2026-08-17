@@ -55,7 +55,6 @@
 #include "servo_dxl.h"
 #include "servo_motion.h"
 #include "servo_recplay.h"
-#include "touch_sensor.h"
 #include "push_buttons.h"
 #include "voice_assist.h"
 #include "wifi_config.h"
@@ -95,6 +94,12 @@ static bool s_audio_queue_ready = false;
 static volatile bool s_wifi_connected_chime_task_running = false;
 static bool s_boot_unprovisioned = false;
 static volatile bool s_provisioned_welcome_scheduled = false;
+<<<<<<< HEAD
+=======
+static bool s_boot_greeting_done = false;
+/* Legacy wake helper remains compiled but is no longer scheduled. */
+static bool s_voice_wake_started;
+>>>>>>> b63091e (Fixed the reply path from Ptron Mic source to P4 speaker out)
 static bool s_mdns_started = false;
 
 #define USB_LIB_TASK_STACK_SIZE 4096
@@ -2042,6 +2047,7 @@ static esp_err_t play_wav_handler(httpd_req_t *req) {
     ESP_LOGI(TAG, "Ignoring X-Nino-Prompt-Ack from server (fixed mic schedule)");
   }
 
+<<<<<<< HEAD
   bool prompt_ack_chime = true;
   (void)prompt_ack_chime;
   char chime_hdr[4] = {0};
@@ -2050,6 +2056,8 @@ static esp_err_t play_wav_handler(httpd_req_t *req) {
     /* ignored with prompt_ack */
   }
 
+=======
+>>>>>>> b63091e (Fixed the reply path from Ptron Mic source to P4 speaker out)
   char ws_hdr[160] = {0};
   if (httpd_req_get_hdr_value_str(req, "X-Nino-Voice-Ws-Url", ws_hdr,
                                   sizeof(ws_hdr)) == ESP_OK) {
@@ -2949,6 +2957,23 @@ static void apply_voice_ws_url_from_server(const char *uri) {
   ESP_LOGI(TAG, "Voice WS URL from server: %s", s_voice_ws_url);
 }
 
+static int cmd_start(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+  if (!nino_voice_assist_has_ws_uri()) {
+    printf("Voice server not set. Run: voice connect <PC_IP> [port]\n");
+    return 1;
+  }
+  printf("Recording from the external ES8311 line input for 5 seconds...\n");
+  esp_err_t err = nino_voice_assist_run_query_only();
+  if (err != ESP_OK) {
+    printf("Start failed: %s\n", esp_err_to_name(err));
+    return 1;
+  }
+  printf("WAV saved to SD and sent to the server; one reply will play when received.\n");
+  return 0;
+}
+
 static int cmd_voice(int argc, char **argv) {
   if (argc >= 2 && strcmp(argv[1], "connect") == 0) {
     if (argc < 3) {
@@ -3031,8 +3056,12 @@ static int cmd_voice(int argc, char **argv) {
     }
     return 0;
   }
+<<<<<<< HEAD
   printf("Usage: voice connect <ip> [port] | voice url [<ws-uri>] | voice status | voice start\n"
          "  Or type: start\n");
+=======
+  printf("Usage: voice connect <ip> [port] | voice url [<ws-uri>] | voice status\n");
+>>>>>>> b63091e (Fixed the reply path from Ptron Mic source to P4 speaker out)
   return 0;
 }
 
@@ -3111,12 +3140,25 @@ static void start_cli_register(void) {
 static void voice_cli_register(void) {
   const esp_console_cmd_t cmd = {
       .command = "voice",
+<<<<<<< HEAD
       .help = "voice connect <PC_IP> [port] | voice status | voice start",
+=======
+      .help = "voice connect <PC_IP> [port] | voice status",
+>>>>>>> b63091e (Fixed the reply path from Ptron Mic source to P4 speaker out)
       .hint = NULL,
       .func = &cmd_voice,
       .argtable = NULL,
   };
   ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+
+  const esp_console_cmd_t start_cmd = {
+      .command = "start",
+      .help = "record 5 s, save to SD, send once to server, and play one reply",
+      .hint = NULL,
+      .func = &cmd_start,
+      .argtable = NULL,
+  };
+  ESP_ERROR_CHECK(esp_console_cmd_register(&start_cmd));
 }
 
 static void device_cli_register(void) {
@@ -3946,9 +3988,6 @@ void app_main(void) {
      * is coming up, without waiting for USB/camera startup. */
     (void)play_go_app_clip();
   }
-  if (nino_touch_sensor_start() != ESP_OK) {
-    ESP_LOGW(TAG, "QT2120 touch sensor task not started");
-  }
   if (nino_push_buttons_start() != ESP_OK) {
     ESP_LOGW(TAG, "GPIO push button task not started");
   }
@@ -4007,6 +4046,10 @@ void app_main(void) {
   };
   ESP_ERROR_CHECK(uvc_host_install(&uvc_driver_config));
 
+<<<<<<< HEAD
+=======
+  /* If no camera plugs in, still start wake after USB/SDIO settle (HP WDT on boot). */
+>>>>>>> b63091e (Fixed the reply path from Ptron Mic source to P4 speaker out)
   ESP_LOGI(TAG, "J18: powered USB hub -> UVC camera + FTDI U2D2 (Dynamixel)");
   ESP_LOGI(TAG, "Audio: onboard ES8311 mic → speaker loopback");
   ESP_LOGI(

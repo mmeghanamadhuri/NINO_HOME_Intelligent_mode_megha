@@ -30,6 +30,7 @@ esp_err_t nino_voice_preload_wake_chime(void);
 /** Same embedded beep.wav — played after voice reply playback. */
 esp_err_t nino_voice_play_done_chime(void);
 
+<<<<<<< HEAD
 /**
  * Energy VAD + adaptive end-of-utterance: wait for speech, record until
  * adaptive trailing silence (or max_seconds). Mid-utterance pauses raise the
@@ -47,6 +48,11 @@ bool nino_voice_assist_has_ws_uri(void);
 esp_err_t nino_voice_assist_console_start(void);
 
 /** After wake word: VAD + WebSocket + queue TTS reply (no chime here). */
+=======
+bool nino_voice_assist_has_ws_uri(void);
+
+/** Capture exactly five seconds, save it to microSD, send it to the voice WS, and queue the reply. */
+>>>>>>> b63091e (Fixed the reply path from Ptron Mic source to P4 speaker out)
 esp_err_t nino_voice_assist_run_query_only(void);
 
 /**
