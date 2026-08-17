@@ -23,9 +23,9 @@ dependencies:
     version: "*"
     rules:
       - if: "target in [esp32p4]"
-  # 2.9.0 renamed DSI DPI vsync to on_frame_buf_complete; IDF 5.5.2 still has on_refresh_done.
+  # 2.9.0 renamed DPI vsync to on_frame_buf_complete; IDF 5.5.2 still has on_refresh_done.
   espressif/esp_lvgl_port:
-    version: "2.8.0"
+    version: "~2.8.0"
   espressif/mdns:
     version: "*"
   idf: ">=5.5"

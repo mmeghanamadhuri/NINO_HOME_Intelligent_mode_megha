@@ -47,7 +47,6 @@
 #include "camera_orientation.h"
 #include "face_detect.hpp"
 #include "face_tracker.h"
-#include "audio_loopback.h"
 #include "mic_input.h"
 #include "nino_eye.h"
 #include "nino_display.h"
@@ -94,12 +93,7 @@ static bool s_audio_queue_ready = false;
 static volatile bool s_wifi_connected_chime_task_running = false;
 static bool s_boot_unprovisioned = false;
 static volatile bool s_provisioned_welcome_scheduled = false;
-<<<<<<< HEAD
-=======
 static bool s_boot_greeting_done = false;
-/* Legacy wake helper remains compiled but is no longer scheduled. */
-static bool s_voice_wake_started;
->>>>>>> b63091e (Fixed the reply path from Ptron Mic source to P4 speaker out)
 static bool s_mdns_started = false;
 
 #define USB_LIB_TASK_STACK_SIZE 4096
@@ -368,12 +362,20 @@ static bool wifi_disconnect_is_connect_failure(uint8_t reason) {
  *  - Provisioned and connected -> greet with Hello-home after the WIFI.wav clip.
  *    Falls back to greeting anyway if Wi-Fi never connects within the timeout,
  *    unless we already played the "unable to connect" prompt. */
-static void finish_boot_greeting(void) {
+static void finish_boot_greeting_and_enable_wake(void) {
   nino_audio_queue_wait_idle(45000);
-  if (nino_audio_loopback_start() != ESP_OK) {
-    ESP_LOGW(TAG, "Onboard mic loopback not started");
+  if (nino_voice_preload_wake_chime() == ESP_OK) {
+    ESP_LOGI(TAG, "Speaker path ready after boot greeting");
   } else {
-    ESP_LOGI(TAG, "Onboard ES8311 loopback on — speak into the mic");
+    ESP_LOGW(TAG, "Speaker warm after boot greeting failed");
+  }
+  s_boot_greeting_done = true;
+  if (s_voice_ws_url[0] == '\0') {
+    ESP_LOGW(TAG,
+             "Voice PC URL not set — serial: voice connect <YOUR_PC_LAN_IP> 8000 "
+             "then start [seconds]");
+  } else {
+    ESP_LOGI(TAG, "Voice assistant URL: %s — type start to talk", s_voice_ws_url);
   }
 }
 
@@ -381,7 +383,7 @@ static void hello_home_task(void *arg) {
   (void)arg;
   if (s_sta_ssid[0] == '\0') {
     /* NiNO-Home_Wifi.wav is queued immediately after audio setup during boot. */
-    finish_boot_greeting();
+    finish_boot_greeting_and_enable_wake();
     vTaskDelete(NULL);
     return;
   }
@@ -396,7 +398,7 @@ static void hello_home_task(void *arg) {
   if (s_sta_connected) {
     play_hello_home_clip();
   }
-  finish_boot_greeting();
+  finish_boot_greeting_and_enable_wake();
   vTaskDelete(NULL);
 }
 
@@ -509,7 +511,6 @@ static void mdns_start_service(void) {
   }
 }
 #endif
-
 
 static void copy_cstr_field(uint8_t *dst, size_t dst_size, const char *src) {
   if (dst == NULL || dst_size == 0 || src == NULL) {
@@ -1301,8 +1302,8 @@ static void console_init(void) {
 
   esp_console_register_help_command();
   wifi_cli_register();
-  voice_cli_register();
   start_cli_register();
+  voice_cli_register();
   device_cli_register();
   servo_cli_register();
   track_cli_register();
@@ -2039,29 +2040,27 @@ static esp_err_t play_wav_handler(httpd_req_t *req) {
   }
 
   bool prompt_ack = false;
-  (void)prompt_ack;
   char ack_hdr[4] = {0};
   if (httpd_req_get_hdr_value_str(req, "X-Nino-Prompt-Ack", ack_hdr,
-                                  sizeof(ack_hdr)) == ESP_OK &&
-      ack_hdr[0] == '1') {
-    ESP_LOGI(TAG, "Ignoring X-Nino-Prompt-Ack from server (fixed mic schedule)");
+                                  sizeof(ack_hdr)) == ESP_OK) {
+    prompt_ack = (ack_hdr[0] == '1');
   }
 
-<<<<<<< HEAD
   bool prompt_ack_chime = true;
-  (void)prompt_ack_chime;
   char chime_hdr[4] = {0};
   if (httpd_req_get_hdr_value_str(req, "X-Nino-Prompt-Ack-Chime", chime_hdr,
                                   sizeof(chime_hdr)) == ESP_OK) {
-    /* ignored with prompt_ack */
+    prompt_ack_chime = (chime_hdr[0] != '0');
   }
 
-=======
->>>>>>> b63091e (Fixed the reply path from Ptron Mic source to P4 speaker out)
   char ws_hdr[160] = {0};
   if (httpd_req_get_hdr_value_str(req, "X-Nino-Voice-Ws-Url", ws_hdr,
                                   sizeof(ws_hdr)) == ESP_OK) {
     apply_voice_ws_url_from_server(ws_hdr);
+  }
+
+  if (prompt_ack) {
+    nino_voice_assist_set_next_prompt_ack_chime(prompt_ack_chime);
   }
 
   /* Optional emotion tag from server (e.g. happy/sad/surprised). */
@@ -2957,28 +2956,11 @@ static void apply_voice_ws_url_from_server(const char *uri) {
   ESP_LOGI(TAG, "Voice WS URL from server: %s", s_voice_ws_url);
 }
 
-static int cmd_start(int argc, char **argv) {
-  (void)argc;
-  (void)argv;
-  if (!nino_voice_assist_has_ws_uri()) {
-    printf("Voice server not set. Run: voice connect <PC_IP> [port]\n");
-    return 1;
-  }
-  printf("Recording from the external ES8311 line input for 5 seconds...\n");
-  esp_err_t err = nino_voice_assist_run_query_only();
-  if (err != ESP_OK) {
-    printf("Start failed: %s\n", esp_err_to_name(err));
-    return 1;
-  }
-  printf("WAV saved to SD and sent to the server; one reply will play when received.\n");
-  return 0;
-}
-
 static int cmd_voice(int argc, char **argv) {
   if (argc >= 2 && strcmp(argv[1], "connect") == 0) {
     if (argc < 3) {
       printf("Usage: voice connect <IPv4> [port]   (default port 8000)\n"
-             "  Saves ws://<ip>:<port>/voice-query?device_id=...\n");
+             "  Saves ws://<ip>:<port>/voice-query?device_id=... then use: start [seconds]\n");
       return 0;
     }
     int port = 8000;
@@ -3008,6 +2990,7 @@ static int cmd_voice(int argc, char **argv) {
     nino_voice_assist_set_ws_uri(s_voice_ws_url);
     schedule_wifi_network_report();
     printf("Voice assistant: %s\n", s_voice_ws_url);
+    printf("Type start to record AUX IN and send to the server\n");
     return 0;
   }
   if (argc >= 2 && strcmp(argv[1], "url") == 0) {
@@ -3032,36 +3015,14 @@ static int cmd_voice(int argc, char **argv) {
     return 0;
   }
   if (argc >= 2 && strcmp(argv[1], "status") == 0) {
-    printf("voice mic: %s (loopback %s)\n",
-           nino_mic_source_name(nino_mic_preferred_source()),
-           nino_audio_loopback_is_running() ? "on" : "paused");
+    printf("voice mic: %s\n",
+           nino_mic_source_name(nino_mic_preferred_source()));
     printf("device_id: %s\n", s_device_id);
     printf("voice url: \"%s\"\n", s_voice_ws_url[0] ? s_voice_ws_url : "(not set)");
-    printf("Loopback on by default. Type 'start': 2 s delay, record/save/send 5 s.\n");
+    printf("Tip: voice connect <PC_LAN_IP> 8000 then start [seconds]\n");
     return 0;
   }
-  if (argc >= 2 && strcmp(argv[1], "start") == 0) {
-    esp_err_t e = nino_voice_assist_console_start();
-    if (e == ESP_ERR_INVALID_STATE) {
-      if (!nino_voice_assist_has_ws_uri()) {
-        printf("Set server first: voice connect <PC_IP> [8000]\n");
-      } else {
-        printf("Already recording/uploading — wait for server reply\n");
-      }
-      return 1;
-    }
-    if (e != ESP_OK) {
-      printf("voice start failed: %s\n", esp_err_to_name(e));
-      return 1;
-    }
-    return 0;
-  }
-<<<<<<< HEAD
-  printf("Usage: voice connect <ip> [port] | voice url [<ws-uri>] | voice status | voice start\n"
-         "  Or type: start\n");
-=======
   printf("Usage: voice connect <ip> [port] | voice url [<ws-uri>] | voice status\n");
->>>>>>> b63091e (Fixed the reply path from Ptron Mic source to P4 speaker out)
   return 0;
 }
 
@@ -3107,29 +3068,33 @@ static int cmd_device(int argc, char **argv) {
 }
 
 static int cmd_start(int argc, char **argv) {
-  (void)argc;
-  (void)argv;
-
-  esp_err_t e = nino_voice_assist_console_start();
-  if (e == ESP_ERR_INVALID_STATE) {
-    if (!nino_voice_assist_has_ws_uri()) {
-      printf("Set server first: voice connect <PC_IP> [8000]\n");
-    } else {
-      printf("Already recording/uploading — wait for server reply\n");
+  uint32_t seconds = 5;
+  if (argc >= 2) {
+    int s = atoi(argv[1]);
+    if (s < 1 || s > 10) {
+      printf("Usage: start [seconds]   (1-10, default 5)\n");
+      return 1;
     }
+    seconds = (uint32_t)s;
+  }
+  if (!nino_voice_assist_has_ws_uri()) {
+    printf("Voice PC not linked. First: voice connect <PC_LAN_IP> 8000\n");
     return 1;
   }
-  if (e != ESP_OK) {
-    printf("start failed: %s\n", esp_err_to_name(e));
+  printf("Recording %u s from ES8311 AUX IN...\n", (unsigned)seconds);
+  esp_err_t err = nino_voice_assist_run_query(seconds * 1000U);
+  if (err != ESP_OK) {
+    printf("start failed: %s\n", esp_err_to_name(err));
     return 1;
   }
+  printf("Sent WAV to server — reply will play on the speaker\n");
   return 0;
 }
 
 static void start_cli_register(void) {
   const esp_console_cmd_t cmd = {
       .command = "start",
-      .help = "2 s delay, record 5 s, save to SD, send to server, play reply",
+      .help = "Record AUX IN (default 5 s) and send WAV to the PC voice server",
       .hint = NULL,
       .func = &cmd_start,
       .argtable = NULL,
@@ -3140,25 +3105,12 @@ static void start_cli_register(void) {
 static void voice_cli_register(void) {
   const esp_console_cmd_t cmd = {
       .command = "voice",
-<<<<<<< HEAD
-      .help = "voice connect <PC_IP> [port] | voice status | voice start",
-=======
       .help = "voice connect <PC_IP> [port] | voice status",
->>>>>>> b63091e (Fixed the reply path from Ptron Mic source to P4 speaker out)
       .hint = NULL,
       .func = &cmd_voice,
       .argtable = NULL,
   };
   ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
-
-  const esp_console_cmd_t start_cmd = {
-      .command = "start",
-      .help = "record 5 s, save to SD, send once to server, and play one reply",
-      .hint = NULL,
-      .func = &cmd_start,
-      .argtable = NULL,
-  };
-  ESP_ERROR_CHECK(esp_console_cmd_register(&start_cmd));
 }
 
 static void device_cli_register(void) {
@@ -3980,6 +3932,9 @@ void app_main(void) {
              "Speaker (BSP audio) init failed; POST /play_wav may not work");
   }
   (void)nino_audio_load_saved_volume();
+  if (nino_voice_preload_wake_chime() != ESP_OK) {
+    ESP_LOGW(TAG, "Wake chime preload failed — first beep may be slower");
+  }
   ESP_ERROR_CHECK(nino_audio_queue_start());
   s_audio_queue_ready = true;
   schedule_wifi_connected_chime();
@@ -4046,12 +4001,8 @@ void app_main(void) {
   };
   ESP_ERROR_CHECK(uvc_host_install(&uvc_driver_config));
 
-<<<<<<< HEAD
-=======
-  /* If no camera plugs in, still start wake after USB/SDIO settle (HP WDT on boot). */
->>>>>>> b63091e (Fixed the reply path from Ptron Mic source to P4 speaker out)
   ESP_LOGI(TAG, "J18: powered USB hub -> UVC camera + FTDI U2D2 (Dynamixel)");
-  ESP_LOGI(TAG, "Audio: onboard ES8311 mic → speaker loopback");
+  ESP_LOGI(TAG, "Mic: ES8311 AUX IN — type start after voice connect");
   ESP_LOGI(
       TAG,
       "Open / in a browser on your camera's IP address (check 'wifi status')");

@@ -56,6 +56,12 @@ esp_err_t nino_audio_write_pcm16_mono_locked(const int16_t *samples, size_t samp
 void nino_audio_bus_lock(void);
 void nino_audio_bus_unlock(void);
 
+/**
+ * Close the speaker I2S stream. Caller must hold nino_audio_bus_lock().
+ * Required before opening the ES8311 ADC — mic and speaker share one duplex.
+ */
+void nino_audio_drop_speaker_stream_locked(void);
+
 /** Set speaker output volume percent (0-100). Persisted to NVS. */
 esp_err_t nino_audio_set_volume_percent(int volume_percent);
 

@@ -19,7 +19,7 @@ static const char *TAG = "push_btn";
  *    triple press = erase Wi-Fi + BLE setup
  *
  * Do NOT use:
- *  - GPIO7 / GPIO8  — BSP I2C SDA/SCL (ES8311 + QT2120). Pressing GPIO7
+ *  - GPIO7 / GPIO8  — BSP I2C SDA/SCL (ES8311). Pressing GPIO7
  *    shorts SDA and kills the speaker codec (I2C_If Fail to … dev 30).
  *  - GPIO53         — BSP_POWER_AMP_IO (speaker amp enable).
  *  - GPIO9–13       — I2S to the codec.
