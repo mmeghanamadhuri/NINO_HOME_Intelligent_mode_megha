@@ -249,6 +249,9 @@ def startup() -> None:
     face_registration.apply_settings_from_environ()
     configure_memory_from_environ()
     preload_piper_voice()
+    from voice_service import preload_whisper_model
+
+    preload_whisper_model()
     get_memory_service().startup()
     get_alarm_service().start()
     ensure_esp_play_wav_url_configured()
@@ -646,6 +649,12 @@ def latency_log(limit: int = 50) -> dict:
     }
 
 
+def _stt_status() -> dict:
+    from voice_service import whisper_runtime_status
+
+    return whisper_runtime_status()
+
+
 @app.get("/api/status")
 def status(device_id: str | None = None) -> dict:
     from llm_service import ollama_runtime_status
@@ -661,6 +670,7 @@ def status(device_id: str | None = None) -> dict:
         "emotion": emotion.stats(),
         "voice_pipeline_active": voice_pipeline_active(),
         "tts": tts.status(),
+        "stt": _stt_status(),
         "llm": ollama_runtime_status(
             model=os.environ.get("OLLAMA_MODEL"),
             api_url=os.environ.get("OLLAMA_URL"),
@@ -1400,6 +1410,17 @@ def main() -> None:
         help="faster-whisper model for /ws/voice (tiny, base, small, ...)",
     )
     parser.add_argument(
+        "--whisper-device",
+        default=os.environ.get("WHISPER_DEVICE", "auto"),
+        choices=["", "auto", "cuda", "gpu", "cpu"],
+        help="faster-whisper device: auto (CUDA if CTranslate2 sees a GPU), cuda, or cpu.",
+    )
+    parser.add_argument(
+        "--whisper-compute-type",
+        default=os.environ.get("WHISPER_COMPUTE_TYPE", "auto"),
+        help="faster-whisper compute type (auto=float16 on CUDA, int8 on CPU).",
+    )
+    parser.add_argument(
         "--stt-provider",
         default=os.environ.get("STT_PROVIDER", ""),
         choices=["", "whisper", "elevenlabs", "openai_whisper", "openai", "whisper_api"],
@@ -1540,6 +1561,10 @@ def main() -> None:
     os.environ["OLLAMA_URL"] = ollama_url
     os.environ["OLLAMA_MODEL"] = args.ollama_model.strip()
     os.environ["WHISPER_MODEL"] = args.whisper_model.strip()
+    if args.whisper_device.strip():
+        os.environ["WHISPER_DEVICE"] = args.whisper_device.strip().lower()
+    if args.whisper_compute_type.strip():
+        os.environ["WHISPER_COMPUTE_TYPE"] = args.whisper_compute_type.strip()
     if args.stt_provider.strip():
         os.environ["STT_PROVIDER"] = args.stt_provider.strip().lower()
     if args.elevenlabs_api_key.strip():

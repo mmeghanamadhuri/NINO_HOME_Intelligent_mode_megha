@@ -19,9 +19,14 @@ transformers>=4.40
 safetensors
 pillow
 
-# --- Voice STT (local Whisper fallback) ---
+# --- Voice STT (local Whisper; uses GPU when CTranslate2 CUDA is available) ---
 # ElevenLabs Scribe uses requests + ELEVENLABS_API_KEY (no extra pip package)
 faster-whisper>=1.1.0
+# GPU STT needs a CUDA-enabled ctranslate2 wheel. Check:
+#   python -c "import ctranslate2; print(ctranslate2.get_cuda_device_count())"
+# If that prints 0, pip installed a CPU wheel. On x86_64 DGX, reinstall a CUDA
+# ctranslate2 matching the machine CUDA. On DGX Spark (aarch64) CUDA ctranslate2
+# may be unavailable — Whisper then stays on CPU automatically.
 
 # --- TTS ---
 # Neural local fallback: Piper. Linux: also install system espeak-ng as last fallback.

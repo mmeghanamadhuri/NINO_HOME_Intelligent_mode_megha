@@ -314,6 +314,12 @@ class VoiceSettings:
     ollama_model: str = DEFAULT_MODEL
     whisper_model: str = "tiny"
     whisper_language: str | None = "en"
+    # auto | cuda | cpu — resolved at load time against CTranslate2 CUDA.
+    whisper_device: str = "auto"
+    whisper_compute_type: str = "auto"
+    whisper_device_index: int = 0
+    whisper_runtime_device: str = ""
+    whisper_runtime_compute_type: str = ""
     # "elevenlabs" | "openai_whisper" (cloud Whisper API) | "whisper" (local faster-whisper).
     stt_provider: str = "whisper"
     elevenlabs_api_key: str = ""
@@ -329,6 +335,7 @@ class VoiceSettings:
 
 SETTINGS = VoiceSettings()
 _WHISPER_MODEL: Any = None
+_CTRANSLATE2_CUDA_COUNT: int | None = None
 
 
 def minimal_voice_reply_wav() -> bytes:
@@ -346,10 +353,118 @@ def minimal_voice_reply_wav() -> bytes:
     return bio.getvalue()
 
 
+def _ctranslate2_cuda_device_count() -> int:
+    """How many GPUs CTranslate2 (faster-whisper) can actually use."""
+    global _CTRANSLATE2_CUDA_COUNT
+    if _CTRANSLATE2_CUDA_COUNT is not None:
+        return _CTRANSLATE2_CUDA_COUNT
+    try:
+        import ctranslate2
+
+        _CTRANSLATE2_CUDA_COUNT = int(ctranslate2.get_cuda_device_count())
+    except Exception:
+        _CTRANSLATE2_CUDA_COUNT = 0
+    return _CTRANSLATE2_CUDA_COUNT
+
+
+def ctranslate2_cuda_available() -> bool:
+    return _ctranslate2_cuda_device_count() > 0
+
+
+def resolve_whisper_device(preferred: str | None = None, *, cuda_available: bool | None = None) -> str:
+    """Pick cuda vs cpu. `auto` uses CTranslate2 CUDA, not torch."""
+    raw = (preferred if preferred is not None else SETTINGS.whisper_device).strip().lower()
+    if raw in {"gpu"}:
+        raw = "cuda"
+    cuda = ctranslate2_cuda_available() if cuda_available is None else cuda_available
+    if raw in {"", "auto"}:
+        return "cuda" if cuda else "cpu"
+    if raw == "cuda":
+        if cuda:
+            return "cuda"
+        logger.warning(
+            "WHISPER_DEVICE=cuda but CTranslate2 reports no GPU; using CPU. "
+            "Install a CUDA ctranslate2 wheel for this machine."
+        )
+        return "cpu"
+    return "cpu"
+
+
+def resolve_whisper_compute_type(
+    device: str, preferred: str | None = None
+) -> str:
+    raw = (
+        preferred if preferred is not None else SETTINGS.whisper_compute_type
+    ).strip().lower()
+    if raw in {"", "auto", "default"}:
+        return "float16" if device == "cuda" else "int8"
+    return raw
+
+
+def whisper_runtime_status() -> dict[str, Any]:
+    device = SETTINGS.whisper_runtime_device or resolve_whisper_device()
+    compute = SETTINGS.whisper_runtime_compute_type or resolve_whisper_compute_type(
+        device
+    )
+    return {
+        "provider": SETTINGS.stt_provider,
+        "model": SETTINGS.whisper_model,
+        "requested_device": SETTINGS.whisper_device,
+        "device": device,
+        "device_index": SETTINGS.whisper_device_index,
+        "compute_type": compute,
+        "loaded": _WHISPER_MODEL is not None,
+        "cuda_available": ctranslate2_cuda_available(),
+        "cuda_device_count": _ctranslate2_cuda_device_count(),
+    }
+
+
+def _whisper_preload_enabled() -> bool:
+    raw = os.environ.get("WHISPER_PRELOAD", "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return SETTINGS.stt_provider == "whisper"
+
+
+def preload_whisper_model() -> bool:
+    """Load faster-whisper at startup so the first voice query is not cold."""
+    if not _whisper_preload_enabled():
+        return False
+    try:
+        _ensure_whisper()
+        status = whisper_runtime_status()
+        logger.info(
+            "Whisper preloaded: model=%s device=%s compute_type=%s",
+            status["model"],
+            status["device"],
+            status["compute_type"],
+        )
+        return True
+    except Exception as exc:
+        logger.warning("Whisper preload failed: %s", exc)
+        return False
+
+
 def configure_from_environ() -> None:
+    global _WHISPER_MODEL
     SETTINGS.ollama_url = os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL).strip()
     SETTINGS.ollama_model = os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL).strip()
     SETTINGS.whisper_model = os.environ.get("WHISPER_MODEL", "tiny").strip()
+    SETTINGS.whisper_device = os.environ.get("WHISPER_DEVICE", "auto").strip() or "auto"
+    SETTINGS.whisper_compute_type = (
+        os.environ.get("WHISPER_COMPUTE_TYPE", "auto").strip() or "auto"
+    )
+    try:
+        SETTINGS.whisper_device_index = int(
+            os.environ.get("WHISPER_DEVICE_INDEX", "0").strip() or "0"
+        )
+    except ValueError:
+        SETTINGS.whisper_device_index = 0
+    SETTINGS.whisper_runtime_device = ""
+    SETTINGS.whisper_runtime_compute_type = ""
+    _WHISPER_MODEL = None
     lang = os.environ.get("WHISPER_LANGUAGE", "en").strip()
     SETTINGS.whisper_language = None if lang.lower() in {"", "auto"} else lang
     SETTINGS.elevenlabs_api_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
@@ -900,14 +1015,43 @@ def apply_volume_command(
 
 def _ensure_whisper() -> Any:
     global _WHISPER_MODEL
-    if _WHISPER_MODEL is None:
-        from faster_whisper import WhisperModel
+    if _WHISPER_MODEL is not None:
+        return _WHISPER_MODEL
+    from faster_whisper import WhisperModel
 
+    device = resolve_whisper_device()
+    compute_type = resolve_whisper_compute_type(device)
+    device_index = max(0, SETTINGS.whisper_device_index)
+    logger.info(
+        "Loading faster-whisper model=%s device=%s index=%s compute_type=%s",
+        SETTINGS.whisper_model,
+        device,
+        device_index,
+        compute_type,
+    )
+    try:
+        _WHISPER_MODEL = WhisperModel(
+            SETTINGS.whisper_model,
+            device=device,
+            device_index=device_index if device == "cuda" else 0,
+            compute_type=compute_type,
+        )
+    except Exception as exc:
+        if device == "cpu":
+            raise
+        logger.warning(
+            "GPU Whisper failed (%s); falling back to CPU int8.",
+            exc,
+        )
+        device = "cpu"
+        compute_type = "int8"
         _WHISPER_MODEL = WhisperModel(
             SETTINGS.whisper_model,
             device="cpu",
-            compute_type="int8",
+            compute_type=compute_type,
         )
+    SETTINGS.whisper_runtime_device = device
+    SETTINGS.whisper_runtime_compute_type = compute_type
     return _WHISPER_MODEL
 
 
