@@ -1650,14 +1650,25 @@ static esp_err_t wifi_switch_mode(wifi_mode_t mode) {
   return ESP_OK;
 }
 
-static void wifi_init_all(void) {
-  ESP_ERROR_CHECK(esp_netif_init());
-  ESP_ERROR_CHECK(esp_event_loop_create_default());
+static esp_err_t wifi_init_all(void) {
+  esp_err_t err = esp_netif_init();
+  if (err != ESP_OK) {
+    return err;
+  }
+  err = esp_event_loop_create_default();
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    return err;
+  }
   esp_netif_create_default_wifi_ap();
   esp_netif_create_default_wifi_sta();
 
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-  ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+  err = esp_wifi_init(&cfg);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "esp_wifi_init failed: %s (check ESP-Hosted SDIO / C6 link)",
+             esp_err_to_name(err));
+    return err;
+  }
 
   s_wifi_connected_chime_pending = true;
 
@@ -1667,7 +1678,7 @@ static void wifi_init_all(void) {
       IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
 
   wifi_mode_t saved_mode = wifi_load_from_nvs();
-  ESP_ERROR_CHECK(wifi_switch_mode(saved_mode));
+  return wifi_switch_mode(saved_mode);
 }
 
 /* Start BLE after wifi_init_all() has brought Hosted SDIO up. */
@@ -3906,7 +3917,9 @@ void app_main(void) {
 
   /* Wi-Fi init brings Hosted SDIO transport up. BLE must start AFTER that —
    * starting earlier races slave reset / SDIO and reboots the host. */
-  wifi_init_all();
+  if (wifi_init_all() != ESP_OK) {
+    ESP_LOGW(TAG, "Running without Wi-Fi (ESP-Hosted SDIO to C6 not ready)");
+  }
   s_boot_unprovisioned = !wifi_config_is_provisioned();
   BaseType_t ble_task_ok = xTaskCreatePinnedToCore(
       wifi_provisioning_task, "wifi_prov", 4096, NULL, 6, NULL, APP_CORE_NET);

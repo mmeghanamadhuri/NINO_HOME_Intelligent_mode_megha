@@ -28,6 +28,14 @@ menu "NiNO Eye Displays"
                 Requires backlight on GPIO 19 (LED pin) or tie LED to 3.3 V.
                 Shared SPI: SCK 23, MOSI 22, DC 21, RST 20, CS 32/33.
 
+        config NINO_ST7735_BL_HARDCODED_3V3
+            bool "ST7735 backlight wired to 3.3 V (do not use GPIO 19)"
+            depends on NINO_EYE_DISPLAY_TFT
+            default y
+            help
+                On Waveshare ESP32-P4-Module-DEV-KIT, GPIO 19 is SDIO CMD to the
+                onboard ESP32-C6. Tie TFT BL/LED to 3.3 V and enable this so
+                st7735_init() never claims GPIO 19 (required for Wi-Fi/BLE).
     endchoice
 
 endmenu
