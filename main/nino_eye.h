@@ -9,13 +9,13 @@ extern "C" {
 /*
  * NINO eye animation engine.
  *
- * States rendered on the dual SSD1351 OLEDs: idle + animated emotions + med
- * capsule + static RGB565 emoji bitmaps (jai_bhalaiah … bigsmile).
- * State changes are instant and non-blocking: the running animation switches on
- * its next frame.
+ * States rendered on dual eye panels (SSD1351 OLED or ST7735 TFT): idle +
+ * animated emotions + med capsule + static RGB565 emoji bitmaps
+ * (jai_bhalaiah … bigsmile). State changes are instant and non-blocking: the
+ * running animation switches on its next frame.
  *
  * Integration:
- *   1) ssd1351_init();       // bring up the displays (once)
+ *   1) nino_display_init();  // bring up the displays (once; Kconfig selects panel)
  *   2) nino_eye_begin();     // spawns the animator task, returns immediately
  *   3) call any per-emotion trigger (or nino_eye_apply_expression) from any task.
  */
@@ -64,12 +64,22 @@ bool nino_eye_apply_command(const char *line);
  */
 nino_eye_state_t nino_eye_state_from_name(const char *name);
 
+/** Reverse lookup for logs / console (returns "?" if unknown). */
+const char *nino_eye_state_to_name(nino_eye_state_t state);
+
 /**
  * Apply a server expression tag: shows the matching emotion, or returns the
  * eyes to idle when @p name is NULL/empty/unknown. Mirrors the server contract
  * where a missing eye_expression key means "stay idle for this reply".
  */
 void nino_eye_apply_expression(const char *name);
+
+/**
+ * Demo-only faster idle blink pace (shorter open-hold before blink).
+ * Normal idle (~5.6 s/cycle) is unchanged when disabled. Enable around the
+ * UK IFA demo cue timeline so short idle gaps can still show a blink.
+ */
+void nino_eye_set_demo_idle_pace(bool enabled);
 
 /* ---- Per-emotion triggers ---- */
 void nino_eye_idle(void);
