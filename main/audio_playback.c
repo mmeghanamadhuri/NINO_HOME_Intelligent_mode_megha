@@ -6,7 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "voice_wake.h"
+#include "audio_loopback.h"
+#include "mic_input.h"
 
 #include "bsp/esp32_p4_function_ev_board.h"
 #include "esp_codec_dev.h"
@@ -77,8 +78,8 @@ static esp_err_t spk_stream_open_locked(uint32_t sample_rate_hz, bool leave_open
     return ESP_OK;
   }
   /* ES8311 mic + speaker share one duplex I2S. Drop the ADC before any
-   * rate change / reopen so wake_feed does not keep a stale mic handle. */
-  nino_voice_wake_drop_mic_locked();
+   * rate change / reopen so loopback does not keep a stale mic handle. */
+  nino_mic_drop_es8311_locked();
   spk_stream_close_locked();
 
   esp_codec_dev_sample_info_t fs = {
@@ -260,6 +261,35 @@ esp_err_t nino_audio_load_saved_volume(void) {
   return nino_audio_set_volume_percent(volume_percent);
 }
 
+esp_err_t nino_audio_write_pcm16_mono_locked(const int16_t *samples, size_t sample_count,
+                                             uint32_t sample_rate_hz) {
+  if (sample_rate_hz < 8000 || sample_rate_hz > 48000) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  if (sample_count > 0 && samples == NULL) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  if (!s_ready) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  esp_err_t err = spk_stream_open_locked(sample_rate_hz, true);
+  if (err != ESP_OK) {
+    return err;
+  }
+  if (sample_count == 0) {
+    return ESP_OK;
+  }
+
+  const int cr = esp_codec_dev_write(s_spk, (void *)samples,
+                                     (int)(sample_count * sizeof(int16_t)));
+  if (cr != ESP_CODEC_DEV_OK) {
+    ESP_LOGE(TAG, "esp_codec_dev_write failed: %d", cr);
+    return ESP_FAIL;
+  }
+  return ESP_OK;
+}
+
 esp_err_t nino_audio_warm_chime_path(uint32_t sample_rate_hz) {
   if (sample_rate_hz < 8000 || sample_rate_hz > 48000) {
     return ESP_ERR_INVALID_ARG;
@@ -270,6 +300,7 @@ esp_err_t nino_audio_warm_chime_path(uint32_t sample_rate_hz) {
       return e;
     }
   }
+  nino_audio_loopback_pause();
   xSemaphoreTake(s_mutex, portMAX_DELAY);
   esp_err_t e = spk_stream_open_locked(sample_rate_hz, true);
   if (e == ESP_OK) {
@@ -280,6 +311,7 @@ esp_err_t nino_audio_warm_chime_path(uint32_t sample_rate_hz) {
     ESP_LOGI(TAG, "Chime path warm @ %u Hz", (unsigned)sample_rate_hz);
   }
   xSemaphoreGive(s_mutex);
+  nino_audio_loopback_resume();
   return e;
 }
 
@@ -298,11 +330,13 @@ esp_err_t nino_audio_play_chime_pcm16_mono(const int16_t *samples, size_t sample
   }
 
   const size_t play_len = sample_count * sizeof(int16_t);
+  nino_audio_loopback_pause();
   xSemaphoreTake(s_mutex, portMAX_DELAY);
 
   esp_err_t err = spk_stream_open_locked(sample_rate_hz, true);
   if (err != ESP_OK) {
     xSemaphoreGive(s_mutex);
+    nino_audio_loopback_resume();
     return err;
   }
 
@@ -341,8 +375,9 @@ esp_err_t nino_audio_play_chime_pcm16_mono(const int16_t *samples, size_t sample
     }
   }
 
-  nino_voice_wake_drop_mic_locked();
+  nino_mic_drop_es8311_locked();
   xSemaphoreGive(s_mutex);
+  nino_audio_loopback_resume();
   return (cr == ESP_CODEC_DEV_OK) ? ESP_OK : ESP_FAIL;
 }
 
@@ -361,11 +396,13 @@ esp_err_t nino_audio_play_pcm16_mono(const int16_t *samples, size_t sample_count
   }
 
   const size_t play_len = sample_count * sizeof(int16_t);
+  nino_audio_loopback_pause();
   xSemaphoreTake(s_mutex, portMAX_DELAY);
 
   esp_err_t err = spk_stream_open_locked(sample_rate_hz, false);
   if (err != ESP_OK) {
     xSemaphoreGive(s_mutex);
+    nino_audio_loopback_resume();
     return err;
   }
 
@@ -391,8 +428,9 @@ esp_err_t nino_audio_play_pcm16_mono(const int16_t *samples, size_t sample_count
   }
 
   spk_stream_close_locked();
-  nino_voice_wake_drop_mic_locked();
+  nino_mic_drop_es8311_locked();
   xSemaphoreGive(s_mutex);
+  nino_audio_loopback_resume();
   return (cr == ESP_CODEC_DEV_OK) ? ESP_OK : ESP_FAIL;
 }
 
@@ -487,11 +525,13 @@ esp_err_t nino_audio_play_decoded(const nino_decoded_wav_t *decoded, size_t *pcm
 
   const uint8_t *play_ptr = (const uint8_t *)decoded->samples;
 
+  nino_audio_loopback_pause();
   xSemaphoreTake(s_mutex, portMAX_DELAY);
 
   esp_err_t open_err = spk_stream_open_locked(decoded->sample_rate_hz, false);
   if (open_err != ESP_OK) {
     xSemaphoreGive(s_mutex);
+    nino_audio_loopback_resume();
     return open_err;
   }
 
@@ -526,8 +566,9 @@ esp_err_t nino_audio_play_decoded(const nino_decoded_wav_t *decoded, size_t *pcm
   }
 
   spk_stream_close_locked();
-  nino_voice_wake_drop_mic_locked();
+  nino_mic_drop_es8311_locked();
   xSemaphoreGive(s_mutex);
+  nino_audio_loopback_resume();
 
   if (cr != ESP_CODEC_DEV_OK) {
     return ESP_FAIL;

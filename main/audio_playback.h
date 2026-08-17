@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 esp_err_t nino_audio_init(void);
@@ -43,6 +44,13 @@ esp_err_t nino_audio_play_chime_pcm16_mono(const int16_t *samples, size_t sample
 
 /** Open speaker at 16 kHz once at boot so the first wake beep has no codec setup delay. */
 esp_err_t nino_audio_warm_chime_path(uint32_t sample_rate_hz);
+
+/**
+ * Open the speaker (sample_count == 0) or write 16-bit mono PCM without closing
+ * the codec. Caller must hold nino_audio_bus_lock().
+ */
+esp_err_t nino_audio_write_pcm16_mono_locked(const int16_t *samples, size_t sample_count,
+                                             uint32_t sample_rate_hz);
 
 /** Serialize access to the ES8311 speaker I2S path (playback). */
 void nino_audio_bus_lock(void);

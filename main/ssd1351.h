@@ -12,9 +12,7 @@
  *   RST -> GPIO20 (pin 13), CS left -> GPIO32, CS right -> GPIO33.
  *
  * CS was moved off GPIO 26/27 because those are the ESP32-P4 USB OTG FS PHY
- * D-/D+ pads; enabling the header mic (CONFIG_USB4MIC_USB_PHY_ON_HEADER) claims
- * them and blanked the eyes. GPIO 32/33 are plain digital I/O with no USB
- * overlap, so eyes and the USB mic now run together with no workaround.
+ * D-/D+ pads. GPIO 32/33 are plain digital I/O with no USB overlap.
  */
 #define OLED_PIN_SCLK   23   /* shared CLK -> both displays */
 #define OLED_PIN_MOSI   22   /* shared DIN -> both displays */

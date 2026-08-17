@@ -8,7 +8,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "mic_input.h"
-#include "voice_wake.h"
+#include "audio_loopback.h"
 
 static const char *TAG = "nino_cap";
 
@@ -59,7 +59,7 @@ esp_err_t nino_audio_capture_wav(uint8_t **out_wav, size_t *out_len,
     goto out;
   }
 
-  nino_voice_wake_set_mic_capture_hold(true);
+  nino_audio_loopback_pause();
   nino_mic_flush();
 
   size_t got = 0;
@@ -118,6 +118,7 @@ esp_err_t nino_audio_capture_wav(uint8_t **out_wav, size_t *out_len,
   err = ESP_OK;
 
 out:
-  nino_voice_wake_set_mic_capture_hold(false);
+  nino_mic_close();
+  nino_audio_loopback_resume();
   return err;
 }

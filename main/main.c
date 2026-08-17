@@ -47,6 +47,7 @@
 #include "camera_orientation.h"
 #include "face_detect.hpp"
 #include "face_tracker.h"
+#include "audio_loopback.h"
 #include "mic_input.h"
 #include "nino_eye.h"
 #include "ssd1351.h"
@@ -55,9 +56,7 @@
 #include "servo_recplay.h"
 #include "touch_sensor.h"
 #include "push_buttons.h"
-#include "usb_mic.h"
 #include "voice_assist.h"
-#include "voice_wake.h"
 #include "wifi_config.h"
 #include "wifi_prov_ble.h"
 #if CONFIG_ESP_HOSTED_ENABLED
@@ -95,7 +94,6 @@ static bool s_audio_queue_ready = false;
 static volatile bool s_wifi_connected_chime_task_running = false;
 static bool s_boot_unprovisioned = false;
 static volatile bool s_provisioned_welcome_scheduled = false;
-static bool s_boot_greeting_done = false;
 static bool s_mdns_started = false;
 
 #define USB_LIB_TASK_STACK_SIZE 4096
@@ -178,7 +176,6 @@ static latest_frame_t s_latest_frame;
 static httpd_handle_t s_http_server;
 static esp_console_repl_t *s_repl;
 static char s_voice_ws_url[200];
-static bool s_voice_wake_started;
 static int64_t s_last_uvc_timeout_log_us;
 static char s_device_name[WIFI_PROV_BLE_DEVICE_NAME_MAX + 1] =
     DEVICE_NAME_DEFAULT;
@@ -365,17 +362,12 @@ static bool wifi_disconnect_is_connect_failure(uint8_t reason) {
  *  - Provisioned and connected -> greet with Hello-home after the WIFI.wav clip.
  *    Falls back to greeting anyway if Wi-Fi never connects within the timeout,
  *    unless we already played the "unable to connect" prompt. */
-static void finish_boot_greeting_and_enable_wake(void) {
+static void finish_boot_greeting(void) {
   nino_audio_queue_wait_idle(45000);
-  if (nino_voice_preload_wake_chime() == ESP_OK) {
-    ESP_LOGI(TAG, "Wake chime path ready after boot greeting");
+  if (nino_audio_loopback_start() != ESP_OK) {
+    ESP_LOGW(TAG, "Onboard mic loopback not started");
   } else {
-    ESP_LOGW(TAG, "Wake chime warm after boot greeting failed");
-  }
-  s_boot_greeting_done = true;
-  if (nino_voice_wake_hw_ready()) {
-    nino_voice_wake_set_enabled(true);
-    ESP_LOGI(TAG, "Wake word on — say \"Hi ESP\" or \"Jarvis\"");
+    ESP_LOGI(TAG, "Onboard ES8311 loopback on — speak into the mic");
   }
 }
 
@@ -383,7 +375,7 @@ static void hello_home_task(void *arg) {
   (void)arg;
   if (s_sta_ssid[0] == '\0') {
     /* NiNO-Home_Wifi.wav is queued immediately after audio setup during boot. */
-    finish_boot_greeting_and_enable_wake();
+    finish_boot_greeting();
     vTaskDelete(NULL);
     return;
   }
@@ -398,7 +390,7 @@ static void hello_home_task(void *arg) {
   if (s_sta_connected) {
     play_hello_home_clip();
   }
-  finish_boot_greeting_and_enable_wake();
+  finish_boot_greeting();
   vTaskDelete(NULL);
 }
 
@@ -512,37 +504,6 @@ static void mdns_start_service(void) {
 }
 #endif
 
-static void voice_wake_start_once(void) {
-  if (s_voice_wake_started) {
-    return;
-  }
-  s_voice_wake_started = true;
-  nino_voice_wake_init();
-  if (nino_voice_wake_hw_ready()) {
-    if (s_boot_greeting_done) {
-      nino_voice_wake_set_enabled(true);
-    } else {
-      ESP_LOGI(TAG, "Wake hardware ready — waiting for boot greeting to finish");
-    }
-    if (s_voice_ws_url[0] == '\0') {
-      ESP_LOGW(TAG,
-               "Voice PC URL not set — serial: voice connect <YOUR_PC_LAN_IP> 8000 "
-               "(not the ESP camera IP)");
-    } else {
-      ESP_LOGI(TAG, "Voice assistant URL: %s", s_voice_ws_url);
-    }
-  } else {
-    nino_voice_wake_set_enabled(false);
-    ESP_LOGE(TAG, "Wake word not started — check srmodels partition / flash size");
-  }
-}
-
-static void delayed_voice_wake_task(void *arg) {
-  (void)arg;
-  vTaskDelay(pdMS_TO_TICKS(5000));
-  voice_wake_start_once();
-  vTaskDelete(NULL);
-}
 
 static void copy_cstr_field(uint8_t *dst, size_t dst_size, const char *src) {
   if (dst == NULL || dst_size == 0 || src == NULL) {
@@ -1283,6 +1244,7 @@ static void wifi_cli_register(void) {
 }
 
 static void voice_cli_register(void);
+static void start_cli_register(void);
 static void device_cli_register(void);
 static void servo_cli_register(void);
 static void track_cli_register(void);
@@ -1334,6 +1296,7 @@ static void console_init(void) {
   esp_console_register_help_command();
   wifi_cli_register();
   voice_cli_register();
+  start_cli_register();
   device_cli_register();
   servo_cli_register();
   track_cli_register();
@@ -2058,27 +2021,26 @@ static esp_err_t play_wav_handler(httpd_req_t *req) {
   }
 
   bool prompt_ack = false;
+  (void)prompt_ack;
   char ack_hdr[4] = {0};
   if (httpd_req_get_hdr_value_str(req, "X-Nino-Prompt-Ack", ack_hdr,
-                                  sizeof(ack_hdr)) == ESP_OK) {
-    prompt_ack = (ack_hdr[0] == '1');
+                                  sizeof(ack_hdr)) == ESP_OK &&
+      ack_hdr[0] == '1') {
+    ESP_LOGI(TAG, "Ignoring X-Nino-Prompt-Ack from server (fixed mic schedule)");
   }
 
   bool prompt_ack_chime = true;
+  (void)prompt_ack_chime;
   char chime_hdr[4] = {0};
   if (httpd_req_get_hdr_value_str(req, "X-Nino-Prompt-Ack-Chime", chime_hdr,
                                   sizeof(chime_hdr)) == ESP_OK) {
-    prompt_ack_chime = (chime_hdr[0] != '0');
+    /* ignored with prompt_ack */
   }
 
   char ws_hdr[160] = {0};
   if (httpd_req_get_hdr_value_str(req, "X-Nino-Voice-Ws-Url", ws_hdr,
                                   sizeof(ws_hdr)) == ESP_OK) {
     apply_voice_ws_url_from_server(ws_hdr);
-  }
-
-  if (prompt_ack) {
-    nino_voice_assist_set_next_prompt_ack_chime(prompt_ack_chime);
   }
 
   /* Optional emotion tag from server (e.g. happy/sad/surprised). */
@@ -2970,7 +2932,6 @@ static void apply_voice_ws_url_from_server(const char *uri) {
     nvs_close(h);
   }
   nino_voice_assist_set_ws_uri(s_voice_ws_url);
-  nino_voice_wake_set_enabled(true);
   schedule_wifi_network_report();
   ESP_LOGI(TAG, "Voice WS URL from server: %s", s_voice_ws_url);
 }
@@ -2979,7 +2940,7 @@ static int cmd_voice(int argc, char **argv) {
   if (argc >= 2 && strcmp(argv[1], "connect") == 0) {
     if (argc < 3) {
       printf("Usage: voice connect <IPv4> [port]   (default port 8000)\n"
-             "  Saves ws://<ip>:<port>/voice-query?device_id=... for Hi ESP / Jarvis wake flow\n");
+             "  Saves ws://<ip>:<port>/voice-query?device_id=...\n");
       return 0;
     }
     int port = 8000;
@@ -3007,7 +2968,6 @@ static int cmd_voice(int argc, char **argv) {
       printf("NVS open failed\n");
     }
     nino_voice_assist_set_ws_uri(s_voice_ws_url);
-    nino_voice_wake_set_enabled(s_voice_ws_url[0] != '\0');
     schedule_wifi_network_report();
     printf("Voice assistant: %s\n", s_voice_ws_url);
     return 0;
@@ -3030,42 +2990,36 @@ static int cmd_voice(int argc, char **argv) {
       printf("NVS open failed\n");
     }
     nino_voice_assist_set_ws_uri(s_voice_ws_url);
-    nino_voice_wake_set_enabled(s_voice_ws_url[0] != '\0');
     schedule_wifi_network_report();
     return 0;
   }
   if (argc >= 2 && strcmp(argv[1], "status") == 0) {
-    printf("voice wake hw: %s\n", nino_voice_wake_hw_ready() ? "ready" : "not loaded");
-    printf("voice wake: %s\n", nino_voice_wake_is_enabled() ? "on" : "off");
-    printf("voice mic: %s\n",
-           nino_mic_source_name(nino_mic_preferred_source()));
-    printf("usb header mic: %s\n",
-           usb_mic_ready() ? "streaming (preferred)"
-                           : "not ready; using onboard ES8311 fallback");
-    usb_mic_print_status();
-    usb_mic_print_usb_devices();
+    printf("voice mic: %s (loopback %s)\n",
+           nino_mic_source_name(nino_mic_preferred_source()),
+           nino_audio_loopback_is_running() ? "on" : "paused");
     printf("device_id: %s\n", s_device_id);
     printf("voice url: \"%s\"\n", s_voice_ws_url[0] ? s_voice_ws_url : "(not set)");
-    printf("Tip: voice connect must use your PC LAN IP (where python app.py runs), not 192.168.x.x of the board.\n");
+    printf("Loopback on by default. Type 'start': 2 s delay, record/save/send 5 s.\n");
     return 0;
   }
-  if (argc >= 2 && strcmp(argv[1], "wake") == 0) {
-    if (argc < 3) {
-      printf("voice wake: %s\n", nino_voice_wake_is_enabled() ? "on" : "off");
-      return 0;
+  if (argc >= 2 && strcmp(argv[1], "start") == 0) {
+    esp_err_t e = nino_voice_assist_console_start();
+    if (e == ESP_ERR_INVALID_STATE) {
+      if (!nino_voice_assist_has_ws_uri()) {
+        printf("Set server first: voice connect <PC_IP> [8000]\n");
+      } else {
+        printf("Already recording/uploading — wait for server reply\n");
+      }
+      return 1;
     }
-    if (strcmp(argv[2], "on") == 0) {
-      nino_voice_wake_set_enabled(true);
-      return 0;
+    if (e != ESP_OK) {
+      printf("voice start failed: %s\n", esp_err_to_name(e));
+      return 1;
     }
-    if (strcmp(argv[2], "off") == 0) {
-      nino_voice_wake_set_enabled(false);
-      return 0;
-    }
-    printf("Usage: voice wake [on|off]\n");
-    return 1;
+    return 0;
   }
-  printf("Usage: voice connect <ip> [port] | voice url [<ws-uri>] | voice wake [on|off] | voice status\n");
+  printf("Usage: voice connect <ip> [port] | voice url [<ws-uri>] | voice status | voice start\n"
+         "  Or type: start\n");
   return 0;
 }
 
@@ -3110,10 +3064,41 @@ static int cmd_device(int argc, char **argv) {
   return 0;
 }
 
+static int cmd_start(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+
+  esp_err_t e = nino_voice_assist_console_start();
+  if (e == ESP_ERR_INVALID_STATE) {
+    if (!nino_voice_assist_has_ws_uri()) {
+      printf("Set server first: voice connect <PC_IP> [8000]\n");
+    } else {
+      printf("Already recording/uploading — wait for server reply\n");
+    }
+    return 1;
+  }
+  if (e != ESP_OK) {
+    printf("start failed: %s\n", esp_err_to_name(e));
+    return 1;
+  }
+  return 0;
+}
+
+static void start_cli_register(void) {
+  const esp_console_cmd_t cmd = {
+      .command = "start",
+      .help = "2 s delay, record 5 s, save to SD, send to server, play reply",
+      .hint = NULL,
+      .func = &cmd_start,
+      .argtable = NULL,
+  };
+  ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+}
+
 static void voice_cli_register(void) {
   const esp_console_cmd_t cmd = {
       .command = "voice",
-      .help = "voice connect <PC_IP> [port] | voice status | voice wake [on|off]",
+      .help = "voice connect <PC_IP> [port] | voice status | voice start",
       .hint = NULL,
       .func = &cmd_voice,
       .argtable = NULL,
@@ -3858,7 +3843,6 @@ static void uvc_driver_event_callback(const uvc_host_driver_event_data_t *event,
 
   s_selected_stream.dev_addr = event->device_connected.dev_addr;
   s_selected_stream.stream_index = event->device_connected.uvc_stream_index;
-  usb_mic_block_dev_addr(event->device_connected.dev_addr);
   if (!select_stream_format(s_frame_info_list, s_frame_info_count,
                             &s_selected_stream.format)) {
     ESP_LOGE(TAG, "No MJPEG format available for HTTP streaming");
@@ -3879,7 +3863,6 @@ static void uvc_driver_event_callback(const uvc_host_driver_event_data_t *event,
     assert(ok == pdPASS);
     s_stream_task_created = true;
   }
-  /* Wake word starts from delayed_voice_wake_task — avoids racing UVC USB DMA alloc. */
 }
 
 void app_main(void) {
@@ -3938,9 +3921,6 @@ void app_main(void) {
              "Speaker (BSP audio) init failed; POST /play_wav may not work");
   }
   (void)nino_audio_load_saved_volume();
-  if (nino_voice_preload_wake_chime() != ESP_OK) {
-    ESP_LOGW(TAG, "Wake chime preload failed — first beep may be slower");
-  }
   ESP_ERROR_CHECK(nino_audio_queue_start());
   s_audio_queue_ready = true;
   schedule_wifi_connected_chime();
@@ -3966,27 +3946,14 @@ void app_main(void) {
   /* HTTP-only mode for now: keep status/websocket on port 80. */
 
   ESP_LOGI(TAG, "Installing USB host stack");
-#if CONFIG_USB4MIC_USB_PHY_ON_HEADER
-  esp_err_t phy_err = usb_mic_phy_init_for_header();
-  if (phy_err != ESP_OK) {
-    ESP_LOGE(TAG, "USB header mic PHY init failed: %s", esp_err_to_name(phy_err));
-  }
-#endif
   const usb_host_config_t usb_host_config = {
-#if CONFIG_USB4MIC_USB_PHY_ON_HEADER
-      /* HS (J18 camera + U2D2) + FS (GPIO 24/25 USB mic) — single host install (ESP-USB 1.3+). */
-      .peripheral_map = BIT0 | BIT1,
-      .skip_phy_setup = true,
-#else
       .peripheral_map = 0,
       .skip_phy_setup = false,
-#endif
       .intr_flags = ESP_INTR_FLAG_LOWMED,
   };
   esp_err_t usb_err = usb_host_install(&usb_host_config);
   if (usb_err != ESP_OK) {
-    ESP_LOGE(TAG, "usb_host_install failed: %s (need ESP-USB 1.3+ for dual host on P4)",
-             esp_err_to_name(usb_err));
+    ESP_LOGE(TAG, "usb_host_install failed: %s", esp_err_to_name(usb_err));
     ESP_ERROR_CHECK(usb_err);
   }
 
@@ -3996,13 +3963,6 @@ void app_main(void) {
       USB_LIB_TASK_PRIORITY, NULL, APP_CORE_USB);
   assert(ok == pdPASS);
   vTaskDelay(pdMS_TO_TICKS(300));
-
-  esp_err_t mic_err = usb_mic_start();
-  if (mic_err != ESP_OK) {
-    ESP_LOGE(TAG, "USB header mic UAC failed: %s", esp_err_to_name(mic_err));
-  } else {
-    ESP_LOGI(TAG, "USB 4-mic UAC started (GPIO D-=24 D+=25, 5V+GND)");
-  }
 
   if (nino_servo_dxl_start() != ESP_OK) {
     ESP_LOGW(TAG, "Dynamixel servo task not started (connect U2D2 on J18 USB hub)");
@@ -4027,12 +3987,8 @@ void app_main(void) {
   };
   ESP_ERROR_CHECK(uvc_host_install(&uvc_driver_config));
 
-  /* If no camera plugs in, still start wake after USB/SDIO settle (HP WDT on boot). */
-  (void)xTaskCreatePinnedToCore(delayed_voice_wake_task, "wake_delay", 4096, NULL, 3, NULL,
-                                APP_CORE_NET);
-
   ESP_LOGI(TAG, "J18: powered USB hub -> UVC camera + FTDI U2D2 (Dynamixel)");
-  ESP_LOGI(TAG, "GPIO header: USB 4-mic for voice (separate from J18 hub)");
+  ESP_LOGI(TAG, "Audio: onboard ES8311 mic → speaker loopback");
   ESP_LOGI(
       TAG,
       "Open / in a browser on your camera's IP address (check 'wifi status')");

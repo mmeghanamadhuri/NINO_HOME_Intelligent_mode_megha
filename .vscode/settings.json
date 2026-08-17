@@ -1,6 +1,6 @@
 {
   "C_Cpp.intelliSenseEngine": "default",
-  "idf.currentSetup": "C:\\Users\\udayk\\esp\\v5.5.2\\esp-idf",
+  "idf.currentSetup": "C:\\esp\\v5.5.2\\esp-idf",
   "idf.espIdfPathWin": "C:\\esp\\v5.5.2\\esp-idf",
   "idf.buildPath": "C:\\esp\\sirena-p4-build",
   "idf.openOcdConfigs": [
@@ -11,7 +11,7 @@
     "PYTHONUTF8": "1",
     "PYTHONIOENCODING": "utf-8"
   },
-  "idf.portWin": "COM5",
+  "idf.portWin": "COM4",
   "idf.flashType": "JTAG",
   "idf.extensionActivationMode": "always",
   "idf.port": "/dev/ttyUSB0",

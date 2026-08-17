@@ -81,7 +81,7 @@ static void after_wake_task(void *arg) {
   if (beep_e != ESP_OK) {
     ESP_LOGW(TAG, "wake chime failed: %s", esp_err_to_name(beep_e));
   }
-  ESP_LOGI(TAG, "Chime finished in %" PRId64 " ms; VAD recording now",
+  ESP_LOGI(TAG, "Chime finished in %" PRId64 " ms; recording 5 s to SD card",
            (esp_timer_get_time() - chime_started_us) / 1000LL);
   nino_eye_listening();
   esp_err_t e = nino_voice_assist_run_query_only();
@@ -199,19 +199,12 @@ static void wake_fetch_task(void *arg) {
         s_last_wake_us = now;
         ESP_LOGI(TAG, "WakeNet detected (" WAKE_PHRASE_HINT ") via %s",
                  nino_mic_source_name(nino_mic_preferred_source()));
-        if (!nino_voice_assist_has_ws_uri()) {
-          /* Mic/WakeNet worked; erase-flash clears NVS so the PC URL is gone. */
-          ESP_LOGW(TAG,
-                   "Wake heard, but voice PC URL not set — serial: "
-                   "voice connect <YOUR_PC_LAN_IP> 8000");
-        } else {
-          s_after_wake_busy = true;
-          BaseType_t ok = xTaskCreatePinnedToCore(after_wake_task, "voice_wake_q", AFTER_WAKE_TASK_STACK, NULL,
-                                                  WAKE_TASK_PRIO + 1, NULL, WAKE_FEED_CORE);
-          if (ok != pdPASS) {
-            ESP_LOGW(TAG, "could not start voice_wake_q task");
-            s_after_wake_busy = false;
-          }
+        s_after_wake_busy = true;
+        BaseType_t ok = xTaskCreatePinnedToCore(after_wake_task, "voice_wake_q", AFTER_WAKE_TASK_STACK, NULL,
+                                                WAKE_TASK_PRIO + 1, NULL, WAKE_FEED_CORE);
+        if (ok != pdPASS) {
+          ESP_LOGW(TAG, "could not start voice_wake_q task");
+          s_after_wake_busy = false;
         }
       }
     }

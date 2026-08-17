@@ -31,15 +31,29 @@ esp_err_t nino_voice_preload_wake_chime(void);
 esp_err_t nino_voice_play_done_chime(void);
 
 /**
- * Energy VAD: wait for speech, record until trailing silence or max_seconds.
+ * Energy VAD + adaptive end-of-utterance: wait for speech, record until
+ * adaptive trailing silence (or max_seconds). Mid-utterance pauses raise the
+ * stop timeout within clamped bounds (see docs/ADVA_PLAN.md).
  * Output is 16-bit mono WAV at 16 kHz. Caller frees with nino_audio_capture_free().
  */
 esp_err_t nino_voice_capture_vad_wav(int max_seconds, uint8_t **out_wav, size_t *out_len);
 
 bool nino_voice_assist_has_ws_uri(void);
 
+/**
+ * Console `start`: 2 s delay, record 5 s WAV, save to SD, send to server,
+ * play reply on speaker. Requires `voice connect`.
+ */
+esp_err_t nino_voice_assist_console_start(void);
+
 /** After wake word: VAD + WebSocket + queue TTS reply (no chime here). */
 esp_err_t nino_voice_assist_run_query_only(void);
+
+/**
+ * Optional SD record loop (not started by default). Boot uses mic→speaker loopback
+ * via nino_audio_loopback_start() in main.c.
+ */
+void nino_voice_assist_start_listen_loop(void);
 
 /** After a medical alarm WAV from the PC: chime + listen for yes/no (needs voice connect). */
 void nino_voice_assist_prompt_medical_ack(void);

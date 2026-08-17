@@ -1,6 +1,7 @@
 #include "voice_assist.h"
 
 #include <inttypes.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -16,7 +17,8 @@
 #include "freertos/task.h"
 
 #include "nino_eye.h"
-#include "voice_wake.h"
+#include "audio_loopback.h"
+#include "sd_record.h"
 #include "voice_ws_client.h"
 
 extern const uint8_t beep_wav_start[] asm("_binary_beep_wav_start");
@@ -28,7 +30,6 @@ static const char *TAG = "voice_ast";
 #define WAV_HEADER_SIZE 44
 #define VAD_FRAME_MS 20
 #define VAD_LISTEN_TIMEOUT_MS 6000
-#define VAD_TRAILING_SILENCE_MS 450
 #define VAD_PRE_ROLL_MS 200
 #define VAD_START_CONSECUTIVE_FRAMES 3
 #define VAD_STATUS_LOG_PERIOD_MS 1000
@@ -41,23 +42,40 @@ static const char *TAG = "voice_ast";
 #define VAD_SILENCE_PEAK_RATIO_PCT 30
 #define VAD_MIN_SPEECH_MS 300
 
+/**
+ * Adaptive end-of-utterance (EOU): how long trailing silence must last before
+ * we stop recording. Mid-utterance pauses (speech→silence→speech) raise the
+ * timeout within [EOU_MIN_MS, EOU_MAX_MS]. See docs/ADVA_PLAN.md.
+ */
+#define EOU_DEFAULT_MS 750
+#define EOU_MIN_MS 500
+#define EOU_MAX_MS 1500
+#define EOU_MARGIN_MS 350
+
 #define VAD_FRAME_SAMPLES ((VOICE_MIC_RATE * VAD_FRAME_MS) / 1000)
 #define VAD_FRAME_BYTES (VAD_FRAME_SAMPLES * (int)sizeof(int16_t))
 #define VAD_LISTEN_FRAMES (VAD_LISTEN_TIMEOUT_MS / VAD_FRAME_MS)
-#define VAD_SILENCE_STOP_FRAMES (VAD_TRAILING_SILENCE_MS / VAD_FRAME_MS)
 #define VAD_PRE_ROLL_FRAMES (VAD_PRE_ROLL_MS / VAD_FRAME_MS)
 #define VAD_MIN_SPEECH_FRAMES (VAD_MIN_SPEECH_MS / VAD_FRAME_MS)
 
 #define VOICE_WS_URI_MAX 200
 #define VOICE_QUERY_VAD_MAX_SEC 10
 #define MED_ACK_VAD_MAX_SEC 8
+#define LISTEN_CAPTURE_MS 5000
+#define LISTEN_LOOP_STACK 8192
+#define START_PRE_RECORD_DELAY_MS 2000
+#define START_RECORD_MS LISTEN_CAPTURE_MS
 
 static char s_ws_uri[VOICE_WS_URI_MAX];
 static SemaphoreHandle_t s_ws_uri_mutex;
-static volatile bool s_next_prompt_ack_play_chime = true;
+static SemaphoreHandle_t s_query_mu;
+static volatile bool s_listen_loop_started;
+static volatile bool s_console_start_busy;
+
+#define VOICE_START_STACK 12288
 
 void nino_voice_assist_set_next_prompt_ack_chime(bool play_chime) {
-  s_next_prompt_ack_play_chime = play_chime;
+  (void)play_chime;
 }
 
 void nino_voice_assist_set_ws_uri(const char *uri) {
@@ -122,6 +140,28 @@ static uint32_t frame_mean_abs(const int16_t *samples, size_t count) {
 }
 
 static inline uint32_t max_u32(uint32_t a, uint32_t b) { return a > b ? a : b; }
+
+static uint32_t eou_clamp_ms(uint32_t ms) {
+  if (ms < EOU_MIN_MS) {
+    return EOU_MIN_MS;
+  }
+  if (ms > EOU_MAX_MS) {
+    return EOU_MAX_MS;
+  }
+  return ms;
+}
+
+/** Recompute trailing-silence timeout from the longest completed mid-pause. */
+static uint32_t eou_recompute(uint32_t max_intra_pause_ms) {
+  uint32_t t = EOU_DEFAULT_MS;
+  if (max_intra_pause_ms > 0U) {
+    const uint32_t candidate = max_intra_pause_ms + EOU_MARGIN_MS;
+    if (candidate > t) {
+      t = candidate;
+    }
+  }
+  return eou_clamp_ms(t);
+}
 
 static uint32_t vad_start_threshold(uint32_t noise_floor) {
   return max_u32(VAD_MIN_START_ENERGY, noise_floor * 3U);
@@ -291,6 +331,9 @@ esp_err_t nino_voice_capture_vad_wav(int max_seconds, uint8_t **out_wav, size_t 
   uint32_t listen_frames = 0;
   uint32_t speech_streak = 0;
   uint32_t silence_streak = 0;
+  uint32_t adaptive_timeout_ms = EOU_DEFAULT_MS;
+  uint32_t max_intra_pause_ms = 0;
+  uint32_t intra_pause_count = 0;
   bool recording = false;
   esp_err_t result = ESP_FAIL;
 
@@ -317,13 +360,14 @@ esp_err_t nino_voice_capture_vad_wav(int max_seconds, uint8_t **out_wav, size_t 
     goto cleanup;
   }
 
-  nino_voice_wake_set_mic_capture_hold(true);
+  nino_audio_loopback_pause();
   nino_mic_flush();
 
   /* Mic is live: show the listening face until this capture session ends. */
   nino_eye_listening();
 
-  ESP_LOGI(TAG, "VAD armed (max %d s)", max_seconds);
+  ESP_LOGI(TAG, "VAD armed (max %d s, EOU default=%d ms [%d-%d])", max_seconds, EOU_DEFAULT_MS,
+           EOU_MIN_MS, EOU_MAX_MS);
 
   while (1) {
     esp_err_t rr = nino_mic_read(cap.frame, VAD_FRAME_SAMPLES);
@@ -389,6 +433,19 @@ esp_err_t nino_voice_capture_vad_wav(int max_seconds, uint8_t **out_wav, size_t 
     const bool still_speaking = energy >= silence_end_th;
 
     if (still_speaking) {
+      /* speech → silence → speech: treat completed pause as intra-utterance. */
+      if (silence_streak > 0U) {
+        const uint32_t pause_ms = silence_streak * VAD_FRAME_MS;
+        if (pause_ms > max_intra_pause_ms) {
+          max_intra_pause_ms = pause_ms;
+        }
+        intra_pause_count++;
+        adaptive_timeout_ms = eou_recompute(max_intra_pause_ms);
+        ESP_LOGI(TAG,
+                 "EOU resume pause=%" PRIu32 "ms intra_max=%" PRIu32 " adaptive=%" PRIu32
+                 "ms count=%" PRIu32,
+                 pause_ms, max_intra_pause_ms, adaptive_timeout_ms, intra_pause_count);
+      }
       silence_streak = 0;
       cap.speaking_log_ms += VAD_FRAME_MS;
       if (cap.speaking_log_ms >= VAD_SPEAKING_LOG_PERIOD_MS) {
@@ -401,16 +458,22 @@ esp_err_t nino_voice_capture_vad_wav(int max_seconds, uint8_t **out_wav, size_t 
       vad_update_noise_floor(&cap.noise_floor, energy, true);
       cap.speaking_log_ms += VAD_FRAME_MS;
       if (cap.speaking_log_ms >= VAD_SPEAKING_LOG_PERIOD_MS) {
-        ESP_LOGI(TAG, "VAD trailing energy=%" PRIu32 " peak=%" PRIu32 " end_th=%" PRIu32 " silence=%" PRIu32 "ms",
-                 energy, cap.peak_energy, silence_end_th, silence_streak * VAD_FRAME_MS);
+        ESP_LOGI(TAG,
+                 "VAD trailing energy=%" PRIu32 " peak=%" PRIu32 " end_th=%" PRIu32
+                 " silence=%" PRIu32 "ms adaptive=%" PRIu32 "ms",
+                 energy, cap.peak_energy, silence_end_th, silence_streak * VAD_FRAME_MS,
+                 adaptive_timeout_ms);
         cap.speaking_log_ms = 0;
       }
     }
 
-    if (silence_streak >= VAD_SILENCE_STOP_FRAMES &&
+    const uint32_t silence_ms = silence_streak * VAD_FRAME_MS;
+    if (silence_ms >= adaptive_timeout_ms &&
         (pcm_samples / VAD_FRAME_SAMPLES) >= VAD_MIN_SPEECH_FRAMES) {
-      ESP_LOGI(TAG, "VAD end on silence (peak=%" PRIu32 " end_th=%" PRIu32 ")", cap.peak_energy,
-               silence_end_th);
+      ESP_LOGI(TAG,
+               "EOU end silence=%" PRIu32 "ms adaptive=%" PRIu32 " intra_max=%" PRIu32
+               " peak=%" PRIu32 " end_th=%" PRIu32,
+               silence_ms, adaptive_timeout_ms, max_intra_pause_ms, cap.peak_energy, silence_end_th);
       break;
     }
 
@@ -426,15 +489,16 @@ esp_err_t nino_voice_capture_vad_wav(int max_seconds, uint8_t **out_wav, size_t 
     *out_len = WAV_HEADER_SIZE + pcm_samples * sizeof(int16_t);
     cap.wav = NULL;
     result = ESP_OK;
-    ESP_LOGI(TAG, "VAD WAV %" PRIu32 " ms", (uint32_t)(pcm_samples * 1000U / VOICE_MIC_RATE));
+    ESP_LOGI(TAG, "Mic closed — WAV %" PRIu32 " ms (%u bytes) ready for server",
+             (uint32_t)(pcm_samples * 1000U / VOICE_MIC_RATE), (unsigned)*out_len);
   } else if (result == ESP_FAIL) {
     result = ESP_ERR_NOT_FOUND;
   }
 
 cleanup:
-  /* Eyes stay in listening here: the captured audio still has to reach the
-   * server. nino_voice_ws_exchange() (or the caller on failure) ends it. */
-  nino_voice_wake_set_mic_capture_hold(false);
+  /* Close the ADC before Wi-Fi upload so the speaker path is free. */
+  nino_mic_close();
+  nino_audio_loopback_resume();
   free(cap.wav);
   free(cap.preroll);
   free(cap.frame);
@@ -448,6 +512,12 @@ esp_err_t nino_voice_assist_init_mutex(void) {
       return ESP_ERR_NO_MEM;
     }
   }
+  if (s_query_mu == NULL) {
+    s_query_mu = xSemaphoreCreateMutex();
+    if (s_query_mu == NULL) {
+      return ESP_ERR_NO_MEM;
+    }
+  }
   return ESP_OK;
 }
 
@@ -458,7 +528,56 @@ typedef struct {
   size_t cap_len;
   char uri[VOICE_WS_URI_MAX];
   bool medical_ack_session;
+  bool console_start;
 } voice_ws_job_t;
+
+static void copy_ws_uri(char *buf, size_t buflen) {
+  if (buf == NULL || buflen == 0) {
+    return;
+  }
+  buf[0] = '\0';
+  if (s_ws_uri_mutex == NULL) {
+    return;
+  }
+  xSemaphoreTake(s_ws_uri_mutex, portMAX_DELAY);
+  (void)snprintf(buf, buflen, "%s", s_ws_uri);
+  xSemaphoreGive(s_ws_uri_mutex);
+}
+
+static void queue_server_reply(uint8_t *resp, size_t resp_len, bool prompt_after,
+                               const char *eye_expr, bool medical_ack) {
+  (void)medical_ack;
+  if (prompt_after) {
+    ESP_LOGI(TAG, "Ignoring server mic re-listen request (fixed 5 s / 20 s schedule only)");
+  }
+  nino_eye_state_t eye_state = nino_eye_state_from_name(eye_expr);
+  if (eye_state < NINO_EYE_STATE_COUNT) {
+    ESP_LOGI(TAG, "Reply eye_expression=%s -> state %d", eye_expr, (int)eye_state);
+  }
+  nino_main_queue_audio_wav(resp, resp_len, true, false, eye_state);
+}
+
+static esp_err_t send_wav_to_server(const char *uri, uint8_t *cap, size_t cap_len,
+                                    bool medical_ack_session) {
+  uint8_t *resp = NULL;
+  size_t resp_len = 0;
+  bool prompt_after = false;
+  char eye_expr[16] = {0};
+  const int64_t t_ws = esp_timer_get_time();
+  ESP_LOGI(TAG, "Sending %u-byte WAV to server over Wi-Fi", (unsigned)cap_len);
+  esp_err_t e = nino_voice_ws_exchange(uri, cap, cap_len, &resp, &resp_len, 300000,
+                                       &prompt_after, eye_expr, sizeof(eye_expr));
+  ESP_LOGI(TAG, "latency: WS round-trip %" PRId64 " ms", (esp_timer_get_time() - t_ws) / 1000LL);
+  nino_audio_capture_free(cap);
+  if (e != ESP_OK || resp == NULL || resp_len == 0) {
+    ESP_LOGE(TAG, "WS exchange failed: %s", esp_err_to_name(e));
+    free(resp);
+    nino_eye_idle();
+    return (e != ESP_OK) ? e : ESP_FAIL;
+  }
+  queue_server_reply(resp, resp_len, prompt_after, eye_expr, medical_ack_session);
+  return ESP_OK;
+}
 
 static void voice_ws_job_task(void *pv) {
   voice_ws_job_t *job = (voice_ws_job_t *)pv;
@@ -466,46 +585,18 @@ static void voice_ws_job_task(void *pv) {
     vTaskDelete(NULL);
     return;
   }
-
-  uint8_t *resp = NULL;
-  size_t resp_len = 0;
-  bool prompt_after = false;
-  char eye_expr[16] = {0};
-  const int64_t t_ws = esp_timer_get_time();
-  esp_err_t e = nino_voice_ws_exchange(job->uri, job->cap, job->cap_len, &resp, &resp_len, 300000,
-                                       &prompt_after, eye_expr, sizeof(eye_expr));
-  ESP_LOGI(TAG, "latency: WS round-trip %" PRId64 " ms", (esp_timer_get_time() - t_ws) / 1000LL);
-  nino_audio_capture_free(job->cap);
-  const bool medical_ack = job->medical_ack_session;
+  const bool console_start = job->console_start;
+  (void)send_wav_to_server(job->uri, job->cap, job->cap_len, job->medical_ack_session);
   free(job);
-
-  if (e != ESP_OK || resp == NULL || resp_len == 0) {
-    ESP_LOGE(TAG, "WS exchange failed: %s", esp_err_to_name(e));
-    free(resp);
-    nino_eye_idle();
-    vTaskDelete(NULL);
-    return;
-  }
-
-  nino_eye_state_t eye_state = nino_eye_state_from_name(eye_expr);
-  if (eye_state < NINO_EYE_STATE_COUNT) {
-    ESP_LOGI(TAG, "Reply eye_expression=%s -> state %d", eye_expr, (int)eye_state);
-  }
-  /* If a prompt-ack listen follows, skip the done beep — that listen already
-   * plays one chime when it opens the mic. Avoids the double-chime. */
-  const bool play_done_chime = !prompt_after;
-  nino_main_queue_audio_wav(resp, resp_len, play_done_chime, prompt_after, eye_state);
-  if (medical_ack && prompt_after) {
-    ESP_LOGI(TAG, "Medical follow-up listen scheduled after reply");
-  }
-  if (prompt_after) {
-    ESP_LOGI(TAG, "Prompt-ack listen scheduled after reply (mic opens after chime)");
+  nino_audio_loopback_resume();
+  if (console_start) {
+    s_console_start_busy = false;
   }
   vTaskDelete(NULL);
 }
 
 static esp_err_t spawn_voice_ws_job(uint8_t *cap, size_t cap_len, const char *uri,
-                                    bool medical_ack_session) {
+                                    bool medical_ack_session, bool console_start) {
   voice_ws_job_t *job = (voice_ws_job_t *)malloc(sizeof(voice_ws_job_t));
   if (job == NULL) {
     nino_audio_capture_free(cap);
@@ -516,6 +607,7 @@ static esp_err_t spawn_voice_ws_job(uint8_t *cap, size_t cap_len, const char *ur
   strncpy(job->uri, uri, sizeof(job->uri) - 1);
   job->uri[sizeof(job->uri) - 1] = '\0';
   job->medical_ack_session = medical_ack_session;
+  job->console_start = console_start;
 
   BaseType_t ok =
       xTaskCreate(voice_ws_job_task, "voice_ws", VOICE_WS_JOB_STACK, job, 3, NULL);
@@ -525,106 +617,156 @@ static esp_err_t spawn_voice_ws_job(uint8_t *cap, size_t cap_len, const char *ur
     ESP_LOGE(TAG, "Could not start voice_ws task");
     return ESP_ERR_NO_MEM;
   }
-  ESP_LOGI(TAG, "Voice query running in background (wake already re-armed)");
+  ESP_LOGI(TAG, "Voice clip queued for server upload");
+  return ESP_OK;
+}
+
+static void console_start_task(void *arg) {
+  (void)arg;
+
+  char uri[VOICE_WS_URI_MAX];
+  copy_ws_uri(uri, sizeof(uri));
+  if (uri[0] == '\0') {
+    printf("No voice server — run: voice connect <PC_IP> [8000]\n");
+    s_console_start_busy = false;
+    vTaskDelete(NULL);
+    return;
+  }
+
+  if (s_query_mu != NULL) {
+    xSemaphoreTake(s_query_mu, portMAX_DELAY);
+  }
+
+  if (!nino_sd_record_ready()) {
+    esp_err_t sd_err = nino_sd_record_init();
+    if (sd_err != ESP_OK) {
+      printf("SD card not ready — clip will not be saved locally\n");
+    }
+  }
+
+  printf("Recording in 2 s...\n");
+  nino_audio_loopback_pause();
+  vTaskDelay(pdMS_TO_TICKS(START_PRE_RECORD_DELAY_MS));
+
+  printf("Recording 5 s from onboard mic...\n");
+  ESP_LOGI(TAG, "Console start: %u ms delay, %u ms capture (SD + server)",
+           (unsigned)START_PRE_RECORD_DELAY_MS, (unsigned)START_RECORD_MS);
+
+  uint8_t *cap = NULL;
+  size_t cap_len = 0;
+  esp_err_t e = nino_audio_capture_wav(&cap, &cap_len, START_RECORD_MS);
+  if (e != ESP_OK || cap == NULL || cap_len == 0) {
+    printf("Capture failed: %s\n", esp_err_to_name(e));
+    nino_audio_capture_free(cap);
+    nino_audio_loopback_resume();
+    if (s_query_mu != NULL) {
+      xSemaphoreGive(s_query_mu);
+    }
+    s_console_start_busy = false;
+    vTaskDelete(NULL);
+    return;
+  }
+
+  printf("Captured %u byte WAV (5 s)\n", (unsigned)cap_len);
+
+  if (nino_sd_record_ready()) {
+    char path[64];
+    e = nino_sd_record_save_wav(cap, cap_len, path, sizeof(path));
+    if (e != ESP_OK) {
+      printf("Save failed: %s\n", esp_err_to_name(e));
+    } else {
+      printf("Saved: %s\n", path);
+    }
+  }
+
+  nino_audio_loopback_pause();
+  e = spawn_voice_ws_job(cap, cap_len, uri, false, true);
+  if (e != ESP_OK) {
+    printf("Could not start upload: %s\n", esp_err_to_name(e));
+    nino_audio_capture_free(cap);
+    nino_audio_loopback_resume();
+    if (s_query_mu != NULL) {
+      xSemaphoreGive(s_query_mu);
+    }
+    s_console_start_busy = false;
+    vTaskDelete(NULL);
+    return;
+  }
+
+  printf("Sending 5 s to server (reply plays on speaker when ready)...\n");
+  if (s_query_mu != NULL) {
+    xSemaphoreGive(s_query_mu);
+  }
+  vTaskDelete(NULL);
+}
+
+esp_err_t nino_voice_assist_console_start(void) {
+  if (s_console_start_busy) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  if (!nino_voice_assist_has_ws_uri()) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  s_console_start_busy = true;
+  BaseType_t ok =
+      xTaskCreate(console_start_task, "voice_start", VOICE_START_STACK, NULL, 3, NULL);
+  if (ok != pdPASS) {
+    s_console_start_busy = false;
+    return ESP_ERR_NO_MEM;
+  }
+  return ESP_OK;
+}
+
+static esp_err_t capture_and_save_to_sd(void) {
+  if (!nino_sd_record_ready()) {
+    esp_err_t sd_err = nino_sd_record_init();
+    if (sd_err != ESP_OK) {
+      return sd_err;
+    }
+  }
+
+  uint8_t *cap = NULL;
+  size_t cap_len = 0;
+  esp_err_t e = nino_audio_capture_wav(&cap, &cap_len, LISTEN_CAPTURE_MS);
+  if (e != ESP_OK || cap == NULL || cap_len == 0) {
+    nino_audio_capture_free(cap);
+    return (e != ESP_OK) ? e : ESP_FAIL;
+  }
+
+  char path[64];
+  e = nino_sd_record_save_wav(cap, cap_len, path, sizeof(path));
+  nino_audio_capture_free(cap);
+  if (e != ESP_OK) {
+    return e;
+  }
+  ESP_LOGI(TAG, "Recording saved: %s", path);
   return ESP_OK;
 }
 
 static esp_err_t run_ws_and_queue(int max_seconds, bool medical_ack_session) {
-  char uri[VOICE_WS_URI_MAX];
-  if (s_ws_uri_mutex == NULL) {
-    return ESP_ERR_INVALID_STATE;
+  (void)max_seconds;
+  (void)medical_ack_session;
+
+  if (s_query_mu != NULL) {
+    xSemaphoreTake(s_query_mu, portMAX_DELAY);
   }
-  xSemaphoreTake(s_ws_uri_mutex, portMAX_DELAY);
-  strncpy(uri, s_ws_uri, sizeof(uri) - 1);
-  uri[sizeof(uri) - 1] = '\0';
-  xSemaphoreGive(s_ws_uri_mutex);
-
-  if (uri[0] == '\0') {
-    ESP_LOGW(TAG, "WS URI not set");
-    nino_voice_wake_release_after_wake();
-    return ESP_ERR_INVALID_STATE;
+  esp_err_t e = capture_and_save_to_sd();
+  if (s_query_mu != NULL) {
+    xSemaphoreGive(s_query_mu);
   }
-
-  const int64_t t_query = esp_timer_get_time();
-
-  uint8_t *cap = NULL;
-  size_t cap_len = 0;
-  esp_err_t e = nino_voice_capture_vad_wav(max_seconds, &cap, &cap_len);
-  ESP_LOGI(TAG, "latency: VAD capture %" PRId64 " ms", (esp_timer_get_time() - t_query) / 1000LL);
   if (e != ESP_OK) {
-    ESP_LOGE(TAG, "VAD capture failed: %s", esp_err_to_name(e));
+    ESP_LOGE(TAG, "5 s capture to SD failed: %s", esp_err_to_name(e));
     nino_eye_idle();
-    nino_voice_wake_release_after_wake();
-    return e;
   }
-
-  nino_voice_wake_release_after_wake();
-  return spawn_voice_ws_job(cap, cap_len, uri, medical_ack_session);
+  return e;
 }
 
 esp_err_t nino_voice_assist_run_query_only(void) {
   return run_ws_and_queue(VOICE_QUERY_VAD_MAX_SEC, false);
 }
 
-#define MED_ACK_TASK_STACK 20480
-#define PROMPT_ACK_POST_PLAY_MS 900
-
-static void prompt_listen_task(void *arg) {
-  (void)arg;
-  const bool play_chime = s_next_prompt_ack_play_chime;
-  s_next_prompt_ack_play_chime = true;
-
-  vTaskDelay(pdMS_TO_TICKS(PROMPT_ACK_POST_PLAY_MS));
-  if (!nino_voice_assist_has_ws_uri()) {
-    ESP_LOGW(TAG,
-             "Prompt listen: PC voice not linked — need voice connect or "
-             "X-Nino-Voice-Ws-Url from server");
-    vTaskDelete(NULL);
-    return;
-  }
-  ESP_LOGI(TAG, "Prompt listen — VAD (%d s, chime=%d)", MED_ACK_VAD_MAX_SEC, (int)play_chime);
-  if (play_chime) {
-    esp_err_t chime = nino_voice_play_wake_chime();
-    if (chime != ESP_OK) {
-      ESP_LOGW(TAG, "Prompt listen chime failed: %s", esp_err_to_name(chime));
-    }
-    vTaskDelay(pdMS_TO_TICKS(350));
-  }
-  esp_err_t e = run_ws_and_queue(MED_ACK_VAD_MAX_SEC, false);
-  if (e != ESP_OK) {
-    ESP_LOGW(TAG, "Prompt listen voice query failed: %s", esp_err_to_name(e));
-  }
-  vTaskDelete(NULL);
-}
-
-static void medical_ack_prompt_task(void *arg) {
-  (void)arg;
-  s_next_prompt_ack_play_chime = true;
-  vTaskDelay(pdMS_TO_TICKS(500));
-  if (!nino_voice_assist_has_ws_uri()) {
-    ESP_LOGW(TAG,
-             "Medical ack: PC voice not linked — serial: voice connect <PC_LAN_IP> 8000");
-    vTaskDelete(NULL);
-    return;
-  }
-  ESP_LOGI(TAG, "Medical reminder — listening (%d s)", MED_ACK_VAD_MAX_SEC);
-  esp_err_t chime = nino_voice_play_wake_chime();
-  if (chime != ESP_OK) {
-    ESP_LOGW(TAG, "Medical ack chime failed: %s", esp_err_to_name(chime));
-  }
-  esp_err_t e = run_ws_and_queue(MED_ACK_VAD_MAX_SEC, true);
-  if (e != ESP_OK) {
-    ESP_LOGW(TAG, "Medical ack voice query failed: %s", esp_err_to_name(e));
-  }
-  vTaskDelete(NULL);
-}
-
 void nino_voice_assist_prompt_medical_ack(void) {
-  BaseType_t ok =
-      xTaskCreate(prompt_listen_task, "prompt_listen", MED_ACK_TASK_STACK, NULL, 3, NULL);
-  if (ok != pdPASS) {
-    ESP_LOGW(TAG, "Could not start prompt listen task");
-  }
+  ESP_LOGD(TAG, "Ignoring server mic prompt (fixed 5 s / 20 s schedule only)");
 }
 
 bool nino_voice_assist_has_ws_uri(void) {
@@ -636,4 +778,52 @@ bool nino_voice_assist_has_ws_uri(void) {
   ok = (s_ws_uri[0] != '\0');
   xSemaphoreGive(s_ws_uri_mutex);
   return ok;
+}
+
+static void voice_sd_record_task(void *arg) {
+  (void)arg;
+
+  while (!nino_mic_available()) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+
+  while (!nino_sd_record_ready()) {
+    esp_err_t sd_err = nino_sd_record_init();
+    if (sd_err != ESP_OK) {
+      ESP_LOGW(TAG, "SD card not ready — retry in 3 s (insert FAT32 card in board slot)");
+      vTaskDelay(pdMS_TO_TICKS(3000));
+      continue;
+    }
+    break;
+  }
+
+  ESP_LOGI(TAG, "SD record loop — 5 s 16 kHz mono WAV clips, no server upload");
+
+  while (true) {
+    if (s_query_mu != NULL) {
+      xSemaphoreTake(s_query_mu, portMAX_DELAY);
+    }
+    esp_err_t e = capture_and_save_to_sd();
+    if (s_query_mu != NULL) {
+      xSemaphoreGive(s_query_mu);
+    }
+    if (e != ESP_OK) {
+      ESP_LOGW(TAG, "SD capture failed: %s", esp_err_to_name(e));
+      nino_eye_idle();
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+  }
+}
+
+void nino_voice_assist_start_listen_loop(void) {
+  if (s_listen_loop_started) {
+    return;
+  }
+  s_listen_loop_started = true;
+  BaseType_t ok =
+      xTaskCreate(voice_sd_record_task, "voice_sd_rec", LISTEN_LOOP_STACK, NULL, 3, NULL);
+  if (ok != pdPASS) {
+    s_listen_loop_started = false;
+    ESP_LOGE(TAG, "Could not start SD record task");
+  }
 }
