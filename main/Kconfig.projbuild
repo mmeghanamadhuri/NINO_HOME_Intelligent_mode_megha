@@ -1,0 +1,33 @@
+# Onboard ES8311 is the microphone (no USB 4-mic GPIO header PHY).
+menu "NiNO audio"
+
+    config NINO_ONBOARD_MIC_LOOPBACK
+        bool
+        default y
+        help
+            Always-on onboard ES8311 microphone to speaker loopback.
+
+endmenu
+
+menu "NiNO Eye Displays"
+
+    choice NINO_EYE_DISPLAY
+        prompt "Eye panel type"
+        default NINO_EYE_DISPLAY_TFT
+
+        config NINO_EYE_DISPLAY_OLED
+            bool "SSD1351 OLED (Waveshare 1.27\" 128x96)"
+            help
+                Dual Waveshare SSD1351 RGB OLED modules. No backlight pin.
+                Uses shadow framebuffer + delta SPI to reduce flicker.
+
+        config NINO_EYE_DISPLAY_TFT
+            bool "ST7735 TFT (1.44\" SPI 128x128)"
+            help
+                Dual 1.44 inch ST7735 SPI TFT modules (128x128 RGB565).
+                Requires backlight on GPIO 19 (LED pin) or tie LED to 3.3 V.
+                Shared SPI: SCK 23, MOSI 22, DC 21, RST 20, CS 32/33.
+
+    endchoice
+
+endmenu

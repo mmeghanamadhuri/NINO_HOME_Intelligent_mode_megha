@@ -2,12 +2,20 @@
 
 #include <ctype.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "ssd1351.h"
+#include "nino_display.h"
+#include "sdkconfig.h"
+#if CONFIG_NINO_EYE_DISPLAY_TFT
+#include "tft_neutral.h"
+#endif
 #include "fire_emoji.h"
 #include "smile_emoji.h"
 #include "sparkle_emoji.h"
@@ -20,11 +28,11 @@
 
 static const char *TAG = "nino_eye";
 
-/* One SSD1351 OLED per eye, native landscape 128 x 96. */
+/* One panel per eye — 128x96 OLED or 128x128 TFT (see nino_display.h). */
 #define LOGICAL_WIDTH   OLED_WIDTH
 #define LOGICAL_HEIGHT  OLED_HEIGHT
 #define EYE_CX          (LOGICAL_WIDTH / 2)
-/* Global downward shift for all states (idle, happy, tired, thinking, etc.). */
+/* Same downward shift on both panels — keeps the eye at a similar vertical ratio. */
 #define NINO_VOFFSET    8
 #define EYE_CY          (LOGICAL_HEIGHT / 2 + NINO_VOFFSET)
 /* Legacy draw-time trim (0 = off); prefer NINO_VOFFSET for vertical centering. */
@@ -36,11 +44,39 @@ static const char *TAG = "nino_eye";
 #define EYE_CLIP_Y0       (EYE_CY - 52)
 #define EYE_CLIP_Y1       (EYE_CY + 44)
 
-/* Quick eyelid blink: per-frame delay for the close/open sweep. Smaller =
- * snappier. The number of frames is ry / BLINK_CLOSE_STEP. */
-#define BLINK_FRAME_MS      24
-#define BLINK_CLOSE_STEP    6
+/*
+ * Two independent clocks (do not conflate them):
+ *
+ * 1) Animation FPS — how often we rewrite GDDRAM during motion sweeps.
+ *    Locked to ~30.3 FPS (33 ms) to match default phone video capture so the
+ *    camera does not sample mid-blink against a 100+ FPS software beat.
+ * 2) Panel scan FPS — SSD1351 continuously refreshes the glass from GDDRAM
+ *    (CLOCKDIV in ssd1351.c). SPI writes only update RAM; there is no
+ *    display stop / refresh command after each image. Between animation
+ *    frames we simply wait; the panel keeps showing the last RAM contents.
+ *
+ * Motion frames are composed in RAM; only changed pixels are SPI-written
+ * (delta spans), and both OLEDs latch the same bits together (broadcast CS).
+ */
+#define NINO_EYE_FRAME_MS   33
+#define BLINK_FRAME_MS      NINO_EYE_FRAME_MS
+#define BLINK_CLOSE_STEP    2
 #define MAX_GAZE_POINTS 5
+
+/* Jetson neutral animation (spi_render.py) — 128×128 TFT values; scaled for OLED. */
+#if CONFIG_NINO_EYE_DISPLAY_TFT
+#define NEU_MAX_RADIUS          34
+#define NEU_LOOK_DIST           28
+#else
+#define NEU_MAX_RADIUS          26
+#define NEU_LOOK_DIST           21
+#endif
+#define NEU_HOLD_OPEN_MS        1600
+#define NEU_SHUTTER_STEP_MS     9
+#define NEU_WHITE_MS            480
+#define NEU_DIAMETER_STEP_MS    11
+#define NEU_SHUTTER_STEP_PX     4
+#define NEU_DIAMETER_STEP_PX    2
 
 /* 1 = cycle all states for testing. 0 = hold current state (loops forever). */
 #define DEMO_CYCLE          0
@@ -57,6 +93,7 @@ typedef enum {
     NINO_RENDER_SMILE,
     NINO_RENDER_SPARKLE,
     NINO_RENDER_EMOJI,
+    NINO_RENDER_NEUTRAL,
 } nino_render_mode_t;
 
 typedef struct {
@@ -88,22 +125,29 @@ typedef struct {
 
 static volatile nino_eye_state_t s_state = NINO_EYE_IDLE;
 static volatile bool s_restart_requested = false;
+/* When set, idle uses a shorter open-hold so demo cue gaps can blink. */
+static volatile bool s_demo_idle_pace = false;
+
+/* Demo idle: ~0.8 s open + ~0.6 s blink ≈ 1.4 s/cycle (vs ~5.6 s normal). */
+#define DEMO_IDLE_HOLD_MS 1600
 
 static const nino_state_profile_t s_profiles[NINO_EYE_STATE_COUNT] = {
-    /* idle: neutral / half-open, normal pupil, slow blink (~4-7 s -> ~5 s).
-     * blink_ms = 17 ≈ 60 FPS for blink frames (pair with CONFIG_FREERTOS_HZ=1000). */
+#if CONFIG_NINO_EYE_DISPLAY_TFT
+    /* Idle on TFT: tft_neutral.c (standalone oval blink, no OLED engine). */
     [NINO_EYE_IDLE] = {
         .mode = NINO_RENDER_BLINK,
-        .rx = 24,
-        .ry = 30,
-        .hold_ms = 10000,
-        .closed_hold_ms = 240,
-        .blink_step = 3,
-        .blink_ms = 17,
-        .gaze_offsets = {0},
-        .gaze_count = 1,
         .eye_r = 0, .eye_g = 0, .eye_b = 0,
     },
+#else
+    /* OLED idle: Jetson neutral loop — hold, shutter close, white flash, diameter
+     * open with gaze center → right → center → left → center. */
+    [NINO_EYE_IDLE] = {
+        .mode = NINO_RENDER_NEUTRAL,
+        .rx = NEU_MAX_RADIUS,
+        .ry = NEU_MAX_RADIUS,
+        .eye_r = 0, .eye_g = 0, .eye_b = 0,
+    },
+#endif
     /* happy: kept as the single red heart symbol (no eyelid/pupil/blink). */
     [NINO_EYE_HAPPY] = {
         .mode = NINO_RENDER_HEART,
@@ -113,7 +157,8 @@ static const nino_state_profile_t s_profiles[NINO_EYE_STATE_COUNT] = {
         .heart_frame_ms = 900,
         .eye_r = 255, .eye_g = 40, .eye_b = 70,   /* happy = red heart (only coloured state) */
     },
-    /* tired: low eye with heavy lowered lid (bottom sliver visible). Slow blink. */
+    /* tired: low eye with heavy lowered lid (bottom sliver visible). Slow blink
+     * cadence via hold_ms; sweep paced at NINO_EYE_FRAME_MS for phone capture. */
     [NINO_EYE_TIRED] = {
         .mode = NINO_RENDER_STATIC,
         .rx = 24,
@@ -123,7 +168,7 @@ static const nino_state_profile_t s_profiles[NINO_EYE_STATE_COUNT] = {
         .hold_ms = 4500,
         .closed_hold_ms = 300,
         .blink_step = 2,
-        .blink_ms = 45,
+        .blink_ms = NINO_EYE_FRAME_MS,
         .state_ms = 4000,
         .eye_r = 0, .eye_g = 0, .eye_b = 0,
     },
@@ -144,8 +189,8 @@ static const nino_state_profile_t s_profiles[NINO_EYE_STATE_COUNT] = {
         .ry = 33,
         .hold_ms = 2500,
         .closed_hold_ms = 120,
-        .blink_step = 4,
-        .blink_ms = 20,
+        .blink_step = 2,
+        .blink_ms = NINO_EYE_FRAME_MS,
         .gaze_offsets = {0},
         .gaze_count = 1,
         .eye_r = 0, .eye_g = 0, .eye_b = 0,
@@ -159,20 +204,20 @@ static const nino_state_profile_t s_profiles[NINO_EYE_STATE_COUNT] = {
         .bottom = EYE_CY + 30,
         .hold_ms = 6000,
         .closed_hold_ms = 300,
-        .blink_step = 3,
-        .blink_ms = 45,
+        .blink_step = 2,
+        .blink_ms = NINO_EYE_FRAME_MS,
         .state_ms = 4000,
         .eye_r = 0, .eye_g = 0, .eye_b = 0,
     },
     /* surprised: widest/tallest eye; one fast snap-open on entry, then hold wide
-     * (no frantic blink). blink_step/blink_ms tune the entry snap only. */
+     * (no frantic blink). blink_step tunes snap geometry; pace is NINO_EYE_FRAME_MS. */
     [NINO_EYE_SURPRISED] = {
         .mode = NINO_RENDER_STATIC,
         .rx = 27,
         .ry = 36,
         .hold_ms = 5000,
-        .blink_step = 8,
-        .blink_ms = 12,
+        .blink_step = 4,
+        .blink_ms = NINO_EYE_FRAME_MS,
         .state_ms = 5000,
         .eye_r = 0, .eye_g = 0, .eye_b = 0,
     },
@@ -184,8 +229,8 @@ static const nino_state_profile_t s_profiles[NINO_EYE_STATE_COUNT] = {
         .ry = 36,
         .hold_ms = 6000,
         .closed_hold_ms = 120,
-        .blink_step = 4,
-        .blink_ms = 20,
+        .blink_step = 2,
+        .blink_ms = NINO_EYE_FRAME_MS,
         .gaze_offsets = {0},
         .gaze_count = 1,
         .eye_r = 0, .eye_g = 0, .eye_b = 0,
@@ -198,22 +243,22 @@ static const nino_state_profile_t s_profiles[NINO_EYE_STATE_COUNT] = {
         .ry = 28,
         .hold_ms = 3600,
         .closed_hold_ms = 280,
-        .blink_step = 3,
-        .blink_ms = 45,
+        .blink_step = 2,
+        .blink_ms = NINO_EYE_FRAME_MS,
         .gaze_offsets = {0},
         .gaze_count = 1,
         .eye_r = 0, .eye_g = 0, .eye_b = 0,
     },
     /* mad: idle-size eye that shakes frantically - 3 s fast left<->right, then
      * 2 s fast up<->down, repeating. hold_ms = horizontal phase, state_ms =
-     * vertical phase, blink_ms = per-frame delay (smaller = faster shake). */
+     * vertical phase; per-frame pace is NINO_EYE_FRAME_MS (~30 FPS). */
     [NINO_EYE_MAD] = {
         .mode = NINO_RENDER_STATIC,
         .rx = 24,
         .ry = 30,
         .hold_ms = 3000,
         .state_ms = 2000,
-        .blink_ms = 6,
+        .blink_ms = NINO_EYE_FRAME_MS,
         .eye_r = 0, .eye_g = 0, .eye_b = 0,
     },
     /* med: red/white capsule pill, slanted (45 deg from vertical), static symbol. */
@@ -280,10 +325,21 @@ static const nino_emoji_bmp_t s_emoji_bulb     = { s_bulb_emoji,     BULB_EMOJI_
 static const nino_emoji_bmp_t s_emoji_robot    = { s_robot_emoji,    ROBOT_EMOJI_W,    ROBOT_EMOJI_H };
 static const nino_emoji_bmp_t s_emoji_bigsmile = { s_bigsmile_emoji, BIGSMILE_EMOJI_W, BIGSMILE_EMOJI_H };
 
-/* Background is white; eyes are black (per-state colour). */
+/* Background is a warm-blue white (not pure 255,255,255 — that reads pink on
+ * one panel and blue on the other). Eyes stay black. */
 static uint16_t s_eye_color = 0x0000;
 
 static uint16_t color_bg(void)
+{
+#if CONFIG_NINO_EYE_DISPLAY_TFT
+    return ssd1351_color(255, 255, 255);
+#else
+    return ssd1351_color(225, 236, 255);
+#endif
+}
+
+/* Jetson neutral uses pure white background during the blink cycle. */
+static uint16_t color_neu_white(void)
 {
     return ssd1351_color(255, 255, 255);
 }
@@ -330,16 +386,21 @@ static int ellipse_half_width(int rx, int ry, int dy)
 }
 
 /*
- * Dirty-rectangle tracking (logical coords). Every shape draw records the area
- * it touches; redraw_bg_region() then erases ONLY that area to background
- * instead of repainting the whole screen. This keeps the white background
- * static during transitions so only the black eye appears to change, rather
- * than a full-screen white "window" wiping top-to-bottom each frame.
+ * Dirty-rectangle tracking. AABB alone is not enough for present: blitting the
+ * whole box rewrites unchanged background pixels inside it, and this Waveshare
+ * SSD1351 flashes when background is rewritten (phone flicker up close).
+ * Present uses a second "what's on the glass" buffer and SPI-writes only
+ * pixels that actually changed (horizontal delta spans).
  */
 static int s_dirty_x0 = LOGICAL_WIDTH;
 static int s_dirty_y0 = LOGICAL_HEIGHT;
 static int s_dirty_x1 = -1;
 static int s_dirty_y1 = -1;
+
+/* Compose buffer + mirror of GDDRAM contents after the last successful present. */
+static uint16_t *s_fb = NULL;
+static uint16_t *s_fb_hw = NULL;
+static bool s_fb_batch = false;
 
 static void dirty_reset(void)
 {
@@ -355,6 +416,129 @@ static void dirty_add(int x0, int y0, int x1, int y1)
     if (y0 < s_dirty_y0) s_dirty_y0 = y0;
     if (x1 > s_dirty_x1) s_dirty_x1 = x1;
     if (y1 > s_dirty_y1) s_dirty_y1 = y1;
+}
+
+static bool fb_init(void)
+{
+    if (s_fb != NULL && s_fb_hw != NULL) {
+        return true;
+    }
+    const size_t bytes = (size_t)LOGICAL_WIDTH * (size_t)LOGICAL_HEIGHT * sizeof(uint16_t);
+    if (s_fb == NULL) {
+        s_fb = (uint16_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_fb == NULL) {
+            s_fb = (uint16_t *)malloc(bytes);
+        }
+    }
+    if (s_fb_hw == NULL) {
+        s_fb_hw = (uint16_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_fb_hw == NULL) {
+            s_fb_hw = (uint16_t *)malloc(bytes);
+        }
+    }
+    if (s_fb == NULL || s_fb_hw == NULL) {
+        ESP_LOGE(TAG, "eye framebuffer alloc failed (%u bytes x2)", (unsigned)bytes);
+        return false;
+    }
+    memset(s_fb, 0, bytes);
+    memset(s_fb_hw, 0, bytes);
+    ESP_LOGI(TAG, "eye framebuffer ready %dx%d (~%u FPS, delta-span present)",
+             LOGICAL_WIDTH, LOGICAL_HEIGHT, (unsigned)(1000 / NINO_EYE_FRAME_MS));
+    return true;
+}
+
+static void fb_present_full(void)
+{
+    if (s_fb == NULL) {
+        return;
+    }
+    ssd1351_draw_bitmap(0, 0, LOGICAL_WIDTH, LOGICAL_HEIGHT, s_fb);
+    if (s_fb_hw != NULL) {
+        memcpy(s_fb_hw, s_fb,
+               (size_t)LOGICAL_WIDTH * (size_t)LOGICAL_HEIGHT * sizeof(uint16_t));
+    }
+    dirty_reset();
+}
+
+/*
+ * SPI only pixels that differ from what is already on the glass. Unchanged
+ * background is never rewritten — that is what stopped the close-range flash.
+ */
+static void fb_present(void)
+{
+    if (s_fb == NULL || s_fb_hw == NULL) {
+        return;
+    }
+    if (s_dirty_x1 < s_dirty_x0 || s_dirty_y1 < s_dirty_y0) {
+        return;
+    }
+
+    int x0 = s_dirty_x0;
+    int y0 = s_dirty_y0;
+    int x1 = s_dirty_x1;
+    int y1 = s_dirty_y1;
+    if (x0 < 0) {
+        x0 = 0;
+    }
+    if (y0 < 0) {
+        y0 = 0;
+    }
+    if (x1 >= LOGICAL_WIDTH) {
+        x1 = LOGICAL_WIDTH - 1;
+    }
+    if (y1 >= LOGICAL_HEIGHT) {
+        y1 = LOGICAL_HEIGHT - 1;
+    }
+    if (x1 < x0 || y1 < y0) {
+        dirty_reset();
+        return;
+    }
+
+    for (int y = y0; y <= y1; y++) {
+        uint16_t *row = &s_fb[(size_t)y * (size_t)LOGICAL_WIDTH];
+        uint16_t *hw = &s_fb_hw[(size_t)y * (size_t)LOGICAL_WIDTH];
+        int x = x0;
+        while (x <= x1) {
+            while (x <= x1 && row[x] == hw[x]) {
+                x++;
+            }
+            if (x > x1) {
+                break;
+            }
+            const int xs = x;
+            while (x <= x1 && row[x] != hw[x]) {
+                x++;
+            }
+            const int xe = x - 1;
+            const int w = xe - xs + 1;
+            ssd1351_draw_bitmap(xs, y, w, 1, &row[xs]);
+            memcpy(&hw[xs], &row[xs], (size_t)w * sizeof(uint16_t));
+        }
+    }
+    dirty_reset();
+}
+
+static void fb_batch_begin(void)
+{
+    s_fb_batch = true;
+    dirty_reset();
+}
+
+static void fb_batch_end(void)
+{
+    s_fb_batch = false;
+    fb_present();
+}
+
+static void fb_hw_note_span(int x, int y, int width, uint16_t color)
+{
+    if (s_fb_hw == NULL || width <= 0) {
+        return;
+    }
+    uint16_t *row = &s_fb_hw[(size_t)y * (size_t)LOGICAL_WIDTH + (size_t)x];
+    for (int i = 0; i < width; i++) {
+        row[i] = color;
+    }
 }
 
 static void draw_landscape_hline(int x, int y, int width, uint16_t color)
@@ -397,8 +581,22 @@ static void draw_landscape_hline(int x, int y, int width, uint16_t color)
         return;
     }
 
-    ssd1351_fill_rect(x, y, width, 1, color);
-    dirty_add(x, logical_y, x + width - 1, logical_y);
+    /* Always keep the shadow buffer in sync with what we intend to show. */
+    if (s_fb != NULL) {
+        uint16_t *row = &s_fb[(size_t)y * (size_t)LOGICAL_WIDTH + (size_t)x];
+        for (int i = 0; i < width; i++) {
+            row[i] = color;
+        }
+    }
+
+    /* Dirty uses the same coords as the framebuffer / SPI window. */
+    dirty_add(x, y, x + width - 1, y);
+
+    /* During a batch with a shadow buffer, defer SPI until fb_batch_end(). */
+    if (!s_fb_batch || s_fb == NULL) {
+        ssd1351_fill_rect(x, y, width, 1, color);
+        fb_hw_note_span(x, y, width, color);
+    }
 }
 
 #if NINO_ORIENT_TEST
@@ -412,8 +610,17 @@ static void draw_landscape_rect(int x, int y, int width, int height, uint16_t co
 
 static void clear_screen(uint16_t color)
 {
-    ssd1351_fill_screen(color);
-    dirty_reset();
+    if (s_fb != NULL) {
+        const size_t n = (size_t)LOGICAL_WIDTH * (size_t)LOGICAL_HEIGHT;
+        for (size_t i = 0; i < n; i++) {
+            s_fb[i] = color;
+        }
+        /* Full clear must rewrite every pixel once (boot / state reset only). */
+        fb_present_full();
+    } else {
+        ssd1351_fill_screen(color);
+        dirty_reset();
+    }
 }
 
 /*
@@ -1117,13 +1324,45 @@ static void erase_emoji_bmp(int cx, int cy, const nino_emoji_bmp_t *bmp)
 }
 
 /*
- * Clear the previous glyph. Shape-only white redraw leaves a brighter OLED
- * "window" oval (fresh white vs untouched white). A full-screen bg clear keeps
- * the panel uniform white with no leftover oval plate.
+ * Un-draw the previous glyph by shape (background colour over its footprint).
+ * Full-screen clear is avoided — on TFT that looked like a pop; on OLED it
+ * caused a white flash. Blink frames compose in the shadow FB, then one SPI
+ * present per animation step (~30 FPS).
  */
 static void erase_prev_eye(void)
 {
-    clear_screen(color_bg());
+    fb_batch_begin();
+    switch (s_prev_kind) {
+    case PREV_ELLIPSE:
+        draw_eye_rows(s_prev_cx, s_prev_rx, s_prev_ry, s_prev_top, s_prev_bottom, color_bg());
+        break;
+    case PREV_HEART:
+        draw_heart(s_prev_heart_cx, s_prev_heart_cy, s_prev_heart_scale, color_bg());
+        break;
+    case PREV_BLOB:
+        fill_ellipse(s_prev_cx, s_prev_blob_cy, s_prev_rx, s_prev_ry, color_bg());
+        break;
+    case PREV_CAPSULE:
+        erase_capsule(s_prev_cap_cx, s_prev_cap_cy, s_prev_cap_half_len, s_prev_cap_radius);
+        break;
+    case PREV_FIRE:
+        erase_fire(s_prev_fire_cx, s_prev_fire_cy);
+        break;
+    case PREV_SMILE:
+        erase_smile(s_prev_smile_cx, s_prev_smile_cy);
+        break;
+    case PREV_SPARKLE:
+        erase_sparkle(s_prev_sparkle_cx, s_prev_sparkle_cy);
+        break;
+    case PREV_EMOJI:
+        if (s_prev_emoji_bmp != NULL) {
+            erase_emoji_bmp(s_prev_emoji_cx, s_prev_emoji_cy, s_prev_emoji_bmp);
+        }
+        break;
+    default:
+        break;
+    }
+    fb_batch_end();
     s_prev_kind = PREV_NONE;
     s_prev_emoji_bmp = NULL;
 }
@@ -1133,10 +1372,23 @@ static nino_eye_state_t current_state(void)
     return (nino_eye_state_t)s_state;
 }
 
+/*
+ * Deadline-based wait so SPI draw time does not stack on top of frame_ms
+ * (which made motion look low-FPS / jittery on phone video). Long waits still
+ * yield to FreeRTOS; sub-ms remainders spin with esp_rom_delay_us.
+ */
 static bool delay_ms_interruptible(int total_ms, nino_eye_state_t expected)
 {
-    int elapsed = 0;
-    while (elapsed < total_ms) {
+    if (total_ms <= 0) {
+        if (s_restart_requested) {
+            s_restart_requested = false;
+            return false;
+        }
+        return current_state() == expected;
+    }
+
+    const int64_t deadline_us = esp_timer_get_time() + (int64_t)total_ms * 1000LL;
+    while (esp_timer_get_time() < deadline_us) {
         if (s_restart_requested) {
             s_restart_requested = false;
             return false;
@@ -1145,23 +1397,232 @@ static bool delay_ms_interruptible(int total_ms, nino_eye_state_t expected)
             return false;
         }
 
-        int slice_ms = total_ms - elapsed;
-        if (slice_ms > 25) {
-            slice_ms = 25;
+        const int64_t remaining_us = deadline_us - esp_timer_get_time();
+        if (remaining_us <= 0) {
+            break;
         }
-        /* Always wait at least 1 tick. With CONFIG_FREERTOS_HZ=100 (10 ms/tick),
-         * pdMS_TO_TICKS() of a small value rounds to 0, so vTaskDelay(0) would
-         * NOT yield - a fast loop (e.g. mad's 6 ms frames) would then starve the
-         * idle task and trip the task watchdog. */
-        TickType_t ticks = pdMS_TO_TICKS(slice_ms);
-        if (ticks == 0) {
-            ticks = 1;
+
+        /* Yield in ~1 ms slices so other tasks / the idle task keep running. */
+        if (remaining_us > 1000) {
+            int slice_ms = (int)(remaining_us / 1000);
+            if (slice_ms > 25) {
+                slice_ms = 25;
+            }
+            TickType_t ticks = pdMS_TO_TICKS(slice_ms);
+            if (ticks == 0) {
+                ticks = 1;
+            }
+            vTaskDelay(ticks);
+        } else {
+            esp_rom_delay_us((uint32_t)remaining_us);
+            break;
         }
-        vTaskDelay(ticks);
-        elapsed += slice_ms;
     }
 
     return current_state() == expected;
+}
+
+/* Wait the remainder of a frame budget after drawing (true FPS = 1000/frame_ms). */
+static bool pace_frame_interruptible(int64_t frame_start_us, int frame_ms,
+                                     nino_eye_state_t expected)
+{
+    const int64_t budget_us = (int64_t)frame_ms * 1000LL;
+    const int64_t elapsed_us = esp_timer_get_time() - frame_start_us;
+    const int64_t remain_us = budget_us - elapsed_us;
+    if (remain_us <= 0) {
+        if (s_restart_requested) {
+            s_restart_requested = false;
+            return false;
+        }
+        return current_state() == expected;
+    }
+    return delay_ms_interruptible((int)((remain_us + 999) / 1000), expected);
+}
+
+static void fill_rect_rows(int x, int y, int w, int h, uint16_t color)
+{
+    if (h <= 0 || w <= 0) {
+        return;
+    }
+    for (int row = 0; row < h; row++) {
+        draw_landscape_hline(x, y + row, w, color);
+    }
+}
+
+static float ease_out_cubic(float t)
+{
+    if (t <= 0.0f) {
+        return 0.0f;
+    }
+    if (t >= 1.0f) {
+        return 1.0f;
+    }
+    const float u = 1.0f - t;
+    return 1.0f - (u * u * u);
+}
+
+typedef struct {
+    int seg;
+    int phase;
+    int64_t mark_ms;
+    int shutter_y;
+    int diameter_d;
+    int from_x;
+    int to_x;
+} neutral_anim_t;
+
+static neutral_anim_t s_neu;
+
+static int64_t neu_now_ms(void)
+{
+    return esp_timer_get_time() / 1000;
+}
+
+static void neu_load_seg(int seg)
+{
+    static const int k_from[4] = {0, NEU_LOOK_DIST, 0, -NEU_LOOK_DIST};
+    static const int k_to[4] = {NEU_LOOK_DIST, 0, -NEU_LOOK_DIST, 0};
+    seg &= 3;
+    s_neu.seg = seg;
+    s_neu.from_x = k_from[seg];
+    s_neu.to_x = k_to[seg];
+}
+
+static void neu_reset(void)
+{
+    s_neu.seg = 0;
+    neu_load_seg(0);
+    s_neu.phase = 0;
+    s_neu.mark_ms = neu_now_ms();
+    s_neu.shutter_y = 0;
+    s_neu.diameter_d = 0;
+}
+
+static void neu_paint_shutter_close(int shutter_y, int look_x)
+{
+    const int cx = EYE_CX + look_x;
+    const int cy = EYE_CY;
+    const int r = NEU_MAX_RADIUS;
+    const uint16_t white = color_neu_white();
+
+    fill_rect_rows(EYE_CX - EYE_CLIP_HALF_W, EYE_CLIP_Y0,
+                   EYE_CLIP_HALF_W * 2 + 1, EYE_CLIP_Y1 - EYE_CLIP_Y0 + 1, white);
+    fill_ellipse(cx, cy, r, r, color_eye());
+    const int shutter_top = cy + r - shutter_y;
+    if (shutter_top < LOGICAL_HEIGHT) {
+        const int h = LOGICAL_HEIGHT - shutter_top;
+        if (h > 0) {
+            fill_rect_rows(0, shutter_top, LOGICAL_WIDTH, h, white);
+        }
+    }
+    remember_blob(cx, cy, r, r);
+}
+
+static void neu_paint_diameter_open(int open_dist, int look_x)
+{
+    const int cx = EYE_CX + look_x;
+    const int cy = EYE_CY;
+    const int r = NEU_MAX_RADIUS;
+    const uint16_t white = color_neu_white();
+
+    fill_rect_rows(EYE_CX - EYE_CLIP_HALF_W, EYE_CLIP_Y0,
+                   EYE_CLIP_HALF_W * 2 + 1, EYE_CLIP_Y1 - EYE_CLIP_Y0 + 1, white);
+    fill_ellipse(cx, cy, r, r, color_eye());
+    if (open_dist > 0) {
+        const int top_h = cy - open_dist;
+        if (top_h > 0) {
+            fill_rect_rows(0, 0, LOGICAL_WIDTH, top_h, white);
+        }
+        const int bot_y = cy + open_dist;
+        if (bot_y < LOGICAL_HEIGHT) {
+            fill_rect_rows(0, bot_y, LOGICAL_WIDTH, LOGICAL_HEIGHT - bot_y, white);
+        }
+    }
+    remember_blob(cx, cy, r, r);
+}
+
+/*
+ * Jetson neutral: hold open → shutter close → white flash → diameter open at
+ * next gaze (center → right → center → left → center …).
+ */
+static void run_neutral_nino(const nino_state_profile_t *profile, nino_eye_state_t expected)
+{
+    (void)profile;
+    neu_reset();
+    fb_batch_begin();
+    erase_prev_eye();
+    neu_paint_diameter_open(NEU_MAX_RADIUS, s_neu.from_x);
+    fb_batch_end();
+
+    while (current_state() == expected) {
+        if (s_restart_requested) {
+            s_restart_requested = false;
+            neu_reset();
+            fb_batch_begin();
+            neu_paint_diameter_open(NEU_MAX_RADIUS, s_neu.from_x);
+            fb_batch_end();
+            continue;
+        }
+
+        const int64_t now = neu_now_ms();
+
+        if (s_neu.phase == 0) {
+            if (now - s_neu.mark_ms >= NEU_HOLD_OPEN_MS) {
+                s_neu.phase = 1;
+                s_neu.shutter_y = 0;
+                s_neu.mark_ms = now;
+            } else if (!delay_ms_interruptible(20, expected)) {
+                return;
+            }
+        } else if (s_neu.phase == 1) {
+            if (now - s_neu.mark_ms >= NEU_SHUTTER_STEP_MS) {
+                s_neu.mark_ms = now;
+                fb_batch_begin();
+                neu_paint_shutter_close(s_neu.shutter_y, s_neu.from_x);
+                fb_batch_end();
+                s_neu.shutter_y += NEU_SHUTTER_STEP_PX;
+                if (s_neu.shutter_y > NEU_MAX_RADIUS * 2) {
+                    fb_batch_begin();
+                    fill_rect_rows(EYE_CX - EYE_CLIP_HALF_W, EYE_CLIP_Y0,
+                                   EYE_CLIP_HALF_W * 2 + 1,
+                                   EYE_CLIP_Y1 - EYE_CLIP_Y0 + 1, color_neu_white());
+                    fb_batch_end();
+                    s_prev_kind = PREV_NONE;
+                    s_neu.phase = 2;
+                    s_neu.mark_ms = now;
+                }
+            } else if (!delay_ms_interruptible(5, expected)) {
+                return;
+            }
+        } else if (s_neu.phase == 2) {
+            if (now - s_neu.mark_ms >= NEU_WHITE_MS) {
+                s_neu.phase = 3;
+                s_neu.diameter_d = 0;
+                s_neu.mark_ms = now;
+            } else if (!delay_ms_interruptible(20, expected)) {
+                return;
+            }
+        } else {
+            if (now - s_neu.mark_ms >= NEU_DIAMETER_STEP_MS) {
+                s_neu.mark_ms = now;
+                const float t =
+                    fminf(1.0f, (float)s_neu.diameter_d / (float)NEU_MAX_RADIUS);
+                const int dd = (int)(ease_out_cubic(t) * (float)NEU_MAX_RADIUS);
+                fb_batch_begin();
+                neu_paint_diameter_open(dd, s_neu.to_x);
+                fb_batch_end();
+                s_neu.diameter_d += NEU_DIAMETER_STEP_PX;
+                if (s_neu.diameter_d > NEU_MAX_RADIUS) {
+                    s_neu.seg = (s_neu.seg + 1) & 3;
+                    neu_load_seg(s_neu.seg);
+                    s_neu.phase = 0;
+                    s_neu.mark_ms = now;
+                }
+            } else if (!delay_ms_interruptible(5, expected)) {
+                return;
+            }
+        }
+    }
 }
 
 static int blink_eye_to_position(const nino_state_profile_t *profile,
@@ -1175,59 +1636,88 @@ static int blink_eye_to_position(const nino_state_profile_t *profile,
     if (step <= 0) {
         step = 1;
     }
-    int frame_ms = profile->blink_ms > 0 ? profile->blink_ms : BLINK_FRAME_MS;
+    const int frame_ms = NINO_EYE_FRAME_MS;
 
-    if (!delay_ms_interruptible(profile->hold_ms / 2, expected)) {
+    int open_hold_ms = profile->hold_ms / 2;
+    if (expected == NINO_EYE_IDLE && s_demo_idle_pace) {
+        open_hold_ms = DEMO_IDLE_HOLD_MS / 2;
+    }
+    if (!delay_ms_interruptible(open_hold_ms, expected)) {
         return current_x;
     }
 
-    /* Geometric close: erase oval rows from top/bottom toward center (profile
-     * blink_step + blink_ms set the original per-state timing). */
+    /* Geometric close: erase oval rows from top/bottom toward center. Each
+     * step is composed in RAM then blitted once (~30 FPS, camera-safe). */
     int previous_open = ry;
     for (int open = ry - step; open >= 0; open -= step) {
         if (current_state() != expected) {
             return current_x;
         }
+        const int64_t frame_start = esp_timer_get_time();
+        fb_batch_begin();
         erase_eye_rows(current_x, rx, ry, EYE_CY - previous_open, EYE_CY - open - 1);
         erase_eye_rows(current_x, rx, ry, EYE_CY + open + 1, EYE_CY + previous_open);
+        fb_batch_end();
         previous_open = open;
-        if (!delay_ms_interruptible(frame_ms, expected)) {
+        if (!pace_frame_interruptible(frame_start, frame_ms, expected)) {
             return current_x;
         }
     }
 
+    fb_batch_begin();
     erase_eye_rows(current_x, rx, ry, EYE_CY - ry, EYE_CY + ry);
+    fb_batch_end();
     if (!delay_ms_interruptible(profile->closed_hold_ms, expected)) {
         return current_x;
     }
 
     int previous_reveal = 0;
+    fb_batch_begin();
     draw_eye_rows(next_x, rx, ry, EYE_CY, EYE_CY, color_eye());
+    fb_batch_end();
     for (int open = step; open <= ry; open += step) {
         if (current_state() != expected) {
             return next_x;
         }
+        const int64_t frame_start = esp_timer_get_time();
+        fb_batch_begin();
         draw_eye_rows(next_x, rx, ry, EYE_CY - open, EYE_CY - previous_reveal - 1, color_eye());
         draw_eye_rows(next_x, rx, ry, EYE_CY + previous_reveal + 1, EYE_CY + open, color_eye());
+        fb_batch_end();
         previous_reveal = open;
-        if (!delay_ms_interruptible(frame_ms, expected)) {
+        if (!pace_frame_interruptible(frame_start, frame_ms, expected)) {
             return next_x;
         }
     }
 
     if (previous_reveal < ry) {
+        fb_batch_begin();
         draw_eye_rows(next_x, rx, ry, EYE_CY - ry, EYE_CY - previous_reveal - 1, color_eye());
         draw_eye_rows(next_x, rx, ry, EYE_CY + previous_reveal + 1, EYE_CY + ry, color_eye());
+        fb_batch_end();
     }
 
     remember_ellipse(next_x, rx, ry, EYE_CY - ry, EYE_CY + ry);
     return next_x;
 }
 
+#if CONFIG_NINO_EYE_DISPLAY_TFT
+static bool tft_idle_should_run(void)
+{
+    if (s_restart_requested) {
+        s_restart_requested = false;
+        return false;
+    }
+    return current_state() == NINO_EYE_IDLE;
+}
+#endif
+
 static void draw_static_eye(const nino_state_profile_t *profile)
 {
+    fb_batch_begin();
     erase_prev_eye();
     draw_eye_rows(EYE_CX, profile->rx, profile->ry, profile->top, profile->bottom, color_eye());
+    fb_batch_end();
     remember_ellipse(EYE_CX, profile->rx, profile->ry, profile->top, profile->bottom);
 }
 
@@ -1238,8 +1728,10 @@ static void run_blink_profile_once(const nino_state_profile_t *profile, nino_eye
     /* Un-draw the previous state's shape (only its own pixels), then draw the
      * eye ONCE. After that we only blink/move incrementally, so there is no
      * full-eye erase-and-redraw flash on every cycle. */
+    fb_batch_begin();
     erase_prev_eye();
     draw_full_eye(center_x, profile->rx, profile->ry);
+    fb_batch_end();
 
     while (current_state() == expected) {
         for (int i = 0; i < profile->gaze_count; i++) {
@@ -1281,10 +1773,12 @@ static void run_lidded_blink(const nino_state_profile_t *profile, nino_eye_state
     if (step <= 0) {
         step = 1;
     }
-    const int frame_ms = profile->blink_ms > 0 ? profile->blink_ms : BLINK_FRAME_MS;
+    const int frame_ms = NINO_EYE_FRAME_MS;
 
+    fb_batch_begin();
     erase_prev_eye();
     draw_eye_rows(EYE_CX, rx, ry, top, bottom, color_eye());
+    fb_batch_end();
     remember_ellipse(EYE_CX, rx, ry, top, bottom);
 
     while (current_state() == expected) {
@@ -1298,6 +1792,7 @@ static void run_lidded_blink(const nino_state_profile_t *profile, nino_eye_state
             if (current_state() != expected) {
                 return;
             }
+            const int64_t frame_start = esp_timer_get_time();
             int new_top = top + off;
             int new_bot = bottom - off;
             if (new_top > cy) {
@@ -1306,11 +1801,13 @@ static void run_lidded_blink(const nino_state_profile_t *profile, nino_eye_state
             if (new_bot < cy) {
                 new_bot = cy;
             }
+            fb_batch_begin();
             erase_eye_rows(EYE_CX, rx, ry, cur_top, new_top - 1);
             erase_eye_rows(EYE_CX, rx, ry, new_bot + 1, cur_bot);
+            fb_batch_end();
             cur_top = new_top;
             cur_bot = new_bot;
-            if (!delay_ms_interruptible(frame_ms, expected)) {
+            if (!pace_frame_interruptible(frame_start, frame_ms, expected)) {
                 return;
             }
             if (new_top >= cy && new_bot <= cy) {
@@ -1318,18 +1815,23 @@ static void run_lidded_blink(const nino_state_profile_t *profile, nino_eye_state
             }
         }
 
+        fb_batch_begin();
         erase_eye_rows(EYE_CX, rx, ry, top, bottom);
+        fb_batch_end();
         if (!delay_ms_interruptible(profile->closed_hold_ms, expected)) {
             return;
         }
 
         cur_top = cy;
         cur_bot = cy;
+        fb_batch_begin();
         draw_eye_rows(EYE_CX, rx, ry, cy, cy, color_eye());
+        fb_batch_end();
         for (int off = step; ; off += step) {
             if (current_state() != expected) {
                 return;
             }
+            const int64_t frame_start = esp_timer_get_time();
             int new_top = cy - off;
             int new_bot = cy + off;
             if (new_top < top) {
@@ -1338,11 +1840,13 @@ static void run_lidded_blink(const nino_state_profile_t *profile, nino_eye_state
             if (new_bot > bottom) {
                 new_bot = bottom;
             }
+            fb_batch_begin();
             draw_eye_rows(EYE_CX, rx, ry, new_top, cur_top - 1, color_eye());
             draw_eye_rows(EYE_CX, rx, ry, cur_bot + 1, new_bot, color_eye());
+            fb_batch_end();
             cur_top = new_top;
             cur_bot = new_bot;
-            if (!delay_ms_interruptible(frame_ms, expected)) {
+            if (!pace_frame_interruptible(frame_start, frame_ms, expected)) {
                 return;
             }
             if (new_top <= top && new_bot >= bottom) {
@@ -1350,7 +1854,9 @@ static void run_lidded_blink(const nino_state_profile_t *profile, nino_eye_state
             }
         }
 
+        fb_batch_begin();
         draw_eye_rows(EYE_CX, rx, ry, top, bottom, color_eye());
+        fb_batch_end();
         remember_ellipse(EYE_CX, rx, ry, top, bottom);
     }
 }
@@ -1371,7 +1877,9 @@ static void run_thinking_eye(const nino_state_profile_t *profile, nino_eye_state
     static const int gy[] = {-10, -22, -16, -22, -16};
     const int gaze_n = (int)(sizeof(gx) / sizeof(gx[0]));
 
+    fb_batch_begin();
     erase_prev_eye();
+    fb_batch_end();
 
     int prev_cx = 0, prev_cy = 0;
     bool have_eye = false;
@@ -1379,10 +1887,12 @@ static void run_thinking_eye(const nino_state_profile_t *profile, nino_eye_state
     while (current_state() == expected) {
         int ex = EYE_CX + gx[i];
         int ey = EYE_CY + gy[i];
+        fb_batch_begin();
         if (have_eye) {
             fill_ellipse(prev_cx, prev_cy, rx, ry, color_bg());
         }
         fill_ellipse(ex, ey, rx, ry, color_eye());
+        fb_batch_end();
         remember_blob(ex, ey, rx, ry);
         prev_cx = ex;
         prev_cy = ey;
@@ -1408,36 +1918,48 @@ static bool blink_move_blob(int cx0, int cy0, int cx1, int cy1, int rx, int ry,
         if (current_state() != expected) {
             return false;
         }
+        const int64_t frame_start = esp_timer_get_time();
+        fb_batch_begin();
         draw_blob_rows(cx0, cy0, rx, ry, cy0 - previous_open, cy0 - open - 1, color_bg());
         draw_blob_rows(cx0, cy0, rx, ry, cy0 + open + 1, cy0 + previous_open, color_bg());
+        fb_batch_end();
         previous_open = open;
-        if (!delay_ms_interruptible(frame_ms, expected)) {
+        if (!pace_frame_interruptible(frame_start, frame_ms, expected)) {
             return false;
         }
     }
 
+    fb_batch_begin();
     draw_blob_rows(cx0, cy0, rx, ry, cy0 - ry, cy0 + ry, color_bg());
+    fb_batch_end();
     if (!delay_ms_interruptible(closed_hold, expected)) {
         return false;
     }
 
     int previous_reveal = 0;
+    fb_batch_begin();
     draw_blob_rows(cx1, cy1, rx, ry, cy1, cy1, color_eye());
+    fb_batch_end();
     for (int open = step; open <= ry; open += step) {
         if (current_state() != expected) {
             return false;
         }
+        const int64_t frame_start = esp_timer_get_time();
+        fb_batch_begin();
         draw_blob_rows(cx1, cy1, rx, ry, cy1 - open, cy1 - previous_reveal - 1, color_eye());
         draw_blob_rows(cx1, cy1, rx, ry, cy1 + previous_reveal + 1, cy1 + open, color_eye());
+        fb_batch_end();
         previous_reveal = open;
-        if (!delay_ms_interruptible(frame_ms, expected)) {
+        if (!pace_frame_interruptible(frame_start, frame_ms, expected)) {
             return false;
         }
     }
 
     if (previous_reveal < ry) {
+        fb_batch_begin();
         draw_blob_rows(cx1, cy1, rx, ry, cy1 - ry, cy1 - previous_reveal - 1, color_eye());
         draw_blob_rows(cx1, cy1, rx, ry, cy1 + previous_reveal + 1, cy1 + ry, color_eye());
+        fb_batch_end();
     }
 
     remember_blob(cx1, cy1, rx, ry);
@@ -1456,18 +1978,20 @@ static void run_curious_eye(const nino_state_profile_t *profile, nino_eye_state_
     if (step <= 0) {
         step = 1;
     }
-    const int frame_ms = profile->blink_ms > 0 ? profile->blink_ms : BLINK_FRAME_MS;
+    const int frame_ms = NINO_EYE_FRAME_MS;
 
     /* Tilted look-points: up-left then up-right (head-tilt feel). */
     static const int px[] = {-16, 16};
     static const int py[] = {-10, -10};
     const int n = (int)(sizeof(px) / sizeof(px[0]));
 
+    fb_batch_begin();
     erase_prev_eye();
     int i = 0;
     int cx = EYE_CX + px[i];
     int cy = EYE_CY + py[i];
     fill_ellipse(cx, cy, rx, ry, color_eye());
+    fb_batch_end();
     remember_blob(cx, cy, rx, ry);
 
     while (current_state() == expected) {
@@ -1490,26 +2014,34 @@ static void run_curious_eye(const nino_state_profile_t *profile, nino_eye_state_
 static void snap_open_eye(int cx, int rx, int ry, int step, int frame_ms, nino_eye_state_t expected)
 {
     int previous_reveal = 0;
+    fb_batch_begin();
     draw_eye_rows(cx, rx, ry, EYE_CY, EYE_CY, color_eye());
+    fb_batch_end();
     for (int open = step; open <= ry; open += step) {
         if (current_state() != expected) {
             return;
         }
+        const int64_t frame_start = esp_timer_get_time();
+        fb_batch_begin();
         draw_eye_rows(cx, rx, ry, EYE_CY - open, EYE_CY - previous_reveal - 1, color_eye());
         draw_eye_rows(cx, rx, ry, EYE_CY + previous_reveal + 1, EYE_CY + open, color_eye());
+        fb_batch_end();
         previous_reveal = open;
-        if (!delay_ms_interruptible(frame_ms, expected)) {
+        if (!pace_frame_interruptible(frame_start, frame_ms, expected)) {
             return;
         }
     }
     if (previous_reveal < ry) {
+        fb_batch_begin();
         draw_eye_rows(cx, rx, ry, EYE_CY - ry, EYE_CY - previous_reveal - 1, color_eye());
         draw_eye_rows(cx, rx, ry, EYE_CY + previous_reveal + 1, EYE_CY + ry, color_eye());
+        fb_batch_end();
     }
 }
 
 /*
- * Surprised: fast snap-open on entry (profile blink_step/blink_ms), then hold.
+ * Surprised: snap-open on entry (geometry from blink_step), then hold.
+ * Paced at NINO_EYE_FRAME_MS for phone 30 fps capture.
  */
 static void run_surprised_eye(const nino_state_profile_t *profile, nino_eye_state_t expected)
 {
@@ -1519,10 +2051,12 @@ static void run_surprised_eye(const nino_state_profile_t *profile, nino_eye_stat
     if (step <= 0) {
         step = 1;
     }
-    const int frame_ms = profile->blink_ms > 0 ? profile->blink_ms : 12;
+    const int frame_ms = NINO_EYE_FRAME_MS;
     const int hold_ms = profile->hold_ms > 0 ? profile->hold_ms : 5000;
 
+    fb_batch_begin();
     erase_prev_eye();
+    fb_batch_end();
     snap_open_eye(EYE_CX, rx, ry, step, frame_ms, expected);
     if (current_state() != expected) {
         return;
@@ -1547,17 +2081,19 @@ static void run_recalling_eye(const nino_state_profile_t *profile, nino_eye_stat
     if (step <= 0) {
         step = 1;
     }
-    const int frame_ms = profile->blink_ms > 0 ? profile->blink_ms : 45;
+    const int frame_ms = NINO_EYE_FRAME_MS;
 
     static const int px[] = {0, -12, 0, 12, 0};
     static const int py[] = {-4, -12, -16, -12, -6};
     const int n = (int)(sizeof(px) / sizeof(px[0]));
 
+    fb_batch_begin();
     erase_prev_eye();
     int i = 0;
     int cx = EYE_CX + px[i];
     int cy = EYE_CY + py[i];
     fill_ellipse(cx, cy, rx, ry, color_eye());
+    fb_batch_end();
     remember_blob(cx, cy, rx, ry);
 
     while (current_state() == expected) {
@@ -1585,6 +2121,7 @@ static void run_recalling_eye(const nino_state_profile_t *profile, nino_eye_stat
  */
 static void move_eye_blob(int ox, int oy, int nx, int ny, int rx, int ry)
 {
+    fb_batch_begin();
     int ytop = ((oy < ny) ? oy : ny) - ry;
     int ybot = ((oy > ny) ? oy : ny) + ry;
     for (int y = ytop; y <= ybot; y++) {
@@ -1613,27 +2150,29 @@ static void move_eye_blob(int ox, int oy, int nx, int ny, int rx, int ry)
             draw_landscape_hline(l, y, (oxr - l) + 1, color_bg());
         }
     }
+    fb_batch_end();
 }
 
 /*
- * Mad: an idle-size eye that shakes frantically. Phase 1 darts left<->right for
- * hold_ms, phase 2 darts up<->down for state_ms, then repeats. blink_ms is the
- * per-frame delay (smaller = faster). Only the moving eye is redrawn each frame.
+ * Mad: idle-size eye that shakes. Phase 1 left<->right for hold_ms, phase 2
+ * up<->down for state_ms. Motion paced at NINO_EYE_FRAME_MS (~30 FPS).
  */
 static void run_mad_eye(const nino_state_profile_t *profile, nino_eye_state_t expected)
 {
     const int rx = profile->rx;
     const int ry = profile->ry;
-    const int frame_ms = profile->blink_ms > 0 ? profile->blink_ms : 6;
+    const int frame_ms = NINO_EYE_FRAME_MS;
     const int h_amp = 18;   /* horizontal shake amplitude (px from center) */
     const int v_amp = 12;   /* vertical shake amplitude */
-    const int h_step = 9;   /* px moved per frame -> very fast dart */
-    const int v_step = 8;
+    const int h_step = 4;   /* px/frame — smaller steps look smoother at 30 FPS */
+    const int v_step = 4;
 
+    fb_batch_begin();
     erase_prev_eye();
     int cx = EYE_CX;
     int cy = EYE_CY;
     fill_ellipse(cx, cy, rx, ry, color_eye());
+    fb_batch_end();
     remember_blob(cx, cy, rx, ry);
 
     while (current_state() == expected) {
@@ -1651,15 +2190,18 @@ static void run_mad_eye(const nino_state_profile_t *profile, nino_eye_state_t ex
                 ncx = (cx - h_step < target) ? target : cx - h_step;
             }
             if (ncx != cx) {
+                const int64_t frame_start = esp_timer_get_time();
                 move_eye_blob(cx, cy, ncx, cy, rx, ry);
                 cx = ncx;
                 remember_blob(cx, cy, rx, ry);
+                if (!pace_frame_interruptible(frame_start, frame_ms, expected)) {
+                    return;
+                }
+            } else if (!delay_ms_interruptible(frame_ms, expected)) {
+                return;
             }
             if (cx == target) {
                 target = (target > EYE_CX) ? (EYE_CX - h_amp) : (EYE_CX + h_amp);
-            }
-            if (!delay_ms_interruptible(frame_ms, expected)) {
-                return;
             }
             elapsed += frame_ms;
         }
@@ -1683,15 +2225,18 @@ static void run_mad_eye(const nino_state_profile_t *profile, nino_eye_state_t ex
                 ncy = (cy - v_step < vtarget) ? vtarget : cy - v_step;
             }
             if (ncy != cy) {
+                const int64_t frame_start = esp_timer_get_time();
                 move_eye_blob(cx, cy, cx, ncy, rx, ry);
                 cy = ncy;
                 remember_blob(cx, cy, rx, ry);
+                if (!pace_frame_interruptible(frame_start, frame_ms, expected)) {
+                    return;
+                }
+            } else if (!delay_ms_interruptible(frame_ms, expected)) {
+                return;
             }
             if (cy == vtarget) {
                 vtarget = (vtarget > EYE_CY) ? (EYE_CY - v_amp) : (EYE_CY + v_amp);
-            }
-            if (!delay_ms_interruptible(frame_ms, expected)) {
-                return;
             }
             elapsed += frame_ms;
         }
@@ -1705,10 +2250,12 @@ static void run_mad_eye(const nino_state_profile_t *profile, nino_eye_state_t ex
 
 static void run_heart_profile_once(const nino_state_profile_t *profile, nino_eye_state_t expected)
 {
+    fb_batch_begin();
     erase_prev_eye();
     /* Heart's pointed bottom reaches lower than its lobes rise, so lift the
      * center well above mid-screen to keep the symbol visually centered. */
     draw_heart(EYE_CX, EYE_CY - 4, profile->heart_max_scale, color_red());
+    fb_batch_end();
     remember_heart(EYE_CX, EYE_CY - 4, profile->heart_max_scale);
     while (delay_ms_interruptible(profile->state_ms, expected)) {
         /* Happy is intentionally still: one red symbol, no pulse or flicker. */
@@ -1723,8 +2270,10 @@ static void run_med_profile_once(const nino_state_profile_t *profile, nino_eye_s
         return;
     }
 
+    fb_batch_begin();
     erase_prev_eye();
     draw_capsule(EYE_CX, EYE_CY, half_len, radius);
+    fb_batch_end();
     remember_capsule(EYE_CX, EYE_CY, half_len, radius);
     while (delay_ms_interruptible(profile->state_ms, expected)) {
         /* Static slanted capsule, like happy. */
@@ -1736,8 +2285,10 @@ static void run_jai_bhalaiah_profile_once(const nino_state_profile_t *profile, n
     const int cx = EYE_CX;
     const int cy = EYE_CY + 2;
 
+    fb_batch_begin();
     erase_prev_eye();
     draw_fire(cx, cy);
+    fb_batch_end();
     remember_fire(cx, cy);
     while (delay_ms_interruptible(profile->state_ms, expected)) {
         /* Static fire emoji — exact bitmap from the reference image. */
@@ -1749,8 +2300,10 @@ static void run_smile_profile_once(const nino_state_profile_t *profile, nino_eye
     const int cx = EYE_CX;
     const int cy = EYE_CY;
 
+    fb_batch_begin();
     erase_prev_eye();
     draw_smile(cx, cy);
+    fb_batch_end();
     remember_smile(cx, cy);
     while (delay_ms_interruptible(profile->state_ms, expected)) {
         /* Static WhatsApp-style smile emoji. */
@@ -1762,8 +2315,10 @@ static void run_sparkle_profile_once(const nino_state_profile_t *profile, nino_e
     const int cx = EYE_CX;
     const int cy = EYE_CY;
 
+    fb_batch_begin();
     erase_prev_eye();
     draw_sparkle(cx, cy);
+    fb_batch_end();
     remember_sparkle(cx, cy);
     while (delay_ms_interruptible(profile->state_ms, expected)) {
         /* Static WhatsApp-style sparkle emoji. */
@@ -1776,8 +2331,10 @@ static void run_emoji_bmp_profile_once(const nino_state_profile_t *profile, nino
     const int cx = EYE_CX;
     const int cy = EYE_CY;
 
+    fb_batch_begin();
     erase_prev_eye();
     draw_emoji_bmp(cx, cy, bmp);
+    fb_batch_end();
     remember_emoji(cx, cy, bmp);
     while (delay_ms_interruptible(profile->state_ms, expected)) {
         /* Static emoji bitmap. */
@@ -1789,8 +2346,23 @@ void nino_eye_set_state(nino_eye_state_t state)
     if (state >= NINO_EYE_STATE_COUNT) {
         return;
     }
+    const bool same = (s_state == state);
     s_state = state;
-    ESP_LOGI(TAG, "state set -> %d", (int)state);
+    if (same) {
+      /* Re-applying the same emotion must force a redraw (e.g. smile again). */
+      s_restart_requested = true;
+    }
+    ESP_LOGI(TAG, "state set -> %d%s", (int)state, same ? " (restart)" : "");
+}
+
+void nino_eye_set_demo_idle_pace(bool enabled)
+{
+    s_demo_idle_pace = enabled;
+    if (current_state() == NINO_EYE_IDLE) {
+        /* Restart so the new open-hold is picked up immediately. */
+        s_restart_requested = true;
+    }
+    ESP_LOGI(TAG, "demo idle pace %s", enabled ? "on (~1.4s/cycle)" : "off");
 }
 
 void nino_eye_idle(void)      { nino_eye_set_state(NINO_EYE_IDLE); }
@@ -1842,7 +2414,8 @@ nino_eye_state_t nino_eye_state_from_name(const char *name)
     }
     token[len] = '\0';
 
-    if (strcmp(token, "idle") == 0) {
+    if (strcmp(token, "idle") == 0 || strcmp(token, "neutral") == 0 ||
+        strcmp(token, "normal") == 0) {
         return NINO_EYE_IDLE;
     } else if (strcmp(token, "happy") == 0) {
         return NINO_EYE_HAPPY;
@@ -1888,6 +2461,33 @@ nino_eye_state_t nino_eye_state_from_name(const char *name)
         return NINO_EYE_BIGSMILE;
     }
     return NINO_EYE_STATE_COUNT;
+}
+
+const char *nino_eye_state_to_name(nino_eye_state_t state)
+{
+    switch (state) {
+    case NINO_EYE_IDLE:           return "idle";
+    case NINO_EYE_HAPPY:          return "happy";
+    case NINO_EYE_TIRED:          return "tired";
+    case NINO_EYE_THINKING:       return "thinking";
+    case NINO_EYE_CURIOUS_QUIZ:   return "curious";
+    case NINO_EYE_SAD:            return "sad";
+    case NINO_EYE_SURPRISED:      return "surprised";
+    case NINO_EYE_LISTENING:      return "listening";
+    case NINO_EYE_RECALLING:      return "recalling";
+    case NINO_EYE_MAD:            return "mad";
+    case NINO_EYE_MED:            return "med";
+    case NINO_EYE_JAI_BHALAIAH:   return "fire";
+    case NINO_EYE_SMILE:          return "smile";
+    case NINO_EYE_SPARKLE:        return "sparkle";
+    case NINO_EYE_PENCIL:         return "pencil";
+    case NINO_EYE_RADIO:          return "radio";
+    case NINO_EYE_TV:             return "tv";
+    case NINO_EYE_BULB:           return "bulb";
+    case NINO_EYE_ROBOT:          return "robot";
+    case NINO_EYE_BIGSMILE:       return "bigsmile";
+    default:                      return "?";
+    }
 }
 
 void nino_eye_apply_expression(const char *name)
@@ -2022,6 +2622,17 @@ static void run_current_state_once(void)
     case NINO_EYE_MAD:
         run_mad_eye(profile, state);
         break;
+    case NINO_EYE_IDLE:
+#if CONFIG_NINO_EYE_DISPLAY_TFT
+        tft_neutral_run(tft_idle_should_run);
+#else
+        if (profile->mode == NINO_RENDER_NEUTRAL) {
+            run_neutral_nino(profile, state);
+        } else {
+            run_blink_profile_once(profile, state);
+        }
+#endif
+        break;
     default:
         if (profile->mode == NINO_RENDER_STATIC) {
             run_static_profile_once(profile, state);
@@ -2052,7 +2663,11 @@ static void orientation_test(void)
 static void eye_engine_task(void *arg)
 {
     (void)arg;
-    ESP_LOGI(TAG, "eye engine task started");
+    ESP_LOGI(TAG, "eye engine task started (animation %d ms/frame ≈ %u FPS)",
+             NINO_EYE_FRAME_MS, (unsigned)(1000 / NINO_EYE_FRAME_MS));
+    if (!fb_init()) {
+        ESP_LOGW(TAG, "continuing without framebuffer (row SPI may tear on camera)");
+    }
     clear_screen(color_bg());
 
 #if NINO_ORIENT_TEST

@@ -49,7 +49,8 @@
 #include "face_tracker.h"
 #include "mic_input.h"
 #include "nino_eye.h"
-#include "ssd1351.h"
+#include "nino_display.h"
+#include "rgb_led.h"
 #include "servo_dxl.h"
 #include "servo_motion.h"
 #include "servo_recplay.h"
@@ -1308,6 +1309,7 @@ static void console_init(void) {
   track_cli_register();
   speaker_cli_register();
   eye_cli_register();
+  nino_rgb_led_cli_register();
   hstop_cli_register();
   dinner_cli_register();
   bday_cli_register();
@@ -3878,11 +3880,13 @@ void app_main(void) {
   ESP_ERROR_CHECK(esp_hosted_init());
 #endif
 
-  /* Eye OLEDs come up first so the robot shows its idle face during boot. */
-  if (ssd1351_init() == ESP_OK) {
+  /* Eye panels come up first so the robot shows its idle face during boot. */
+  if (nino_display_init() == ESP_OK) {
     nino_eye_begin(); /* defaults to NINO_EYE_IDLE */
+    ESP_LOGI(TAG, "NINO eyes ready (%s) — serial: eye <name> | rgb status",
+             NINO_DISPLAY_LABEL);
   } else {
-    ESP_LOGW(TAG, "SSD1351 eye displays init failed; running without eyes");
+    ESP_LOGW(TAG, "%s eye displays init failed; running without eyes", NINO_DISPLAY_LABEL);
   }
 
   ESP_ERROR_CHECK(nino_voice_assist_init_mutex());
@@ -3928,6 +3932,9 @@ void app_main(void) {
   }
   if (nino_push_buttons_start() != ESP_OK) {
     ESP_LOGW(TAG, "GPIO push button task not started");
+  }
+  if (nino_rgb_led_init() != ESP_OK) {
+    ESP_LOGW(TAG, "RGB LED init failed (GPIO 2/3/4)");
   }
 
   xTaskCreatePinnedToCore(multicast_discovery_task, "discovery", 4096, NULL, 5,

@@ -4,9 +4,19 @@ set(main_requires esp_psram esp_wifi esp_event esp_netif nvs_flash esp_http_serv
 
 set(main_priv_requires bt)
 
+set(main_srcs
+    servo_recplay.c mic_input.c wifi_prov_ble.c servo_dxl.c servo_motion.c
+    face_tracker.c face_detect.cpp main.c audio_playback.c audio_capture.c audio_queue.c
+    voice_ws_client.c voice_assist.c nino_eye.c push_buttons.c rgb_led.c)
+
+if(CONFIG_NINO_EYE_DISPLAY_TFT)
+    list(APPEND main_srcs st7735.c tft_neutral.c)
+else()
+    list(APPEND main_srcs ssd1351.c)
+endif()
+
 idf_component_register(
-    SRCS "servo_recplay.c" "mic_input.c" "wifi_prov_ble.c" "servo_dxl.c" "servo_motion.c" "face_tracker.c" "face_detect.cpp" "main.c" "audio_playback.c" "audio_capture.c" "audio_queue.c" "voice_ws_client.c" "voice_assist.c"
-           "nino_eye.c" "ssd1351.c" "push_buttons.c"
+    SRCS ${main_srcs}
     INCLUDE_DIRS "."
     EMBED_FILES "beep.wav" "WIFI.wav" "Hello-home.wav" "Wifi_Unable.wav" "NiNO-Home_Wifi.wav"
                 "schedule_dinnner.wav" "Bday_Surprise.wav" "DEMO_main.wav"
