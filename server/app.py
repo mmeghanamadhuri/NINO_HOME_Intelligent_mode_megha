@@ -496,7 +496,14 @@ def set_camera_orientation(req: CameraOrientationRequest) -> dict:
             status_code=422,
             detail="Rotation must be none, cw90, 180, or ccw90",
         )
-    registry.set_camera_rotation(device_id, rotation)
+    try:
+        record = registry.set_camera_rotation(device_id, rotation)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown device_id: {exc.args[0]!r}",
+        ) from exc
+    device_id = record.device_id
     stream = cameras.set_rotation(device_id, rotation)
     logger.info("Camera orientation set device_id=%s rotation=%s", device_id, rotation)
     return {
@@ -1133,7 +1140,7 @@ def _device_id_from_websocket(websocket: WebSocket) -> str:
 
 
 async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
-    """Whisper STT → Ollama → SAPI WAV. Multiple receive_bytes → send_bytes cycles per connection."""
+    """STT (WAV or 16 kHz mono PCM) → Ollama → SAPI WAV. Multiple receive_bytes → send_bytes cycles per connection."""
     await websocket.accept()
     from voice_service import (
         SERVO_360_TRIGGER_DELAY_SECONDS,
@@ -1395,8 +1402,9 @@ def main() -> None:
     parser.add_argument(
         "--stt-provider",
         default=os.environ.get("STT_PROVIDER", ""),
-        choices=["", "whisper", "elevenlabs"],
-        help="STT engine: elevenlabs (cloud Scribe, needs API key) or whisper (local). "
+        choices=["", "whisper", "elevenlabs", "openai_whisper", "openai", "whisper_api"],
+        help="STT engine: openai_whisper (cloud Whisper API), elevenlabs (Scribe), "
+        "or whisper (local faster-whisper). "
         "Default: elevenlabs when an API key is set, else whisper.",
     )
     parser.add_argument(

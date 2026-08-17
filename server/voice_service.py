@@ -1,4 +1,7 @@
-"""STT (ElevenLabs Scribe / Whisper) + LLM (Ollama) + WAV TTS for /ws/voice and helpers."""
+"""STT (ElevenLabs Scribe / Whisper) + LLM (Ollama) + WAV TTS for /ws/voice and helpers.
+
+Voice WebSocket input may be WAV or raw 16-bit mono PCM at 16 kHz.
+"""
 
 from __future__ import annotations
 
@@ -21,6 +24,7 @@ logger = logging.getLogger(__name__)
 from llm_service import (
     answer_conversation_recap,
     answer_identity_question,
+    answer_last_user_question,
     answer_recap_contextual_question,
     answer_voice_query,
     DEFAULT_MODEL,
@@ -29,12 +33,22 @@ from llm_service import (
     extract_recap_follow_up_question,
     is_assumed_prior_topic_question,
     is_conversation_recap_question,
+    is_last_question_query,
+    last_user_question_from_history,
     recap_topic_not_found_reply,
 )
-from memory_filters import is_likely_tts_echo, is_unintelligible_stt
+from memory_filters import (
+    is_likely_tts_echo,
+    is_unintelligible_stt,
+    query_needs_recent_context,
+)
 from eye_expression import infer_eye_expression_for_response
 from tts_service import last_tts_synthesis_info, synthesize_sapi_wav_bytes
-from wav_resample import resample_wav_bytes_to_mono_16bit
+from wav_resample import (
+    normalize_voice_input_bytes,
+    resample_wav_bytes_to_mono_16bit,
+    wav_pcm_duration_seconds,
+)
 
 # Voice assistant path uses 16 kHz on device (ESP-SR WakeNet + VAD); face TTS stays 22050 in tts_service.
 VOICE_ASSIST_PLAYBACK_HZ = 16000
@@ -60,8 +74,9 @@ _IDENTITY_QUESTION_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
 
 _LOCAL_TIME_QUESTION_PATTERN = re.compile(
     r"\b(?:"
-    r"what(?:'s| is)? (?:the )?time(?: now)?"
-    r"|what time is it"
+    r"what time is it"
+    r"|what(?:'s| is) (?:the )?time(?: now)?"
+    r"|what(?:'s)? (?:the )?time(?: now)?"
     r"|tell me (?:the )?time"
     r"|current time"
     r"|time now"
@@ -223,7 +238,9 @@ CONTINUE_LISTEN_REPLY_PATHS = frozenset(
         "recap_answer",
         "recap_not_found",
         "recap_blocked_no_face",
+        "last_question",
         "joke",
+        "joke_and_time",
         "greeting",
         "smalltalk",
     }
@@ -297,10 +314,13 @@ class VoiceSettings:
     ollama_model: str = DEFAULT_MODEL
     whisper_model: str = "tiny"
     whisper_language: str | None = "en"
-    # "elevenlabs" (cloud Scribe API; needs ELEVENLABS_API_KEY) or "whisper" (local).
+    # "elevenlabs" | "openai_whisper" (cloud Whisper API) | "whisper" (local faster-whisper).
     stt_provider: str = "whisper"
     elevenlabs_api_key: str = ""
     elevenlabs_stt_model: str = "scribe_v1"
+    openai_api_key: str = ""
+    openai_api_base: str = "https://api.openai.com/v1"
+    openai_whisper_model: str = "whisper-1"
     max_request_bytes: int = 512_000
     max_words_reply: int = 45
     recap_max_words: int = 55
@@ -336,6 +356,13 @@ def configure_from_environ() -> None:
     SETTINGS.elevenlabs_stt_model = os.environ.get(
         "ELEVENLABS_STT_MODEL", "scribe_v1"
     ).strip()
+    SETTINGS.openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    SETTINGS.openai_api_base = os.environ.get(
+        "OPENAI_API_BASE", "https://api.openai.com/v1"
+    ).strip().rstrip("/")
+    SETTINGS.openai_whisper_model = os.environ.get(
+        "OPENAI_WHISPER_MODEL", "whisper-1"
+    ).strip()
     provider = os.environ.get("STT_PROVIDER", "").strip().lower()
     if not provider:
         # Default to ElevenLabs whenever a key is available, else local Whisper.
@@ -344,6 +371,12 @@ def configure_from_environ() -> None:
     if provider == "elevenlabs" and not SETTINGS.elevenlabs_api_key:
         logger.warning(
             "STT provider is elevenlabs but ELEVENLABS_API_KEY is not set; "
+            "falling back to local Whisper."
+        )
+        SETTINGS.stt_provider = "whisper"
+    if provider in {"openai_whisper", "openai", "whisper_api"} and not SETTINGS.openai_api_key:
+        logger.warning(
+            "STT provider is openai_whisper but OPENAI_API_KEY is not set; "
             "falling back to local Whisper."
         )
         SETTINGS.stt_provider = "whisper"
@@ -440,12 +473,61 @@ def is_identity_question(user_text: str) -> bool:
     return any(p.search(text) for p in _IDENTITY_QUESTION_PATTERNS)
 
 
+_COMPOUND_FILLER = re.compile(
+    r"\b(?:and|also|plus|please|hey|hi|hello|so|um|uh)\b",
+    re.IGNORECASE,
+)
+
+
+def _extra_words_after_intent(pattern: re.Pattern[str], user_text: str) -> list[str]:
+    leftover = pattern.sub(" ", user_text.strip())
+    leftover = _COMPOUND_FILLER.sub(" ", leftover)
+    leftover = re.sub(r"[^\w']+", " ", leftover)
+    return [w for w in leftover.lower().split() if w]
+
+
+def is_exclusive_intent(pattern: re.Pattern[str], user_text: str) -> bool:
+    """True when the utterance is only this shortcut, not 'X and Y'."""
+    text = user_text.strip()
+    if not text or not pattern.search(text):
+        return False
+    return len(_extra_words_after_intent(pattern, text)) < 2
+
+
 def is_local_time_question(user_text: str) -> bool:
     return bool(_LOCAL_TIME_QUESTION_PATTERN.search(user_text.strip()))
 
 
+def is_exclusive_local_time_question(user_text: str) -> bool:
+    return is_exclusive_intent(_LOCAL_TIME_QUESTION_PATTERN, user_text)
+
+
+def non_time_question_text(user_text: str) -> str | None:
+    """If they asked something AND the time, return the non-time question."""
+    text = user_text.strip()
+    if not is_local_time_question(text) or is_exclusive_local_time_question(text):
+        return None
+    leftover = _LOCAL_TIME_QUESTION_PATTERN.sub(" ", text)
+    leftover = re.sub(r"\s+", " ", leftover).strip(" ,.;:!?")
+    leftover = re.sub(
+        r"^(?:and|also|plus)\s+|\s+(?:and|also|plus)$",
+        "",
+        leftover,
+        flags=re.IGNORECASE,
+    ).strip(" ,.;:!?")
+    if len(leftover.split()) < 2:
+        return None
+    if leftover[-1] not in ".!?":
+        leftover += "?"
+    return leftover
+
+
 def is_weather_question(user_text: str) -> bool:
     return bool(_WEATHER_QUESTION_PATTERN.search(user_text.strip()))
+
+
+def is_exclusive_weather_question(user_text: str) -> bool:
+    return is_exclusive_intent(_WEATHER_QUESTION_PATTERN, user_text)
 
 
 def is_football_question(user_text: str) -> bool:
@@ -877,7 +959,37 @@ def _transcribe_whisper(wav_bytes: bytes) -> str:
     )
     text = " ".join(seg.text.strip() for seg in segments).strip()
     if not text:
-        raise RuntimeError("No speech recognized from input audio.")
+        logger.warning("Whisper returned no speech (audio %.2fs).", len(audio) / 16000.0)
+    return text
+
+
+def _transcribe_openai_whisper(wav_bytes: bytes) -> str:
+    """OpenAI-compatible Whisper STT (OpenAI whisper-1, Groq whisper-large-v3, etc.)."""
+    api_key = SETTINGS.openai_api_key
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set.")
+    data: dict[str, str] = {
+        "model": SETTINGS.openai_whisper_model,
+        "response_format": "json",
+    }
+    if SETTINGS.whisper_language:
+        data["language"] = SETTINGS.whisper_language
+    url = f"{SETTINGS.openai_api_base}/audio/transcriptions"
+    resp = requests.post(
+        url,
+        headers={"Authorization": f"Bearer {api_key}"},
+        data=data,
+        files={"file": ("voice.wav", wav_bytes, "audio/wav")},
+        timeout=45,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"OpenAI Whisper STT HTTP {resp.status_code}: {resp.text[:200]}"
+        )
+    payload = resp.json()
+    text = str(payload.get("text", "")).strip()
+    if not text:
+        logger.warning("OpenAI Whisper STT returned no speech.")
     return text
 
 
@@ -905,12 +1017,19 @@ def _transcribe_elevenlabs(wav_bytes: bytes) -> str:
         )
     text = str(resp.json().get("text", "")).strip()
     if not text:
-        raise RuntimeError("No speech recognized from input audio.")
+        logger.warning("ElevenLabs STT returned no speech.")
     return text
 
 
 def transcribe_wav(wav_bytes: bytes) -> tuple[str, str]:
     """Transcribe device WAV. Returns (text, engine_used)."""
+    if SETTINGS.stt_provider in {"openai_whisper", "openai", "whisper_api"}:
+        try:
+            return _transcribe_openai_whisper(wav_bytes), "openai_whisper"
+        except Exception as exc:
+            logger.warning(
+                "OpenAI Whisper STT failed (%s); falling back to local Whisper.", exc
+            )
     if SETTINGS.stt_provider == "elevenlabs":
         try:
             return _transcribe_elevenlabs(wav_bytes), "elevenlabs"
@@ -934,11 +1053,51 @@ def process_voice_wav(
     if len(wav_bytes) > SETTINGS.max_request_bytes:
         raise RuntimeError("Audio exceeds size limit.")
 
+    try:
+        wav_bytes, audio_input_format = normalize_voice_input_bytes(wav_bytes)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
     t_start = time.perf_counter()
+    audio_in_seconds = wav_pcm_duration_seconds(wav_bytes)
 
     user_text, stt_engine = transcribe_wav(wav_bytes)
     t_stt = time.perf_counter()
     reply_path = "llm"
+
+    if not user_text.strip():
+        reply_path = "stt_empty"
+        logger.info(
+            "Voice STT empty | format=%s audio=%.2fs bytes=%s",
+            audio_input_format,
+            audio_in_seconds,
+            len(wav_bytes),
+        )
+        reply = "Sorry, I didn't catch that. Could you say that again?"
+        t_reply = time.perf_counter()
+        wav, _voice = synthesize_sapi_wav_bytes(reply)
+        tts_info = last_tts_synthesis_info()
+        wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
+        t_tts = time.perf_counter()
+        audio_out_seconds = max(0, len(wav_out) - 44) / (VOICE_ASSIST_PLAYBACK_HZ * 2)
+        meta.timings = {
+            "heard": "",
+            "reply_text": reply[:200],
+            "reply_path": reply_path,
+            "audio_input_format": audio_input_format,
+            "audio_in_seconds": round(audio_in_seconds, 2),
+            "audio_in_bytes": len(wav_bytes),
+            "audio_out_seconds": round(audio_out_seconds, 2),
+            "audio_out_bytes": len(wav_out),
+            "stt_engine": stt_engine,
+            "tts_provider": tts_info["provider"],
+            "tts_voice": tts_info["voice"],
+            "stt_seconds": round(t_stt - t_start, 3),
+            "reply_seconds": round(t_reply - t_stt, 3),
+            "tts_seconds": round(t_tts - t_reply, 3),
+            "process_total_seconds": round(t_tts - t_start, 3),
+        }
+        return wav_out, meta
 
     handled_volume, volume_reply = apply_volume_command(
         user_text, device_id=device_id or None
@@ -953,12 +1112,12 @@ def process_voice_wav(
         wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
         t_tts = time.perf_counter()
 
-        audio_in_seconds = max(0, len(wav_bytes) - 44) / (16000 * 2)
         audio_out_seconds = max(0, len(wav_out) - 44) / (VOICE_ASSIST_PLAYBACK_HZ * 2)
         meta.timings = {
             "heard": user_text[:200],
             "reply_text": reply[:200],
             "reply_path": reply_path,
+            "audio_input_format": audio_input_format,
             "audio_in_seconds": round(audio_in_seconds, 2),
             "audio_in_bytes": len(wav_bytes),
             "audio_out_seconds": round(audio_out_seconds, 2),
@@ -1003,12 +1162,12 @@ def process_voice_wav(
         tts_info = last_tts_synthesis_info()
         wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
         t_tts = time.perf_counter()
-        audio_in_seconds = max(0, len(wav_bytes) - 44) / (16000 * 2)
         audio_out_seconds = max(0, len(wav_out) - 44) / (VOICE_ASSIST_PLAYBACK_HZ * 2)
         meta.timings = {
             "heard": user_text[:200],
             "reply_text": reply[:200],
             "reply_path": reply_path,
+            "audio_input_format": audio_input_format,
             "audio_in_seconds": round(audio_in_seconds, 2),
             "audio_in_bytes": len(wav_bytes),
             "audio_out_seconds": round(audio_out_seconds, 2),
@@ -1062,11 +1221,11 @@ def process_voice_wav(
                 user_text[:120],
             )
             if reg_result.relisten_after_reply:
-                audio_in_seconds = max(0, len(wav_bytes) - 44) / (16000 * 2)
                 meta.timings = {
                     "heard": user_text[:200],
                     "reply_text": "(face registration relisten scheduled)",
                     "reply_path": reply_path,
+                    "audio_input_format": audio_input_format,
                     "audio_in_seconds": round(audio_in_seconds, 2),
                     "audio_in_bytes": len(wav_bytes),
                     "stt_engine": stt_engine,
@@ -1101,12 +1260,21 @@ def process_voice_wav(
         reply = wellbeing_status_reply(memory_name or viewer_name)
         logger.info("Voice wellbeing status | heard: %s", user_text[:120])
 
-    if reply_path == "llm" and is_local_time_question(user_text):
+    if (
+        reply_path == "llm"
+        and is_joke_request(user_text)
+        and is_local_time_question(user_text)
+    ):
+        reply_path = "joke_and_time"
+        reply = f"{random_joke_reply()} {local_server_time_reply()}"
+        logger.info("Voice joke + local-time query | heard: %s", user_text[:120])
+
+    if reply_path == "llm" and is_exclusive_local_time_question(user_text):
         reply_path = "local_time"
         reply = local_server_time_reply()
         logger.info("Voice local-time query | heard: %s", user_text[:120])
 
-    if reply_path == "llm" and is_weather_question(user_text):
+    if reply_path == "llm" and is_exclusive_weather_question(user_text):
         from device_registry import get_device_registry
         from weather_service import (
             DeviceLocationUnavailableError,
@@ -1254,6 +1422,22 @@ def process_voice_wav(
         else:
             meta.trigger_servo_360 = True
             reply = reply_for_servo_360_command()
+    if reply_path == "llm" and is_last_question_query(user_text):
+        last_q = last_user_question_from_history(
+            memory_ctx.recent_history if memory_ctx else None
+        )
+        reply_path = "last_question"
+        reply = answer_last_user_question(
+            last_q,
+            viewer_name=memory_name,
+            has_face=bool(memory_name),
+        )
+        logger.info(
+            "Voice last-question | viewer=%s last=%s heard: %s",
+            memory_name or "(none)",
+            (last_q or "")[:80],
+            user_text[:120],
+        )
     if reply_path == "llm" and is_conversation_recap_question(user_text):
         if not memory_name:
             reply_path = "recap_blocked_no_face"
@@ -1418,17 +1602,34 @@ def process_voice_wav(
             )
         else:
             logger.info("Voice query (no recognized viewer) | heard: %s", user_text[:120])
+        topic_text = non_time_question_text(user_text)
+        append_clock = topic_text is not None
+        llm_text = topic_text or user_text
+        if append_clock:
+            logger.info(
+                "Voice compound topic + time | topic=%s heard: %s",
+                llm_text[:80],
+                user_text[:120],
+            )
+        follow_up = query_needs_recent_context(llm_text)
         reply = answer_voice_query(
-            user_text,
+            llm_text,
             viewer_name=effective_viewer,
             model=SETTINGS.ollama_model,
             api_url=SETTINGS.ollama_url,
-            max_words=SETTINGS.max_words_reply,
+            max_words=(
+                max(SETTINGS.max_words_reply, 60)
+                if follow_up or append_clock
+                else SETTINGS.max_words_reply
+            ),
             memory_context=memory_ctx.prompt_block if memory_ctx else None,
             recent_assistant_replies=_recent_assistant_replies(
                 memory_ctx.recent_history if memory_ctx else None
             ),
+            is_follow_up=follow_up,
         )
+        if append_clock:
+            reply = f"{reply.rstrip()} {local_server_time_reply()}"
     t_reply = time.perf_counter()
 
     memory_store = "skipped"
@@ -1452,13 +1653,12 @@ def process_voice_wav(
     wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
     t_tts = time.perf_counter()
 
-    # Input is 16 kHz 16-bit mono WAV from the device (44-byte header).
-    audio_in_seconds = max(0, len(wav_bytes) - 44) / (16000 * 2)
     audio_out_seconds = max(0, len(wav_out) - 44) / (VOICE_ASSIST_PLAYBACK_HZ * 2)
     meta.timings = {
         "heard": user_text[:200],
         "reply_text": reply[:200],
         "reply_path": reply_path,
+        "audio_input_format": audio_input_format,
         "audio_in_seconds": round(audio_in_seconds, 2),
         "audio_in_bytes": len(wav_bytes),
         "audio_out_seconds": round(audio_out_seconds, 2),

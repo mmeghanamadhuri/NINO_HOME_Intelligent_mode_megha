@@ -63,6 +63,7 @@ class ContinueListenGateTests(unittest.TestCase):
             "recap",
             "recap_answer",
             "recap_not_found",
+            "last_question",
             "joke",
         ):
             with self.subTest(path=path):

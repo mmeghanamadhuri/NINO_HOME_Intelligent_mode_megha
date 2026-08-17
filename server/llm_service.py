@@ -971,6 +971,12 @@ _CONVERSATION_RECAP_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"\bwhat did i (?:just )?(?:ask|say|talk about)\b",
         r"\bwhat (?:have )?i (?:just )?asked(?:\s+earlier|\s+before)?\b",
         r"(?:please\s+)?(?:tell me|say) what i (?:just )?asked\b",
+        r"\bwhat was my last question\b",
+        r"\bwhat(?:'s| is) my last question\b",
+        r"\bwhat was the last (?:question|thing) i (?:asked|said)\b",
+        r"\bwhat(?:'s| is) the last (?:question|thing) i (?:asked|said)\b",
+        r"\bremind me (?:what|of) (?:my|the) last question\b",
+        r"\bwhat was my previous question\b",
         r"\brecap(?:ulate)? (?:our )?(?:chat|conversation|discussion)\b",
         r"\b(?:what(?:'s| is)\s+)?(?:the\s+)?context\b",
         r"\b(?:give|tell|share)\s+me\s+(?:the\s+)?context\b",
@@ -1014,6 +1020,7 @@ _VOICE_STYLE_VARIANTS: tuple[str, ...] = _RECAP_STYLE_VARIANTS + (
     "Use a friendly relaxed tone, like chatting at home.",
     "Use a lightly playful tone.",
     "Use a thoughtful helpful tone.",
+    "Use an enthusiastic curious tone, like you are excited to keep talking.",
 )
 
 
@@ -1085,6 +1092,75 @@ def is_conversation_recap_question(user_text: str) -> bool:
     if not text:
         return False
     return any(p.search(text) for p in _CONVERSATION_RECAP_PATTERNS)
+
+
+_LAST_QUESTION_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bwhat was my last question\b",
+        r"\bwhat(?:'s| is) my last question\b",
+        r"\bwhat was the last (?:question|thing) i (?:asked|said)\b",
+        r"\bwhat(?:'s| is) the last (?:question|thing) i (?:asked|said)\b",
+        r"\bremind me (?:what|of) (?:my|the) last question\b",
+        r"\bwhat was my previous question\b",
+        r"\bwhat did i (?:just )?(?:ask|say)\b",
+        r"\bwhat (?:have )?i (?:just )?asked(?:\s+earlier|\s+before)?\b",
+        r"(?:please\s+)?(?:tell me|say) what i (?:just )?asked\b",
+    )
+)
+
+
+def is_last_question_query(user_text: str) -> bool:
+    """True when the user wants the previous question they asked, not a full recap."""
+    text = user_text.strip()
+    if not text:
+        return False
+    return any(p.search(text) for p in _LAST_QUESTION_PATTERNS)
+
+
+def last_user_question_from_history(
+    recent_history: list[tuple[str, str]] | None,
+) -> str | None:
+    """Newest stored user line that is a real question, not a recap/last-question ask."""
+    from memory_service import is_stt_fragment
+
+    if not recent_history:
+        return None
+    for user_text, _assistant_text in reversed(recent_history):
+        cleaned = str(user_text or "").strip()
+        if not cleaned:
+            continue
+        if is_last_question_query(cleaned) or is_conversation_recap_question(cleaned):
+            continue
+        if is_stt_fragment(cleaned):
+            continue
+        return cleaned
+    return None
+
+
+def answer_last_user_question(
+    last_question: str | None,
+    *,
+    viewer_name: str | None = None,
+    has_face: bool = True,
+) -> str:
+    """Deterministic spoken reply — do not ask the LLM to guess the last question."""
+    if not has_face:
+        return (
+            "I need to see you to recall your last question. "
+            "Face the camera and ask again."
+        )
+    cleaned = " ".join((last_question or "").split()).rstrip(" ?.!")
+    if not cleaned:
+        return (
+            "I don't have a previous question stored yet. "
+            "Ask me something and I'll remember it."
+        )
+    name = (viewer_name or "").strip()
+    spoken = cleaned[0].lower() + cleaned[1:] if len(cleaned) > 1 else cleaned.lower()
+    if name:
+        return f"{name}, you asked {spoken}."
+    return f"You asked {spoken}."
 
 
 _TOPIC_FOCUSED_RECAP_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
@@ -1494,6 +1570,7 @@ def answer_voice_query(
     max_words: int = 40,
     memory_context: str | None = None,
     recent_assistant_replies: list[str] | None = None,
+    is_follow_up: bool = False,
 ) -> str:
     if viewer_name:
         who = (
@@ -1514,16 +1591,16 @@ def answer_voice_query(
     part = day_part(now)
     tod_greeting = day_part_greeting(now)
     clock_line = (
-        f"Current local time is {now.strftime('%I:%M %p').lstrip('0')} "
-        f"({part}). For greetings, say \"{tod_greeting}\" — "
-        "never echo a wrong time-of-day greeting from the user "
-        "(e.g. do not say good morning when it is evening).\n"
+        f"Current local time is {now.strftime('%I:%M %p').lstrip('0')} ({part}). "
+        "Use this clock only if they asked the time. "
+        f"If they greeted you, say \"{tod_greeting}\" — never the wrong period. "
+        "If they asked a factual question, do NOT greet; answer the question first.\n"
     )
     memory_rules = ""
     if memory_context:
         name_hint = viewer_name.strip() if viewer_name else "them"
         memory_rules = (
-            "Known facts and recent user lines are below. Use ONLY facts relevant to "
+            "Known facts and recent conversation are below. Use ONLY facts relevant to "
             "the user's current question. "
             "Speak directly to them in second person. "
             f'Never say "You and {name_hint}" or use their name in third person. '
@@ -1531,17 +1608,30 @@ def answer_voice_query(
             "Ignore incomplete fragment lines.\n"
             f"{_anti_repetition_block(recent_assistant_replies)}"
         )
+    follow_up_rules = ""
+    if is_follow_up:
+        follow_up_rules = (
+            "- This is a follow-up. Continue the MOST RECENT topic in the conversation, "
+            "not an older one and not both at once.\n"
+            "- Give a real enthusiastic answer with a new interesting detail. "
+            "Do not ask what they want to know first, and do not restart with hi/hello.\n"
+            "- If they said a short topic like \"the Mars\", treat it as continue that topic.\n"
+        )
 
     prompt = (
-        "You are NiNO, a concise voice assistant for a smart home with a camera.\n"
+        "You are NiNO, an enthusiastic voice assistant for a smart home with a camera.\n"
         f"{who}\n"
         f"{clock_line}"
         f"{memory_rules}"
         f"{_memory_context_block(memory_context)}"
         "Style rules:\n"
         f"- {style_hint}\n"
-        "- Sound warm, human, and conversational — like a friendly housemate, not a helpdesk.\n"
-        "- Never say \"how can I assist you\", \"how may I help\", or similar service-desk phrases.\n"
+        "- Sound warm, curious, and interactive — like a lively friend, not a helpdesk.\n"
+        "- Never start a factual answer with good morning/afternoon/evening or their name as a greeting.\n"
+        "- Never say \"how can I assist you\", \"how may I help\", "
+        "\"further assistance\", or similar service-desk phrases.\n"
+        "- Do not ask about their day unless they brought it up.\n"
+        f"{follow_up_rules}"
         "- If the user shares how they feel (e.g. \"I am great\"), acknowledge warmly and invite "
         "them to keep chatting — do not restart with a greeting or offer of assistance.\n"
         "- If the topic came up before, vary wording and tone — do not repeat the same sentence.\n"

@@ -75,6 +75,55 @@ class JokeRandomizationTests(unittest.TestCase):
 
     def test_continue_listen_after_joke(self) -> None:
         self.assertTrue(should_continue_listen_after_reply("joke", "tell me a joke"))
+        self.assertTrue(
+            should_continue_listen_after_reply(
+                "joke_and_time",
+                "Tell me a joke and what is the time?",
+            )
+        )
+
+
+class CompoundShortcutTests(unittest.TestCase):
+    def test_joke_and_time_is_not_exclusive_time(self) -> None:
+        from voice_service import (
+            is_exclusive_local_time_question,
+            is_joke_request,
+            is_local_time_question,
+        )
+
+        text = "Tell me a joke and what is the time?"
+        self.assertTrue(is_joke_request(text))
+        self.assertTrue(is_local_time_question(text))
+        self.assertFalse(is_exclusive_local_time_question(text))
+
+    def test_plain_time_stays_exclusive(self) -> None:
+        from voice_service import is_exclusive_local_time_question
+
+        for text in (
+            "What is the time?",
+            "what time is it",
+            "tell me the time please",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(is_exclusive_local_time_question(text), msg=text)
+
+    def test_topic_plus_time_falls_through_exclusive_time(self) -> None:
+        from voice_service import is_exclusive_local_time_question, non_time_question_text
+
+        text = "Tell me about Mars and what is the time?"
+        self.assertFalse(is_exclusive_local_time_question(text))
+        self.assertEqual(non_time_question_text(text), "Tell me about Mars?")
+
+    def test_photosynthesis_and_time_strips_to_topic(self) -> None:
+        from voice_service import (
+            is_exclusive_local_time_question,
+            non_time_question_text,
+        )
+
+        text = "What is photosynthesis and what is the time?"
+        self.assertFalse(is_exclusive_local_time_question(text))
+        self.assertEqual(non_time_question_text(text), "What is photosynthesis?")
+        self.assertIsNone(non_time_question_text("What is the time?"))
 
 
 if __name__ == "__main__":

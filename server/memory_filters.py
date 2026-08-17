@@ -845,7 +845,7 @@ _FOLLOWUP_CONNECTOR = re.compile(
 
 _FOLLOWUP_CONTINUATION = re.compile(
     r"\b(?:tell me more|more about (?:it|that|this|them|those)|go on|continue|"
-    r"say more|explain (?:that|it|this|more|again)|"
+    r"say more|explain more|explain (?:that|it|this|more|again)|keep going|"
     r"(?:what|how) about (?:it|that|this|them|those)|"
     r"why is that|how come|what else|and you|elaborate)\b",
     re.IGNORECASE,
@@ -866,6 +866,32 @@ _WELLBEING_FOLLOWUP_RE = re.compile(
     r"[.!?…]*\s*$",
     re.IGNORECASE,
 )
+
+_NOT_TOPIC_FRAGMENT = re.compile(
+    r"^(?:ok|okay|yes|yeah|yep|no|nope|thanks|thank you|please|hello|hi|hey|"
+    r"bye|goodbye|good bye|please|sure)$",
+    re.IGNORECASE,
+)
+
+_STANDALONE_QUESTION_WORD = re.compile(
+    r"\b(?:what|what's|who|how|when|where|why|which|whose|"
+    r"can|could|would|should|do|does|did|is|are|was|were|"
+    r"tell|explain|define|describe)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_topic_fragment(user_text: str) -> bool:
+    """Short echo like 'the Mars.' after a longer chat — treat as continue-topic."""
+    text = user_text.strip().rstrip(".!?…")
+    if not text or _NOT_TOPIC_FRAGMENT.match(text):
+        return False
+    word_count = len(re.findall(r"[A-Za-z0-9']+", text))
+    if word_count < 1 or word_count > 3:
+        return False
+    if _STANDALONE_QUESTION_WORD.search(text):
+        return False
+    return True
 
 
 def query_needs_recent_context(user_text: str) -> bool:
@@ -888,6 +914,8 @@ def query_needs_recent_context(user_text: str) -> bool:
     # Short anaphoric follow-ups ('what is it made of?', 'how does that work?').
     word_count = len(re.findall(r"[A-Za-z0-9']+", text))
     if word_count <= 8 and _ANAPHORA.search(text):
+        return True
+    if _looks_like_topic_fragment(text):
         return True
     return False
 

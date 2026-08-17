@@ -218,11 +218,27 @@ class DeviceRegistry:
 
     def set_camera_rotation(self, device_id: str, rotation: str) -> DeviceRecord:
         """Persist a validated per-device camera orientation."""
-        key = (device_id or "").strip()
+        key = (device_id or "").strip() or LEGACY_DEVICE_ID
         with self._lock:
             existing = self._devices.get(key)
             if existing is None:
-                raise KeyError(key)
+                # UI often sends stale "default" after discovery, or the registry
+                # is only holding a CLI/env camera that was never persisted.
+                if self._devices:
+                    fallback_id = (
+                        self._ui_device_id
+                        if self._ui_device_id in self._devices
+                        else next(iter(self._devices))
+                    )
+                    existing = self._devices[fallback_id]
+                    key = fallback_id
+                else:
+                    legacy = self._legacy_from_environ()
+                    if not legacy:
+                        raise KeyError(key)
+                    existing = legacy[0]
+                    key = existing.device_id
+                    self._devices = {key: existing}
             record = DeviceRecord(
                 device_id=existing.device_id,
                 display_name=existing.display_name,

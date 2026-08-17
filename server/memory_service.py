@@ -1272,14 +1272,27 @@ class MemoryService:
 
         if recent and include_recent:
             lines: list[str] = []
-            for user_text, _assistant_text in recent:
+            for user_text, assistant_text in recent[-5:]:
                 cleaned_user = truncate_context_text(user_text)
-                if cleaned_user:
-                    lines.append(f"- User said: {cleaned_user}")
+                if not cleaned_user:
+                    continue
+                lines.append(f"- User: {cleaned_user}")
+                cleaned_reply = truncate_context_text(assistant_text, 140)
+                if cleaned_reply:
+                    lines.append(f"  NiNO: {cleaned_reply}")
             if lines:
+                last_user = truncate_context_text(recent[-1][0])
+                latest = (
+                    f"Latest user topic to continue: {last_user}\n"
+                    if last_user
+                    else ""
+                )
                 parts.append(
-                    "Recent things they asked or said (speech-to-text may have errors):\n"
+                    "Recent conversation (oldest first). Continue the LAST user topic, "
+                    "not older ones:\n"
                     + "\n".join(lines)
+                    + f"\n{latest}"
+                    "Give a real spoken answer. Do not ask which topic they meant."
                 )
 
         if len(parts) == 1:

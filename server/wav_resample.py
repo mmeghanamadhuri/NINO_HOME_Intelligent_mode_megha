@@ -4,11 +4,64 @@ from __future__ import annotations
 
 import io
 import wave
+from typing import Literal
 
 import numpy as np
 
 # Match ES8311 / I2S peer clock used after typical Windows SAPI output (see firmware audio_capture).
 ESP_PCM_SAMPLE_RATE_HZ = 22050
+
+# Voice WebSocket mic input from ESP (and raw-PCM clients): 16 kHz mono 16-bit LE.
+VOICE_INPUT_SAMPLE_RATE_HZ = 16000
+
+
+def is_wav_bytes(data: bytes) -> bool:
+    """True when `data` looks like a canonical RIFF/WAVE PCM container."""
+    return (
+        len(data) >= 44
+        and data[:4] == b"RIFF"
+        and data[8:12] == b"WAVE"
+    )
+
+
+def pcm16_mono_to_wav(pcm: bytes, sample_rate: int = VOICE_INPUT_SAMPLE_RATE_HZ) -> bytes:
+    """Wrap raw 16-bit little-endian mono PCM in a PCM format-1 WAV."""
+    if not pcm:
+        raise ValueError("Empty PCM input.")
+    if len(pcm) % 2 != 0:
+        raise ValueError("PCM byte length must be a multiple of 2 (16-bit samples).")
+    bio = io.BytesIO()
+    with wave.open(bio, "wb") as wo:
+        wo.setnchannels(1)
+        wo.setsampwidth(2)
+        wo.setframerate(sample_rate)
+        wo.writeframes(pcm)
+    return bio.getvalue()
+
+
+def normalize_voice_input_bytes(
+    data: bytes,
+    *,
+    pcm_sample_rate: int = VOICE_INPUT_SAMPLE_RATE_HZ,
+) -> tuple[bytes, Literal["wav", "pcm"]]:
+    """Accept WAV or raw 16-bit mono PCM; always return canonical WAV for STT."""
+    if not data:
+        raise ValueError("Empty audio input.")
+    if is_wav_bytes(data):
+        return data, "wav"
+    return pcm16_mono_to_wav(data, pcm_sample_rate), "pcm"
+
+
+def wav_pcm_duration_seconds(wav_bytes: bytes) -> float:
+    """Duration from a PCM WAV header; 0.0 if the container cannot be read."""
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            rate = wf.getframerate()
+            if rate <= 0:
+                return 0.0
+            return wf.getnframes() / float(rate)
+    except Exception:
+        return 0.0
 
 
 def _resample_mono_float(samples: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:

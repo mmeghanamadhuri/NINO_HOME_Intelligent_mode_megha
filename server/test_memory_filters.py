@@ -50,11 +50,69 @@ class FollowUpContextTests(unittest.TestCase):
             "And then what happened?",
             "How does that work?",
             "Explain that again.",
+            "Explain more.",
             "Why is that?",
             "What is it made of?",
+            "the Mars.",
+            "Mars.",
         ):
             with self.subTest(text=text):
                 self.assertTrue(query_needs_recent_context(text), msg=text)
+
+
+class LastQuestionRecallTests(unittest.TestCase):
+    def test_last_question_phrases_detected(self) -> None:
+        from llm_service import is_last_question_query
+
+        for text in (
+            "What was my last question?",
+            "what's my last question",
+            "What was the last thing I asked?",
+            "Remind me of my last question",
+            "What did I just ask?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(is_last_question_query(text), msg=text)
+
+    def test_last_question_reply_uses_stored_turn(self) -> None:
+        from llm_service import (
+            answer_last_user_question,
+            last_user_question_from_history,
+        )
+
+        history = [
+            ("Tell me about Mars.", "Mars is the red planet."),
+            ("Tell me about Planet Earth.", "Earth is the blue marble."),
+            ("Why is the Mars called Red Planet?", "Because of iron oxide."),
+        ]
+        last = last_user_question_from_history(history)
+        self.assertEqual(last, "Why is the Mars called Red Planet?")
+        reply = answer_last_user_question(last, viewer_name="Kartik", has_face=True)
+        self.assertIn("Kartik", reply)
+        self.assertIn("why is the Mars called Red Planet", reply)
+        self.assertNotIn("status and availability", reply.lower())
+
+    def test_last_question_skips_recap_turns(self) -> None:
+        from llm_service import last_user_question_from_history
+
+        history = [
+            ("Tell me about Mars.", "Mars is dusty and red."),
+            ("What was my last question?", "Your previous request was about status."),
+        ]
+        self.assertEqual(
+            last_user_question_from_history(history),
+            "Tell me about Mars.",
+        )
+
+    def test_last_question_without_face(self) -> None:
+        from llm_service import answer_last_user_question
+
+        reply = answer_last_user_question(
+            "Tell me about Mars.",
+            viewer_name=None,
+            has_face=False,
+        )
+        self.assertIn("camera", reply.lower())
 
 
 class MemoryFilterTests(unittest.TestCase):
@@ -122,6 +180,9 @@ class MemoryFilterTests(unittest.TestCase):
             "So we are talking about CEOs of India. Aren't we?",
             "Hope that we are talking about CEO of India's",
             "Are we talking about CEOs of India?",
+            "What was my last question?",
+            "What is my last question?",
+            "What was the last thing I asked?",
         ):
             with self.subTest(text=text):
                 self.assertTrue(is_conversation_recap_question(text))
