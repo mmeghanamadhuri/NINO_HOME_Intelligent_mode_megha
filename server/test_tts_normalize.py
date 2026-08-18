@@ -63,6 +63,20 @@ class NormalizeTtsTextTests(unittest.TestCase):
             "I'm NiNO, your home assistant.",
         )
 
+    def test_strips_placeholders_and_latex(self) -> None:
+        self.assertNotIn(
+            "Insert",
+            _normalize_tts_text(
+                "Let's add:\n1. First number: [Insert the first number]\n"
+                r"\[ 222 \times 18 = ? \]"
+            ),
+        )
+        clean = _normalize_tts_text(
+            "Let's add: [Insert the first number] and [Insert the second number]"
+        )
+        self.assertNotIn("[", clean)
+        self.assertIn("Let's add:", clean)
+
 
 if __name__ == "__main__":
     unittest.main()

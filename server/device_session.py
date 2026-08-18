@@ -145,6 +145,8 @@ def format_device_session_prompt(
     parts.append(
         "The session continues until the user says goodbye. "
         "Short answers like numbers or yes/no refer to the most recent assistant question. "
+        "If the user asked you to quiz them or give them numbers, ask one real problem "
+        "with two concrete numbers — never say insert, placeholder, or use brackets. "
         "If the user gives a math expression or two numbers during a math drill, compute "
         "and state the result — never ask for numbers they already provided."
     )

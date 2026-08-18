@@ -70,6 +70,7 @@ class LastQuestionRecallTests(unittest.TestCase):
             "What was the last thing I asked?",
             "Remind me of my last question",
             "What did I just ask?",
+            "That's what I wanted to know from you. I asked you what is my last question.",
         ):
             with self.subTest(text=text):
                 self.assertTrue(is_last_question_query(text), msg=text)
@@ -89,7 +90,7 @@ class LastQuestionRecallTests(unittest.TestCase):
         self.assertEqual(last, "Why is the Mars called Red Planet?")
         reply = answer_last_user_question(last, viewer_name="Kartik", has_face=True)
         self.assertIn("Kartik", reply)
-        self.assertIn("why is the Mars called Red Planet", reply)
+        self.assertIn("Why is the Mars called Red Planet?", reply)
         self.assertNotIn("status and availability", reply.lower())
 
     def test_last_question_skips_recap_turns(self) -> None:
@@ -102,6 +103,25 @@ class LastQuestionRecallTests(unittest.TestCase):
         self.assertEqual(
             last_user_question_from_history(history),
             "Tell me about Mars.",
+        )
+
+    def test_last_question_skips_comments_jokes_and_meta(self) -> None:
+        from llm_service import last_user_question_from_history
+
+        history = [
+            ("Okay, is it closer to Neptune?", "Pluto is near Neptune."),
+            ("That's really long.", "The Earth began as a giant cloud."),
+            ("Tell me a joke.", "Parallel lines have so much in common."),
+            ("What was my last question?", "Kartik, you asked that's really long."),
+            ("That was not my question.", "What were you looking for?"),
+            (
+                "That's what I wanted to know from you. I asked you what is my last question.",
+                "Kartik, you asked that was not my question.",
+            ),
+        ]
+        self.assertEqual(
+            last_user_question_from_history(history),
+            "Okay, is it closer to Neptune?",
         )
 
     def test_last_question_without_face(self) -> None:

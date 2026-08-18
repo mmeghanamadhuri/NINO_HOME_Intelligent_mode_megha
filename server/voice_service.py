@@ -547,6 +547,7 @@ class VoiceSettings:
 SETTINGS = VoiceSettings()
 _WHISPER_MODEL: Any = None
 _CTRANSLATE2_CUDA_COUNT: int | None = None
+_WHISPER_CUDA_FALLBACK_LOGGED = False
 
 
 DEFAULT_MIN_SPEECH_ENERGY = 5
@@ -644,10 +645,13 @@ def resolve_whisper_device(preferred: str | None = None, *, cuda_available: bool
     if raw == "cuda":
         if cuda:
             return "cuda"
-        logger.warning(
-            "WHISPER_DEVICE=cuda but CTranslate2 reports no GPU; using CPU. "
-            "Install a CUDA ctranslate2 wheel for this machine."
-        )
+        global _WHISPER_CUDA_FALLBACK_LOGGED
+        if not _WHISPER_CUDA_FALLBACK_LOGGED:
+            logger.warning(
+                "WHISPER_DEVICE=cuda but CTranslate2 reports no GPU; using CPU. "
+                "Install a CUDA ctranslate2 wheel for this machine."
+            )
+            _WHISPER_CUDA_FALLBACK_LOGGED = True
         return "cpu"
     return "cpu"
 
@@ -710,7 +714,7 @@ def preload_whisper_model() -> bool:
 
 
 def configure_from_environ() -> None:
-    global _WHISPER_MODEL
+    global _WHISPER_MODEL, _CTRANSLATE2_CUDA_COUNT, _WHISPER_CUDA_FALLBACK_LOGGED
     SETTINGS.ollama_url = os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL).strip()
     SETTINGS.ollama_model = os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL).strip()
     SETTINGS.whisper_model = os.environ.get("WHISPER_MODEL", "small").strip()
@@ -727,6 +731,8 @@ def configure_from_environ() -> None:
     SETTINGS.whisper_runtime_device = ""
     SETTINGS.whisper_runtime_compute_type = ""
     _WHISPER_MODEL = None
+    _CTRANSLATE2_CUDA_COUNT = None
+    _WHISPER_CUDA_FALLBACK_LOGGED = False
     lang = os.environ.get("WHISPER_LANGUAGE", "en").strip()
     SETTINGS.whisper_language = None if lang.lower() in {"", "auto"} else lang
     SETTINGS.elevenlabs_api_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
@@ -1560,6 +1566,7 @@ def _speak_short_reply(
         "stt_engine": stt_engine,
         "tts_provider": tts_info["provider"],
         "tts_voice": tts_info["voice"],
+        "tts_style": tts_info.get("style", ""),
         "stt_seconds": round(t_stt - t_start, 3),
         "reply_seconds": round(t_reply - t_stt, 3),
         "tts_seconds": round(t_tts - t_reply, 3),
@@ -1882,6 +1889,7 @@ def process_voice_wav(
             "stt_engine": stt_engine,
             "tts_provider": tts_info["provider"],
             "tts_voice": tts_info["voice"],
+            "tts_style": tts_info.get("style", ""),
             "stt_seconds": round(t_stt - t_start, 3),
             "reply_seconds": round(t_reply - t_stt, 3),
             "tts_seconds": round(t_tts - t_reply, 3),
@@ -2185,9 +2193,11 @@ def process_voice_wav(
             meta.trigger_servo_360 = True
             reply = reply_for_servo_360_command()
     if reply_path == "llm" and is_last_question_query(user_text):
-        last_q = last_user_question_from_history(
-            memory_ctx.recent_history if memory_ctx else None
-        )
+        from device_session import get_device_session_turns
+
+        session_turns = get_device_session_turns(device_id)
+        db_turns = list(memory_ctx.recent_history) if memory_ctx else []
+        last_q = last_user_question_from_history(db_turns + session_turns)
         reply_path = "last_question"
         reply = answer_last_user_question(
             last_q,
@@ -2365,10 +2375,14 @@ def process_voice_wav(
         else:
             logger.info("Voice query (no recognized viewer) | heard: %s", user_text[:120])
         from device_session import get_device_session_turns
-        from math_voice import try_spoken_math_reply
+        from math_voice import try_math_quiz_reply, try_spoken_math_reply
 
         session_turns = get_device_session_turns(device_id)
-        math_reply = try_spoken_math_reply(user_text, session_turns=session_turns)
+        math_reply = try_math_quiz_reply(
+            user_text,
+            device_id=device_id,
+            session_turns=session_turns,
+        ) or try_spoken_math_reply(user_text, session_turns=session_turns)
         if math_reply:
             reply_path = "math"
             reply = math_reply
@@ -2451,6 +2465,7 @@ def process_voice_wav(
         "stt_engine": stt_engine,
         "tts_provider": tts_info["provider"],
         "tts_voice": tts_info["voice"],
+        "tts_style": tts_info.get("style", ""),
         "stt_seconds": stt_seconds,
         "memory_seconds": memory_seconds,
         "reply_seconds": reply_seconds,
@@ -2487,11 +2502,13 @@ def process_voice_wav(
         clear_device_session,
         get_device_session_turns,
     )
+    from math_voice import clear_math_quiz
 
     if reply_path in DEVICE_SESSION_LOG_PATHS:
         append_device_session_turn(device_id, user_text, reply)
     if is_conversation_goodbye(user_text) or reply_path == "goodbye":
         clear_device_session(device_id)
+        clear_math_quiz(device_id)
     else:
         session_turns = get_device_session_turns(device_id)
         if session_turns:

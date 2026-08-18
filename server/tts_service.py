@@ -21,6 +21,7 @@ from typing import Any, Callable
 import requests
 
 from esp_wav_chunking import chunk_text_for_esp_limit
+from tts_prosody import infer_speech_prosody, piper_prosody_enabled, pitch_shift_wav_bytes
 from wav_resample import ESP_PCM_SAMPLE_RATE_HZ, resample_wav_bytes_to_mono_16bit
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,11 @@ _TTS_MARKDOWN_CODE_RE = re.compile(r"`([^`]+)`")
 # Chat-style speaker labels the LLM sometimes leaks into spoken text.
 _TTS_SPEAKER_LABEL_RE = re.compile(
     r"^\s*(?:ni\s*no|nino)\s*(?:says|said)?\s*[:\-–—]\s*",
+    re.IGNORECASE,
+)
+_TTS_LATEX_RE = re.compile(r"\\\[.*?\\\]|\\\(.*?\\\)", re.DOTALL)
+_TTS_PLACEHOLDER_RE = re.compile(
+    r"\[(?:insert|placeholder|your|number|first|second)[^\]]*\]",
     re.IGNORECASE,
 )
 
@@ -161,6 +167,8 @@ def _normalize_tts_text(text: str) -> str:
     clean = _TTS_EMOJI_RE.sub("", clean)
     clean = _TTS_EMOJI_SHORTCODE_RE.sub("", clean)
     clean = _TTS_DECORATIVE_RE.sub("", clean)
+    clean = _TTS_LATEX_RE.sub(" ", clean)
+    clean = _TTS_PLACEHOLDER_RE.sub(" ", clean)
     clean = re.sub(r"[ \t]+", " ", clean)
     clean = re.sub(r" ?\n ?", " ", clean)
     clean = clean.strip()
@@ -285,8 +293,14 @@ def preload_piper_voice() -> bool:
         return False
 
 
-def _set_tts_synthesis_info(provider: str, voice: str) -> None:
-    _SYNTHESIS_INFO.value = {"provider": provider, "voice": voice}
+def _set_tts_synthesis_info(
+    provider: str, voice: str, *, style: str = ""
+) -> None:
+    _SYNTHESIS_INFO.value = {
+        "provider": provider,
+        "voice": voice,
+        "style": style,
+    }
 
 
 def last_tts_synthesis_info() -> dict[str, str]:
@@ -295,7 +309,12 @@ def last_tts_synthesis_info() -> dict[str, str]:
     return {
         "provider": str(info.get("provider", "")),
         "voice": str(info.get("voice", "")),
+        "style": str(info.get("style", "")),
     }
+
+
+def _keep_tts_style() -> str:
+    return last_tts_synthesis_info().get("style", "")
 
 
 def _synthesize_piper_wav_bytes(
@@ -313,6 +332,9 @@ def _synthesize_piper_wav_bytes(
     except ImportError as exc:
         raise RuntimeError("Piper Python package is not installed.") from exc
 
+    prosody = infer_speech_prosody(clean)
+    length_scale = max(0.5, min(2.0, _piper_length_scale() * prosody.length_mul))
+    spoken_volume = max(0.0, min(1.0, volume * prosody.volume_mul))
     voice = _load_piper_voice()
     output = io.BytesIO()
     with _PIPER_LOCK:
@@ -321,13 +343,26 @@ def _synthesize_piper_wav_bytes(
                 clean,
                 wav_file,
                 SynthesisConfig(
-                    length_scale=_piper_length_scale(),
-                    volume=max(0.0, min(1.0, volume)),
+                    length_scale=length_scale,
+                    noise_scale=prosody.noise_scale,
+                    noise_w_scale=prosody.noise_w_scale,
+                    volume=spoken_volume,
                 ),
             )
     wav = output.getvalue()
     if not wav:
         raise RuntimeError("Piper produced no audio.")
+    if abs(prosody.pitch_semitones) >= 0.05:
+        wav = pitch_shift_wav_bytes(wav, prosody.pitch_semitones)
+    logger.info(
+        "Piper prosody style=%s length=%.2f noise=%.2f volume=%.2f pitch=%+.1f",
+        prosody.style,
+        length_scale,
+        prosody.noise_scale,
+        spoken_volume,
+        prosody.pitch_semitones,
+    )
+    _set_tts_synthesis_info("piper", model_path.stem, style=prosody.style)
     return wav, model_path.stem
 
 
@@ -633,7 +668,7 @@ def synthesize_sapi_wav_bytes(
             wav, voice, used_provider = _synthesize_local_fallback_wav_bytes(
                 text, rate, volume
             )
-            _set_tts_synthesis_info(used_provider, voice)
+            _set_tts_synthesis_info(used_provider, voice, style=_keep_tts_style())
             return wav, voice
         try:
             wav, voice = _synthesize_elevenlabs_wav_bytes(
@@ -647,14 +682,14 @@ def synthesize_sapi_wav_bytes(
             wav, voice, used_provider = _synthesize_local_fallback_wav_bytes(
                 text, rate, volume
             )
-            _set_tts_synthesis_info(used_provider, voice)
+            _set_tts_synthesis_info(used_provider, voice, style=_keep_tts_style())
             return wav, voice
     if provider == "piper":
         try:
             wav, voice = _synthesize_piper_wav_bytes(
                 text, rate=rate, volume=volume
             )
-            _set_tts_synthesis_info("piper", voice)
+            _set_tts_synthesis_info("piper", voice, style=_keep_tts_style())
             return wav, voice
         except Exception as exc:
             logger.warning("Piper TTS failed (%s); falling back to system TTS.", exc)
@@ -694,6 +729,7 @@ def tts_status() -> dict[str, Any]:
         "piper_model_path": str(model_path),
         "piper_preloaded": piper_preloaded,
         "piper_length_scale": _piper_length_scale(),
+        "piper_prosody": piper_prosody_enabled(),
     }
     if provider == "elevenlabs":
         out.update(

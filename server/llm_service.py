@@ -1152,6 +1152,19 @@ _LAST_QUESTION_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
 )
 
 
+_LAST_QUESTION_META_RE = re.compile(
+    r"\b(?:"
+    r"that was not my question|"
+    r"that wasn'?t my question|"
+    r"that(?:'s| is) not (?:what i asked|my question)|"
+    r"i didn'?t ask that|"
+    r"wrong question|"
+    r"not (?:the|my) (?:last )?question"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
 def is_last_question_query(user_text: str) -> bool:
     """True when the user wants the previous question they asked, not a full recap."""
     text = user_text.strip()
@@ -1160,23 +1173,37 @@ def is_last_question_query(user_text: str) -> bool:
     return any(p.search(text) for p in _LAST_QUESTION_PATTERNS)
 
 
+def _is_recallable_user_question(user_text: str) -> bool:
+    """Keep information questions; drop reactions, jokes, recap, and meta-corrections."""
+    from memory_filters import is_ephemeral_query, is_question_query
+    from memory_service import is_stt_fragment
+
+    cleaned = str(user_text or "").strip()
+    if not cleaned:
+        return False
+    if is_last_question_query(cleaned) or is_conversation_recap_question(cleaned):
+        return False
+    if _LAST_QUESTION_META_RE.search(cleaned):
+        return False
+    if is_stt_fragment(cleaned) or is_ephemeral_query(cleaned):
+        return False
+    if re.fullmatch(r"(?:alright|okay|ok|thanks|thank you)[,.]?\s*(?:good\s*)?bye[.!?…]?", cleaned, re.I):
+        return False
+    if re.search(r"\b(?:good\s*bye|goodbye|bye)\b", cleaned, re.I) and not is_question_query(cleaned):
+        return False
+    return is_question_query(cleaned)
+
+
 def last_user_question_from_history(
     recent_history: list[tuple[str, str]] | None,
 ) -> str | None:
     """Newest stored user line that is a real question, not a recap/last-question ask."""
-    from memory_service import is_stt_fragment
-
     if not recent_history:
         return None
     for user_text, _assistant_text in reversed(recent_history):
         cleaned = str(user_text or "").strip()
-        if not cleaned:
-            continue
-        if is_last_question_query(cleaned) or is_conversation_recap_question(cleaned):
-            continue
-        if is_stt_fragment(cleaned):
-            continue
-        return cleaned
+        if _is_recallable_user_question(cleaned):
+            return cleaned
     return None
 
 
@@ -1192,17 +1219,18 @@ def answer_last_user_question(
             "I need to see you to recall your last question. "
             "Face the camera and ask again."
         )
-    cleaned = " ".join((last_question or "").split()).rstrip(" ?.!")
+    cleaned = " ".join((last_question or "").split()).strip()
     if not cleaned:
         return (
             "I don't have a previous question stored yet. "
             "Ask me something and I'll remember it."
         )
+    if cleaned[-1] not in ".!?":
+        cleaned = f"{cleaned}?"
     name = (viewer_name or "").strip()
-    spoken = cleaned[0].lower() + cleaned[1:] if len(cleaned) > 1 else cleaned.lower()
     if name:
-        return f"{name}, you asked {spoken}."
-    return f"You asked {spoken}."
+        return f"{name}, you last asked: {cleaned}"
+    return f"You last asked: {cleaned}"
 
 
 _TOPIC_FOCUSED_RECAP_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
@@ -1703,6 +1731,8 @@ def answer_voice_query(
         "- Answer ONLY what the user asked; do not bring up unrelated stored facts.\n"
         "- Answer general-knowledge questions yourself; do not tell the speaker to ask another person.\n"
         "- The recognized speaker is the person you are addressing, never a third party to ask about the answer.\n"
+        "- If they asked you to quiz them or give them numbers, ask one problem with two "
+        "real numbers. Never say insert, placeholder, or use square brackets.\n"
         "- If the user is saying goodbye / bye / ending the chat, reply with a short farewell only — "
         "do not ask a follow-up question or invite them to keep talking.\n"
         f"Rules: one short spoken reply under {max_words} words, plain sentences, "
