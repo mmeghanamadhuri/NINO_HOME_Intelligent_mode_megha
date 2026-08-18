@@ -272,6 +272,9 @@ class VoiceReplyMeta:
     trigger_servo_360: bool = False
     # Reuses ESP prompt_ack path: after TTS, chime + open mic (no wake word).
     prompt_medical_ack: bool = False
+    # After TTS, P4 raises GPIO 5 so Sirena closes the mics.
+    end_session: bool = False
+    session_id: str = ""
     eye_expression: str | None = None
     registered_face_name: str | None = None
     face_reg_relisten: bool = False
@@ -354,6 +357,12 @@ _CONVERSATION_GOODBYE_RE = re.compile(
     r"stop\s+listening|"
     r"end\s+(?:the\s+)?(?:conversation|chat)"
     r")\b",
+    re.IGNORECASE,
+)
+
+# Bare "stop" ends the session; "stop the music" is handled by music_stop instead.
+_CONVERSATION_STOP_RE = re.compile(
+    r"^\s*(?:please\s+)?stop(?:\s+(?:now|please))?[.!?]*\s*$",
     re.IGNORECASE,
 )
 
@@ -468,7 +477,19 @@ def _record_rejected_wake(
 
 def is_conversation_goodbye(user_text: str) -> bool:
     """True when the user is ending the chat (do not reopen the mic)."""
-    return bool(_CONVERSATION_GOODBYE_RE.search(str(user_text or "").strip()))
+    text = str(user_text or "").strip()
+    if not text:
+        return False
+    if _CONVERSATION_STOP_RE.match(text):
+        return True
+    return bool(_CONVERSATION_GOODBYE_RE.search(text))
+
+
+def utterance_ends_session(reply_path: str, user_text: str) -> bool:
+    """Streaming sessions close only on goodbye/stop, after TTS plays."""
+    if reply_path == "goodbye":
+        return True
+    return is_conversation_goodbye(user_text)
 
 
 def conversation_goodbye_reply() -> str:
@@ -495,6 +516,18 @@ def should_continue_listen_after_reply(reply_path: str, user_text: str) -> bool:
 
 def _mark_continue_listen(meta: VoiceReplyMeta, reply_path: str, user_text: str) -> None:
     turn = meta.timings.get("turn")
+    meta.end_session = utterance_ends_session(reply_path, user_text)
+    if meta.end_session:
+        meta.prompt_medical_ack = False
+        log_nino_voice(
+            "SESSION",
+            turn=turn,
+            state="end",
+            path=reply_path,
+            heard=str(user_text or "")[:120],
+            next="GPIO 5 after TTS, then wait for Ok Nino",
+        )
+        return
     if should_continue_listen_after_reply(reply_path, user_text):
         meta.prompt_medical_ack = True
         log_nino_voice(
@@ -1727,11 +1760,13 @@ def process_voice_wav(
     camera_scene: str | None = None,
     device_id: str = "",
     session_kind: str = "wake",
+    session_id: str = "",
     aux_energy: int | None = None,
     voice_turn: int | None = None,
     pipeline_t0: float | None = None,
 ) -> tuple[bytes, VoiceReplyMeta]:
     meta = VoiceReplyMeta(device_id=device_id or "")
+    meta.session_id = str(session_id or "").strip()
     session = "continue" if str(session_kind or "").strip().lower() in {
         "continue",
         "conv",
@@ -2469,6 +2504,7 @@ def process_voice_wav(
             reply,
             existing=memory_ctx,
             reply_path=reply_path,
+            session_id=meta.session_id,
         )
 
     meta.eye_expression = infer_eye_expression_for_response(
@@ -2517,6 +2553,7 @@ def process_voice_wav(
         "memory_ready": memory_svc.ready,
         "memory_store": memory_store,
         "session": session,
+        "session_id": meta.session_id,
         "wake_ok": True if session == "wake" else None,
         "heard_raw": heard_raw[:200],
         "turn": voice_turn,
@@ -2540,12 +2577,29 @@ def process_voice_wav(
         get_device_session_turns,
     )
     from math_voice import clear_math_quiz
+    from conversation_sessions import append_session_turn, end_session as persist_end_session
 
     if reply_path in DEVICE_SESSION_LOG_PATHS:
         append_device_session_turn(device_id, user_text, reply)
+        if meta.session_id:
+            append_session_turn(
+                meta.session_id,
+                device_id=device_id,
+                user_name=memory_name or viewer_name,
+                user_text=user_text,
+                assistant_text=reply,
+                reply_path=reply_path,
+            )
     if is_conversation_goodbye(user_text) or reply_path == "goodbye":
         clear_device_session(device_id)
         clear_math_quiz(device_id)
+        if meta.session_id:
+            persist_end_session(
+                meta.session_id,
+                device_id=device_id,
+                user_name=memory_name or viewer_name,
+                reason="goodbye",
+            )
     else:
         session_turns = get_device_session_turns(device_id)
         if session_turns:

@@ -21,6 +21,7 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 #include "esp_wifi.h"
 #include "lwip/inet.h"
 #include "lwip/ip4_addr.h"
@@ -84,12 +85,16 @@
 #define MDNS_HOSTNAME_MAX DEVICE_ID_MAX
 
 #define STA_RECONNECT_DELAY_MS 5000
+#define SERVER_WATCH_TICK_MS 1000
+#define SERVER_PROBE_MS 10000
+#define SERVER_ANNOUNCE_MS 60000
 static char s_sta_ssid[WIFI_CONFIG_STA_SSID_MAX] = "";
 static char s_sta_pass[WIFI_CONFIG_STA_PASS_MAX] = "";
 
 static wifi_mode_t s_wifi_mode = WIFI_MODE_AP;
 static bool s_sta_connected = false;
 static bool s_wifi_connected_chime_pending = false;
+static bool s_wifi_connected_chime_played = false;
 static bool s_audio_queue_ready = false;
 static volatile bool s_wifi_connected_chime_task_running = false;
 static bool s_boot_unprovisioned = false;
@@ -191,6 +196,9 @@ extern const uint8_t hello_home_wav_end[] asm("_binary_Hello_home_wav_end");
 extern const uint8_t wifi_unable_wav_start[] asm("_binary_Wifi_Unable_wav_start");
 extern const uint8_t wifi_unable_wav_end[] asm("_binary_Wifi_Unable_wav_end");
 
+extern const uint8_t server_unable_wav_start[] asm("_binary_Server_Unable_wav_start");
+extern const uint8_t server_unable_wav_end[] asm("_binary_Server_Unable_wav_end");
+
 extern const uint8_t go_app_wav_start[] asm("_binary_NiNO_Home_Wifi_wav_start");
 extern const uint8_t go_app_wav_end[] asm("_binary_NiNO_Home_Wifi_wav_end");
 
@@ -233,6 +241,7 @@ static void wifi_connected_chime_task(void *arg) {
        ++attempt) {
     if (s_audio_queue_ready && play_wifi_connected_clip()) {
       s_wifi_connected_chime_pending = false;
+      s_wifi_connected_chime_played = true;
       break;
     }
     vTaskDelay(pdMS_TO_TICKS(250));
@@ -245,8 +254,8 @@ static void wifi_connected_chime_task(void *arg) {
 }
 
 static void schedule_wifi_connected_chime(void) {
-  if (!s_sta_connected || !s_wifi_connected_chime_pending ||
-      s_wifi_connected_chime_task_running) {
+  if (s_wifi_connected_chime_played || !s_sta_connected ||
+      !s_wifi_connected_chime_pending || s_wifi_connected_chime_task_running) {
     return;
   }
   s_wifi_connected_chime_task_running = true;
@@ -791,6 +800,134 @@ static bool wifi_report_url_from_voice_ws(char *dst, size_t dst_size) {
   return written > 0 && (size_t)written < dst_size;
 }
 
+static bool voice_server_status_url(char *dst, size_t dst_size) {
+  if (dst == NULL || dst_size == 0 || s_voice_ws_url[0] == '\0') {
+    return false;
+  }
+  const char *separator = strstr(s_voice_ws_url, "://");
+  if (separator == NULL ||
+      (strncmp(s_voice_ws_url, "ws://", 5) != 0 &&
+       strncmp(s_voice_ws_url, "wss://", 6) != 0 &&
+       strncmp(s_voice_ws_url, "http://", 7) != 0 &&
+       strncmp(s_voice_ws_url, "https://", 8) != 0)) {
+    return false;
+  }
+  const char *authority = separator + 3;
+  size_t authority_len = strcspn(authority, "/?#");
+  if (authority_len == 0 || authority_len > 180) {
+    return false;
+  }
+  const char *http_scheme =
+      (strncmp(s_voice_ws_url, "wss://", 6) == 0 ||
+       strncmp(s_voice_ws_url, "https://", 8) == 0)
+          ? "https"
+          : "http";
+  int written = snprintf(dst, dst_size, "%s://%.*s/api/status", http_scheme,
+                         (int)authority_len, authority);
+  return written > 0 && (size_t)written < dst_size;
+}
+
+static bool probe_voice_server(void) {
+  char url[256] = "";
+  if (!voice_server_status_url(url, sizeof(url))) {
+    return false;
+  }
+  esp_http_client_config_t config = {
+      .url = url,
+      .method = HTTP_METHOD_GET,
+      .timeout_ms = 3000,
+  };
+  esp_http_client_handle_t client = esp_http_client_init(&config);
+  if (client == NULL) {
+    return false;
+  }
+  esp_err_t err = esp_http_client_perform(client);
+  const int status = esp_http_client_get_status_code(client);
+  esp_http_client_cleanup(client);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Voice server probe failed: %s (%s)", esp_err_to_name(err), url);
+    return false;
+  }
+  ESP_LOGI(TAG, "Voice server probe HTTP %d (%s)", status, url);
+  return status > 0;
+}
+
+static bool play_server_unable_clip(void) {
+  const size_t wav_len = (size_t)(server_unable_wav_end - server_unable_wav_start);
+  if (wav_len < 44) {
+    ESP_LOGW(TAG, "Embedded Server_Unable.wav missing or too small");
+    return false;
+  }
+  if (nino_voice_assist_query_is_busy() || nino_audio_queue_busy() ||
+      nino_music_blocks_mic()) {
+    return false;
+  }
+  esp_err_t err = nino_audio_queue_wav_copy(server_unable_wav_start, wav_len, false,
+                                            NINO_AUDIO_SERVO_PRIORITY_NONE, false);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Failed to queue Server_Unable.wav: %s", esp_err_to_name(err));
+    return false;
+  }
+  ESP_LOGI(TAG, "Queued Server_Unable.wav (%u bytes): voice server unreachable",
+           (unsigned)wav_len);
+  return true;
+}
+
+static bool server_fail_led_can_takeover(nino_rgb_show_t cur) {
+  return cur == NINO_RGB_SHOW_IDLE || cur == NINO_RGB_SHOW_DONE ||
+         cur == NINO_RGB_SHOW_WIFI_OK || cur == NINO_RGB_SHOW_SERVER_FAIL;
+}
+
+static void apply_server_watch_led(bool reachable) {
+  if (!s_sta_connected) {
+    return;
+  }
+  const nino_rgb_show_t cur = nino_rgb_led_current();
+  if (reachable) {
+    if (cur == NINO_RGB_SHOW_SERVER_FAIL) {
+      (void)nino_rgb_led_show(NINO_RGB_SHOW_WIFI_OK);
+    }
+    return;
+  }
+  if (server_fail_led_can_takeover(cur) && cur != NINO_RGB_SHOW_SERVER_FAIL) {
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_SERVER_FAIL);
+  }
+}
+
+static void server_watch_task(void *arg) {
+  (void)arg;
+  int64_t last_probe_us = 0;
+  int64_t last_announce_us = 0;
+  bool reachable = true;
+  ESP_LOGI(TAG, "Voice server watch started (announce every %d s while down)",
+           SERVER_ANNOUNCE_MS / 1000);
+  while (true) {
+    vTaskDelay(pdMS_TO_TICKS(SERVER_WATCH_TICK_MS));
+    if (!s_sta_connected || !s_boot_greeting_done) {
+      continue;
+    }
+    const int64_t now = esp_timer_get_time();
+    if (last_probe_us == 0 ||
+        (now - last_probe_us) >= (int64_t)SERVER_PROBE_MS * 1000) {
+      reachable = probe_voice_server();
+      last_probe_us = now;
+      if (reachable) {
+        last_announce_us = 0;
+      }
+    }
+    apply_server_watch_led(reachable);
+    if (reachable) {
+      continue;
+    }
+    if (last_announce_us == 0 ||
+        (now - last_announce_us) >= (int64_t)SERVER_ANNOUNCE_MS * 1000) {
+      if (play_server_unable_clip()) {
+        last_announce_us = now;
+      }
+    }
+  }
+}
+
 static void report_wifi_network_task(void *arg) {
   (void)arg;
   /* The server may need a moment to rediscover the board after DHCP changes. */
@@ -1102,8 +1239,8 @@ esp_err_t wifi_config_set_sta_credentials(const char *ssid, const char *pass) {
   /* New credentials: allow the "unable to connect" prompt to play again if
    * this attempt also fails. */
   s_wifi_unable_chimed = false;
-  /* Each new connection attempt should announce success only after it receives
-   * an IP address. */
+  /* New network: allow the connected clip once after this attempt gets an IP. */
+  s_wifi_connected_chime_played = false;
   s_wifi_connected_chime_pending = true;
   return ESP_OK;
 }
@@ -1158,6 +1295,20 @@ esp_err_t wifi_config_enter_setup_mode(void) {
 
   ESP_LOGI(TAG, "Setup mode active — BLE advertising for provisioning");
   return ESP_OK;
+}
+
+static int cmd_wifi_setup(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+  printf("Erasing Wi-Fi credentials and rebooting into setup (AP + BLE)...\n");
+  esp_err_t err = wifi_config_enter_setup_mode();
+  if (err != ESP_OK) {
+    printf("Setup mode failed: %s\n", esp_err_to_name(err));
+    return 1;
+  }
+  vTaskDelay(pdMS_TO_TICKS(300));
+  esp_restart();
+  return 0;
 }
 
 static int cmd_wifi_connect(int argc, char **argv) {
@@ -1236,8 +1387,11 @@ static int cmd_wifi(int argc, char **argv) {
   if (argc >= 2 && strcmp(argv[1], "status") == 0) {
     return cmd_wifi_status(0, NULL);
   }
+  if (argc >= 2 && strcmp(argv[1], "setup") == 0) {
+    return cmd_wifi_setup(0, NULL);
+  }
   printf("Usage: wifi mode <ap|sta|both> | wifi connect <ssid> [pass] | wifi "
-         "disconnect | wifi status\n");
+         "disconnect | wifi status | wifi setup\n");
   return 0;
 }
 
@@ -1245,7 +1399,7 @@ static void wifi_cli_register(void) {
   const esp_console_cmd_t wifi_cmd = {
       .command = "wifi",
       .help = "wifi mode <ap|sta|both> | wifi connect <ssid> [pass] | wifi "
-              "disconnect | wifi status",
+              "disconnect | wifi status | wifi setup",
       .hint = NULL,
       .func = &cmd_wifi,
       .argtable = NULL,
@@ -1537,7 +1691,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 
   if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
     s_sta_connected = false;
-    s_wifi_connected_chime_pending = true;
     wifi_prov_ble_on_sta_ip_changed(false);
     mdns_stop_service();
     (void)nino_rgb_led_show(NINO_RGB_SHOW_WIFI_FAIL);
@@ -1937,6 +2090,22 @@ static esp_err_t snapshot_handler(httpd_req_t *req) {
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   err = httpd_resp_send(req, (const char *)buffer, frame_len);
   free(buffer);
+  return err;
+}
+
+static esp_err_t aux_in_wav_handler(httpd_req_t *req) {
+  uint8_t *wav = NULL;
+  size_t wav_len = 0;
+  esp_err_t err = nino_audio_capture_copy_last(&wav, &wav_len);
+  if (err != ESP_OK || wav == NULL) {
+    httpd_resp_set_status(req, "404 Not Found");
+    return httpd_resp_sendstr(req, "No Aux-in capture yet");
+  }
+  httpd_resp_set_type(req, "audio/wav");
+  httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=aux_in.wav");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  err = httpd_resp_send(req, (const char *)wav, (ssize_t)wav_len);
+  free(wav);
   return err;
 }
 
@@ -3224,20 +3393,20 @@ static int cmd_start(int argc, char **argv) {
     printf("Voice PC not linked. First: voice connect <PC_LAN_IP> 8000\n");
     return 1;
   }
-  printf("Recording %u s from ES8311 AUX IN...\n", (unsigned)seconds);
+  printf("Starting Aux-in stream session (ASR end-of-speech, not a fixed clip)...\n");
   esp_err_t err = nino_voice_assist_run_query(seconds * 1000U);
   if (err != ESP_OK) {
     printf("start failed: %s\n", esp_err_to_name(err));
     return 1;
   }
-  printf("Sent WAV to server — reply will play on the speaker\n");
+  printf("Session armed — speak after Sirena wake, or audio is already streaming\n");
   return 0;
 }
 
 static void start_cli_register(void) {
   const esp_console_cmd_t cmd = {
       .command = "start",
-      .help = "Record AUX IN (default 5 s) and send WAV to the PC voice server",
+      .help = "Start a streamed Aux-in conversation session (ASR end-of-speech)",
       .hint = NULL,
       .func = &cmd_start,
       .argtable = NULL,
@@ -3602,6 +3771,12 @@ static void start_http_server(void) {
       .handler = snapshot_handler,
       .user_ctx = NULL,
   };
+  const httpd_uri_t aux_in_wav_uri = {
+      .uri = "/aux_in.wav",
+      .method = HTTP_GET,
+      .handler = aux_in_wav_handler,
+      .user_ctx = NULL,
+  };
   const httpd_uri_t play_wav_uri = {
       .uri = "/play_wav",
       .method = HTTP_POST,
@@ -3745,6 +3920,7 @@ static void start_http_server(void) {
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &view_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &stream_mjpeg_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &snapshot_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &aux_in_wav_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &play_wav_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &music_play_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &music_stop_uri));
@@ -4176,5 +4352,7 @@ void app_main(void) {
 
   /* Boot sequence complete: greet with Hello-home after the Wi-Fi clip. */
   xTaskCreatePinnedToCore(hello_home_task, "hello_home", 4096, NULL, 4, NULL,
+                          APP_CORE_NET);
+  xTaskCreatePinnedToCore(server_watch_task, "srv_watch", 5120, NULL, 4, NULL,
                           APP_CORE_NET);
 }

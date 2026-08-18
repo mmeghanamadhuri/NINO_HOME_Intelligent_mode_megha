@@ -15,14 +15,22 @@ from typing import Literal
 os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
 
 import cv2
-from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import Response, StreamingResponse
+from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.staticfiles import StaticFiles as StarletteStaticFiles
 
+from aux_recordings import list_aux_recordings, save_aux_wav, recordings_dir
+from conversation_sessions import (
+    begin_session as begin_voice_session,
+    list_recent_sessions,
+    list_sessions_for_user,
+    new_session_id,
+)
+from stream_asr import UtteranceBuffer
 from alarm_service import get_alarm_service
 from camera import CameraPool, normalize_camera_rotation
 from device_discovery import (
@@ -435,6 +443,80 @@ def index(request: Request):
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     response.headers["Pragma"] = "no-cache"
     return response
+
+
+@app.post("/recordings")
+async def upload_aux_recording(
+    request: Request,
+    device_id: str = Query(""),
+    turn: int | None = Query(None),
+    energy: int | None = Query(None),
+    session: str = Query(""),
+):
+    """Store a Sirena Aux-in WAV from the P4 (also used when ASR is skipped)."""
+    wav = await request.body()
+    if not wav:
+        raise HTTPException(status_code=400, detail="empty audio body")
+    header_id = (request.headers.get("x-nino-device-id") or "").strip()
+    resolved = resolve_device_id(device_id or header_id or None)
+    try:
+        path = await run_in_threadpool(
+            lambda: save_aux_wav(
+                wav,
+                device_id=resolved,
+                turn=turn,
+                energy=energy,
+                session=session,
+                source="aux",
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    rel = path.relative_to(recordings_dir()).as_posix()
+    logger.info(
+        "Saved Aux-in recording %s (%d bytes) device=%s turn=%s energy=%s",
+        rel,
+        len(wav),
+        resolved,
+        turn,
+        energy,
+    )
+    return {
+        "ok": True,
+        "path": rel,
+        "bytes": len(wav),
+        "url": f"/recordings/{rel}",
+    }
+
+
+@app.get("/recordings")
+def recordings_index(limit: int = Query(50, ge=1, le=200)):
+    return {"ok": True, "recordings": list_aux_recordings(limit=limit)}
+
+
+@app.get("/recordings/{device_id}/{filename}")
+def download_aux_recording(device_id: str, filename: str):
+    if "/" in filename or "\\" in filename or filename.startswith("."):
+        raise HTTPException(status_code=400, detail="invalid filename")
+    path = recordings_dir() / device_id / filename
+    try:
+        path.resolve().relative_to(recordings_dir().resolve())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid path") from exc
+    if not path.is_file() or path.suffix.lower() != ".wav":
+        raise HTTPException(status_code=404, detail="recording not found")
+    return FileResponse(path, media_type="audio/wav", filename=filename)
+
+
+@app.get("/sessions")
+def sessions_index(
+    user: str = Query(""),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """Conversation session history, optionally filtered by user name."""
+    if user.strip():
+        return {"ok": True, "sessions": list_sessions_for_user(user, limit=limit)}
+    return {"ok": True, "sessions": list_recent_sessions(limit=limit)}
 
 
 @app.get("/actions")
@@ -1315,6 +1397,16 @@ def _voice_turn_from_websocket(websocket: WebSocket) -> int | None:
         return None
 
 
+def _session_id_from_websocket(websocket: WebSocket) -> str:
+    raw = (websocket.query_params.get("session_id") or "").strip()
+    return raw or new_session_id()
+
+
+def _voice_wants_stream(websocket: WebSocket) -> bool:
+    raw = (websocket.query_params.get("stream") or "").strip().lower()
+    return raw in {"1", "true", "yes", "pcm"}
+
+
 def _device_id_from_websocket(websocket: WebSocket) -> str:
     """Resolve device_id from query param or X-Nino-Device-Id header."""
     raw = (websocket.query_params.get("device_id") or "").strip()
@@ -1336,6 +1428,369 @@ def _device_id_from_websocket(websocket: WebSocket) -> str:
             resolved,
         )
     return resolved
+
+
+async def _process_voice_query_audio(
+    wav_in: bytes,
+    *,
+    device_id: str,
+    session_kind: str,
+    session_id: str,
+    aux_energy: int | None,
+    voice_turn: int | None,
+    client_label: str,
+) -> tuple[bytes | None, object, str | None]:
+    """Run STT → LLM → TTS. Returns (wav_out, reply_meta, pipeline_error)."""
+    from voice_service import (
+        VoiceReplyMeta,
+        minimal_voice_reply_wav,
+        process_voice_wav,
+    )
+
+    wav_out: bytes | None = None
+    reply_meta = VoiceReplyMeta(device_id=device_id, session_id=session_id)
+    pipeline_error: str | None = None
+    t_query_start = time.perf_counter()
+    identity_seconds = 0.0
+    await run_in_threadpool(begin_voice_query)
+    await run_in_threadpool(face_registration.on_voice_query_started)
+    try:
+        try:
+            t_ident = time.perf_counter()
+            identity_name, identity_state = await run_in_threadpool(
+                _camera_identity_snapshot, True, device_id
+            )
+            active_viewer: str | None = None
+            if identity_state == "recognized" and identity_name:
+                normalized_identity = str(identity_name).strip()
+                if normalized_identity and normalized_identity.lower() not in {
+                    "unknown",
+                    "face",
+                }:
+                    active_viewer = normalized_identity
+            if not active_viewer:
+                active_viewer = await run_in_threadpool(
+                    _recall_voice_viewer, device_id
+                )
+            identity_seconds = round(time.perf_counter() - t_ident, 3)
+            camera_scene = await run_in_threadpool(
+                _camera_scene_snapshot, device_id
+            )
+
+            def _run_voice() -> tuple[bytes, VoiceReplyMeta]:
+                return process_voice_wav(
+                    wav_in,
+                    active_viewer,
+                    camera_identity_name=identity_name,
+                    camera_identity_state=identity_state,
+                    camera_scene=camera_scene,
+                    device_id=device_id,
+                    session_kind=session_kind,
+                    session_id=session_id,
+                    aux_energy=aux_energy,
+                    voice_turn=voice_turn,
+                )
+
+            wav_out, reply_meta = await run_in_threadpool(_run_voice)
+            if active_viewer and reply_meta.registered_face_name is None:
+                reply_meta.timings.setdefault("voice_viewer", active_viewer)
+        except Exception as exc:
+            logger.exception("Voice pipeline failed device=%s", device_id)
+            pipeline_error = str(exc)[:200]
+            err_note = str(exc)[:512]
+            try:
+                from llm_service import (
+                    OLLAMA_UNAVAILABLE_REPLY,
+                    brief_spoken_message,
+                    is_ollama_error,
+                )
+                from wav_resample import ESP_PCM_SAMPLE_RATE_HZ, resample_wav_bytes_to_mono_16bit
+
+                def _recover_wav(pipeline_exc: BaseException = exc) -> bytes:
+                    if is_ollama_error(pipeline_exc):
+                        txt = OLLAMA_UNAVAILABLE_REPLY
+                    else:
+                        txt = brief_spoken_message(
+                            err_note,
+                            model=os.environ.get("OLLAMA_MODEL"),
+                            api_url=os.environ.get("OLLAMA_URL"),
+                        )
+                    raw, _ = synthesize_sapi_wav_bytes(txt)
+                    return resample_wav_bytes_to_mono_16bit(raw, ESP_PCM_SAMPLE_RATE_HZ)
+
+                wav_out = await run_in_threadpool(_recover_wav)
+            except Exception:
+                logger.exception("Voice pipeline recovery failed")
+                wav_out = minimal_voice_reply_wav()
+
+        if not wav_out and not reply_meta.face_reg_relisten:
+            wav_out = minimal_voice_reply_wav()
+
+        timings = dict(reply_meta.timings)
+        timings.setdefault("audio_in_bytes", len(wav_in))
+        timings.setdefault("session", session_kind)
+        timings.setdefault("session_id", session_id)
+        server_total = round(time.perf_counter() - t_query_start, 3)
+        process_total = float(timings.get("process_total_seconds") or 0)
+        timings["identity_seconds"] = identity_seconds
+        timings["server_total_seconds"] = server_total
+        timings["overhead_seconds"] = round(max(0.0, server_total - process_total), 3)
+        from voice_service import log_nino_voice
+
+        log_nino_voice(
+            "DONE",
+            turn=timings.get("turn", voice_turn),
+            device=device_id,
+            session=session_kind,
+            session_id=session_id,
+            path=timings.get("reply_path"),
+            wake_ok=timings.get("wake_ok"),
+            continue_listen=int(bool(reply_meta.prompt_medical_ack)),
+            end_session=int(bool(reply_meta.end_session)),
+            heard=str(timings.get("heard") or "")[:120] or "(empty)",
+            reply=str(timings.get("reply_text") or "")[:120],
+            stt=float(timings.get("stt_seconds") or 0),
+            llm=float(timings.get("reply_seconds") or 0),
+            tts=float(timings.get("tts_seconds") or 0),
+            process=process_total,
+            identity=identity_seconds,
+            server=server_total,
+            in_s=float(timings.get("audio_in_seconds") or 0),
+            out_s=float(timings.get("audio_out_seconds") or 0),
+        )
+        record = _latency_log_record(
+            event="voice_query",
+            client=client_label,
+            device_id=device_id,
+            session=session_kind,
+            session_id=session_id,
+            **timings,
+        )
+        if pipeline_error is not None:
+            record["error"] = pipeline_error
+        await run_in_threadpool(_append_latency_record, record)
+        return wav_out, reply_meta, pipeline_error
+    finally:
+        await run_in_threadpool(end_voice_query)
+
+
+async def _voice_ws_send_reply(
+    websocket: WebSocket,
+    *,
+    device_id: str,
+    session_id: str,
+    wav_out: bytes | None,
+    reply_meta: object,
+    client_label: str,
+) -> None:
+    from voice_service import VoiceReplyMeta
+
+    meta = reply_meta if isinstance(reply_meta, VoiceReplyMeta) else VoiceReplyMeta()
+    ws_meta: dict[str, object] = {
+        "type": "reply",
+        "prompt_medical_ack": meta.prompt_medical_ack,
+        "end_session": bool(meta.end_session),
+        "continue_listen": bool(meta.prompt_medical_ack) and not meta.end_session,
+        "device_id": device_id,
+        "session_id": session_id or meta.session_id,
+        "skip": False,
+    }
+    eye_tag = normalize_eye_expression(meta.eye_expression)
+    if eye_tag:
+        ws_meta["eye_expression"] = eye_tag
+        logger.info(
+            "WS send eye_expression=%s device=%s client=%s",
+            eye_tag,
+            device_id,
+            client_label,
+        )
+    await websocket.send_json(ws_meta)
+    if wav_out:
+        await websocket.send_bytes(wav_out)
+
+    if meta.registered_face_name:
+        _remember_voice_viewer(meta.registered_face_name, device_id)
+    viewer = str(meta.timings.get("voice_viewer") or "")
+    await run_in_threadpool(tts.notify_voice_interaction, viewer or None)
+
+    from voice_service import SERVO_360_TRIGGER_DELAY_SECONDS
+
+    if meta.face_reg_relisten:
+        asyncio.create_task(_delayed_face_reg_relisten(0.5))
+    if meta.trigger_servo_360:
+        asyncio.create_task(
+            _delayed_esp_servo_360(SERVO_360_TRIGGER_DELAY_SECONDS, device_id)
+        )
+
+
+async def _voice_ws_stream_pipeline(websocket: WebSocket, device_id: str) -> None:
+    """Stream Aux-in PCM until ASR end-of-speech, then TTS; loop until goodbye."""
+    await websocket.accept()
+    from voice_service import log_nino_voice
+    from wav_resample import is_wav_bytes, pcm16_mono_to_wav
+
+    session_id = _session_id_from_websocket(websocket)
+    aux_energy = _aux_energy_from_websocket(websocket)
+    voice_turn = _voice_turn_from_websocket(websocket) or 0
+    client_label = _ws_client_label(websocket)
+    begin_voice_session(session_id, device_id=device_id)
+    log_nino_voice(
+        "WS_OPEN",
+        turn=voice_turn,
+        device=device_id,
+        session="stream",
+        session_id=session_id,
+        client=client_label,
+        energy=aux_energy,
+    )
+    await websocket.send_json({"type": "session", "session_id": session_id})
+
+    buf = UtteranceBuffer()
+    accepting = True
+    first_turn = True
+    session_queries = 0
+    session_started = time.perf_counter()
+
+    async def finish_utterance(reason: str) -> bool:
+        """Process buffered PCM. Returns False when the session should close."""
+        nonlocal accepting, first_turn, session_queries, voice_turn, aux_energy
+        pcm = bytes(buf.pcm)
+        buf.reset()
+        accepting = False
+        await websocket.send_json({"type": "end_of_speech", "reason": reason})
+        if reason == "timeout" or len(pcm) < 1600:
+            await websocket.send_json(
+                {
+                    "type": "skip",
+                    "skip": True,
+                    "reason": reason or "too_short",
+                    "session_id": session_id,
+                    "end_session": False,
+                }
+            )
+            accepting = True
+            return True
+        try:
+            wav_in = pcm if is_wav_bytes(pcm) else pcm16_mono_to_wav(pcm)
+        except ValueError:
+            await websocket.send_json(
+                {
+                    "type": "skip",
+                    "skip": True,
+                    "reason": "bad_pcm",
+                    "session_id": session_id,
+                    "end_session": False,
+                }
+            )
+            accepting = True
+            return True
+
+        session_kind = "wake" if first_turn else "continue"
+        first_turn = False
+        voice_turn += 1
+        try:
+            saved = await run_in_threadpool(
+                lambda audio=wav_in: save_aux_wav(
+                    audio,
+                    device_id=device_id,
+                    turn=voice_turn,
+                    energy=aux_energy,
+                    session=session_id[:16],
+                    source="stream",
+                )
+            )
+            logger.info(
+                "Saved stream utterance %s device=%s session=%s",
+                saved.relative_to(recordings_dir()).as_posix(),
+                device_id,
+                session_id,
+            )
+        except Exception:
+            logger.exception("Failed to save stream utterance device=%s", device_id)
+
+        wav_out, reply_meta, _err = await _process_voice_query_audio(
+            wav_in,
+            device_id=device_id,
+            session_kind=session_kind,
+            session_id=session_id,
+            aux_energy=aux_energy,
+            voice_turn=voice_turn,
+            client_label=client_label,
+        )
+        session_queries += 1
+        path = str(getattr(reply_meta, "timings", {}).get("reply_path") or "")
+        if path in {"stt_silent", "stt_empty", "silent_skip", "stt_rejected"} and not getattr(
+            reply_meta, "end_session", False
+        ):
+            await websocket.send_json(
+                {
+                    "type": "skip",
+                    "skip": True,
+                    "reason": path,
+                    "session_id": session_id,
+                    "end_session": False,
+                }
+            )
+            accepting = True
+            return True
+        await _voice_ws_send_reply(
+            websocket,
+            device_id=device_id,
+            session_id=session_id,
+            wav_out=wav_out,
+            reply_meta=reply_meta,
+            client_label=client_label,
+        )
+        if getattr(reply_meta, "end_session", False):
+            return False
+        accepting = True
+        return True
+
+    try:
+        while True:
+            try:
+                message = await websocket.receive()
+            except WebSocketDisconnect:
+                break
+            if message.get("type") == "websocket.disconnect":
+                break
+            if message.get("text") is not None:
+                continue
+            chunk = message.get("bytes")
+            if not chunk:
+                continue
+            if not accepting:
+                continue
+            from wav_resample import is_wav_bytes
+
+            if is_wav_bytes(chunk) and len(chunk) > 4096:
+                buf.reset()
+                buf.pcm.extend(chunk)
+                keep = await finish_utterance("wav")
+                if not keep:
+                    break
+                continue
+            state = buf.feed(chunk)
+            if state in {"end_of_speech", "timeout"}:
+                keep = await finish_utterance(state)
+                if not keep:
+                    break
+    finally:
+        await run_in_threadpool(
+            _append_latency_record,
+            _latency_log_record(
+                event="ws_closed",
+                client=client_label,
+                device_id=device_id,
+                session_id=session_id,
+                session_queries=session_queries,
+                session_seconds=round(time.perf_counter() - session_started, 3),
+            ),
+        )
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
@@ -1412,6 +1867,26 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                 )
                 continue
 
+            try:
+                saved = await run_in_threadpool(
+                    lambda audio=wav_in: save_aux_wav(
+                        audio,
+                        device_id=device_id,
+                        turn=voice_turn,
+                        energy=aux_energy,
+                        session=session_kind,
+                        source="query",
+                    )
+                )
+                logger.info(
+                    "Saved voice-query WAV %s (%d bytes) device=%s",
+                    saved.relative_to(recordings_dir()).as_posix(),
+                    len(wav_in),
+                    device_id,
+                )
+            except Exception:
+                logger.exception("Failed to save incoming Aux-in WAV device=%s", device_id)
+
             wav_out: bytes | None = None
             reply_meta = VoiceReplyMeta(device_id=device_id)
             active_viewer: str | None = None
@@ -1482,6 +1957,7 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                             camera_scene=camera_scene,
                             device_id=device_id,
                             session_kind=session_kind,
+                            session_id=_session_id_from_websocket(websocket),
                             aux_energy=aux_energy,
                             voice_turn=voice_turn,
                             pipeline_t0=t_query_start,
@@ -1586,7 +2062,9 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
 
                 ws_meta: dict[str, object] = {
                     "prompt_medical_ack": reply_meta.prompt_medical_ack,
+                    "end_session": bool(reply_meta.end_session),
                     "device_id": device_id,
+                    "session_id": reply_meta.session_id,
                 }
                 eye_tag = normalize_eye_expression(reply_meta.eye_expression)
                 if eye_tag:
@@ -1687,6 +2165,9 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
 @app.websocket("/ws/voice")
 async def voice_websocket(websocket: WebSocket) -> None:
     device_id = _device_id_from_websocket(websocket)
+    if _voice_wants_stream(websocket):
+        await _voice_ws_stream_pipeline(websocket, device_id)
+        return
     await _voice_ws_pipeline(websocket, device_id)
 
 
@@ -1694,6 +2175,9 @@ async def voice_websocket(websocket: WebSocket) -> None:
 async def voice_query_websocket(websocket: WebSocket) -> None:
     """Same pipeline as /ws/voice (ESP32 voice_optimized URI compatibility)."""
     device_id = _device_id_from_websocket(websocket)
+    if _voice_wants_stream(websocket):
+        await _voice_ws_stream_pipeline(websocket, device_id)
+        return
     await _voice_ws_pipeline(websocket, device_id)
 
 

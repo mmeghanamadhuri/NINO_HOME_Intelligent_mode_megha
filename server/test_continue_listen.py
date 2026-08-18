@@ -16,6 +16,9 @@ from voice_service import (
 class ConversationGoodbyeTests(unittest.TestCase):
     def test_goodbye_phrases(self) -> None:
         for text in (
+            "stop",
+            "Stop",
+            "please stop",
             "goodbye",
             "Good bye",
             "bye",
@@ -43,6 +46,9 @@ class ConversationGoodbyeTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertFalse(is_conversation_goodbye(text))
+
+    def test_stop_the_music_is_not_session_end(self) -> None:
+        self.assertFalse(is_conversation_goodbye("stop the music"))
 
     def test_goodbye_reply_has_no_follow_up(self) -> None:
         reply = conversation_goodbye_reply()

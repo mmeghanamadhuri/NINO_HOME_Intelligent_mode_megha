@@ -960,12 +960,13 @@ class MemoryService:
         assistant_text: str,
         *,
         reply_path: str = "llm",
+        session_id: str = "",
     ) -> None:
         if not self._ready:
             return
         threading.Thread(
             target=self._log_conversation_safe,
-            args=(user_id, user_text, assistant_text, reply_path),
+            args=(user_id, user_text, assistant_text, reply_path, session_id),
             daemon=True,
             name="memory-log-conversation",
         ).start()
@@ -983,6 +984,7 @@ class MemoryService:
         *,
         existing: LoadedMemoryContext | None = None,
         reply_path: str = "llm",
+        session_id: str = "",
     ) -> str:
         """Log exchange; returns skip reason or 'queued'."""
         if not display_name:
@@ -999,7 +1001,8 @@ class MemoryService:
         if not ctx:
             return "user_resolve_failed"
         self.log_conversation_background(
-            ctx.user_id, user_text, assistant_text, reply_path=reply_path
+            ctx.user_id, user_text, assistant_text, reply_path=reply_path,
+            session_id=session_id,
         )
         return "queued"
 
@@ -1325,16 +1328,22 @@ class MemoryService:
         user_text: str,
         assistant_text: str,
         reply_path: str = "llm",
+        session_id: str = "",
     ) -> None:
         try:
             with self._connect() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        INSERT INTO conversations (user_id, user_text, assistant_text)
-                        VALUES (%s, %s, %s)
+                        INSERT INTO conversations (user_id, user_text, assistant_text, session_id)
+                        VALUES (%s, %s, %s, %s)
                         """,
-                        (user_id, user_text.strip(), assistant_text.strip()),
+                        (
+                            user_id,
+                            user_text.strip(),
+                            assistant_text.strip(),
+                            (session_id or "").strip() or None,
+                        ),
                     )
                 conn.commit()
             self.after_conversation_logged(

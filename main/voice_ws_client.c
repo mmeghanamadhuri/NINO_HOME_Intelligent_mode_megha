@@ -350,3 +350,361 @@ cleanup:
   free(ctx);
   return ESP_OK;
 }
+
+struct nino_voice_ws_session {
+  SemaphoreHandle_t evt;
+  SemaphoreHandle_t mu;
+  esp_websocket_client_handle_t client;
+  uint8_t *buf;
+  size_t len;
+  size_t cap;
+  bool connected;
+  bool error;
+  bool eos;
+  bool skip;
+  bool end_session;
+  bool wav_msg_open;
+  bool reply_ready;
+  char eye_expr[EYE_EXPR_MAX];
+};
+
+static bool json_has_key_true(const char *text, size_t len, const char *key) {
+  const size_t key_len = strlen(key);
+  if (text == NULL || key_len == 0 || len < key_len) {
+    return false;
+  }
+  for (size_t i = 0; i + key_len < len; ++i) {
+    if (memcmp(text + i, key, key_len) != 0) {
+      continue;
+    }
+    size_t j = i + key_len;
+    while (j < len && (text[j] == ' ' || text[j] == '\t' || text[j] == '\n' ||
+                       text[j] == '\r')) {
+      ++j;
+    }
+    if (j >= len || text[j] != ':') {
+      continue;
+    }
+    ++j;
+    while (j < len && (text[j] == ' ' || text[j] == '\t' || text[j] == '\n' ||
+                       text[j] == '\r')) {
+      ++j;
+    }
+    return j + 4 <= len && memcmp(text + j, "true", 4) == 0;
+  }
+  return false;
+}
+
+static bool json_type_is(const char *text, size_t len, const char *want) {
+  static const char key[] = "\"type\"";
+  const size_t key_len = sizeof(key) - 1;
+  const size_t want_len = strlen(want);
+  if (text == NULL || want_len == 0 || len < key_len + want_len) {
+    return false;
+  }
+  for (size_t i = 0; i + key_len < len; ++i) {
+    if (memcmp(text + i, key, key_len) != 0) {
+      continue;
+    }
+    size_t j = i + key_len;
+    while (j < len && (text[j] == ' ' || text[j] == '\t' || text[j] == ':')) {
+      ++j;
+    }
+    if (j >= len || text[j] != '"') {
+      continue;
+    }
+    ++j;
+    if (j + want_len < len && memcmp(text + j, want, want_len) == 0 &&
+        text[j + want_len] == '"') {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void stream_signal(nino_voice_ws_session_t *s) {
+  if (s != NULL && s->evt != NULL) {
+    xSemaphoreGive(s->evt);
+  }
+}
+
+static void stream_on_event(void *handler_args, esp_event_base_t base, int32_t event_id,
+                            void *event_data) {
+  (void)base;
+  nino_voice_ws_session_t *s = (nino_voice_ws_session_t *)handler_args;
+  if (s == NULL) {
+    return;
+  }
+  esp_websocket_event_data_t *ws = (esp_websocket_event_data_t *)event_data;
+
+  switch (event_id) {
+  case WEBSOCKET_EVENT_CONNECTED:
+    s->connected = true;
+    ESP_LOGI(TAG, "stream WS connected");
+    stream_signal(s);
+    break;
+  case WEBSOCKET_EVENT_DATA:
+    if (ws->data_ptr == NULL || ws->data_len <= 0) {
+      break;
+    }
+    if (ws->op_code == 0x01) {
+      const char *text = (const char *)ws->data_ptr;
+      const size_t tlen = (size_t)ws->data_len;
+      if (json_type_is(text, tlen, "end_of_speech")) {
+        s->eos = true;
+        stream_signal(s);
+      }
+      if (json_type_is(text, tlen, "skip") || json_has_key_true(text, tlen, "\"skip\"")) {
+        s->skip = true;
+        s->eos = true;
+        s->reply_ready = true;
+        stream_signal(s);
+      }
+      if (json_type_is(text, tlen, "reply") ||
+          json_has_key_true(text, tlen, "\"end_session\"") ||
+          json_has_key_true(text, tlen, "\"prompt_medical_ack\"")) {
+        if (json_has_key_true(text, tlen, "\"end_session\"")) {
+          s->end_session = true;
+        }
+        if (json_has_key_true(text, tlen, "\"skip\"")) {
+          s->skip = true;
+          s->reply_ready = true;
+          stream_signal(s);
+        }
+      }
+      {
+        static const char key[] = "\"eye_expression\"";
+        const size_t key_len = sizeof(key) - 1;
+        for (size_t i = 0; i + key_len <= tlen; ++i) {
+          if (memcmp(text + i, key, key_len) != 0) {
+            continue;
+          }
+          size_t p = i + key_len;
+          while (p < tlen && (text[p] == ' ' || text[p] == '\t' || text[p] == ':')) {
+            p++;
+          }
+          if (p >= tlen || text[p] != '"') {
+            break;
+          }
+          p++;
+          size_t out = 0;
+          while (p < tlen && text[p] != '"' && out < sizeof(s->eye_expr) - 1) {
+            s->eye_expr[out++] = text[p++];
+          }
+          s->eye_expr[out] = '\0';
+          if (s->eye_expr[0] != '\0') {
+            nino_eye_apply_expression(s->eye_expr);
+          }
+          break;
+        }
+      }
+      break;
+    }
+    if (ws->op_code != 0x02 && ws->op_code != 0x00) {
+      break;
+    }
+    if (ws->op_code == 0x02) {
+      s->wav_msg_open = true;
+    }
+    {
+      vws_ctx_t tmp = {
+          .buf = s->buf,
+          .len = s->len,
+          .cap = s->cap,
+      };
+      append_chunk(&tmp, (const uint8_t *)ws->data_ptr, (size_t)ws->data_len);
+      s->buf = tmp.buf;
+      s->len = tmp.len;
+      s->cap = tmp.cap;
+      s->error = tmp.error;
+    }
+    if (ws->fin && s->wav_msg_open && nino_audio_wav_bytes_valid(s->buf, s->len)) {
+      s->reply_ready = true;
+      s->eos = true;
+      stream_signal(s);
+    }
+    break;
+  case WEBSOCKET_EVENT_DISCONNECTED:
+  case WEBSOCKET_EVENT_ERROR:
+    s->error = true;
+    s->connected = false;
+    stream_signal(s);
+    break;
+  default:
+    break;
+  }
+}
+
+esp_err_t nino_voice_ws_session_open(const char *ws_uri,
+                                     nino_voice_ws_session_t **out) {
+  if (ws_uri == NULL || out == NULL) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  *out = NULL;
+  nino_voice_ws_session_t *s = (nino_voice_ws_session_t *)calloc(1, sizeof(*s));
+  if (s == NULL) {
+    return ESP_ERR_NO_MEM;
+  }
+  s->evt = xSemaphoreCreateBinary();
+  s->mu = xSemaphoreCreateMutex();
+  if (s->evt == NULL || s->mu == NULL) {
+    if (s->evt) {
+      vSemaphoreDelete(s->evt);
+    }
+    if (s->mu) {
+      vSemaphoreDelete(s->mu);
+    }
+    free(s);
+    return ESP_ERR_NO_MEM;
+  }
+  esp_websocket_client_config_t ws_cfg = make_ws_cfg(ws_uri);
+  s->client = esp_websocket_client_init(&ws_cfg);
+  if (s->client == NULL) {
+    vSemaphoreDelete(s->evt);
+    vSemaphoreDelete(s->mu);
+    free(s);
+    return ESP_ERR_NO_MEM;
+  }
+  esp_websocket_register_events(s->client, WEBSOCKET_EVENT_ANY, stream_on_event, s);
+  esp_err_t err = esp_websocket_client_start(s->client);
+  if (err != ESP_OK) {
+    esp_websocket_unregister_events(s->client, WEBSOCKET_EVENT_ANY, stream_on_event);
+    esp_websocket_client_destroy(s->client);
+    vSemaphoreDelete(s->evt);
+    vSemaphoreDelete(s->mu);
+    free(s);
+    return err;
+  }
+  for (int i = 0; i < 200; i++) {
+    if (esp_websocket_client_is_connected(s->client)) {
+      s->connected = true;
+      break;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+  if (!s->connected) {
+    nino_voice_ws_session_close(s);
+    return ESP_ERR_TIMEOUT;
+  }
+  *out = s;
+  return ESP_OK;
+}
+
+bool nino_voice_ws_session_is_open(nino_voice_ws_session_t *session) {
+  return session != NULL && session->connected && !session->error &&
+         session->client != NULL &&
+         esp_websocket_client_is_connected(session->client);
+}
+
+esp_err_t nino_voice_ws_session_send_pcm(nino_voice_ws_session_t *session,
+                                         const void *pcm, size_t len) {
+  if (session == NULL || pcm == NULL || len == 0 || session->client == NULL) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  if (session->eos || session->error || !session->connected) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  int sent = esp_websocket_client_send_bin(session->client, (const char *)pcm, (int)len,
+                                           pdMS_TO_TICKS(200));
+  if (sent < 0 || (size_t)sent != len) {
+    return ESP_FAIL;
+  }
+  return ESP_OK;
+}
+
+bool nino_voice_ws_session_should_pause(nino_voice_ws_session_t *session) {
+  return session == NULL || session->eos || session->error || session->skip ||
+         session->reply_ready;
+}
+
+void nino_voice_ws_session_begin_turn(nino_voice_ws_session_t *session) {
+  if (session == NULL) {
+    return;
+  }
+  session->eos = false;
+  session->skip = false;
+  session->end_session = false;
+  session->wav_msg_open = false;
+  session->reply_ready = false;
+  session->len = 0;
+  session->eye_expr[0] = '\0';
+  while (xSemaphoreTake(session->evt, 0) == pdTRUE) {
+  }
+}
+
+esp_err_t nino_voice_ws_session_wait_reply(nino_voice_ws_session_t *session,
+                                           int timeout_ms, uint8_t **wav_out,
+                                           size_t *wav_out_len, bool *skip,
+                                           bool *end_session, char *eye_expr_out,
+                                           size_t eye_expr_cap) {
+  if (session == NULL || wav_out == NULL || wav_out_len == NULL) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  *wav_out = NULL;
+  *wav_out_len = 0;
+  if (skip) {
+    *skip = false;
+  }
+  if (end_session) {
+    *end_session = false;
+  }
+  const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+  while (!session->reply_ready && !session->skip && !session->error) {
+    TickType_t now = xTaskGetTickCount();
+    if (now >= deadline) {
+      return ESP_ERR_TIMEOUT;
+    }
+    TickType_t wait = deadline - now;
+    if (wait > pdMS_TO_TICKS(200)) {
+      wait = pdMS_TO_TICKS(200);
+    }
+    xSemaphoreTake(session->evt, wait);
+  }
+  if (session->error) {
+    return ESP_FAIL;
+  }
+  if (skip) {
+    *skip = session->skip;
+  }
+  if (end_session) {
+    *end_session = session->end_session;
+  }
+  if (eye_expr_out != NULL && eye_expr_cap > 0) {
+    strncpy(eye_expr_out, session->eye_expr, eye_expr_cap - 1);
+    eye_expr_out[eye_expr_cap - 1] = '\0';
+  }
+  if (session->skip || session->len == 0) {
+    return ESP_OK;
+  }
+  if (!nino_audio_wav_bytes_valid(session->buf, session->len)) {
+    return ESP_FAIL;
+  }
+  uint8_t *copy = (uint8_t *)malloc(session->len);
+  if (copy == NULL) {
+    return ESP_ERR_NO_MEM;
+  }
+  memcpy(copy, session->buf, session->len);
+  *wav_out = copy;
+  *wav_out_len = session->len;
+  return ESP_OK;
+}
+
+void nino_voice_ws_session_close(nino_voice_ws_session_t *session) {
+  if (session == NULL) {
+    return;
+  }
+  if (session->client != NULL) {
+    esp_websocket_unregister_events(session->client, WEBSOCKET_EVENT_ANY, stream_on_event);
+    esp_websocket_client_stop(session->client);
+    esp_websocket_client_destroy(session->client);
+    session->client = NULL;
+  }
+  free(session->buf);
+  if (session->evt) {
+    vSemaphoreDelete(session->evt);
+  }
+  if (session->mu) {
+    vSemaphoreDelete(session->mu);
+  }
+  free(session);
+}

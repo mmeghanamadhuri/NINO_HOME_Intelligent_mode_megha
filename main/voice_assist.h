@@ -32,15 +32,17 @@ esp_err_t nino_voice_play_done_chime(void);
 
 bool nino_voice_assist_has_ws_uri(void);
 
-/** Record AUX IN for @p duration_ms, send WAV to the PC, queue TTS reply. */
+/** Record AUX IN for @p duration_ms (CLI debug) or start a stream session. */
 esp_err_t nino_voice_assist_run_query(uint32_t duration_ms);
 
-/** CLI / default path: 5 s AUX IN capture then WebSocket query. */
+/** CLI: start a streamed conversation session (no fixed 5 s clip). */
 esp_err_t nino_voice_assist_run_query_only(void);
 
 /**
- * Watch ES8311 Aux-in for Sirena wake-word audio, then capture 5 s and upload.
- * Call after nino_audio_init() / greeting so speaker clips own I2S first.
+ * Watch ES8311 Aux-in for Sirena wake energy, then stream PCM to the PC
+ * until ASR end-of-speech. The session stays open through LLM/TTS turns
+ * until the user says goodbye or stop. After that TTS, GPIO 5 goes high
+ * so Sirena can close its mics.
  */
 void nino_voice_assist_start_listen_loop(void);
 

@@ -17,8 +17,13 @@ CREATE TABLE IF NOT EXISTS conversations (
     assistant_text TEXT NOT NULL
 );
 
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS session_id VARCHAR(64);
+
 CREATE INDEX IF NOT EXISTS idx_conversations_user_ts
     ON conversations (user_id, timestamp DESC);
+
+CREATE INDEX IF NOT EXISTS idx_conversations_user_session
+    ON conversations (user_id, session_id);
 
 CREATE TABLE IF NOT EXISTS memories (
     id BIGSERIAL PRIMARY KEY,
