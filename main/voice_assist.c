@@ -13,6 +13,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "mic_input.h"
 #include "nino_eye.h"
 #include "voice_ws_client.h"
 
@@ -27,11 +28,26 @@ static const char *TAG = "voice_ast";
 #define VOICE_QUERY_DEFAULT_MS 5000
 #define VOICE_QUERY_MAX_MS 10000
 #define MED_ACK_CAPTURE_MS 5000
+#define LISTEN_LOOP_STACK 12288
+#define AUX_DETECT_FRAME_MS 20
+#define AUX_DETECT_SAMPLES ((VOICE_MIC_RATE * AUX_DETECT_FRAME_MS) / 1000)
+#define AUX_NOISE_FLOOR_DEFAULT 250
+#define AUX_MIN_START_ENERGY 400
+#define AUX_NOISE_RATIO 4U
+#define AUX_START_CONSECUTIVE_FRAMES 8
+#define AUX_QUIET_MS 800
+#define AUX_QUIET_MAX_MS 4000
+#define AUX_REARM_DELAY_MS 1500
+#define AUX_STATUS_LOG_MS 1000
+#define AUX_REPLY_WAIT_MS 180000
 
 static char s_ws_uri[VOICE_WS_URI_MAX];
 static SemaphoreHandle_t s_ws_uri_mutex;
 static volatile bool s_next_prompt_ack_play_chime = true;
 static volatile bool s_query_busy;
+static volatile bool s_listen_loop_started;
+static volatile bool s_aux_listen_running;
+static uint32_t s_aux_noise_floor = AUX_NOISE_FLOOR_DEFAULT;
 
 void nino_voice_assist_set_next_prompt_ack_chime(bool play_chime) {
   s_next_prompt_ack_play_chime = play_chime;
@@ -191,7 +207,7 @@ static void voice_ws_job_task(void *pv) {
   if (eye_state < NINO_EYE_STATE_COUNT) {
     ESP_LOGI(TAG, "Reply eye_expression=%s -> state %d", eye_expr, (int)eye_state);
   }
-  const bool play_done_chime = !prompt_after;
+  const bool play_done_chime = false;
   nino_main_queue_audio_wav(resp, resp_len, play_done_chime, prompt_after, eye_state);
   if (medical_ack && prompt_after) {
     ESP_LOGI(TAG, "Medical follow-up listen scheduled after reply");
@@ -330,4 +346,168 @@ bool nino_voice_assist_has_ws_uri(void) {
   ok = (s_ws_uri[0] != '\0');
   xSemaphoreGive(s_ws_uri_mutex);
   return ok;
+}
+
+static uint32_t aux_frame_energy(const int16_t *samples, size_t count) {
+  uint64_t sum = 0;
+  for (size_t i = 0; i < count; i++) {
+    int32_t s = samples[i];
+    sum += (uint32_t)(s < 0 ? -s : s);
+  }
+  return count == 0 ? 0 : (uint32_t)(sum / count);
+}
+
+static uint32_t aux_start_threshold(uint32_t noise_floor) {
+  const uint32_t from_noise = noise_floor * AUX_NOISE_RATIO;
+  return from_noise > (uint32_t)AUX_MIN_START_ENERGY ? from_noise
+                                                     : (uint32_t)AUX_MIN_START_ENERGY;
+}
+
+static uint32_t aux_quiet_threshold(uint32_t noise_floor) {
+  const uint32_t from_noise = noise_floor + noise_floor / 2U;
+  return from_noise > 200U ? from_noise : 200U;
+}
+
+static void aux_update_noise_floor(uint32_t energy) {
+  s_aux_noise_floor = (s_aux_noise_floor * 31U + energy) / 32U;
+  if (s_aux_noise_floor < 1U) {
+    s_aux_noise_floor = 1U;
+  }
+}
+
+static bool wait_aux_activity(void) {
+  int16_t frame[AUX_DETECT_SAMPLES];
+  uint32_t speech_streak = 0;
+  uint32_t status_ms = 0;
+
+  while (true) {
+    if (s_query_busy) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+      speech_streak = 0;
+      continue;
+    }
+
+    esp_err_t rr = nino_mic_read(frame, AUX_DETECT_SAMPLES);
+    if (rr != ESP_OK) {
+      ESP_LOGW(TAG, "Aux-in listen read failed: %s", esp_err_to_name(rr));
+      vTaskDelay(pdMS_TO_TICKS(20));
+      speech_streak = 0;
+      continue;
+    }
+
+    const uint32_t energy = aux_frame_energy(frame, AUX_DETECT_SAMPLES);
+    const uint32_t threshold = aux_start_threshold(s_aux_noise_floor);
+    status_ms += AUX_DETECT_FRAME_MS;
+    if (status_ms >= AUX_STATUS_LOG_MS) {
+      ESP_LOGI(TAG, "Aux-in listen energy=%" PRIu32 " noise=%" PRIu32 " th=%" PRIu32,
+               energy, s_aux_noise_floor, threshold);
+      status_ms = 0;
+    }
+
+    if (energy >= threshold) {
+      speech_streak++;
+    } else {
+      speech_streak = 0;
+      aux_update_noise_floor(energy);
+    }
+    if (speech_streak >= AUX_START_CONSECUTIVE_FRAMES) {
+      ESP_LOGI(TAG, "Aux-in activity energy=%" PRIu32 " noise=%" PRIu32 " th=%" PRIu32,
+               energy, s_aux_noise_floor, threshold);
+      return true;
+    }
+  }
+}
+
+static void wait_aux_quiet(void) {
+  int16_t frame[AUX_DETECT_SAMPLES];
+  uint32_t quiet_ms = 0;
+  uint32_t waited_ms = 0;
+  uint32_t last_energy = s_aux_noise_floor;
+
+  while (waited_ms < AUX_QUIET_MAX_MS) {
+    if (s_query_busy) {
+      return;
+    }
+    esp_err_t rr = nino_mic_read(frame, AUX_DETECT_SAMPLES);
+    if (rr != ESP_OK) {
+      return;
+    }
+    last_energy = aux_frame_energy(frame, AUX_DETECT_SAMPLES);
+    waited_ms += AUX_DETECT_FRAME_MS;
+    if (last_energy < aux_quiet_threshold(s_aux_noise_floor)) {
+      quiet_ms += AUX_DETECT_FRAME_MS;
+      aux_update_noise_floor(last_energy);
+      if (quiet_ms >= AUX_QUIET_MS) {
+        return;
+      }
+    } else {
+      quiet_ms = 0;
+    }
+  }
+  aux_update_noise_floor(last_energy);
+  ESP_LOGW(TAG, "Aux-in still active after wait; noise floor now %" PRIu32, s_aux_noise_floor);
+}
+
+static void wait_query_and_reply_done(void) {
+  const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(AUX_REPLY_WAIT_MS);
+  while (s_query_busy && xTaskGetTickCount() < deadline) {
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+  nino_audio_queue_wait_idle(AUX_REPLY_WAIT_MS);
+}
+
+static void aux_listen_task(void *arg) {
+  (void)arg;
+
+  while (!nino_mic_available()) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+
+  ESP_LOGI(TAG, "Aux-in listen armed — waiting for Sirena wake-word audio, then 5 s capture");
+  s_aux_listen_running = true;
+
+  while (true) {
+    if (!nino_voice_assist_has_ws_uri()) {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+    if (!wait_aux_activity()) {
+      continue;
+    }
+    if (s_query_busy) {
+      continue;
+    }
+
+    nino_eye_listening();
+    nino_mic_close();
+    esp_err_t e = run_ws_and_queue(VOICE_QUERY_DEFAULT_MS, false);
+    if (e != ESP_OK) {
+      ESP_LOGW(TAG, "Aux-in query failed: %s", esp_err_to_name(e));
+      nino_eye_idle();
+    } else {
+      wait_query_and_reply_done();
+    }
+
+    wait_aux_quiet();
+    vTaskDelay(pdMS_TO_TICKS(AUX_REARM_DELAY_MS));
+    ESP_LOGI(TAG, "Aux-in listen re-armed (noise=%" PRIu32 " th=%" PRIu32 ")",
+             s_aux_noise_floor, aux_start_threshold(s_aux_noise_floor));
+  }
+}
+
+bool nino_voice_assist_aux_listen_is_running(void) {
+  return s_aux_listen_running && !s_query_busy;
+}
+
+void nino_voice_assist_start_listen_loop(void) {
+  if (s_listen_loop_started) {
+    return;
+  }
+  s_listen_loop_started = true;
+  BaseType_t ok =
+      xTaskCreate(aux_listen_task, "aux_listen", LISTEN_LOOP_STACK, NULL, 3, NULL);
+  if (ok != pdPASS) {
+    s_listen_loop_started = false;
+    ESP_LOGE(TAG, "Could not start Aux-in listen task");
+  }
 }

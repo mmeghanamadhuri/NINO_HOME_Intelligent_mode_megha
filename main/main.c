@@ -375,8 +375,10 @@ static void finish_boot_greeting_and_enable_wake(void) {
              "Voice PC URL not set — serial: voice connect <YOUR_PC_LAN_IP> 8000 "
              "then start [seconds]");
   } else {
-    ESP_LOGI(TAG, "Voice assistant URL: %s — type start to talk", s_voice_ws_url);
+    ESP_LOGI(TAG, "Voice assistant URL: %s — Aux-in listen arms after greeting", s_voice_ws_url);
   }
+  nino_voice_assist_start_listen_loop();
+  ESP_LOGI(TAG, "Aux-in listen on — Sirena wake-word audio triggers 5 s capture");
 }
 
 static void hello_home_task(void *arg) {
@@ -3015,11 +3017,12 @@ static int cmd_voice(int argc, char **argv) {
     return 0;
   }
   if (argc >= 2 && strcmp(argv[1], "status") == 0) {
-    printf("voice mic: %s\n",
-           nino_mic_source_name(nino_mic_preferred_source()));
+    printf("voice in: %s (listen %s)\n",
+           nino_mic_source_name(nino_mic_preferred_source()),
+           nino_voice_assist_aux_listen_is_running() ? "armed" : "busy");
     printf("device_id: %s\n", s_device_id);
     printf("voice url: \"%s\"\n", s_voice_ws_url[0] ? s_voice_ws_url : "(not set)");
-    printf("Tip: voice connect <PC_LAN_IP> 8000 then start [seconds]\n");
+    printf("Aux-in energy starts a 5 s capture after Sirena wake; or type start [seconds]\n");
     return 0;
   }
   printf("Usage: voice connect <ip> [port] | voice url [<ws-uri>] | voice status\n");
@@ -4002,7 +4005,7 @@ void app_main(void) {
   ESP_ERROR_CHECK(uvc_host_install(&uvc_driver_config));
 
   ESP_LOGI(TAG, "J18: powered USB hub -> UVC camera + FTDI U2D2 (Dynamixel)");
-  ESP_LOGI(TAG, "Mic: ES8311 AUX IN — type start after voice connect");
+  ESP_LOGI(TAG, "Audio: ES8311 Aux-in (Sirena) → 5 s capture after energy; speaker is playback only");
   ESP_LOGI(
       TAG,
       "Open / in a browser on your camera's IP address (check 'wifi status')");

@@ -30,6 +30,9 @@ static bool s_ready;
 static int s_volume_percent = NINO_AUDIO_DEFAULT_VOLUME;
 static bool s_spk_stream_open;
 static uint32_t s_spk_stream_rate_hz;
+/* Set when Aux-in opens/closes the same ES8311. Next speaker open must reopen
+ * the DAC even if the firmware still thinks the stream is live. */
+static bool s_spk_force_reopen;
 
 static void audio_persist_volume(int volume_percent) {
   nvs_handle_t h;
@@ -73,7 +76,8 @@ static esp_err_t spk_stream_open_locked(uint32_t sample_rate_hz, bool leave_open
   if (s_spk == NULL) {
     return ESP_FAIL;
   }
-  if (s_spk_stream_open && s_spk_stream_rate_hz == sample_rate_hz) {
+  if (s_spk_stream_open && s_spk_stream_rate_hz == sample_rate_hz &&
+      !s_spk_force_reopen) {
     return ESP_OK;
   }
   /* ES8311 AUX ADC + speaker share one duplex I2S. Drop the ADC before any
@@ -91,11 +95,16 @@ static esp_err_t spk_stream_open_locked(uint32_t sample_rate_hz, bool leave_open
   const int cr = esp_codec_dev_open(s_spk, &fs);
   if (cr != ESP_CODEC_DEV_OK) {
     ESP_LOGE(TAG, "esp_codec_dev_open failed: %d", cr);
+    s_spk_force_reopen = true;
     return ESP_FAIL;
   }
   s_spk_stream_open = true;
   s_spk_stream_rate_hz = sample_rate_hz;
+  s_spk_force_reopen = false;
   (void)esp_codec_dev_set_out_vol(s_spk, s_volume_percent);
+  (void)esp_codec_dev_set_out_mute(s_spk, false);
+  ESP_LOGI(TAG, "Speaker opened @ %u Hz vol=%d%%", (unsigned)sample_rate_hz,
+           s_volume_percent);
   (void)leave_open;
   return ESP_OK;
 }
@@ -527,6 +536,8 @@ esp_err_t nino_audio_play_decoded(const nino_decoded_wav_t *decoded, size_t *pcm
     const size_t written = offset - session_start;
     wait_pcm_pipeline_done(decoded->sample_rate_hz, written, write_started);
     *completed = true;
+    ESP_LOGI(TAG, "Speaker finished %u bytes @ %u Hz", (unsigned)written,
+             (unsigned)decoded->sample_rate_hz);
   }
 
   spk_stream_close_locked();
@@ -576,4 +587,5 @@ void nino_audio_drop_speaker_stream_locked(void) {
     ESP_LOGI(TAG, "Closing speaker I2S so AUX ADC can take the duplex");
   }
   spk_stream_close_locked();
+  s_spk_force_reopen = true;
 }

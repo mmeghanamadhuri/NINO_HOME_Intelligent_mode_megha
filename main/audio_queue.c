@@ -49,6 +49,7 @@ static QueueHandle_t s_normal_queue;
 static QueueHandle_t s_touch_queue;
 static volatile bool s_stop_requested;
 static volatile bool s_normal_playing;
+static volatile int s_normal_outstanding;
 static suspended_playback_t s_suspended;
 static bool s_has_suspended;
 
@@ -152,6 +153,8 @@ static bool play_normal_job(audio_play_job_t *job) {
   }
 
   s_normal_playing = true;
+  ESP_LOGI(TAG, "Playing server WAV %u bytes @ %u Hz", (unsigned)decoded.num_bytes,
+           (unsigned)decoded.sample_rate_hz);
   size_t offset = 0;
   const nino_audio_servo_mode_t servo_mode = effective_servo_mode(job->servo_mode);
   const bool completed = play_decoded_job(&decoded, &offset, servo_mode, true);
@@ -181,7 +184,7 @@ static bool play_normal_job(audio_play_job_t *job) {
   }
   nino_decoded_wav_free(&decoded);
   s_normal_playing = false;
-  rewarm_wake_chime_path();
+  /* Do not leave the DAC open: Aux-in listen needs the same ES8311 next. */
   return true;
 }
 
@@ -218,7 +221,6 @@ static bool play_suspended(void) {
   }
   nino_decoded_wav_free(&snap.decoded);
   s_normal_playing = false;
-  rewarm_wake_chime_path();
   return true;
 }
 
@@ -241,6 +243,9 @@ static void audio_playback_task(void *arg) {
       if (!play_suspended()) {
         continue;
       }
+      if (s_normal_outstanding > 0) {
+        s_normal_outstanding--;
+      }
     }
 
     if (try_receive_touch(&job)) {
@@ -256,7 +261,10 @@ static void audio_playback_task(void *arg) {
       continue;
     }
 
-    (void)play_normal_job(&job);
+    const bool finished = play_normal_job(&job);
+    if (finished && s_normal_outstanding > 0) {
+      s_normal_outstanding--;
+    }
   }
 }
 
@@ -334,7 +342,12 @@ esp_err_t nino_audio_queue_wav(uint8_t *wav, size_t len, bool play_done_chime,
     s_stop_requested = true;
     return enqueue_job(job, s_touch_queue);
   }
-  return enqueue_job(job, s_normal_queue);
+  s_normal_outstanding++;
+  esp_err_t err = enqueue_job(job, s_normal_queue);
+  if (err != ESP_OK && s_normal_outstanding > 0) {
+    s_normal_outstanding--;
+  }
+  return err;
 }
 
 esp_err_t nino_audio_queue_wav_copy(const uint8_t *wav, size_t len, bool play_done_chime,
@@ -371,7 +384,7 @@ static bool audio_queue_is_idle(void) {
   if (s_normal_queue == NULL) {
     return true;
   }
-  if (s_normal_playing || s_has_suspended) {
+  if (s_normal_playing || s_has_suspended || s_normal_outstanding > 0) {
     return false;
   }
   return uxQueueMessagesWaiting(s_normal_queue) == 0;

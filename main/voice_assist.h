@@ -38,6 +38,15 @@ esp_err_t nino_voice_assist_run_query(uint32_t duration_ms);
 /** CLI / default path: 5 s AUX IN capture then WebSocket query. */
 esp_err_t nino_voice_assist_run_query_only(void);
 
+/**
+ * Watch ES8311 Aux-in for Sirena wake-word audio, then capture 5 s and upload.
+ * Call after nino_audio_init() / greeting so speaker clips own I2S first.
+ */
+void nino_voice_assist_start_listen_loop(void);
+
+/** True while the Aux-in energy listener is running and not in a query. */
+bool nino_voice_assist_aux_listen_is_running(void);
+
 /** After a medical alarm WAV from the PC: chime + fixed-length listen. */
 void nino_voice_assist_prompt_medical_ack(void);
 

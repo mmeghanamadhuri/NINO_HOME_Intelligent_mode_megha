@@ -1,11 +1,11 @@
-# Onboard ES8311 is the microphone (no USB 4-mic GPIO header PHY).
+# Voice input is ES8311 Aux-in (Sirena AUX-out). Onboard MEMS is unused.
 menu "NiNO audio"
 
     config NINO_ONBOARD_MIC_LOOPBACK
         bool
-        default y
+        default n
         help
-            Always-on onboard ES8311 microphone to speaker loopback.
+            Unused. Onboard mic loopback is disabled; Aux-in is capture-only.
 
 endmenu
 

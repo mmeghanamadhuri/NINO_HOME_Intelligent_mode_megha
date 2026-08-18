@@ -28,6 +28,8 @@ static void close_es8311_mic_locked(void) {
     s_aux_selected = false;
     ESP_LOGI(TAG, "ES8311 AUX ADC closed");
   }
+  /* ADC close retunes the same ES8311; speaker must reopen before the next TTS. */
+  nino_audio_drop_speaker_stream_locked();
 }
 
 static esp_err_t es8311_ensure_i2c(void) {

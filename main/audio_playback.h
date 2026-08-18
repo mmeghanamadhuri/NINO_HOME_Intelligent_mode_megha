@@ -58,7 +58,8 @@ void nino_audio_bus_unlock(void);
 
 /**
  * Close the speaker I2S stream. Caller must hold nino_audio_bus_lock().
- * Required before opening the ES8311 ADC — mic and speaker share one duplex.
+ * Aux-in and the DAC share one ES8311; the ADC path must steal the bus before
+ * opening, and the next speaker play must reopen so the PA/DAC come back.
  */
 void nino_audio_drop_speaker_stream_locked(void);
 
