@@ -39,7 +39,8 @@ esp_err_t nino_voice_assist_run_query(uint32_t duration_ms);
 esp_err_t nino_voice_assist_run_query_only(void);
 
 /**
- * Watch ES8311 Aux-in for Sirena wake-word audio, then capture 5 s and upload.
+ * Watch ES8311 Aux-in for Sirena wake-word energy, keep 500 ms preroll,
+ * record a 1 s gap plus until sentence-end quiet, upload as session=wake.
  * Call after nino_audio_init() / greeting so speaker clips own I2S first.
  */
 void nino_voice_assist_start_listen_loop(void);

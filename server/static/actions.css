@@ -20,6 +20,13 @@
   text-decoration: underline;
 }
 
+.device-count {
+  display: inline-block;
+  margin-left: 8px;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
 .actions-page .name-row {
   display: flex;
   gap: 8px;

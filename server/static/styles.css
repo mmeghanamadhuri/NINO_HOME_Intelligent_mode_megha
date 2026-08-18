@@ -143,6 +143,12 @@ h2 {
   min-width: 10rem;
 }
 
+.device-count {
+  font-size: 0.78rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
 .status-label {
   font-size: 0.78rem;
   font-weight: 700;

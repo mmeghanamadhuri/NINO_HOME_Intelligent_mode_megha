@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>NiNO Actions — Record &amp; Play</title>
     <link rel="stylesheet" href="/static/styles.css?v=14" />
-    <link rel="stylesheet" href="/static/actions.css?v=1" />
+    <link rel="stylesheet" href="/static/actions.css?v=2" />
   </head>
   <body>
     <header class="site-header">
@@ -30,6 +30,7 @@
           <h2>Robot</h2>
           <div class="field">
             <label for="deviceSelect">Device</label>
+            <span id="deviceCount" class="device-count">—</span>
             <select id="deviceSelect">
               {% for d in devices %}
               <option value="{{ d.device_id }}" {% if d.device_id == device_id %}selected{% endif %}>
@@ -108,6 +109,6 @@
       </section>
     </main>
 
-    <script src="/static/actions.js?v=1"></script>
+    <script src="/static/actions.js?v=2"></script>
   </body>
 </html>

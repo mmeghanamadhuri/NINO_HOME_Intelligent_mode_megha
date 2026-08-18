@@ -1126,6 +1126,13 @@ def _ws_client_label(websocket: WebSocket) -> str:
     return f"{host}:{port}" if port is not None else str(host)
 
 
+def _session_kind_from_websocket(websocket: WebSocket) -> str:
+    raw = (websocket.query_params.get("session") or "wake").strip().lower()
+    if raw in {"continue", "conv", "followup", "ack"}:
+        return "continue"
+    return "wake"
+
+
 def _device_id_from_websocket(websocket: WebSocket) -> str:
     """Resolve device_id from query param or X-Nino-Device-Id header."""
     raw = (websocket.query_params.get("device_id") or "").strip()
@@ -1150,7 +1157,7 @@ def _device_id_from_websocket(websocket: WebSocket) -> str:
 
 
 async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
-    """STT (WAV or 16 kHz mono PCM) → Ollama → SAPI WAV. Multiple receive_bytes → send_bytes cycles per connection."""
+    """STT (WAV or 16 kHz mono PCM) → wake validate (if needed) → Ollama → SAPI WAV."""
     await websocket.accept()
     from voice_service import (
         SERVO_360_TRIGGER_DELAY_SECONDS,
@@ -1159,10 +1166,16 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
         process_voice_wav,
     )
 
+    session_kind = _session_kind_from_websocket(websocket)
     session_queries = 0
     session_started = time.perf_counter()
     client_label = _ws_client_label(websocket)
-    logger.info("Voice WS open device_id=%s client=%s", device_id, client_label)
+    logger.info(
+        "Voice WS open device_id=%s session=%s client=%s",
+        device_id,
+        session_kind,
+        client_label,
+    )
     await run_in_threadpool(
         _append_latency_record,
         _latency_log_record(
@@ -1206,11 +1219,13 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
             reply_meta = VoiceReplyMeta(device_id=device_id)
             active_viewer: str | None = None
             t_query_start = time.perf_counter()
+            identity_seconds = 0.0
             pipeline_error: str | None = None
             await run_in_threadpool(begin_voice_query)
             await run_in_threadpool(face_registration.on_voice_query_started)
             try:
                 try:
+                    t_ident = time.perf_counter()
                     identity_name, identity_state = await run_in_threadpool(
                         _camera_identity_snapshot, True, device_id
                     )
@@ -1226,6 +1241,7 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                         active_viewer = await run_in_threadpool(
                             _recall_voice_viewer, device_id
                         )
+                    identity_seconds = round(time.perf_counter() - t_ident, 3)
 
                     def _run_voice() -> tuple[bytes, VoiceReplyMeta]:
                         return process_voice_wav(
@@ -1234,6 +1250,7 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                             camera_identity_name=identity_name,
                             camera_identity_state=identity_state,
                             device_id=device_id,
+                            session_kind=session_kind,
                         )
 
                     wav_out, reply_meta = await run_in_threadpool(_run_voice)
@@ -1271,11 +1288,39 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
 
                 timings = dict(reply_meta.timings)
                 timings.setdefault("audio_in_bytes", len(wav_in))
+                timings.setdefault("session", session_kind)
+                server_total = round(time.perf_counter() - t_query_start, 3)
+                process_total = float(timings.get("process_total_seconds") or 0)
+                timings["identity_seconds"] = identity_seconds
+                timings["server_total_seconds"] = server_total
+                timings["overhead_seconds"] = round(
+                    max(0.0, server_total - process_total), 3
+                )
+                logger.info(
+                    "WS_VOICE_DONE device=%s session=%s path=%s wake_ok=%s continue=%s "
+                    "heard=%r reply=%r stt=%.3fs reply=%.3fs tts=%.3fs process=%.3fs "
+                    "identity=%.3fs server=%.3fs in=%.2fs out=%.2fs",
+                    device_id,
+                    session_kind,
+                    timings.get("reply_path"),
+                    timings.get("wake_ok"),
+                    bool(reply_meta.prompt_medical_ack),
+                    str(timings.get("heard") or "")[:120],
+                    str(timings.get("reply_text") or "")[:120],
+                    float(timings.get("stt_seconds") or 0),
+                    float(timings.get("reply_seconds") or 0),
+                    float(timings.get("tts_seconds") or 0),
+                    process_total,
+                    identity_seconds,
+                    server_total,
+                    float(timings.get("audio_in_seconds") or 0),
+                    float(timings.get("audio_out_seconds") or 0),
+                )
                 record = _latency_log_record(
                     event="voice_query",
                     client=client_label,
                     device_id=device_id,
-                    server_total_seconds=round(time.perf_counter() - t_query_start, 3),
+                    session=session_kind,
                     **timings,
                 )
                 if pipeline_error is not None:

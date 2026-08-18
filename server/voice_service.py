@@ -53,6 +53,11 @@ from wav_resample import (
 # Voice assistant path uses 16 kHz on device (ESP-SR WakeNet + VAD); face TTS stays 22050 in tts_service.
 VOICE_ASSIST_PLAYBACK_HZ = 16000
 
+
+def _wav_seconds(wav_bytes: bytes | None) -> float:
+    """Audio duration from the WAV header (not a 44-byte size guess)."""
+    return round(max(0.0, wav_pcm_duration_seconds(wav_bytes or b"")), 3)
+
 CameraIdentityState = Literal["recognized", "unknown", "no_face"]
 
 _IDENTITY_QUESTION_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
@@ -227,7 +232,16 @@ class VoiceReplyMeta:
     timings: dict[str, Any] = field(default_factory=dict)
 
 
-# Conversational LLM / memory / recap replies — reopen mic after the bot speaks.
+# After a valid wake, keep the conversation open until goodbye.
+# Only these paths close the mic and wait for a new Ok Nino.
+SESSION_END_REPLY_PATHS = frozenset(
+    {
+        "goodbye",
+        "wake_reject",
+    }
+)
+
+# Kept for older callers / docs; session lifetime is no longer gated on this list.
 CONTINUE_LISTEN_REPLY_PATHS = frozenset(
     {
         "llm",
@@ -276,6 +290,55 @@ _GOODBYE_REPLIES = (
     "Take care! Talk soon.",
 )
 
+# Wake session only: these must appear near the start of STT before ASR/LLM.
+# Conversation turns (session=continue) may contain the same words as speech.
+_WAKE_PHRASES = (
+    "okay nino",
+    "ok nino",
+    "hey nino",
+    "hi nino",
+    "hello nino",
+    "okay nano",
+    "ok nano",
+    "okay neno",
+    "ok neno",
+    "okay nina",
+    "ok nina",
+)
+
+_WAKE_REJECT_REPLY = (
+    "I didn't catch Ok Nino. Please say Ok Nino, then your question."
+)
+_WAKE_LISTEN_REPLY = "Yes?"
+
+
+def _normalize_wake_text(text: str) -> str:
+    t = str(text or "").lower().replace("'", "")
+    t = re.sub(r"[,.!?]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def extract_wake_and_command(text: str) -> tuple[bool, str, str]:
+    """Return (found, command_after_wake, matched_phrase)."""
+    raw = str(text or "").strip()
+    norm = _normalize_wake_text(raw)
+    if not norm:
+        return False, "", ""
+    best = ""
+    best_idx = -1
+    for phrase in _WAKE_PHRASES:
+        idx = norm.find(phrase)
+        if idx < 0 or idx > 40:
+            continue
+        if len(phrase) > len(best):
+            best = phrase
+            best_idx = idx
+    if best_idx < 0:
+        return False, raw, ""
+    rest = norm[best_idx + len(best) :].strip(" ,.-")
+    return True, rest, best
+
 
 def is_conversation_goodbye(user_text: str) -> bool:
     """True when the user is ending the chat (do not reopen the mic)."""
@@ -288,7 +351,7 @@ def conversation_goodbye_reply() -> str:
 
 
 def should_continue_listen_after_reply(reply_path: str, user_text: str) -> bool:
-    """After an LLM chat reply, tell the ESP to listen again without wake word."""
+    """Keep the conversation open until the user says goodbye."""
     enabled = os.environ.get("VOICE_CONTINUE_LISTEN", "1").strip().lower() not in {
         "0",
         "false",
@@ -297,11 +360,26 @@ def should_continue_listen_after_reply(reply_path: str, user_text: str) -> bool:
     }
     if not enabled:
         return False
-    if reply_path not in CONTINUE_LISTEN_REPLY_PATHS:
+    if reply_path in SESSION_END_REPLY_PATHS:
         return False
     if is_conversation_goodbye(user_text):
         return False
     return True
+
+
+def _mark_continue_listen(meta: VoiceReplyMeta, reply_path: str, user_text: str) -> None:
+    if should_continue_listen_after_reply(reply_path, user_text):
+        meta.prompt_medical_ack = True
+        logger.info(
+            "SESSION_KEEP path=%s — mic stays open until goodbye",
+            reply_path,
+        )
+    else:
+        logger.info(
+            "SESSION_END path=%s heard=%r — waiting for a new Ok Nino",
+            reply_path,
+            str(user_text or "")[:80],
+        )
 
 
 # Roughly 2–3 personalized voice replies per 10–20 (override with VOICE_PERSONALIZE_PROB).
@@ -1183,6 +1261,57 @@ def transcribe_wav(wav_bytes: bytes) -> tuple[str, str]:
     return _transcribe_whisper(wav_bytes), "whisper"
 
 
+def _speak_short_reply(
+    meta: VoiceReplyMeta,
+    *,
+    reply: str,
+    reply_path: str,
+    heard: str,
+    audio_input_format: str,
+    audio_in_seconds: float,
+    wav_bytes: bytes,
+    stt_engine: str,
+    t_start: float,
+    t_stt: float,
+    extra: dict[str, Any] | None = None,
+) -> tuple[bytes, VoiceReplyMeta]:
+    _mark_continue_listen(meta, reply_path, heard)
+    t_reply = time.perf_counter()
+    wav, _voice = synthesize_sapi_wav_bytes(reply)
+    tts_info = last_tts_synthesis_info()
+    wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
+    t_tts = time.perf_counter()
+    audio_out_seconds = _wav_seconds(wav_out)
+    meta.timings = {
+        "heard": heard[:200],
+        "reply_text": reply[:200],
+        "reply_path": reply_path,
+        "audio_input_format": audio_input_format,
+        "audio_in_seconds": round(audio_in_seconds, 2),
+        "audio_in_bytes": len(wav_bytes),
+        "audio_out_seconds": round(audio_out_seconds, 2),
+        "audio_out_bytes": len(wav_out),
+        "stt_engine": stt_engine,
+        "tts_provider": tts_info["provider"],
+        "tts_voice": tts_info["voice"],
+        "stt_seconds": round(t_stt - t_start, 3),
+        "reply_seconds": round(t_reply - t_stt, 3),
+        "tts_seconds": round(t_tts - t_reply, 3),
+        "process_total_seconds": round(t_tts - t_start, 3),
+        "continue_listen": bool(meta.prompt_medical_ack),
+    }
+    if extra:
+        meta.timings.update(extra)
+    logger.info(
+        "VOICE_OUT path=%s continue=%s heard=%r reply=%r",
+        reply_path,
+        bool(meta.prompt_medical_ack),
+        heard[:120],
+        reply[:120],
+    )
+    return wav_out, meta
+
+
 def process_voice_wav(
     wav_bytes: bytes,
     viewer_name: str | None = None,
@@ -1190,8 +1319,15 @@ def process_voice_wav(
     camera_identity_name: str | None = None,
     camera_identity_state: CameraIdentityState = "no_face",
     device_id: str = "",
+    session_kind: str = "wake",
 ) -> tuple[bytes, VoiceReplyMeta]:
     meta = VoiceReplyMeta(device_id=device_id or "")
+    session = "continue" if str(session_kind or "").strip().lower() in {
+        "continue",
+        "conv",
+        "followup",
+        "ack",
+    } else "wake"
     if not wav_bytes:
         raise RuntimeError("Empty audio.")
     if len(wav_bytes) > SETTINGS.max_request_bytes:
@@ -1203,45 +1339,157 @@ def process_voice_wav(
         raise RuntimeError(str(exc)) from exc
 
     t_start = time.perf_counter()
-    audio_in_seconds = wav_pcm_duration_seconds(wav_bytes)
+    audio_in_seconds = _wav_seconds(wav_bytes)
+    logger.info(
+        "VOICE_IN session=%s device=%s bytes=%s audio=%.2fs format=%s",
+        session,
+        device_id or "-",
+        len(wav_bytes),
+        audio_in_seconds,
+        audio_input_format,
+    )
 
     user_text, stt_engine = transcribe_wav(wav_bytes)
     t_stt = time.perf_counter()
     reply_path = "llm"
+    logger.info(
+        "STT_DONE session=%s device=%s engine=%s text=%r",
+        session,
+        device_id or "-",
+        stt_engine,
+        user_text[:200],
+    )
 
     if not user_text.strip():
-        reply_path = "stt_empty"
+        if session == "wake":
+            logger.warning(
+                "WAKE_REJECT device=%s reason=stt_empty audio=%.2fs — not proceeding to ASR",
+                device_id or "-",
+                audio_in_seconds,
+            )
+            return _speak_short_reply(
+                meta,
+                reply=_WAKE_REJECT_REPLY,
+                reply_path="wake_reject",
+                heard="",
+                audio_input_format=audio_input_format,
+                audio_in_seconds=audio_in_seconds,
+                wav_bytes=wav_bytes,
+                stt_engine=stt_engine,
+                t_start=t_start,
+                t_stt=t_stt,
+                extra={"session": session, "wake_ok": False},
+            )
         logger.info(
-            "Voice STT empty | format=%s audio=%.2fs bytes=%s",
+            "Voice STT empty | session=continue format=%s audio=%.2fs bytes=%s",
             audio_input_format,
             audio_in_seconds,
             len(wav_bytes),
         )
-        reply = "Sorry, I didn't catch that. Could you say that again?"
-        t_reply = time.perf_counter()
-        wav, _voice = synthesize_sapi_wav_bytes(reply)
-        tts_info = last_tts_synthesis_info()
-        wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
-        t_tts = time.perf_counter()
-        audio_out_seconds = max(0, len(wav_out) - 44) / (VOICE_ASSIST_PLAYBACK_HZ * 2)
-        meta.timings = {
-            "heard": "",
-            "reply_text": reply[:200],
-            "reply_path": reply_path,
-            "audio_input_format": audio_input_format,
-            "audio_in_seconds": round(audio_in_seconds, 2),
-            "audio_in_bytes": len(wav_bytes),
-            "audio_out_seconds": round(audio_out_seconds, 2),
-            "audio_out_bytes": len(wav_out),
-            "stt_engine": stt_engine,
-            "tts_provider": tts_info["provider"],
-            "tts_voice": tts_info["voice"],
-            "stt_seconds": round(t_stt - t_start, 3),
-            "reply_seconds": round(t_reply - t_stt, 3),
-            "tts_seconds": round(t_tts - t_reply, 3),
-            "process_total_seconds": round(t_tts - t_start, 3),
-        }
-        return wav_out, meta
+        return _speak_short_reply(
+            meta,
+            reply="Sorry, I didn't catch that. Could you say that again?",
+            reply_path="stt_empty",
+            heard="",
+            audio_input_format=audio_input_format,
+            audio_in_seconds=audio_in_seconds,
+            wav_bytes=wav_bytes,
+            stt_engine=stt_engine,
+            t_start=t_start,
+            t_stt=t_stt,
+            extra={"session": session},
+        )
+
+    wake_found, command_text, wake_phrase = extract_wake_and_command(user_text)
+    heard_raw = user_text
+    if session == "wake":
+        if not wake_found:
+            logger.warning(
+                "WAKE_REJECT device=%s heard=%r — wake word missing, not proceeding to ASR",
+                device_id or "-",
+                heard_raw[:200],
+            )
+            return _speak_short_reply(
+                meta,
+                reply=_WAKE_REJECT_REPLY,
+                reply_path="wake_reject",
+                heard=heard_raw,
+                audio_input_format=audio_input_format,
+                audio_in_seconds=audio_in_seconds,
+                wav_bytes=wav_bytes,
+                stt_engine=stt_engine,
+                t_start=t_start,
+                t_stt=t_stt,
+                extra={"session": session, "wake_ok": False},
+            )
+        user_text = command_text
+        logger.info(
+            "WAKE_OK device=%s phrase=%r command=%r raw=%r",
+            device_id or "-",
+            wake_phrase,
+            user_text[:200],
+            heard_raw[:200],
+        )
+        if not user_text.strip():
+            meta.prompt_medical_ack = True
+            logger.info(
+                "WAKE_OK_LISTEN device=%s — wake only, opening conversation mic",
+                device_id or "-",
+            )
+            return _speak_short_reply(
+                meta,
+                reply=_WAKE_LISTEN_REPLY,
+                reply_path="wake_listen",
+                heard=heard_raw,
+                audio_input_format=audio_input_format,
+                audio_in_seconds=audio_in_seconds,
+                wav_bytes=wav_bytes,
+                stt_engine=stt_engine,
+                t_start=t_start,
+                t_stt=t_stt,
+                extra={"session": session, "wake_ok": True, "wake_phrase": wake_phrase},
+            )
+        logger.info(
+            "ASR_COMMAND session=wake device=%s text=%r",
+            device_id or "-",
+            user_text[:200],
+        )
+    else:
+        if wake_found:
+            logger.info(
+                "CONV_TURN device=%s stripped_wake=%r command=%r raw=%r — not a new wake",
+                device_id or "-",
+                wake_phrase,
+                command_text[:200],
+                heard_raw[:200],
+            )
+            if command_text.strip():
+                user_text = command_text
+        else:
+            logger.info(
+                "CONV_TURN device=%s command=%r",
+                device_id or "-",
+                user_text[:200],
+            )
+        if not user_text.strip():
+            logger.info(
+                "CONV_TURN empty after strip device=%s raw=%r",
+                device_id or "-",
+                heard_raw[:200],
+            )
+            return _speak_short_reply(
+                meta,
+                reply="Sorry, I didn't catch that. Could you say that again?",
+                reply_path="stt_empty",
+                heard=heard_raw,
+                audio_input_format=audio_input_format,
+                audio_in_seconds=audio_in_seconds,
+                wav_bytes=wav_bytes,
+                stt_engine=stt_engine,
+                t_start=t_start,
+                t_stt=t_stt,
+                extra={"session": session, "wake_in_speech": wake_found},
+            )
 
     handled_volume, volume_reply = apply_volume_command(
         user_text, device_id=device_id or None
@@ -1256,7 +1504,8 @@ def process_voice_wav(
         wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
         t_tts = time.perf_counter()
 
-        audio_out_seconds = max(0, len(wav_out) - 44) / (VOICE_ASSIST_PLAYBACK_HZ * 2)
+        audio_out_seconds = _wav_seconds(wav_out)
+        _mark_continue_listen(meta, reply_path, user_text)
         meta.timings = {
             "heard": user_text[:200],
             "reply_text": reply[:200],
@@ -1273,6 +1522,7 @@ def process_voice_wav(
             "reply_seconds": round(t_reply - t_stt, 3),
             "tts_seconds": round(t_tts - t_reply, 3),
             "process_total_seconds": round(t_tts - t_start, 3),
+            "continue_listen": bool(meta.prompt_medical_ack),
         }
         logger.info(
             "Latency | stt(%s)=%.2fs reply(%s)=%.2fs tts=%.2fs total=%.2fs | in=%.1fs out=%.1fs audio",
@@ -1306,7 +1556,8 @@ def process_voice_wav(
         tts_info = last_tts_synthesis_info()
         wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
         t_tts = time.perf_counter()
-        audio_out_seconds = max(0, len(wav_out) - 44) / (VOICE_ASSIST_PLAYBACK_HZ * 2)
+        audio_out_seconds = _wav_seconds(wav_out)
+        _mark_continue_listen(meta, reply_path, user_text)
         meta.timings = {
             "heard": user_text[:200],
             "reply_text": reply[:200],
@@ -1323,6 +1574,7 @@ def process_voice_wav(
             "reply_seconds": round(t_reply - t_stt, 3),
             "tts_seconds": round(t_tts - t_reply, 3),
             "process_total_seconds": round(t_tts - t_start, 3),
+            "continue_listen": bool(meta.prompt_medical_ack),
         }
         return wav_out, meta
 
@@ -1791,34 +2043,48 @@ def process_voice_wav(
         user_text=user_text,
         reply_path=reply_path,
     )
+    t_pre_tts = time.perf_counter()
 
     wav, _voice = synthesize_sapi_wav_bytes(reply)
     tts_info = last_tts_synthesis_info()
     wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
     t_tts = time.perf_counter()
 
-    audio_out_seconds = max(0, len(wav_out) - 44) / (VOICE_ASSIST_PLAYBACK_HZ * 2)
+    stt_seconds = round(t_stt - t_start, 3)
+    memory_seconds = round(t_memory - t_stt, 3)
+    reply_seconds = round(t_reply - t_memory, 3)
+    post_seconds = round(t_pre_tts - t_reply, 3)
+    tts_seconds = round(t_tts - t_pre_tts, 3)
+    process_total = round(t_tts - t_start, 3)
+    audio_out_seconds = _wav_seconds(wav_out)
     meta.timings = {
         "heard": user_text[:200],
         "reply_text": reply[:200],
         "reply_path": reply_path,
         "audio_input_format": audio_input_format,
-        "audio_in_seconds": round(audio_in_seconds, 2),
+        "audio_in_seconds": audio_in_seconds,
         "audio_in_bytes": len(wav_bytes),
-        "audio_out_seconds": round(audio_out_seconds, 2),
+        "audio_out_seconds": audio_out_seconds,
         "audio_out_bytes": len(wav_out),
         "stt_engine": stt_engine,
         "tts_provider": tts_info["provider"],
         "tts_voice": tts_info["voice"],
-        "stt_seconds": round(t_stt - t_start, 3),
-        "memory_seconds": round(t_memory - t_stt, 3),
-        "reply_seconds": round(t_reply - t_memory, 3),
-        "tts_seconds": round(t_tts - t_reply, 3),
-        "process_total_seconds": round(t_tts - t_start, 3),
+        "stt_seconds": stt_seconds,
+        "memory_seconds": memory_seconds,
+        "reply_seconds": reply_seconds,
+        "post_seconds": post_seconds,
+        "tts_seconds": tts_seconds,
+        "stages_sum_seconds": round(
+            stt_seconds + memory_seconds + reply_seconds + post_seconds + tts_seconds, 3
+        ),
+        "process_total_seconds": process_total,
         "voice_viewer": viewer_name or "",
         "memory_viewer": memory_name or "",
         "memory_ready": memory_svc.ready,
         "memory_store": memory_store,
+        "session": session,
+        "wake_ok": True if session == "wake" else None,
+        "heard_raw": heard_raw[:200],
     }
     if memory_ctx:
         meta.timings["memory_turns"] = memory_ctx.recent_turns
@@ -1827,22 +2093,19 @@ def process_voice_wav(
     if meta.eye_expression:
         meta.timings["eye_expression"] = meta.eye_expression
 
-    # LLM conversation loop: after the bot speaks, ESP chimes and opens the mic.
-    # Volume / alarm / servo / face-reg paths do not use this (they return earlier
-    # or are outside CONTINUE_LISTEN_REPLY_PATHS). Alarm medical-ack may already
-    # have set prompt_medical_ack.
-    if should_continue_listen_after_reply(reply_path, user_text):
-        meta.prompt_medical_ack = True
-        meta.timings["continue_listen"] = True
-        logger.info(
-            "Voice continue-listen after reply | path=%s heard: %s",
-            reply_path,
-            user_text[:80],
-        )
-    elif is_conversation_goodbye(user_text):
-        meta.timings["continue_listen"] = False
-        logger.info("Voice conversation ended (goodbye) | heard: %s", user_text[:80])
+    # Session stays open after every reply until the user says goodbye.
+    # wake_reject never starts a session. Alarm medical-ack may already be set.
+    _mark_continue_listen(meta, reply_path, user_text)
+    meta.timings["continue_listen"] = bool(meta.prompt_medical_ack)
 
+    logger.info(
+        "VOICE_OUT session=%s path=%s continue=%s heard=%r reply=%r",
+        session,
+        reply_path,
+        bool(meta.prompt_medical_ack),
+        user_text[:120],
+        (reply or "")[:120],
+    )
     logger.info(
         "Latency | stt(%s)=%.2fs reply(%s)=%.2fs tts=%.2fs total=%.2fs | in=%.1fs out=%.1fs%s",
         stt_engine,

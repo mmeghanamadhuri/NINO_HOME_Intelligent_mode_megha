@@ -11,6 +11,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "nino_eye.h"
+#include "rgb_led.h"
 #include "servo_dxl.h"
 #include "servo_motion.h"
 #include "voice_assist.h"
@@ -143,6 +144,7 @@ static bool play_normal_job(audio_play_job_t *job) {
     if (has_expr) {
       nino_eye_idle();
     }
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_ERROR);
     return true;
   }
   free(job->data);
@@ -182,6 +184,17 @@ static bool play_normal_job(audio_play_job_t *job) {
   if (job->play_done_chime) {
     (void)nino_voice_play_done_chime();
   }
+  if (job->prompt_ack_after) {
+    /* Conversation turn: stay green — next clip is not a new wake. */
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_LISTEN);
+    /* Done chime already signaled end of TTS — skip second (wake) chime before mic. */
+    if (job->play_done_chime) {
+      nino_voice_assist_set_next_prompt_ack_chime(false);
+    }
+    nino_voice_assist_prompt_medical_ack();
+  } else {
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_DONE);
+  }
   nino_decoded_wav_free(&decoded);
   s_normal_playing = false;
   /* Do not leave the DAC open: Aux-in listen needs the same ES8311 next. */
@@ -218,6 +231,16 @@ static bool play_suspended(void) {
   }
   if (snap.play_done_chime) {
     (void)nino_voice_play_done_chime();
+  }
+  if (snap.prompt_ack_after) {
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_LISTEN);
+    /* Done chime already signaled end of TTS — skip second (wake) chime before mic. */
+    if (snap.play_done_chime) {
+      nino_voice_assist_set_next_prompt_ack_chime(false);
+    }
+    nino_voice_assist_prompt_medical_ack();
+  } else {
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_DONE);
   }
   nino_decoded_wav_free(&snap.decoded);
   s_normal_playing = false;

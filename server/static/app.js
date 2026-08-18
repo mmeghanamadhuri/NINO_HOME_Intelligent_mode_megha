@@ -127,13 +127,37 @@ function renderAlarms(pending, awaiting) {
   }
 }
 
+function setDeviceCount(count) {
+  const el = document.querySelector("#deviceCount");
+  if (!el) {
+    return;
+  }
+  const n = Number(count) || 0;
+  el.textContent = n === 1 ? "1 robot" : `${n} robots`;
+}
+
 function populateDeviceSelect(devices, selectedId) {
-  if (!deviceSelect || !Array.isArray(devices) || devices.length === 0) {
+  const list = Array.isArray(devices) ? devices : [];
+  setDeviceCount(list.length);
+  if (!deviceSelect) {
     return;
   }
   const previous = selectedId || currentDeviceId();
+  const same =
+    deviceSelect.options.length === list.length &&
+    list.every((d, i) => deviceSelect.options[i]?.value === d.device_id);
+  if (same && list.length > 0) {
+    return;
+  }
   deviceSelect.innerHTML = "";
-  for (const d of devices) {
+  if (list.length === 0) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "No robots found";
+    deviceSelect.append(opt);
+    return;
+  }
+  for (const d of list) {
     const opt = document.createElement("option");
     opt.value = d.device_id;
     opt.textContent = d.display_name || d.device_id;
@@ -151,8 +175,10 @@ async function refreshStatus() {
   try {
     const id = currentDeviceId();
     const data = await api(`/api/status?device_id=${encodeURIComponent(id)}`);
-    if (data.devices?.devices) {
-      populateDeviceSelect(data.devices.devices, data.device_id || id);
+    const devices = data.devices?.devices || [];
+    populateDeviceSelect(devices, data.device_id || id);
+    if (typeof data.devices?.count === "number") {
+      setDeviceCount(data.devices.count);
     }
     const connected = data.camera?.connected;
     if (cameraOrientation && data.camera?.rotation) {

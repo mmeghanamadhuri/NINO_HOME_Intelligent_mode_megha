@@ -69,7 +69,10 @@ class DeviceDiscovery:
         self.registry = registry or get_device_registry()
         self.on_registry_updated = on_registry_updated
         self.enabled = _env_bool("NINO_DISCOVERY_ENABLED", True)
-        self.interval_s = _env_float("NINO_DISCOVERY_INTERVAL_S", 45.0, 5.0)
+        self.interval_s = _env_float("NINO_DISCOVERY_INTERVAL_S", 8.0, 2.0)
+        self.stale_after_s = _env_float(
+            "NINO_DISCOVERY_STALE_S", max(16.0, self.interval_s * 2.5), 4.0
+        )
         self.http_timeout_s = _env_float("NINO_DISCOVERY_HTTP_TIMEOUT_S", 1.5)
         self.mdns_timeout_s = _env_float("NINO_DISCOVERY_MDNS_TIMEOUT_S", 1.5)
         self.udp_wait_s = _env_float("NINO_DISCOVERY_UDP_WAIT_S", 1.0)
@@ -77,6 +80,7 @@ class DeviceDiscovery:
         self._thread: threading.Thread | None = None
         self._scan_lock = threading.Lock()
         self._state_lock = threading.Lock()
+        self._last_seen: dict[str, float] = {}
         self._last_scan_at: str | None = None
         self._last_duration_ms: int | None = None
         self._last_found = 0
@@ -89,6 +93,7 @@ class DeviceDiscovery:
                 "enabled": self.enabled,
                 "running": bool(self._thread and self._thread.is_alive()),
                 "interval_s": self.interval_s,
+                "stale_after_s": self.stale_after_s,
                 "last_scan_at": self._last_scan_at,
                 "last_duration_ms": self._last_duration_ms,
                 "last_found": self._last_found,
@@ -106,10 +111,11 @@ class DeviceDiscovery:
         )
         self._thread.start()
         logger.info(
-            "NiNO discovery enabled: mDNS %s, UDP %s, every %.0fs",
+            "NiNO discovery enabled: mDNS %s, UDP %s, every %.0fs (stale after %.0fs)",
             MDNS_SERVICE_TYPE,
             f"{DISCOVERY_MULTICAST[0]}:{DISCOVERY_MULTICAST[1]}",
             self.interval_s,
+            self.stale_after_s,
         )
 
     def stop(self) -> None:
@@ -143,11 +149,27 @@ class DeviceDiscovery:
                 if replace_registry
                 else self.registry.upsert_discovered(records)
             )
-            if changed:
+            removed: list[str] = []
+            if replace_registry:
+                self._last_seen = {
+                    record.device_id: time.monotonic() for record in records
+                }
+            else:
+                removed = self._prune_stale(records)
+            live = self.registry.list_devices()
+            logger.info(
+                "DEVICES live=%d found=%d updated=%d removed=%d ids=%s",
+                len(live),
+                len(records),
+                len(changed),
+                len(removed),
+                [record.device_id for record in live] or ["(none)"],
+            )
+            if changed or removed:
                 logger.info(
-                    "NiNO discovery updated %d device(s): %s",
+                    "NiNO discovery updated %d / removed %d device(s)",
                     len(changed),
-                    ", ".join(record.device_id for record in changed),
+                    len(removed),
                 )
                 if self.on_registry_updated:
                     try:
@@ -157,7 +179,12 @@ class DeviceDiscovery:
             elif records:
                 logger.debug("NiNO discovery found %d unchanged device(s)", len(records))
 
-            self._set_scan_state(found=len(records), updated=len(changed), error=None, started=started)
+            self._set_scan_state(
+                found=len(records),
+                updated=len(changed) + len(removed),
+                error=None,
+                started=started,
+            )
             return records
         except Exception as exc:
             # Discovery is optional infrastructure: never let a LAN failure
@@ -167,6 +194,27 @@ class DeviceDiscovery:
             return []
         finally:
             self._scan_lock.release()
+
+    def _prune_stale(self, found: list[DeviceRecord]) -> list[str]:
+        now = time.monotonic()
+        found_ids = {record.device_id for record in found}
+        for device_id in found_ids:
+            self._last_seen[device_id] = now
+        stale: list[str] = []
+        for record in self.registry.list_devices():
+            device_id = record.device_id
+            last_seen = self._last_seen.get(device_id)
+            if last_seen is None:
+                self._last_seen[device_id] = now
+                continue
+            if device_id not in found_ids and (now - last_seen) >= self.stale_after_s:
+                stale.append(device_id)
+        if not stale:
+            return []
+        removed = self.registry.remove_devices(stale)
+        for device_id in removed:
+            self._last_seen.pop(device_id, None)
+        return removed
 
     def _set_scan_state(
         self, *, found: int, updated: int, error: str | None, started: float

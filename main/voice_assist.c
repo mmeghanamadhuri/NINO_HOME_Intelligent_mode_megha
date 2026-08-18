@@ -1,6 +1,7 @@
 #include "voice_assist.h"
 
 #include <inttypes.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -15,6 +16,7 @@
 
 #include "mic_input.h"
 #include "nino_eye.h"
+#include "rgb_led.h"
 #include "voice_ws_client.h"
 
 extern const uint8_t beep_wav_start[] asm("_binary_beep_wav_start");
@@ -24,7 +26,7 @@ static const char *TAG = "voice_ast";
 
 #define VOICE_MIC_RATE 16000
 #define WAV_HEADER_SIZE 44
-#define VOICE_WS_URI_MAX 200
+#define VOICE_WS_URI_MAX 240
 #define VOICE_QUERY_DEFAULT_MS 5000
 #define VOICE_QUERY_MAX_MS 10000
 #define MED_ACK_CAPTURE_MS 5000
@@ -40,6 +42,17 @@ static const char *TAG = "voice_ast";
 #define AUX_REARM_DELAY_MS 1500
 #define AUX_STATUS_LOG_MS 1000
 #define AUX_REPLY_WAIT_MS 180000
+#define AUX_PREROLL_MS 500
+#define AUX_PREROLL_FRAMES (AUX_PREROLL_MS / AUX_DETECT_FRAME_MS)
+#define AUX_WAKE_GAP_MS 1000
+#define AUX_CAPTURE_MAX_MS 8000
+#define AUX_SENTENCE_QUIET_MS 800
+#define AUX_CONTINUE_MIN_MS 800
+
+typedef enum {
+  VOICE_SESSION_WAKE = 0,
+  VOICE_SESSION_CONTINUE,
+} voice_session_kind_t;
 
 static char s_ws_uri[VOICE_WS_URI_MAX];
 static SemaphoreHandle_t s_ws_uri_mutex;
@@ -48,6 +61,52 @@ static volatile bool s_query_busy;
 static volatile bool s_listen_loop_started;
 static volatile bool s_aux_listen_running;
 static uint32_t s_aux_noise_floor = AUX_NOISE_FLOOR_DEFAULT;
+static int16_t s_preroll_ring[AUX_PREROLL_FRAMES][AUX_DETECT_SAMPLES];
+static size_t s_preroll_head;
+static size_t s_preroll_filled;
+static int16_t s_preroll_flat[AUX_PREROLL_FRAMES * AUX_DETECT_SAMPLES];
+
+static const char *session_query_name(voice_session_kind_t kind) {
+  return kind == VOICE_SESSION_CONTINUE ? "continue" : "wake";
+}
+
+static void preroll_push(const int16_t *frame) {
+  memcpy(s_preroll_ring[s_preroll_head], frame,
+         AUX_DETECT_SAMPLES * sizeof(int16_t));
+  s_preroll_head = (s_preroll_head + 1U) % AUX_PREROLL_FRAMES;
+  if (s_preroll_filled < AUX_PREROLL_FRAMES) {
+    s_preroll_filled++;
+  }
+}
+
+static size_t preroll_flatten(int16_t *out, size_t out_samples) {
+  const size_t frames = s_preroll_filled;
+  if (frames == 0 || out == NULL || out_samples == 0) {
+    return 0;
+  }
+  const size_t start =
+      (s_preroll_head + AUX_PREROLL_FRAMES - frames) % AUX_PREROLL_FRAMES;
+  size_t written = 0;
+  for (size_t i = 0; i < frames; i++) {
+    if (written + AUX_DETECT_SAMPLES > out_samples) {
+      break;
+    }
+    const size_t idx = (start + i) % AUX_PREROLL_FRAMES;
+    memcpy(out + written, s_preroll_ring[idx],
+           AUX_DETECT_SAMPLES * sizeof(int16_t));
+    written += AUX_DETECT_SAMPLES;
+  }
+  return written;
+}
+
+static void uri_append_session(char *uri, size_t uri_sz, voice_session_kind_t kind) {
+  const char *sep = strchr(uri, '?') != NULL ? "&" : "?";
+  const size_t used = strlen(uri);
+  if (used >= uri_sz) {
+    return;
+  }
+  snprintf(uri + used, uri_sz - used, "%ssession=%s", sep, session_query_name(kind));
+}
 
 void nino_voice_assist_set_next_prompt_ack_chime(bool play_chime) {
   s_next_prompt_ack_play_chime = play_chime;
@@ -163,6 +222,13 @@ esp_err_t nino_voice_assist_init_mutex(void) {
   return ESP_OK;
 }
 
+static uint32_t aux_quiet_threshold(uint32_t noise_floor);
+
+static esp_err_t run_ws_and_queue_ex(
+    voice_session_kind_t session, const int16_t *preroll, size_t preroll_samples,
+    uint32_t min_ms, uint32_t max_ms, uint32_t quiet_end_ms,
+    uint32_t quiet_energy, bool flush_first, bool medical_ack_session);
+
 #define VOICE_WS_JOB_STACK 20480
 
 typedef struct {
@@ -195,9 +261,10 @@ static void voice_ws_job_task(void *pv) {
   free(job);
 
   if (e != ESP_OK || resp == NULL || resp_len == 0) {
-    ESP_LOGE(TAG, "WS exchange failed: %s", esp_err_to_name(e));
+    ESP_LOGE(TAG, "VOICE_FAIL WS exchange: %s — RGB error", esp_err_to_name(e));
     free(resp);
     nino_eye_idle();
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_ERROR);
     s_query_busy = false;
     vTaskDelete(NULL);
     return;
@@ -247,6 +314,14 @@ static esp_err_t spawn_voice_ws_job(uint8_t *cap, size_t cap_len, const char *ur
 }
 
 static esp_err_t run_ws_and_queue(uint32_t duration_ms, bool medical_ack_session) {
+  return run_ws_and_queue_ex(VOICE_SESSION_WAKE, NULL, 0, duration_ms, duration_ms,
+                             0, 0, true, medical_ack_session);
+}
+
+static esp_err_t run_ws_and_queue_ex(
+    voice_session_kind_t session, const int16_t *preroll, size_t preroll_samples,
+    uint32_t min_ms, uint32_t max_ms, uint32_t quiet_end_ms,
+    uint32_t quiet_energy, bool flush_first, bool medical_ack_session) {
   char uri[VOICE_WS_URI_MAX];
   if (s_ws_uri_mutex == NULL) {
     return ESP_ERR_INVALID_STATE;
@@ -265,22 +340,37 @@ static esp_err_t run_ws_and_queue(uint32_t duration_ms, bool medical_ack_session
     ESP_LOGW(TAG, "Voice query already running");
     return ESP_ERR_INVALID_STATE;
   }
-  if (duration_ms == 0 || duration_ms > VOICE_QUERY_MAX_MS) {
+  if (max_ms == 0 || max_ms > VOICE_QUERY_MAX_MS) {
     return ESP_ERR_INVALID_ARG;
   }
 
+  uri_append_session(uri, sizeof(uri), session);
   s_query_busy = true;
   nino_eye_listening();
+  (void)nino_rgb_led_show(NINO_RGB_SHOW_LISTEN);
   const int64_t t_query = esp_timer_get_time();
 
   uint8_t *cap = NULL;
   size_t cap_len = 0;
-  esp_err_t e = nino_audio_capture_wav(&cap, &cap_len, duration_ms);
-  ESP_LOGI(TAG, "latency: AUX capture %" PRId64 " ms (%u ms requested)",
-           (esp_timer_get_time() - t_query) / 1000LL, (unsigned)duration_ms);
+  esp_err_t e;
+  if (quiet_end_ms > 0) {
+    ESP_LOGI(TAG,
+             "%s capture: preroll=%u samples min=%u ms max=%u ms quiet=%u ms session=%s",
+             session == VOICE_SESSION_WAKE ? "WAKE" : "CONV",
+             (unsigned)preroll_samples, (unsigned)min_ms, (unsigned)max_ms,
+             (unsigned)quiet_end_ms, session_query_name(session));
+    e = nino_audio_capture_wav_until_quiet(&cap, &cap_len, preroll, preroll_samples,
+                                           min_ms, max_ms, quiet_end_ms,
+                                           quiet_energy, flush_first);
+  } else {
+    e = nino_audio_capture_wav(&cap, &cap_len, max_ms);
+  }
+  ESP_LOGI(TAG, "latency: AUX capture %" PRId64 " ms (session=%s)",
+           (esp_timer_get_time() - t_query) / 1000LL, session_query_name(session));
   if (e != ESP_OK) {
-    ESP_LOGE(TAG, "AUX capture failed: %s", esp_err_to_name(e));
+    ESP_LOGE(TAG, "VOICE_FAIL AUX capture: %s — RGB error", esp_err_to_name(e));
     nino_eye_idle();
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_ERROR);
     s_query_busy = false;
     return e;
   }
@@ -313,8 +403,9 @@ static void prompt_listen_task(void *arg) {
     vTaskDelete(NULL);
     return;
   }
-  ESP_LOGI(TAG, "Prompt listen — AUX IN %d ms (chime=%d)", MED_ACK_CAPTURE_MS,
+  ESP_LOGI(TAG, "CONV_LISTEN — no wake required, VAD until sentence end (chime=%d)",
            (int)play_chime);
+  (void)nino_rgb_led_show(NINO_RGB_SHOW_LISTEN);
   if (play_chime) {
     esp_err_t chime = nino_voice_play_wake_chime();
     if (chime != ESP_OK) {
@@ -322,9 +413,11 @@ static void prompt_listen_task(void *arg) {
     }
     vTaskDelay(pdMS_TO_TICKS(350));
   }
-  esp_err_t e = run_ws_and_queue(MED_ACK_CAPTURE_MS, false);
+  esp_err_t e = run_ws_and_queue_ex(
+      VOICE_SESSION_CONTINUE, NULL, 0, AUX_CONTINUE_MIN_MS, AUX_CAPTURE_MAX_MS,
+      AUX_SENTENCE_QUIET_MS, aux_quiet_threshold(s_aux_noise_floor), true, false);
   if (e != ESP_OK) {
-    ESP_LOGW(TAG, "Prompt listen voice query failed: %s", esp_err_to_name(e));
+    ESP_LOGW(TAG, "CONV_LISTEN voice query failed: %s", esp_err_to_name(e));
   }
   vTaskDelete(NULL);
 }
@@ -395,6 +488,7 @@ static bool wait_aux_activity(void) {
       continue;
     }
 
+    preroll_push(frame);
     const uint32_t energy = aux_frame_energy(frame, AUX_DETECT_SAMPLES);
     const uint32_t threshold = aux_start_threshold(s_aux_noise_floor);
     status_ms += AUX_DETECT_FRAME_MS;
@@ -463,7 +557,9 @@ static void aux_listen_task(void *arg) {
     vTaskDelay(pdMS_TO_TICKS(500));
   }
 
-  ESP_LOGI(TAG, "Aux-in listen armed — waiting for Sirena wake-word audio, then 5 s capture");
+  ESP_LOGI(TAG,
+           "Aux-in listen armed — Sirena wake energy, 500 ms preroll + 1 s gap, "
+           "then VAD until sentence end");
   s_aux_listen_running = true;
 
   while (true) {
@@ -478,18 +574,33 @@ static void aux_listen_task(void *arg) {
       continue;
     }
 
+    const size_t preroll_n =
+        preroll_flatten(s_preroll_flat, AUX_PREROLL_FRAMES * AUX_DETECT_SAMPLES);
+    ESP_LOGI(TAG,
+             "WAKE_ENERGY — listen LED, preroll=%u samples (%u ms), then 1 s gap "
+             "+ sentence capture session=wake",
+             (unsigned)preroll_n,
+             (unsigned)(preroll_n * 1000U / (size_t)VOICE_MIC_RATE));
     nino_eye_listening();
-    nino_mic_close();
-    esp_err_t e = run_ws_and_queue(VOICE_QUERY_DEFAULT_MS, false);
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_LISTEN);
+    /* Keep the mic open so the rest of "Ok Nino" is in the 1 s gap recording. */
+    esp_err_t e = run_ws_and_queue_ex(
+        VOICE_SESSION_WAKE, s_preroll_flat, preroll_n, AUX_WAKE_GAP_MS,
+        AUX_CAPTURE_MAX_MS, AUX_SENTENCE_QUIET_MS,
+        aux_quiet_threshold(s_aux_noise_floor), false, false);
     if (e != ESP_OK) {
-      ESP_LOGW(TAG, "Aux-in query failed: %s", esp_err_to_name(e));
+      ESP_LOGW(TAG, "WAKE query failed: %s", esp_err_to_name(e));
       nino_eye_idle();
+      (void)nino_rgb_led_show(NINO_RGB_SHOW_ERROR);
     } else {
       wait_query_and_reply_done();
     }
 
     wait_aux_quiet();
     vTaskDelay(pdMS_TO_TICKS(AUX_REARM_DELAY_MS));
+    if (!s_query_busy) {
+      (void)nino_rgb_led_show(NINO_RGB_SHOW_IDLE);
+    }
     ESP_LOGI(TAG, "Aux-in listen re-armed (noise=%" PRIu32 " th=%" PRIu32 ")",
              s_aux_noise_floor, aux_start_threshold(s_aux_noise_floor));
   }

@@ -470,6 +470,28 @@ class DeviceRegistry:
             )
         ]
 
+    def remove_devices(self, device_ids: list[str]) -> list[str]:
+        """Drop robots that discovery no longer sees on the LAN."""
+        wanted = {str(device_id).strip() for device_id in device_ids if str(device_id).strip()}
+        if not wanted:
+            return []
+        with self._lock:
+            removed = [device_id for device_id in wanted if device_id in self._devices]
+            if not removed:
+                return []
+            updated = {
+                device_id: record
+                for device_id, record in self._devices.items()
+                if device_id not in wanted
+            }
+            self._write_devices_locked(updated.values())
+            self._devices = updated
+            self._persisted_device_ids = set(updated)
+            if self._ui_device_id not in self._devices:
+                self._ui_device_id = next(iter(self._devices), LEGACY_DEVICE_ID)
+            logger.info("Device registry removed %d device(s): %s", len(removed), removed)
+            return removed
+
     def list_devices(self) -> list[DeviceRecord]:
         with self._lock:
             return list(self._devices.values())
@@ -524,8 +546,10 @@ class DeviceRegistry:
 
     def status(self) -> dict:
         with self._lock:
+            devices = list(self._devices.values())
             return {
                 "ui_device_id": self._ui_device_id if self._devices else LEGACY_DEVICE_ID,
+                "count": len(devices),
                 "devices": [
                     {
                         "device_id": d.device_id,
@@ -544,7 +568,7 @@ class DeviceRegistry:
                         "wifi_channel": d.wifi_channel,
                         "wifi_updated_at": d.wifi_updated_at,
                     }
-                    for d in self._devices.values()
+                    for d in devices
                 ],
             }
 

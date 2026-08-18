@@ -9,6 +9,7 @@
 #include "esp_check.h"
 #include "esp_console.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 static const char *TAG = "rgb_led";
 
@@ -61,6 +62,39 @@ static const rgb_named_color_t s_named_colors[] = {
 };
 
 static uint8_t s_global_brightness = RGB_LED_LEVEL_MAX;
+static nino_rgb_show_t s_show = NINO_RGB_SHOW_IDLE;
+static esp_timer_handle_t s_blink_timer;
+static bool s_blink_on;
+static int s_blink_remaining; /* on-phases left; -1 = forever */
+static uint8_t s_blink_r;
+static uint8_t s_blink_g;
+static uint8_t s_blink_b;
+
+const char *nino_rgb_led_show_name(nino_rgb_show_t show)
+{
+  switch (show) {
+  case NINO_RGB_SHOW_IDLE:
+    return "idle";
+  case NINO_RGB_SHOW_LISTEN:
+    return "listen";
+  case NINO_RGB_SHOW_DONE:
+    return "done";
+  case NINO_RGB_SHOW_BATTERY:
+    return "battery";
+  case NINO_RGB_SHOW_OTA:
+    return "ota";
+  case NINO_RGB_SHOW_ERROR:
+    return "error";
+  case NINO_RGB_SHOW_WIFI_WAIT:
+    return "wifi-wait";
+  case NINO_RGB_SHOW_WIFI_OK:
+    return "wifi-ok";
+  case NINO_RGB_SHOW_WIFI_FAIL:
+    return "wifi-fail";
+  default:
+    return "unknown";
+  }
+}
 
 static rgb_channel_t *find_channel(const char *name) {
   for (size_t i = 0; i < sizeof(s_channels) / sizeof(s_channels[0]); i++) {
@@ -114,6 +148,102 @@ static esp_err_t apply_all(void) {
   return ESP_OK;
 }
 
+static void blink_timer_stop(void)
+{
+  if (s_blink_timer != NULL) {
+    (void)esp_timer_stop(s_blink_timer);
+  }
+}
+
+static void blink_cb(void *arg)
+{
+  (void)arg;
+  s_blink_on = !s_blink_on;
+  if (s_blink_on) {
+    (void)nino_rgb_led_set_rgb(s_blink_r, s_blink_g, s_blink_b);
+    return;
+  }
+  (void)nino_rgb_led_set_rgb(0, 0, 0);
+  if (s_blink_remaining < 0) {
+    return;
+  }
+  s_blink_remaining--;
+  if (s_blink_remaining <= 0) {
+    blink_timer_stop();
+    s_show = NINO_RGB_SHOW_IDLE;
+  }
+}
+
+static esp_err_t blink_timer_start(uint64_t period_us, int on_count)
+{
+  if (s_blink_timer == NULL) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  s_blink_on = false;
+  s_blink_remaining = on_count;
+  blink_timer_stop();
+  s_blink_on = true;
+  (void)nino_rgb_led_set_rgb(s_blink_r, s_blink_g, s_blink_b);
+  return esp_timer_start_periodic(s_blink_timer, period_us);
+}
+
+esp_err_t nino_rgb_led_show(nino_rgb_show_t show)
+{
+  if (s_blink_timer == NULL) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  blink_timer_stop();
+  s_show = show;
+
+  switch (show) {
+  case NINO_RGB_SHOW_IDLE:
+    nino_rgb_led_all_off();
+    break;
+  case NINO_RGB_SHOW_LISTEN:
+    (void)nino_rgb_led_set_named("green", RGB_LED_LEVEL_MAX);
+    break;
+  case NINO_RGB_SHOW_DONE:
+    s_blink_r = 0;
+    s_blink_g = 255;
+    s_blink_b = 0;
+    ESP_RETURN_ON_ERROR(blink_timer_start(350 * 1000, 3), TAG, "done blink failed");
+    break;
+  case NINO_RGB_SHOW_BATTERY:
+    /* Slow orange — must not look like error (fast red). */
+    s_blink_r = 255;
+    s_blink_g = 102;
+    s_blink_b = 0;
+    ESP_RETURN_ON_ERROR(blink_timer_start(800 * 1000, -1), TAG, "battery blink failed");
+    break;
+  case NINO_RGB_SHOW_OTA:
+    (void)nino_rgb_led_set_named("purple", RGB_LED_LEVEL_MAX);
+    break;
+  case NINO_RGB_SHOW_ERROR:
+    s_blink_r = 255;
+    s_blink_g = 0;
+    s_blink_b = 0;
+    ESP_RETURN_ON_ERROR(blink_timer_start(200 * 1000, -1), TAG, "error blink failed");
+    break;
+  case NINO_RGB_SHOW_WIFI_WAIT:
+    s_blink_r = 255;
+    s_blink_g = 255;
+    s_blink_b = 255;
+    ESP_RETURN_ON_ERROR(blink_timer_start(400 * 1000, -1), TAG, "wifi blink failed");
+    break;
+  case NINO_RGB_SHOW_WIFI_OK:
+    (void)nino_rgb_led_set_named("cyan", RGB_LED_LEVEL_MAX);
+    break;
+  case NINO_RGB_SHOW_WIFI_FAIL:
+    (void)nino_rgb_led_set_named("orange", RGB_LED_LEVEL_MAX);
+    break;
+  default:
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  ESP_LOGI(TAG, "show -> %s", nino_rgb_led_show_name(show));
+  return ESP_OK;
+}
+
 esp_err_t nino_rgb_led_init(void) {
   const ledc_timer_config_t timer = {
       .speed_mode = RGB_LEDC_MODE,
@@ -123,6 +253,15 @@ esp_err_t nino_rgb_led_init(void) {
       .clk_cfg = LEDC_AUTO_CLK,
   };
   ESP_RETURN_ON_ERROR(ledc_timer_config(&timer), TAG, "timer config failed");
+
+  if (s_blink_timer == NULL) {
+    const esp_timer_create_args_t blink_args = {
+        .callback = blink_cb,
+        .name = "rgb_blink",
+    };
+    ESP_RETURN_ON_ERROR(esp_timer_create(&blink_args, &s_blink_timer), TAG,
+                        "blink timer create failed");
+  }
 
   for (size_t i = 0; i < sizeof(s_channels) / sizeof(s_channels[0]); i++) {
     const ledc_channel_config_t ch = {
@@ -258,6 +397,16 @@ static void print_help(void) {
   printf("\nUsage:\n");
   printf("  rgb status\n");
   printf("  rgb off\n");
+  printf("  rgb show <scene>   — preview / force a status light\n");
+  printf("      listen     solid green     (Ok Nino — user can speak)\n");
+  printf("      done       blink green x3  (answer finished, then off)\n");
+  printf("      idle       off\n");
+      printf("      battery    slow blink orange (low battery)\n");
+      printf("      ota        solid purple      (firmware update)\n");
+      printf("      error      fast blink red    (capture/WS/error)\n");
+  printf("      wifi-wait  blink white     (Wi-Fi connecting)\n");
+  printf("      wifi-ok    solid cyan      (Wi-Fi connected)\n");
+  printf("      wifi-fail  solid orange    (Wi-Fi not connected)\n");
   printf("  rgb brightness [0-255]\n");
   printf("  rgb red|green|blue [0-255|on|off|max]\n");
   printf("  rgb color <name> [0-255]   — yellow cyan magenta white orange ...\n");
@@ -278,12 +427,51 @@ static int cmd_rgb(int argc, char **argv) {
 
   if (strcmp(argv[1], "status") == 0) {
     print_status();
+    printf("scene: %s\n", nino_rgb_led_show_name(s_show));
     return 0;
   }
 
-  if (strcmp(argv[1], "off") == 0) {
-    nino_rgb_led_all_off();
-    printf("RGB: all off\n");
+  if (strcmp(argv[1], "off") == 0 || strcmp(argv[1], "idle") == 0) {
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_IDLE);
+    printf("RGB: idle (off)\n");
+    return 0;
+  }
+
+  if (strcmp(argv[1], "show") == 0) {
+    if (argc < 3 || strcmp(argv[2], "list") == 0) {
+      print_help();
+      return 0;
+    }
+    nino_rgb_show_t show = NINO_RGB_SHOW_IDLE;
+    if (strcmp(argv[2], "listen") == 0) {
+      show = NINO_RGB_SHOW_LISTEN;
+    } else if (strcmp(argv[2], "done") == 0) {
+      show = NINO_RGB_SHOW_DONE;
+    } else if (strcmp(argv[2], "idle") == 0) {
+      show = NINO_RGB_SHOW_IDLE;
+    } else if (strcmp(argv[2], "battery") == 0) {
+      show = NINO_RGB_SHOW_BATTERY;
+    } else if (strcmp(argv[2], "ota") == 0) {
+      show = NINO_RGB_SHOW_OTA;
+    } else if (strcmp(argv[2], "error") == 0) {
+      show = NINO_RGB_SHOW_ERROR;
+    } else if (strcmp(argv[2], "wifi-wait") == 0) {
+      show = NINO_RGB_SHOW_WIFI_WAIT;
+    } else if (strcmp(argv[2], "wifi-ok") == 0) {
+      show = NINO_RGB_SHOW_WIFI_OK;
+    } else if (strcmp(argv[2], "wifi-fail") == 0) {
+      show = NINO_RGB_SHOW_WIFI_FAIL;
+    } else {
+      printf("Unknown scene '%s'\n", argv[2]);
+      print_help();
+      return 1;
+    }
+    esp_err_t err = nino_rgb_led_show(show);
+    if (err != ESP_OK) {
+      printf("rgb show failed: %s\n", esp_err_to_name(err));
+      return 1;
+    }
+    printf("RGB scene: %s\n", nino_rgb_led_show_name(show));
     return 0;
   }
 
@@ -425,8 +613,8 @@ void nino_rgb_led_cli_register(void) {
   const esp_console_cmd_t cmd = {
       .command = "rgb",
       .help =
-          "rgb red|green|blue [0-255] | rgb color <name> [0-255] | rgb mix R G B | "
-          "rgb #RRGGBB | rgb brightness [0-255] | rgb off | rgb status",
+          "rgb show listen|done|idle|battery|ota|error|wifi-wait|wifi-ok|wifi-fail | "
+          "rgb off | rgb status",
       .hint = NULL,
       .func = &cmd_rgb,
       .argtable = NULL,

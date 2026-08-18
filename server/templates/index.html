@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>NiNO Camera Face Server</title>
-    <link rel="stylesheet" href="/static/styles.css?v=13" />
+    <link rel="stylesheet" href="/static/styles.css?v=15" />
   </head>
   <body>
     <header class="site-header">
@@ -29,6 +29,7 @@
           <h2>Live Feed</h2>
           <div class="device-picker">
             <label for="deviceSelect">Robot</label>
+            <span id="deviceCount" class="device-count">—</span>
             <select id="deviceSelect">
               {% for d in devices %}
               <option value="{{ d.device_id }}" {% if d.device_id == device_id %}selected{% endif %}>
@@ -111,6 +112,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js?v=4"></script>
+    <script src="/static/app.js?v=5"></script>
   </body>
 </html>

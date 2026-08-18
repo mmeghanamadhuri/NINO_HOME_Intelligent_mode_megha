@@ -26,6 +26,59 @@ function deviceId() {
   return (deviceSelect?.value || "default").trim() || "default";
 }
 
+function setDeviceCount(count) {
+  const el = document.querySelector("#deviceCount");
+  if (!el) {
+    return;
+  }
+  const n = Number(count) || 0;
+  el.textContent = n === 1 ? "1 robot" : `${n} robots`;
+}
+
+function populateDeviceSelect(devices, selectedId) {
+  const list = Array.isArray(devices) ? devices : [];
+  setDeviceCount(list.length);
+  if (!deviceSelect) {
+    return;
+  }
+  const previous = selectedId || deviceId();
+  const same =
+    deviceSelect.options.length === list.length &&
+    list.every((d, i) => deviceSelect.options[i]?.value === d.device_id);
+  if (same) {
+    return;
+  }
+  deviceSelect.innerHTML = "";
+  if (!list.length) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "No robots found";
+    deviceSelect.append(opt);
+    return;
+  }
+  for (const d of list) {
+    const opt = document.createElement("option");
+    opt.value = d.device_id;
+    opt.textContent = d.display_name || d.device_id;
+    if (d.device_id === previous) {
+      opt.selected = true;
+    }
+    deviceSelect.append(opt);
+  }
+  if (![...deviceSelect.options].some((o) => o.selected)) {
+    deviceSelect.options[0].selected = true;
+  }
+}
+
+async function refreshDevices() {
+  try {
+    const data = await api("/api/devices");
+    populateDeviceSelect(data.devices || [], data.ui_device_id);
+  } catch {
+    /* keep the current dropdown if discovery is briefly unavailable */
+  }
+}
+
 function setStatus(text, ok = true) {
   if (connectionStatus) {
     connectionStatus.textContent = text;
@@ -420,5 +473,7 @@ deviceSelect?.addEventListener("change", () => {
 
 renderFrames();
 renderActionList();
+refreshDevices();
 pollPosition();
 pollTimer = setInterval(pollPosition, 500);
+setInterval(refreshDevices, 2000);

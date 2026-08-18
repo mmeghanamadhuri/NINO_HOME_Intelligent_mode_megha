@@ -1539,6 +1539,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     s_wifi_connected_chime_pending = true;
     wifi_prov_ble_on_sta_ip_changed(false);
     mdns_stop_service();
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_WIFI_FAIL);
     wifi_event_sta_disconnected_t *ev =
         (wifi_event_sta_disconnected_t *)event_data;
     ESP_LOGW(TAG, "STA: Disconnected (reason %d)", ev->reason);
@@ -1560,6 +1561,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
     s_sta_connected = true;
     s_wifi_unable_chimed = false;
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_WIFI_OK);
     ESP_LOGI(TAG, "STA: Got IP " IPSTR, IP2STR(&event->ip_info.ip));
     mdns_start_service();
     wifi_prov_ble_on_sta_ip_changed(true);
@@ -1641,6 +1643,7 @@ static esp_err_t wifi_switch_mode(wifi_mode_t mode) {
 
   if ((mode == WIFI_MODE_STA || mode == WIFI_MODE_APSTA) &&
       strlen(s_sta_ssid) > 0) {
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_WIFI_WAIT);
     esp_wifi_connect();
   }
 
@@ -3918,6 +3921,10 @@ void app_main(void) {
   nino_face_tracker_init();
   nino_servo_recplay_init();
 
+  if (nino_rgb_led_init() != ESP_OK) {
+    ESP_LOGW(TAG, "RGB LED init failed (GPIO 2/3/4)");
+  }
+
   /* Wi-Fi init brings Hosted SDIO transport up. BLE must start AFTER that —
    * starting earlier races slave reset / SDIO and reboots the host. */
   if (wifi_init_all() != ESP_OK) {
@@ -3949,10 +3956,6 @@ void app_main(void) {
   if (nino_push_buttons_start() != ESP_OK) {
     ESP_LOGW(TAG, "GPIO push button task not started");
   }
-  if (nino_rgb_led_init() != ESP_OK) {
-    ESP_LOGW(TAG, "RGB LED init failed (GPIO 2/3/4)");
-  }
-
   xTaskCreatePinnedToCore(multicast_discovery_task, "discovery", 4096, NULL, 5,
                           NULL, APP_CORE_NET);
   xTaskCreatePinnedToCore(tcp_message_server_task, "tcp_server", 4096, NULL, 5,
