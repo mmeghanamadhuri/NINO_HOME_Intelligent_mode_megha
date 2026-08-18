@@ -314,7 +314,11 @@ def test_stop_is_per_device(monkeypatch):
 
 
 def test_music_replies_do_not_continue_the_conversation():
-    from voice_service import CONTINUE_LISTEN_REPLY_PATHS, should_continue_listen_after_reply
+    from voice_service import (
+        CONTINUE_LISTEN_REPLY_PATHS,
+        SESSION_END_REPLY_PATHS,
+        should_continue_listen_after_reply,
+    )
 
     for path in (
         "music_play",
@@ -325,4 +329,5 @@ def test_music_replies_do_not_continue_the_conversation():
         "music_no_device",
     ):
         assert path not in CONTINUE_LISTEN_REPLY_PATHS
+        assert path in SESSION_END_REPLY_PATHS
         assert should_continue_listen_after_reply(path, "play kalyani") is False

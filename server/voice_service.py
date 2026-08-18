@@ -280,14 +280,27 @@ class VoiceReplyMeta:
     timings: dict[str, Any] = field(default_factory=dict)
 
 
-# After a valid wake, keep the conversation open until goodbye.
-# Only these paths close the mic and wait for a new Ok Nino.
+# After a valid wake, keep the conversation open until goodbye — except music.
+# Play/stop are one-shot: "Playing X." then the mic closes. A new Ok Nino is
+# required for the next command so song turns never become a chat.
+MUSIC_SESSION_END_REPLY_PATHS = frozenset(
+    {
+        "music_play",
+        "music_stop",
+        "music_now_playing",
+        "music_not_found",
+        "music_unavailable",
+        "music_no_device",
+        "music_resume",
+    }
+)
+
 SESSION_END_REPLY_PATHS = frozenset(
     {
         "goodbye",
         "wake_reject",
     }
-)
+) | MUSIC_SESSION_END_REPLY_PATHS
 
 # Kept for older callers / docs; session lifetime is no longer gated on this list.
 CONTINUE_LISTEN_REPLY_PATHS = frozenset(

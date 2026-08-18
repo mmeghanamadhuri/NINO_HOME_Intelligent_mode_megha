@@ -1,38 +1,38 @@
 {
   "devices": [
     {
-      "device_id": "nino-home-147",
-      "display_name": "NINO - HOME BOT",
-      "camera_url": "http://192.168.1.147/stream",
-      "play_wav_url": "http://192.168.1.147/play_wav",
-      "base_url": "http://192.168.1.147",
+      "device_id": "Nino-P4",
+      "display_name": "NINO - HOME Vaseekaran",
+      "camera_url": "http://192.168.0.173/stream",
+      "play_wav_url": "http://192.168.0.173/play_wav",
+      "base_url": "http://192.168.0.173",
       "camera_rotation": "none",
       "latitude": null,
       "longitude": null,
       "location_name": "",
       "location_updated_at": "",
-      "wifi_ssid": "okgoogle",
-      "wifi_bssid": "30:23:03:C2:AD:5B",
-      "wifi_rssi": -52,
-      "wifi_channel": 13,
-      "wifi_updated_at": "2026-08-18T14:43:28.109799+00:00"
+      "wifi_ssid": "NINO-Home",
+      "wifi_bssid": "98:BA:5F:95:FE:92",
+      "wifi_rssi": -55,
+      "wifi_channel": 4,
+      "wifi_updated_at": "2026-08-18T16:37:09.977744+00:00"
     },
     {
-      "device_id": "ninofarfromhome",
-      "display_name": "NINO far from HOME",
-      "camera_url": "http://192.168.1.169/stream",
-      "play_wav_url": "http://192.168.1.169/play_wav",
-      "base_url": "http://192.168.1.169",
+      "device_id": "nino-home",
+      "display_name": "NINO - HOME meghana",
+      "camera_url": "http://192.168.0.230/stream",
+      "play_wav_url": "http://192.168.0.230/play_wav",
+      "base_url": "http://192.168.0.230",
       "camera_rotation": "none",
       "latitude": null,
       "longitude": null,
       "location_name": "",
       "location_updated_at": "",
-      "wifi_ssid": "okgoogle",
-      "wifi_bssid": "30:23:03:C2:AD:5B",
+      "wifi_ssid": "NINO-Home",
+      "wifi_bssid": "98:BA:5F:95:FE:92",
       "wifi_rssi": -50,
-      "wifi_channel": 13,
-      "wifi_updated_at": "2026-08-18T13:36:48.640067+00:00"
+      "wifi_channel": 4,
+      "wifi_updated_at": "2026-08-18T16:37:10.282116+00:00"
     }
   ]
 }

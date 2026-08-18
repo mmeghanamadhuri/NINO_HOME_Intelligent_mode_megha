@@ -1468,7 +1468,6 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                     event="voice_query",
                     client=client_label,
                     device_id=device_id,
-                    session=session_kind,
                     **timings,
                 )
                 if pipeline_error is not None:
