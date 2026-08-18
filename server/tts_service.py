@@ -21,6 +21,7 @@ from typing import Any, Callable
 import requests
 
 from esp_wav_chunking import chunk_text_for_esp_limit
+from pipeline_log import log_http, pipeline_log
 from tts_prosody import infer_speech_prosody, piper_prosody_enabled, pitch_shift_wav_bytes
 from wav_resample import ESP_PCM_SAMPLE_RATE_HZ, resample_wav_bytes_to_mono_16bit
 
@@ -450,6 +451,7 @@ def _synthesize_elevenlabs_wav_bytes(
         "model_id": model_id,
         "voice_settings": _elevenlabs_voice_settings(),
     }
+    t0 = time.perf_counter()
     resp = requests.post(
         url,
         headers={
@@ -459,6 +461,16 @@ def _synthesize_elevenlabs_wav_bytes(
         },
         json=payload,
         timeout=60,
+    )
+    log_http(
+        "CLOUD",
+        "POST",
+        url,
+        status=resp.status_code,
+        stage_s=time.perf_counter() - t0,
+        service="elevenlabs_tts",
+        model=model_id,
+        chars=len(clean),
     )
     if resp.status_code != 200:
         raise RuntimeError(
@@ -661,6 +673,42 @@ def synthesize_sapi_wav_bytes(
 ) -> tuple[bytes, str]:
     """Synthesize speech to WAV bytes with Piper/espeak as offline fallbacks."""
     _set_tts_synthesis_info("", "")
+    provider = _tts_provider()
+    pipeline_log(
+        "TTS",
+        "START",
+        provider=provider,
+        chars=len(text or ""),
+        text=text,
+    )
+    t0 = time.perf_counter()
+    try:
+        wav, voice = _synthesize_sapi_wav_bytes_inner(text, rate=rate, volume=volume)
+        info = last_tts_synthesis_info()
+        pipeline_log(
+            "TTS",
+            "DONE",
+            provider=info.get("provider") or provider,
+            voice=voice or info.get("voice"),
+            wav_bytes=len(wav or b""),
+            text=text,
+            stage_s=time.perf_counter() - t0,
+        )
+        return wav, voice
+    except Exception as exc:
+        pipeline_log(
+            "TTS",
+            "FAIL",
+            provider=provider,
+            error=str(exc),
+            stage_s=time.perf_counter() - t0,
+        )
+        raise
+
+
+def _synthesize_sapi_wav_bytes_inner(
+    text: str, rate: int = 135, volume: float = 0.75
+) -> tuple[bytes, str]:
     provider = _tts_provider()
     if provider == "elevenlabs":
         if _elevenlabs_fallback_active():

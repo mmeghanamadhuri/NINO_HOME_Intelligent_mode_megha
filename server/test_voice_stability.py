@@ -10,6 +10,7 @@ import numpy as np
 
 from voice_service import (
     clip_peak_energy,
+    extract_wake_and_command,
     min_speech_energy,
     process_voice_wav,
     should_continue_listen_after_reply,
@@ -55,6 +56,49 @@ def test_good_reply_can_keep_session_open() -> None:
     os.environ["VOICE_CONTINUE_LISTEN"] = "1"
     assert should_continue_listen_after_reply("llm", "what time is it") is True
     assert should_continue_listen_after_reply("llm", "goodbye") is False
+
+
+def test_transcript_without_ok_nino_is_not_rejected() -> None:
+    found, command, phrase = extract_wake_and_command("what time is it")
+    assert found is False
+    assert command == "what time is it"
+    assert phrase == ""
+
+    found, command, phrase = extract_wake_and_command("ok nino what time is it")
+    assert found is True
+    assert command == "what time is it"
+    assert "nino" in phrase
+
+
+def test_speech_without_wake_phrase_is_answered() -> None:
+    os.environ["VOICE_MIN_ENERGY"] = "5"
+    tone = (8000 * np.sin(2 * np.pi * 220 * np.arange(16000) / 16000)).astype(np.int16)
+    wav = _mono_wav(tone)
+    dummy_wav = _mono_wav(np.zeros(1600, dtype=np.int16))
+
+    from unittest.mock import patch
+
+    with (
+        patch("voice_service.transcribe_wav", return_value=("what time is it", "mock")),
+        patch("voice_service.synthesize_sapi_wav_bytes", return_value=(dummy_wav, "mock")),
+        patch("voice_service.resample_wav_bytes_to_mono_16bit", return_value=dummy_wav),
+        patch(
+            "voice_service.last_tts_synthesis_info",
+            return_value={"provider": "mock", "voice": "mock"},
+        ),
+    ):
+        out, meta = process_voice_wav(
+            wav,
+            session_kind="wake",
+            aux_energy=99,
+            device_id="test",
+            voice_turn=8,
+        )
+
+    assert out
+    assert meta.timings["reply_path"] != "wake_reject"
+    assert meta.timings["reply_path"] == "local_time"
+    assert meta.timings["wake_ok"] is True
 
 
 def test_low_energy_skips_stt_and_does_not_reopen() -> None:

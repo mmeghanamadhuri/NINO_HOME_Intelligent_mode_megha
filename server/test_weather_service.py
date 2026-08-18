@@ -63,7 +63,7 @@ class WeatherServiceTests(unittest.TestCase):
             WeatherService().current_for_device(DeviceRecord(device_id="no-location"))
 
     @patch("device_registry.logger.warning")
-    def test_unknown_device_warning_is_logged_once(self, warning: MagicMock) -> None:
+    def test_default_device_id_is_an_alias_for_the_ui_device(self, warning: MagicMock) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "devices.json"
             path.write_text(
@@ -74,12 +74,60 @@ class WeatherServiceTests(unittest.TestCase):
 
             for _ in range(3):
                 self.assertEqual(registry.resolve_or_default("default").device_id, "nino-test")
+                self.assertEqual(registry.resolve_or_default("").device_id, "nino-test")
 
-        warning.assert_called_once_with(
-            "Unknown device_id=%r — falling back to %s",
-            "default",
-            "nino-test",
-        )
+        warning.assert_not_called()
+
+    def test_unknown_device_warning_is_logged_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "devices.json"
+            path.write_text(
+                json.dumps({"devices": [{"device_id": "nino-test"}]}),
+                encoding="utf-8",
+            )
+            registry = DeviceRegistry(path)
+            with patch("device_registry.logger.warning") as warning:
+                for _ in range(3):
+                    self.assertEqual(
+                        registry.resolve_or_default("ghost-bot").device_id, "nino-test"
+                    )
+                warning.assert_called_once_with(
+                    "Unknown device_id=%r — falling back to %s",
+                    "ghost-bot",
+                    "nino-test",
+                )
+
+    def test_device_lookup_is_case_insensitive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "devices.json"
+            path.write_text(
+                json.dumps({"devices": [{"device_id": "Nino-P4"}]}),
+                encoding="utf-8",
+            )
+            registry = DeviceRegistry(path)
+            self.assertEqual(registry.get("nino-p4").device_id, "Nino-P4")
+            self.assertEqual(registry.resolve_or_default("NINO-P4").device_id, "Nino-P4")
+
+    def test_empty_startup_discovery_keeps_persisted_devices(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "devices.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "devices": [
+                            {"device_id": "nino-home", "base_url": "http://192.168.0.83"},
+                            {"device_id": "Nino-P4", "base_url": "http://192.168.0.173"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registry = DeviceRegistry(path)
+            changed = registry.replace_with_discovered([])
+            ids = {record.device_id for record in registry.list_devices()}
+
+        self.assertEqual(changed, [])
+        self.assertEqual(ids, {"nino-home", "Nino-P4"})
 
     def test_location_is_persisted_in_device_registry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

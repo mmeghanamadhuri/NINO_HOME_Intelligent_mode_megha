@@ -11,6 +11,7 @@ from typing import Any
 import requests
 
 from device_registry import DeviceRecord
+from pipeline_log import log_http
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,7 @@ class WeatherService:
                 return {**cached.payload, "cached": True}
 
         try:
+            t0 = time.perf_counter()
             response = requests.get(
                 OPEN_METEO_FORECAST_URL,
                 params={
@@ -107,6 +109,14 @@ class WeatherService:
                     "timezone": "auto",
                 },
                 timeout=self.request_timeout_seconds,
+            )
+            log_http(
+                "CLOUD",
+                "GET",
+                OPEN_METEO_FORECAST_URL,
+                status=response.status_code,
+                stage_s=time.perf_counter() - t0,
+                service="open-meteo",
             )
             response.raise_for_status()
             body = response.json()

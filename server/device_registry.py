@@ -76,7 +76,8 @@ class DeviceRegistry:
         self._persisted_device_ids: set[str] = set()
         self._ui_device_id: str = LEGACY_DEVICE_ID
         # Clients may repeatedly send a stale device ID while reconnecting.
-        # Warn once per ID so the fallback remains visible without flooding logs.
+        # Warn once per unknown ID so the fallback remains visible without flooding logs.
+        # "default" is an alias for the UI device, not an unknown robot.
         self._warned_unknown_device_ids: set[str] = set()
         self.reload()
 
@@ -154,13 +155,25 @@ class DeviceRegistry:
 
         Used at server startup so offline devices from a prior server run do not
         appear in the UI. Per-device settings are retained when the same device
-        is found again.
+        is found again. An empty scan keeps the persisted inventory — mDNS/UDP
+        often misses robots on the first boot pass.
         """
         cleaned = self._clean_discovered(devices)
+        if not cleaned:
+            with self._lock:
+                kept = len(self._devices)
+            if kept:
+                logger.info(
+                    "Startup discovery found no robots — keeping %d persisted device(s)",
+                    kept,
+                )
+            return []
+
         with self._lock:
             replacement = {
                 device_id: self._merge_discovered_record(
-                    self._devices.get(device_id), discovered
+                    self._devices.get(device_id) or self._find_locked(device_id),
+                    discovered,
                 )
                 for device_id, discovered in cleaned.items()
             }
@@ -220,7 +233,7 @@ class DeviceRegistry:
         """Persist a validated per-device camera orientation."""
         key = (device_id or "").strip() or LEGACY_DEVICE_ID
         with self._lock:
-            existing = self._devices.get(key)
+            existing = self._find_locked(key)
             if existing is None:
                 # UI often sends stale "default" after discovery, or the registry
                 # is only holding a CLI/env camera that was never persisted.
@@ -259,7 +272,7 @@ class DeviceRegistry:
             if existing == record:
                 return record
             updated = dict(self._devices)
-            updated[key] = record
+            updated[existing.device_id] = record
             self._write_devices_locked(updated.values())
             self._devices = updated
             self._persisted_device_ids = set(updated)
@@ -285,7 +298,7 @@ class DeviceRegistry:
 
         key = (device_id or "").strip()
         with self._lock:
-            existing = self._devices.get(key)
+            existing = self._find_locked(key)
             if existing is None:
                 raise KeyError(key)
             record = DeviceRecord(
@@ -310,7 +323,7 @@ class DeviceRegistry:
                 wifi_updated_at=existing.wifi_updated_at,
             )
             updated = dict(self._devices)
-            updated[key] = record
+            updated[existing.device_id] = record
             self._write_devices_locked(updated.values())
             self._devices = updated
             self._persisted_device_ids = set(updated)
@@ -339,7 +352,7 @@ class DeviceRegistry:
 
         key = (device_id or "").strip()
         with self._lock:
-            existing = self._devices.get(key)
+            existing = self._find_locked(key)
             if existing is None:
                 raise KeyError(key)
             record = DeviceRecord(
@@ -360,7 +373,7 @@ class DeviceRegistry:
                 wifi_updated_at=datetime.now(timezone.utc).isoformat(),
             )
             updated = dict(self._devices)
-            updated[key] = record
+            updated[existing.device_id] = record
             self._write_devices_locked(updated.values())
             self._devices = updated
             self._persisted_device_ids = set(updated)
@@ -496,12 +509,26 @@ class DeviceRegistry:
         with self._lock:
             return list(self._devices.values())
 
+    def _find_locked(self, device_id: str) -> DeviceRecord | None:
+        """Exact match, then case-insensitive. Caller must hold ``self._lock``."""
+        key = (device_id or "").strip()
+        if not key:
+            return None
+        found = self._devices.get(key)
+        if found is not None:
+            return found
+        folded = key.casefold()
+        for stored_id, record in self._devices.items():
+            if stored_id.casefold() == folded:
+                return record
+        return None
+
     def get(self, device_id: str | None) -> DeviceRecord | None:
         key = (device_id or "").strip()
         if not key:
             return None
         with self._lock:
-            return self._devices.get(key)
+            return self._find_locked(key)
 
     def default_device_id(self) -> str:
         with self._lock:
@@ -515,11 +542,11 @@ class DeviceRegistry:
         """Return the named device, or the UI/default device. Never raises."""
         with self._lock:
             key = (device_id or "").strip()
-            if key and key in self._devices:
-                return self._devices[key]
-            if not key:
-                pass
-            elif key not in self._devices:
+            alias = key.casefold() in {"", "default", "ui"}
+            if not alias:
+                found = self._find_locked(key)
+                if found is not None:
+                    return found
                 if key not in self._warned_unknown_device_ids:
                     logger.warning(
                         "Unknown device_id=%r — falling back to %s",
@@ -528,8 +555,9 @@ class DeviceRegistry:
                     )
                     self._warned_unknown_device_ids.add(key)
             fallback_id = self.default_device_id()
-            if fallback_id in self._devices:
-                return self._devices[fallback_id]
+            fallback = self._find_locked(fallback_id)
+            if fallback is not None:
+                return fallback
         # Empty registry — synthesize legacy on the fly.
         legacy = self._legacy_from_environ()
         return legacy[0]

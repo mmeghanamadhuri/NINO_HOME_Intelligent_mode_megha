@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 import requests
 
 from device_registry import DeviceRecord, DeviceRegistry, get_device_registry
+from pipeline_log import log_http, pipeline_log
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +166,16 @@ class DeviceDiscovery:
                 len(removed),
                 [record.device_id for record in live] or ["(none)"],
             )
+            for record in changed:
+                pipeline_log(
+                    "DEVICE",
+                    "ONLINE",
+                    device_id=record.device_id,
+                    url=record.effective_base_url(),
+                    name=record.display_name,
+                )
+            for device_id in removed:
+                pipeline_log("DEVICE", "OFFLINE", device_id=device_id)
             if changed or removed:
                 logger.info(
                     "NiNO discovery updated %d / removed %d device(s)",
@@ -296,8 +307,17 @@ class DeviceDiscovery:
         for ip, port in candidates:
             base_url = f"http://{ip}" if port == 80 else f"http://{ip}:{port}"
             try:
+                t0 = time.perf_counter()
                 response = requests.get(
                     f"{base_url}/status", timeout=self.http_timeout_s
+                )
+                log_http(
+                    "DEVICE",
+                    "GET",
+                    f"{base_url}/status",
+                    status=response.status_code,
+                    stage_s=time.perf_counter() - t0,
+                    extra="discovery",
                 )
                 response.raise_for_status()
                 payload = response.json()

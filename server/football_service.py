@@ -10,6 +10,8 @@ from typing import Any
 
 import requests
 
+from pipeline_log import log_http
+
 API_BASE_URL = "https://v3.football.api-sports.io"
 WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
 DEFAULT_CACHE_TTL_SECONDS = 45.0
@@ -80,11 +82,20 @@ class FootballService:
                 return list(self._cache.matches)
 
         try:
+            t0 = time.perf_counter()
             response = requests.get(
                 f"{self.base_url}/fixtures",
                 params={"live": "all"},
                 headers={"x-apisports-key": self.api_key},
                 timeout=self.request_timeout_seconds,
+            )
+            log_http(
+                "CLOUD",
+                "GET",
+                f"{self.base_url}/fixtures",
+                status=response.status_code,
+                stage_s=time.perf_counter() - t0,
+                service="api-football",
             )
             response.raise_for_status()
             body = response.json()

@@ -13,6 +13,7 @@ import urllib.parse
 import urllib.request
 
 from network_util import voice_ws_url_for_esp
+from pipeline_log import log_http, pipeline_log
 
 logger = logging.getLogger(__name__)
 
@@ -122,18 +123,33 @@ def derive_esp_base_url(camera_source: str) -> str | None:
 
 
 def ensure_esp_play_wav_url_configured(*, camera_source: str | None = None) -> str | None:
-    """Set ESP_PLAY_WAV_URL from CAMERA_SOURCE when unset."""
+    """Set ESP_PLAY_WAV_URL from CAMERA_SOURCE or a known device when unset."""
     existing = os.environ.get("ESP_PLAY_WAV_URL", "").strip()
     if existing:
         return existing
     cam = camera_source if camera_source is not None else os.environ.get("CAMERA_SOURCE", "")
     base = derive_esp_base_url(cam)
-    if not base:
-        return None
-    url = f"{base}/play_wav"
-    os.environ["ESP_PLAY_WAV_URL"] = url
-    logger.info("ESP_PLAY_WAV_URL derived from camera source: %s", url)
-    return url
+    if base:
+        url = f"{base}/play_wav"
+        os.environ["ESP_PLAY_WAV_URL"] = url
+        logger.info("ESP_PLAY_WAV_URL derived from camera source: %s", url)
+        return url
+    try:
+        from device_registry import get_device_registry
+
+        for record in get_device_registry().list_devices():
+            url = record.effective_play_wav_url()
+            if url:
+                os.environ["ESP_PLAY_WAV_URL"] = url
+                logger.info(
+                    "ESP_PLAY_WAV_URL derived from device %s: %s",
+                    record.device_id,
+                    url,
+                )
+                return url
+    except Exception:
+        logger.debug("Could not derive ESP_PLAY_WAV_URL from device registry", exc_info=True)
+    return None
 
 
 def esp_play_wav_url() -> str | None:
@@ -185,6 +201,7 @@ def _post_wav_to_url(
         method="POST",
         headers=headers,
     )
+    t0 = time.perf_counter()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if resp.status != 200:
@@ -193,10 +210,36 @@ def _post_wav_to_url(
             if b'"ok":true' not in body and b'"ok": true' not in body:
                 if b'"ok":false' in body or b'"ok": false' in body:
                     raise RuntimeError(body.decode("utf-8", errors="replace"))
+        log_http(
+            "DEVICE",
+            "POST",
+            url,
+            status=200,
+            stage_s=time.perf_counter() - t0,
+            wav_bytes=len(wav),
+            device=device_id or "-",
+            extra="play_wav",
+        )
     except urllib.error.HTTPError as exc:
+        log_http(
+            "DEVICE",
+            "POST",
+            url,
+            status=exc.code,
+            stage_s=time.perf_counter() - t0,
+            extra=str(exc)[:120],
+        )
         detail = exc.read().decode("utf-8", errors="replace") if exc.fp else str(exc)
         raise RuntimeError(f"ESP HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
+        log_http(
+            "DEVICE",
+            "POST",
+            url,
+            status="error",
+            stage_s=time.perf_counter() - t0,
+            extra=str(exc)[:120],
+        )
         raise RuntimeError(f"ESP URL error: {exc}") from exc
 
 

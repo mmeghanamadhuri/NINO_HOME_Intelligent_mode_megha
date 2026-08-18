@@ -50,6 +50,13 @@ from tts_service import (
     synthesize_sapi_wav_bytes,
 )
 from vision_eye_driver import VisionEyeDriver
+from pipeline_log import (
+    UvicornPollFilter,
+    begin_pipeline,
+    end_pipeline,
+    pipeline_log,
+    uvicorn_log_config,
+)
 from weather_service import (
     DeviceLocationUnavailableError,
     WeatherUnavailableError,
@@ -120,6 +127,7 @@ def _configure_shutdown_logging() -> None:
     logging.getLogger().addFilter(filt)
     for name in ("uvicorn", "uvicorn.error", "uvicorn.access", "starlette", "fastapi"):
         logging.getLogger(name).addFilter(filt)
+    logging.getLogger("uvicorn.access").addFilter(UvicornPollFilter())
 
 
 async def _serve_uvicorn(host: str, port: int) -> None:
@@ -130,9 +138,11 @@ async def _serve_uvicorn(host: str, port: int) -> None:
         host=host,
         port=port,
         log_level="info",
+        log_config=uvicorn_log_config(),
         timeout_graceful_shutdown=3,
     )
     server = uvicorn.Server(config)
+    logging.getLogger("uvicorn.access").addFilter(UvicornPollFilter())
     await server.serve()
 
 
@@ -246,6 +256,7 @@ class DeviceWifiNetworkRequest(BaseModel):
 
 @app.on_event("startup")
 def startup() -> None:
+    logging.getLogger("uvicorn.access").addFilter(UvicornPollFilter())
     _load_env_file()
     faces.apply_settings_from_environ()
     face_registration.apply_settings_from_environ()
@@ -256,10 +267,10 @@ def startup() -> None:
     preload_whisper_model()
     get_memory_service().startup()
     get_alarm_service().start()
-    ensure_esp_play_wav_url_configured()
     registry.reload()
     # Start each server run from a fresh LAN inventory. This removes devices
     # persisted by a previous run when they no longer answer mDNS/UDP discovery.
+    # An empty first scan keeps the persisted robots (mDNS is often late).
     discover_devices_once(replace_registry=True)
     cameras.start_all()
     # Discovery runs in its own daemon thread. Startup remains responsive when
@@ -267,6 +278,7 @@ def startup() -> None:
     start_discovery_loop(on_registry_updated=cameras.configure_from_registry)
     tts.set_playback_device_id(registry.ui_device_id())
     face_registration.set_frame_getter(cameras.frame_getter(registry.ui_device_id()))
+    ensure_esp_play_wav_url_configured()
 
     def _on_vision_greeting_spoken(
         person_name: str,
@@ -289,8 +301,15 @@ def startup() -> None:
         )
 
     tts.set_on_greeting_spoken(_on_vision_greeting_spoken)
+    device_play = [
+        f"{d.device_id}={d.effective_play_wav_url()}"
+        for d in registry.list_devices()
+        if d.effective_play_wav_url()
+    ]
     play_url = esp_play_wav_url()
-    if play_url:
+    if device_play:
+        logger.info("ESP playback URLs: %s", ", ".join(device_play))
+    elif play_url:
         logger.info("ESP speaker/eyes playback URL (legacy): %s", play_url)
     else:
         logger.warning(
@@ -1344,6 +1363,16 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
         client=client_label,
         energy=aux_energy,
     )
+    pipeline_log(
+        "DEVICE",
+        "CONNECT",
+        device_id=device_id,
+        turn=voice_turn,
+        session=session_kind,
+        client=client_label,
+        energy=aux_energy,
+        path=str(websocket.url.path if hasattr(websocket, "url") else "/ws/voice"),
+    )
     await run_in_threadpool(
         _append_latency_record,
         _latency_log_record(
@@ -1389,6 +1418,23 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
             t_query_start = time.perf_counter()
             identity_seconds = 0.0
             pipeline_error: str | None = None
+            begin_pipeline(
+                device_id=device_id,
+                turn=voice_turn,
+                session=session_kind,
+                t0=t_query_start,
+            )
+            pipeline_log(
+                "DEVICE",
+                "AUDIO",
+                device_id=device_id,
+                turn=voice_turn,
+                session=session_kind,
+                t0=t_query_start,
+                bytes=len(wav_in),
+                client=client_label,
+                energy=aux_energy,
+            )
             await run_in_threadpool(begin_voice_query)
             await run_in_threadpool(face_registration.on_voice_query_started)
             try:
@@ -1410,6 +1456,18 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                             _recall_voice_viewer, device_id
                         )
                     identity_seconds = round(time.perf_counter() - t_ident, 3)
+                    pipeline_log(
+                        "IDENT",
+                        "DONE",
+                        device_id=device_id,
+                        turn=voice_turn,
+                        session=session_kind,
+                        t0=t_query_start,
+                        name=identity_name or "(none)",
+                        state=identity_state,
+                        viewer=active_viewer or "(none)",
+                        stage_s=identity_seconds,
+                    )
 
                     camera_scene = await run_in_threadpool(
                         _camera_scene_snapshot, device_id
@@ -1426,6 +1484,7 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                             session_kind=session_kind,
                             aux_energy=aux_energy,
                             voice_turn=voice_turn,
+                            pipeline_t0=t_query_start,
                         )
 
                     wav_out, reply_meta = await run_in_threadpool(_run_voice)
@@ -1490,6 +1549,23 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                     in_s=float(timings.get("audio_in_seconds") or 0),
                     out_s=float(timings.get("audio_out_seconds") or 0),
                 )
+                pipeline_log(
+                    "TOTAL",
+                    "SERVER",
+                    device_id=device_id,
+                    turn=timings.get("turn", voice_turn),
+                    session=session_kind,
+                    t0=t_query_start,
+                    path=timings.get("reply_path"),
+                    asr_s=float(timings.get("stt_seconds") or 0),
+                    llm_s=float(timings.get("reply_seconds") or 0),
+                    tts_s=float(timings.get("tts_seconds") or 0),
+                    identity_s=identity_seconds,
+                    process_s=process_total,
+                    heard=str(timings.get("heard") or "")[:120] or "(empty)",
+                    reply=str(timings.get("reply_text") or "")[:120],
+                    stage_s=server_total,
+                )
                 record = _latency_log_record(
                     event="voice_query",
                     client=client_label,
@@ -1523,7 +1599,19 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                     )
                 await websocket.send_json(ws_meta)
                 if wav_out:
+                    t_send = time.perf_counter()
                     await websocket.send_bytes(wav_out)
+                    pipeline_log(
+                        "DEVICE",
+                        "SEND",
+                        device_id=device_id,
+                        turn=timings.get("turn", voice_turn),
+                        session=session_kind,
+                        t0=t_query_start,
+                        wav_bytes=len(wav_out),
+                        continue_listen=int(bool(reply_meta.prompt_medical_ack)),
+                        stage_s=time.perf_counter() - t_send,
+                    )
 
                 if reply_meta.face_reg_relisten:
                     asyncio.create_task(_delayed_face_reg_relisten(0.5))
@@ -1558,6 +1646,16 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                     session_seconds=round(time.perf_counter() - session_started, 3),
                 ),
             )
+            pipeline_log(
+                "DEVICE",
+                "DISCONNECT",
+                device_id=device_id,
+                turn=voice_turn,
+                session=session_kind,
+                client=client_label,
+                queries=0,
+                stage_s=time.perf_counter() - session_started,
+            )
         else:
             await run_in_threadpool(
                 _append_latency_record,
@@ -1569,6 +1667,17 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                     session_seconds=round(time.perf_counter() - session_started, 3),
                 ),
             )
+            pipeline_log(
+                "DEVICE",
+                "DISCONNECT",
+                device_id=device_id,
+                turn=voice_turn,
+                session=session_kind,
+                client=client_label,
+                queries=session_queries,
+                stage_s=time.perf_counter() - session_started,
+            )
+        end_pipeline()
         try:
             await websocket.close()
         except Exception:

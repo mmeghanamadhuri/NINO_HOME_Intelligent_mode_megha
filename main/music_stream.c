@@ -570,6 +570,12 @@ void nino_music_pause_for_speech(bool paused) {
     return;
   }
   s_speech_pause = paused;
+  if (paused) {
+    /* Free the shared ES8311 so Aux-in can open the ADC. */
+    nino_audio_bus_lock();
+    nino_audio_drop_speaker_stream_locked();
+    nino_audio_bus_unlock();
+  }
   ESP_LOGI(TAG, "Music %s for speech", paused ? "paused" : "resumed");
 }
 

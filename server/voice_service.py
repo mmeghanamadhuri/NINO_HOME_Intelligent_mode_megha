@@ -45,6 +45,7 @@ from memory_filters import (
     query_needs_recent_context,
 )
 from eye_expression import infer_eye_expression_for_response
+from pipeline_log import begin_pipeline, log_http, pipeline_log
 from tts_service import last_tts_synthesis_info, synthesize_sapi_wav_bytes
 from wav_resample import (
     normalize_voice_input_bytes,
@@ -373,9 +374,6 @@ _WAKE_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 
-_WAKE_REJECT_REPLY = (
-    "I didn't catch Ok Nino. Please say Ok Nino, then your question."
-)
 _WAKE_LISTEN_REPLY = "Yes?"
 
 
@@ -387,7 +385,10 @@ def _normalize_wake_text(text: str) -> str:
 
 
 def extract_wake_and_command(text: str) -> tuple[bool, str, str]:
-    """Return (found, command_after_wake, matched_phrase)."""
+    """Return (found, command_after_wake, matched_phrase).
+
+    Used only to strip a leading wake phrase from STT, not to reject queries.
+    """
     raw = str(text or "").strip()
     norm = _normalize_wake_text(raw)
     if not norm:
@@ -415,9 +416,9 @@ def log_nino_voice(stage: str, *, turn: object = None, **fields: object) -> None
             text = repr(text)
         parts.append(f"{key}={text}")
     logger.info(
-        "NINO VOICE | turn=%s | %-8s | %s",
+        "NINO VOICE | turn=%s | %-12s | %s",
         "-" if turn is None else turn,
-        stage[:8],
+        stage[:12],
         " ".join(parts),
     )
 
@@ -1467,12 +1468,22 @@ def _transcribe_openai_whisper(wav_bytes: bytes) -> str:
     if SETTINGS.whisper_language:
         data["language"] = SETTINGS.whisper_language
     url = f"{SETTINGS.openai_api_base}/audio/transcriptions"
+    t0 = time.perf_counter()
     resp = requests.post(
         url,
         headers={"Authorization": f"Bearer {api_key}"},
         data=data,
         files={"file": ("voice.wav", wav_bytes, "audio/wav")},
         timeout=45,
+    )
+    log_http(
+        "CLOUD",
+        "POST",
+        url,
+        status=resp.status_code,
+        stage_s=time.perf_counter() - t0,
+        service="openai_whisper",
+        model=SETTINGS.openai_whisper_model,
     )
     if resp.status_code != 200:
         raise RuntimeError(
@@ -1496,12 +1507,22 @@ def _transcribe_elevenlabs(wav_bytes: bytes) -> str:
     }
     if SETTINGS.whisper_language:
         data["language_code"] = SETTINGS.whisper_language
+    t0 = time.perf_counter()
     resp = requests.post(
         "https://api.elevenlabs.io/v1/speech-to-text",
         headers={"xi-api-key": api_key},
         data=data,
         files={"file": ("voice.wav", wav_bytes, "audio/wav")},
         timeout=30,
+    )
+    log_http(
+        "CLOUD",
+        "POST",
+        "https://api.elevenlabs.io/v1/speech-to-text",
+        status=resp.status_code,
+        stage_s=time.perf_counter() - t0,
+        service="elevenlabs_stt",
+        model=SETTINGS.elevenlabs_stt_model,
     )
     if resp.status_code != 200:
         raise RuntimeError(
@@ -1515,20 +1536,80 @@ def _transcribe_elevenlabs(wav_bytes: bytes) -> str:
 
 def transcribe_wav(wav_bytes: bytes) -> tuple[str, str]:
     """Transcribe device WAV. Returns (text, engine_used)."""
-    if SETTINGS.stt_provider in {"openai_whisper", "openai", "whisper_api"}:
-        try:
-            return _transcribe_openai_whisper(wav_bytes), "openai_whisper"
-        except Exception as exc:
-            logger.warning(
-                "OpenAI Whisper STT failed (%s); falling back to local Whisper.", exc
-            )
-    if SETTINGS.stt_provider == "elevenlabs":
-        try:
-            return _transcribe_elevenlabs(wav_bytes), "elevenlabs"
-        except Exception as exc:
-            # Network/API hiccup must not brick the robot — fall back to local Whisper.
-            logger.warning("ElevenLabs STT failed (%s); falling back to Whisper.", exc)
-    return _transcribe_whisper(wav_bytes), "whisper"
+    audio_s = _wav_seconds(wav_bytes)
+    pipeline_log(
+        "ASR",
+        "START",
+        provider=SETTINGS.stt_provider,
+        audio_s=f"{audio_s:.2f}",
+        bytes=len(wav_bytes),
+    )
+    t0 = time.perf_counter()
+    engine = SETTINGS.stt_provider
+    try:
+        if SETTINGS.stt_provider in {"openai_whisper", "openai", "whisper_api"}:
+            try:
+                text = _transcribe_openai_whisper(wav_bytes)
+                engine = "openai_whisper"
+                pipeline_log(
+                    "ASR",
+                    "DONE",
+                    engine=engine,
+                    text=text or "(empty)",
+                    stage_s=time.perf_counter() - t0,
+                )
+                return text, engine
+            except Exception as exc:
+                pipeline_log(
+                    "ASR",
+                    "FAIL",
+                    engine="openai_whisper",
+                    error=str(exc),
+                    stage_s=time.perf_counter() - t0,
+                )
+                logger.warning(
+                    "OpenAI Whisper STT failed (%s); falling back to local Whisper.", exc
+                )
+        if SETTINGS.stt_provider == "elevenlabs":
+            try:
+                text = _transcribe_elevenlabs(wav_bytes)
+                engine = "elevenlabs"
+                pipeline_log(
+                    "ASR",
+                    "DONE",
+                    engine=engine,
+                    text=text or "(empty)",
+                    stage_s=time.perf_counter() - t0,
+                )
+                return text, engine
+            except Exception as exc:
+                pipeline_log(
+                    "ASR",
+                    "FAIL",
+                    engine="elevenlabs",
+                    error=str(exc),
+                    stage_s=time.perf_counter() - t0,
+                )
+                logger.warning("ElevenLabs STT failed (%s); falling back to Whisper.", exc)
+        text = _transcribe_whisper(wav_bytes)
+        engine = "whisper"
+        pipeline_log(
+            "ASR",
+            "DONE",
+            engine=engine,
+            text=text or "(empty)",
+            stage_s=time.perf_counter() - t0,
+        )
+        return text, engine
+    except Exception as exc:
+        pipeline_log(
+            "ASR",
+            "FAIL",
+            engine=engine,
+            error=str(exc),
+            stage_s=time.perf_counter() - t0,
+        )
+        raise
 
 
 def _speak_short_reply(
@@ -1648,6 +1729,7 @@ def process_voice_wav(
     session_kind: str = "wake",
     aux_energy: int | None = None,
     voice_turn: int | None = None,
+    pipeline_t0: float | None = None,
 ) -> tuple[bytes, VoiceReplyMeta]:
     meta = VoiceReplyMeta(device_id=device_id or "")
     session = "continue" if str(session_kind or "").strip().lower() in {
@@ -1667,6 +1749,12 @@ def process_voice_wav(
         raise RuntimeError(str(exc)) from exc
 
     t_start = time.perf_counter()
+    begin_pipeline(
+        device_id=device_id,
+        turn=voice_turn,
+        session=session,
+        t0=pipeline_t0 or t_start,
+    )
     audio_in_seconds = _wav_seconds(wav_bytes)
     peak_energy = clip_peak_energy(wav_bytes, aux_energy)
     energy_gate = min_speech_energy()
@@ -1740,65 +1828,33 @@ def process_voice_wav(
             },
         )
 
+    # Device Aux-in already decided this clip is a query. Do not require
+    # "Ok Nino" in the transcript; strip it when STT captured it anyway.
     wake_found, command_text, wake_phrase = extract_wake_and_command(user_text)
     heard_raw = user_text
-    if session == "wake":
-        if not wake_found:
-            # Trust a missing wake phrase only when Aux actually carried speech.
-            if (
-                peak_energy >= energy_gate
-                and heard_raw.strip()
-                and not is_unintelligible_stt(heard_raw)
-            ):
-                log_nino_voice(
-                    "WAKE",
-                    turn=voice_turn,
-                    ok=1,
-                    device=device_id or "-",
-                    phrase="(energy)",
-                    command=heard_raw[:200],
-                    energy=peak_energy,
-                )
-                user_text = heard_raw
-            else:
-                _record_rejected_wake(
-                    device_id=device_id,
-                    heard=heard_raw,
-                    reason="no wake phrase and no usable command",
-                    audio_s=audio_in_seconds,
-                )
-                log_nino_voice(
-                    "WAKE",
-                    turn=voice_turn,
-                    ok=0,
-                    device=device_id or "-",
-                    heard=heard_raw[:200],
-                    reason="no wake phrase and no usable command",
-                )
-                return _speak_short_reply(
-                    meta,
-                    reply=_WAKE_REJECT_REPLY,
-                    reply_path="wake_reject",
-                    heard=heard_raw,
-                    audio_input_format=audio_input_format,
-                    audio_in_seconds=audio_in_seconds,
-                    wav_bytes=wav_bytes,
-                    stt_engine=stt_engine,
-                    t_start=t_start,
-                    t_stt=t_stt,
-                    extra={"session": session, "wake_ok": False, "turn": voice_turn},
-                )
-        else:
-            user_text = command_text
-            log_nino_voice(
-                "WAKE",
-                turn=voice_turn,
-                ok=1,
-                device=device_id or "-",
-                phrase=wake_phrase,
-                command=user_text[:200] or "(none)",
-            )
-        if not user_text.strip():
+    if wake_found:
+        user_text = command_text
+        log_nino_voice(
+            "WAKE",
+            turn=voice_turn,
+            ok=1,
+            device=device_id or "-",
+            phrase=wake_phrase,
+            command=user_text[:200] or "(none)",
+            session=session,
+        )
+    else:
+        log_nino_voice(
+            "WAKE" if session == "wake" else "CONV",
+            turn=voice_turn,
+            ok=1,
+            device=device_id or "-",
+            phrase="(none)",
+            command=user_text[:200],
+            session=session,
+        )
+    if not user_text.strip():
+        if session == "wake":
             meta.prompt_medical_ack = True
             log_nino_voice(
                 "WAKE",
@@ -1825,42 +1881,23 @@ def process_voice_wav(
                     "turn": voice_turn,
                 },
             )
-        log_nino_voice("CMD", turn=voice_turn, session="wake", text=user_text[:200])
-    else:
-        if wake_found:
-            log_nino_voice(
-                "CONV",
-                turn=voice_turn,
-                device=device_id or "-",
-                stripped_wake=wake_phrase,
-                command=command_text[:200],
-            )
-            if command_text.strip():
-                user_text = command_text
-        else:
-            log_nino_voice(
-                "CONV",
-                turn=voice_turn,
-                device=device_id or "-",
-                command=user_text[:200],
-            )
-        if not user_text.strip():
-            return _silent_close(
-                meta,
-                reply_path="stt_empty",
-                heard=heard_raw,
-                audio_input_format=audio_input_format,
-                audio_in_seconds=audio_in_seconds,
-                wav_bytes=wav_bytes,
-                stt_engine=stt_engine,
-                t_start=t_start,
-                t_stt=t_stt,
-                extra={
-                    "session": session,
-                    "wake_in_speech": wake_found,
-                    "turn": voice_turn,
-                },
-            )
+        return _silent_close(
+            meta,
+            reply_path="stt_empty",
+            heard=heard_raw,
+            audio_input_format=audio_input_format,
+            audio_in_seconds=audio_in_seconds,
+            wav_bytes=wav_bytes,
+            stt_engine=stt_engine,
+            t_start=t_start,
+            t_stt=t_stt,
+            extra={
+                "session": session,
+                "wake_in_speech": wake_found,
+                "turn": voice_turn,
+            },
+        )
+    log_nino_voice("CMD", turn=voice_turn, session=session, text=user_text[:200])
 
     handled_volume, volume_reply = apply_volume_command(
         user_text, device_id=device_id or None
@@ -2530,5 +2567,16 @@ def process_voice_wav(
         in_s=round(audio_in_seconds, 2),
         out_s=round(audio_out_seconds, 2),
         eye=meta.eye_expression or "",
+    )
+    pipeline_log(
+        "TOTAL",
+        "QUERY",
+        path=reply_path,
+        asr_s=meta.timings["stt_seconds"],
+        llm_s=meta.timings["reply_seconds"],
+        tts_s=meta.timings["tts_seconds"],
+        heard=user_text[:120],
+        reply=(reply or "")[:120],
+        stage_s=meta.timings["process_total_seconds"],
     )
     return wav_out, meta

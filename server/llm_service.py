@@ -9,10 +9,13 @@ import random
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
 import requests
+
+from pipeline_log import pipeline_log
 
 logger = logging.getLogger(__name__)
 
@@ -359,10 +362,43 @@ def ollama_generate(
     if options:
         payload["options"] = options
 
-    r = requests.post(url, json=payload, timeout=timeout_s)
-    r.raise_for_status()
-    data = r.json()
-    text = str(data.get("response", "")).strip()
+    pipeline_log(
+        "LLM",
+        "START",
+        model=m,
+        url=url,
+        prompt_chars=len(prompt),
+        timeout_s=timeout_s,
+    )
+    t0 = time.perf_counter()
+    try:
+        r = requests.post(url, json=payload, timeout=timeout_s)
+        r.raise_for_status()
+        data = r.json()
+        text = str(data.get("response", "")).strip()
+        eval_s = data.get("eval_duration")
+        load_s = data.get("load_duration")
+        pipeline_log(
+            "LLM",
+            "DONE",
+            model=m,
+            url=url,
+            status=r.status_code,
+            text=text or "(empty)",
+            eval_ns=eval_s,
+            load_ns=load_s,
+            stage_s=time.perf_counter() - t0,
+        )
+    except Exception as exc:
+        pipeline_log(
+            "LLM",
+            "FAIL",
+            model=m,
+            url=url,
+            error=str(exc),
+            stage_s=time.perf_counter() - t0,
+        )
+        raise
     if not text:
         raise RuntimeError("Ollama returned an empty response.")
     return text

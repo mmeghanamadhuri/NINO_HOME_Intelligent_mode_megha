@@ -15,6 +15,8 @@ os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
 import cv2
 import numpy as np
 
+from pipeline_log import pipeline_log
+
 try:
     cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
 except Exception:
@@ -111,8 +113,9 @@ def _suppress_native_stderr() -> Any:
 class CameraStream:
     """Continuously pulls frames from a local camera index or stream URL."""
 
-    def __init__(self, default_source: str, rotation: str | None = None) -> None:
+    def __init__(self, default_source: str, rotation: str | None = None, device_id: str = "") -> None:
         self.source = default_source
+        self.device_id = device_id or "-"
         self.active_source: int | str | None = None
         self._capture: cv2.VideoCapture | None = None
         self._frame: np.ndarray | None = None
@@ -147,6 +150,12 @@ class CameraStream:
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run, name="camera-stream", daemon=True)
         self._thread.start()
+        pipeline_log(
+            "CAMERA",
+            "START",
+            device_id=self.device_id,
+            source=self.source,
+        )
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -166,6 +175,21 @@ class CameraStream:
         self._rotation_setting = normalized
         self._rotation_code = parse_camera_rotation(normalized)
         return normalized
+
+    def _mark_connected(self, connected: bool, source: object = "", *, error: str = "") -> None:
+        was = self._connected
+        self._connected = connected
+        if error:
+            self._last_error = error
+        if was == connected:
+            return
+        pipeline_log(
+            "CAMERA",
+            "UP" if connected else "DOWN",
+            device_id=self.device_id,
+            source=source or self.active_source or self.source,
+            error=error or None,
+        )
 
     def _join_worker(self, timeout: float) -> None:
         if (
@@ -269,25 +293,23 @@ class CameraStream:
                 self._store_frame(frame)
                 self._frames_received += 1
                 self._last_frame_at = time.time()
-                self._connected = True
+                self._mark_connected(True, snapshot_url)
                 self._last_error = ""
                 self.active_source = snapshot_url
             except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
-                self._connected = False
-                self._last_error = str(exc)[:240]
+                self._mark_connected(False, snapshot_url, error=str(exc)[:240])
             except ValueError as exc:
                 # Bad or partial JPEG: keep last good frame; do not flip "connected" off
                 # if we were already streaming (avoids UI flicker with MJPEG-style JPEGs).
                 self._last_error = str(exc)[:120]
                 if self._frames_received == 0:
-                    self._connected = False
+                    self._mark_connected(False, snapshot_url, error=str(exc)[:120])
             except Exception as exc:
                 # Keep the poller alive; a single decode/FD glitch must not freeze the UI.
-                self._connected = False
-                self._last_error = str(exc)[:240]
+                self._mark_connected(False, snapshot_url, error=str(exc)[:240])
             time.sleep(SNAPSHOT_POLL_INTERVAL_SECONDS)
 
-        self._connected = False
+        self._mark_connected(False, snapshot_url)
 
     def _run(self) -> None:
         snapshot_url = self._http_snapshot_poll_url(self.source)
@@ -309,8 +331,7 @@ class CameraStream:
 
             ok, frame = capture.read()
             if not ok or frame is None:
-                self._connected = False
-                self._last_error = "Could not read frame; reconnecting"
+                self._mark_connected(False, error="Could not read frame; reconnecting")
                 self._release_capture()
                 time.sleep(0.5)
                 continue
@@ -318,10 +339,10 @@ class CameraStream:
             self._store_frame(frame)
             self._frames_received += 1
             self._last_frame_at = time.time()
-            self._connected = True
+            self._mark_connected(True, self.active_source)
             self._last_error = ""
 
-        self._connected = False
+        self._mark_connected(False)
 
     def _open_capture(self) -> None:
         self._release_capture()
@@ -360,7 +381,7 @@ class CameraStream:
         else:
             self._last_error = f"Could not open camera source: {self.source}"
         self.active_source = None
-        self._connected = False
+        self._mark_connected(False, error=self._last_error)
 
     def _make_capture(self, source: int | str) -> cv2.VideoCapture:
         if isinstance(source, int):
@@ -429,6 +450,7 @@ class CameraPool:
                     stream = CameraStream(
                         source,
                         record.camera_rotation if record else "none",
+                        device_id=device_id,
                     )
                     stream.start()
                     self._streams[device_id] = stream
@@ -456,7 +478,7 @@ class CameraPool:
         with self._lock:
             stream = self._streams.get(record.device_id)
             if stream is None:
-                stream = CameraStream(source, record.camera_rotation)
+                stream = CameraStream(source, record.camera_rotation, device_id=record.device_id)
                 stream.start()
                 self._streams[record.device_id] = stream
             else:
@@ -475,7 +497,7 @@ class CameraPool:
         with self._lock:
             stream = self._streams.get(record.device_id)
             if stream is None:
-                stream = CameraStream(source, record.camera_rotation)
+                stream = CameraStream(source, record.camera_rotation, device_id=record.device_id)
                 stream.start()
                 self._streams[record.device_id] = stream
             else:
