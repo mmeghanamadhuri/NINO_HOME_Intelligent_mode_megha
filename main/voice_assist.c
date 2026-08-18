@@ -285,6 +285,8 @@ static uint32_t aux_quiet_threshold(uint32_t noise_floor);
 
 static uint32_t aux_start_threshold(uint32_t noise_floor);
 
+static uint32_t wav_peak_frame_energy(const uint8_t *wav, size_t len);
+
 static esp_err_t run_ws_and_queue_ex(
     voice_session_kind_t session, const int16_t *preroll, size_t preroll_samples,
     uint32_t min_ms, uint32_t max_ms, uint32_t quiet_end_ms,
