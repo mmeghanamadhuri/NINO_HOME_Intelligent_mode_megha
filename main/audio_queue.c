@@ -185,8 +185,7 @@ static bool play_normal_job(audio_play_job_t *job) {
     (void)nino_voice_play_done_chime();
   }
   if (job->prompt_ack_after) {
-    /* Conversation turn: stay green — next clip is not a new wake. */
-    (void)nino_rgb_led_show(NINO_RGB_SHOW_LISTEN);
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_IDLE);
     /* Done chime already signaled end of TTS — skip second (wake) chime before mic. */
     if (job->play_done_chime) {
       nino_voice_assist_set_next_prompt_ack_chime(false);
@@ -233,7 +232,7 @@ static bool play_suspended(void) {
     (void)nino_voice_play_done_chime();
   }
   if (snap.prompt_ack_after) {
-    (void)nino_rgb_led_show(NINO_RGB_SHOW_LISTEN);
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_IDLE);
     /* Done chime already signaled end of TTS — skip second (wake) chime before mic. */
     if (snap.play_done_chime) {
       nino_voice_assist_set_next_prompt_ack_chime(false);

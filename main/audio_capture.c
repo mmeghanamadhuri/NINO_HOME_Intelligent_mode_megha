@@ -135,7 +135,8 @@ out:
 esp_err_t nino_audio_capture_wav_until_quiet(
     uint8_t **out_wav, size_t *out_len, const int16_t *preroll,
     size_t preroll_samples, uint32_t min_ms, uint32_t max_ms,
-    uint32_t quiet_end_ms, uint32_t quiet_energy, bool flush_first) {
+    uint32_t quiet_end_ms, uint32_t quiet_energy, uint32_t speech_energy,
+    uint32_t wait_speech_ms, bool flush_first) {
   if (out_wav == NULL || out_len == NULL) {
     return ESP_ERR_INVALID_ARG;
   }
@@ -176,6 +177,9 @@ esp_err_t nino_audio_capture_wav_until_quiet(
   int16_t frame[CAP_FRAME_SAMPLES];
   uint32_t elapsed_ms = 0;
   uint32_t quiet_ms = 0;
+  bool heard_speech = false;
+  const uint32_t speech_th =
+      speech_energy > quiet_energy ? speech_energy : (quiet_energy + 80U);
   esp_err_t err = ESP_OK;
 
   while (got + (CAP_FRAME_SAMPLES * CAP_BYTES_PER_SAMPLE) <= pcm_max &&
@@ -193,16 +197,43 @@ esp_err_t nino_audio_capture_wav_until_quiet(
     elapsed_ms += 20;
 
     const uint32_t energy = pcm_abs_mean(frame, CAP_FRAME_SAMPLES);
-    if (elapsed_ms >= min_ms && energy < quiet_energy) {
-      quiet_ms += 20;
-      if (quiet_end_ms > 0 && quiet_ms >= quiet_end_ms) {
-        ESP_LOGI(TAG, "Sentence end: quiet %u ms after %u ms live (energy=%u th=%u)",
-                 (unsigned)quiet_ms, (unsigned)elapsed_ms, (unsigned)energy,
-                 (unsigned)quiet_energy);
+    if (elapsed_ms < min_ms) {
+      /* Wake gap: keep recording, never end on quiet. */
+      quiet_ms = 0;
+      continue;
+    }
+    if (energy >= speech_th) {
+      if (!heard_speech) {
+        ESP_LOGI(TAG, "Question energy after gap: energy=%u th=%u at %u ms",
+                 (unsigned)energy, (unsigned)speech_th, (unsigned)elapsed_ms);
+      }
+      heard_speech = true;
+      quiet_ms = 0;
+      continue;
+    }
+    if (!heard_speech) {
+      if (wait_speech_ms == 0) {
+        quiet_ms += 20;
+        if (quiet_end_ms > 0 && quiet_ms >= quiet_end_ms) {
+          ESP_LOGI(TAG, "Sentence end (no extra question wait) after %u ms",
+                   (unsigned)elapsed_ms);
+          break;
+        }
+        continue;
+      }
+      if ((elapsed_ms - min_ms) >= wait_speech_ms) {
+        ESP_LOGI(TAG, "No question after %u ms gap wait — sending wake clip",
+                 (unsigned)wait_speech_ms);
         break;
       }
-    } else {
-      quiet_ms = 0;
+      continue;
+    }
+    quiet_ms += 20;
+    if (quiet_end_ms > 0 && quiet_ms >= quiet_end_ms) {
+      ESP_LOGI(TAG, "Sentence end: quiet %u ms after %u ms live (energy=%u th=%u)",
+               (unsigned)quiet_ms, (unsigned)elapsed_ms, (unsigned)energy,
+               (unsigned)quiet_energy);
+      break;
     }
   }
 #undef CAP_FRAME_SAMPLES

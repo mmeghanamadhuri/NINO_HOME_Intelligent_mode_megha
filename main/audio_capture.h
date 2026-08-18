@@ -16,14 +16,15 @@ esp_err_t nino_audio_capture_wav(uint8_t **out_wav, size_t *out_len,
 
 /**
  * Record until the Aux-in goes quiet (end of sentence), with an optional
- * pre-roll prepended. Stops after `quiet_end_ms` below `quiet_energy`, but
- * not before `min_ms`, and never after `max_ms` (max 10 s).
- * If `flush_first` is false the current I2S stream is kept (wake tail).
+ * pre-roll prepended. After `min_ms` (wake gap), wait up to `wait_speech_ms`
+ * for the question to start before allowing a quiet stop. Never exceeds
+ * `max_ms` (max 10 s). If `flush_first` is false the I2S stream is kept.
  */
 esp_err_t nino_audio_capture_wav_until_quiet(
     uint8_t **out_wav, size_t *out_len, const int16_t *preroll,
     size_t preroll_samples, uint32_t min_ms, uint32_t max_ms,
-    uint32_t quiet_end_ms, uint32_t quiet_energy, bool flush_first);
+    uint32_t quiet_end_ms, uint32_t quiet_energy, uint32_t speech_energy,
+    uint32_t wait_speech_ms, bool flush_first);
 
 /** Mount the BSP microSD card if needed and save a WAV under /sdcard/recordings. */
 esp_err_t nino_audio_capture_save_to_sd(const uint8_t *wav, size_t wav_len,

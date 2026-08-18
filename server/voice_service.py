@@ -6,6 +6,7 @@ Voice WebSocket input may be WAV or raw 16-bit mono PCM at 16 kHz.
 from __future__ import annotations
 
 import io
+import json
 import os
 import random
 import re
@@ -14,6 +15,7 @@ import wave
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
@@ -290,20 +292,15 @@ _GOODBYE_REPLIES = (
     "Take care! Talk soon.",
 )
 
-# Wake session only: these must appear near the start of STT before ASR/LLM.
-# Conversation turns (session=continue) may contain the same words as speech.
-_WAKE_PHRASES = (
-    "okay nino",
-    "ok nino",
-    "hey nino",
-    "hi nino",
-    "hello nino",
-    "okay nano",
-    "ok nano",
-    "okay neno",
-    "ok neno",
-    "okay nina",
-    "ok nina",
+# Wake session: STT often misspells Nino. Match near the start, then strip.
+_WAKE_RE = re.compile(
+    r"\b(?P<phrase>(?:ok(?:ay)?|hey|hi|hello)\s+"
+    r"(?:nino|nano|neno|nina|nenu|neeno|knee\s*no|you know))\b",
+    re.IGNORECASE,
+)
+_WAKE_NAME_RE = re.compile(
+    r"\b(?P<phrase>nino|nano|neno|nina)\b",
+    re.IGNORECASE,
 )
 
 _WAKE_REJECT_REPLY = (
@@ -325,19 +322,60 @@ def extract_wake_and_command(text: str) -> tuple[bool, str, str]:
     norm = _normalize_wake_text(raw)
     if not norm:
         return False, "", ""
-    best = ""
-    best_idx = -1
-    for phrase in _WAKE_PHRASES:
-        idx = norm.find(phrase)
-        if idx < 0 or idx > 40:
-            continue
-        if len(phrase) > len(best):
-            best = phrase
-            best_idx = idx
-    if best_idx < 0:
+    match = _WAKE_RE.search(norm)
+    if match is None:
+        # "nino" alone in the first few words still counts as the wake name.
+        match = _WAKE_NAME_RE.search(norm)
+        if match is not None and match.start() > 24:
+            match = None
+    if match is None:
         return False, raw, ""
-    rest = norm[best_idx + len(best) :].strip(" ,.-")
-    return True, rest, best
+    rest = norm[match.end() :].strip(" ,.-")
+    return True, rest, _normalize_wake_text(match.group("phrase"))
+
+
+def _log_voice_banner(title: str, **fields: object) -> None:
+    logger.info("========== %s ==========", title)
+    for key, value in fields.items():
+        logger.info("  %-10s %s", key, value)
+    logger.info("================================")
+
+
+_REJECTED_WAKE_PATH = Path(__file__).resolve().parent / "data" / "rejected_wake.log"
+
+
+def _record_rejected_wake(
+    *,
+    device_id: str,
+    heard: str,
+    reason: str,
+    audio_s: float = 0.0,
+) -> None:
+    heard_s = str(heard or "").strip()
+    logger.warning("********** REJECTED WAKE **********")
+    logger.warning("  device   %s", device_id or "-")
+    logger.warning("  heard    %r", heard_s or "(empty STT)")
+    logger.warning("  reason   %s", reason)
+    logger.warning("  log      %s", _REJECTED_WAKE_PATH)
+    logger.warning("***********************************")
+    try:
+        _REJECTED_WAKE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_REJECTED_WAKE_PATH, "a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                        "device_id": device_id or "",
+                        "heard": heard_s,
+                        "reason": reason,
+                        "audio_in_seconds": round(float(audio_s), 3),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    except Exception:
+        logger.exception("Could not append rejected wake log")
 
 
 def is_conversation_goodbye(user_text: str) -> bool:
@@ -370,15 +408,18 @@ def should_continue_listen_after_reply(reply_path: str, user_text: str) -> bool:
 def _mark_continue_listen(meta: VoiceReplyMeta, reply_path: str, user_text: str) -> None:
     if should_continue_listen_after_reply(reply_path, user_text):
         meta.prompt_medical_ack = True
-        logger.info(
-            "SESSION_KEEP path=%s — mic stays open until goodbye",
-            reply_path,
+        _log_voice_banner(
+            "SESSION OPEN",
+            path=reply_path,
+            heard=str(user_text or "")[:120],
+            next="mic stays open until goodbye",
         )
     else:
-        logger.info(
-            "SESSION_END path=%s heard=%r — waiting for a new Ok Nino",
-            reply_path,
-            str(user_text or "")[:80],
+        _log_voice_banner(
+            "SESSION END",
+            path=reply_path,
+            heard=str(user_text or "")[:120],
+            next="waiting for a new Ok Nino",
         )
 
 
@@ -1340,32 +1381,35 @@ def process_voice_wav(
 
     t_start = time.perf_counter()
     audio_in_seconds = _wav_seconds(wav_bytes)
-    logger.info(
-        "VOICE_IN session=%s device=%s bytes=%s audio=%.2fs format=%s",
-        session,
-        device_id or "-",
-        len(wav_bytes),
-        audio_in_seconds,
-        audio_input_format,
+    _log_voice_banner(
+        "VOICE IN",
+        session=session,
+        device=device_id or "-",
+        audio_s=f"{audio_in_seconds:.2f}",
+        bytes=len(wav_bytes),
+        format=audio_input_format,
     )
 
     user_text, stt_engine = transcribe_wav(wav_bytes)
     t_stt = time.perf_counter()
     reply_path = "llm"
-    logger.info(
-        "STT_DONE session=%s device=%s engine=%s text=%r",
-        session,
-        device_id or "-",
-        stt_engine,
-        user_text[:200],
-    )
+    logger.info("STT_DONE engine=%s text=%r", stt_engine, user_text[:200])
 
     if not user_text.strip():
         if session == "wake":
-            logger.warning(
-                "WAKE_REJECT device=%s reason=stt_empty audio=%.2fs — not proceeding to ASR",
-                device_id or "-",
-                audio_in_seconds,
+            _record_rejected_wake(
+                device_id=device_id,
+                heard="",
+                reason="STT empty",
+                audio_s=audio_in_seconds,
+            )
+            _log_voice_banner(
+                "WAKE REJECT",
+                device=device_id or "-",
+                heard="(empty STT)",
+                reason="STT empty",
+                audio_s=f"{audio_in_seconds:.2f}",
+                next="waiting for a new Ok Nino",
             )
             return _speak_short_reply(
                 meta,
@@ -1404,38 +1448,59 @@ def process_voice_wav(
     heard_raw = user_text
     if session == "wake":
         if not wake_found:
-            logger.warning(
-                "WAKE_REJECT device=%s heard=%r — wake word missing, not proceeding to ASR",
-                device_id or "-",
-                heard_raw[:200],
+            # Sirena + P4 energy already triggered this clip. If STT heard a
+            # real command, do not drop the session just because Whisper
+            # missed "Ok Nino".
+            if heard_raw.strip() and not is_unintelligible_stt(heard_raw):
+                _log_voice_banner(
+                    "WAKE OK (device energy)",
+                    device=device_id or "-",
+                    stt=heard_raw[:200],
+                    phrase="(not in STT — Aux energy trigger)",
+                    command=heard_raw[:200],
+                    next="ASR / LLM — session open until goodbye",
+                )
+                user_text = heard_raw
+            else:
+                _record_rejected_wake(
+                    device_id=device_id,
+                    heard=heard_raw,
+                    reason="no wake phrase and no usable command",
+                    audio_s=audio_in_seconds,
+                )
+                _log_voice_banner(
+                    "WAKE REJECT",
+                    device=device_id or "-",
+                    heard=heard_raw[:200],
+                    reason="no wake phrase and no usable command",
+                    next="waiting for a new Ok Nino",
+                )
+                return _speak_short_reply(
+                    meta,
+                    reply=_WAKE_REJECT_REPLY,
+                    reply_path="wake_reject",
+                    heard=heard_raw,
+                    audio_input_format=audio_input_format,
+                    audio_in_seconds=audio_in_seconds,
+                    wav_bytes=wav_bytes,
+                    stt_engine=stt_engine,
+                    t_start=t_start,
+                    t_stt=t_stt,
+                    extra={"session": session, "wake_ok": False},
+                )
+        else:
+            user_text = command_text
+            _log_voice_banner(
+                "WAKE OK",
+                device=device_id or "-",
+                stt=heard_raw[:200],
+                phrase=wake_phrase,
+                command=user_text[:200] or "(none — will listen)",
+                next="ASR / LLM — session open until goodbye",
             )
-            return _speak_short_reply(
-                meta,
-                reply=_WAKE_REJECT_REPLY,
-                reply_path="wake_reject",
-                heard=heard_raw,
-                audio_input_format=audio_input_format,
-                audio_in_seconds=audio_in_seconds,
-                wav_bytes=wav_bytes,
-                stt_engine=stt_engine,
-                t_start=t_start,
-                t_stt=t_stt,
-                extra={"session": session, "wake_ok": False},
-            )
-        user_text = command_text
-        logger.info(
-            "WAKE_OK device=%s phrase=%r command=%r raw=%r",
-            device_id or "-",
-            wake_phrase,
-            user_text[:200],
-            heard_raw[:200],
-        )
         if not user_text.strip():
             meta.prompt_medical_ack = True
-            logger.info(
-                "WAKE_OK_LISTEN device=%s — wake only, opening conversation mic",
-                device_id or "-",
-            )
+            logger.info("WAKE_OK_LISTEN — wake only, opening conversation mic")
             return _speak_short_reply(
                 meta,
                 reply=_WAKE_LISTEN_REPLY,
@@ -1449,11 +1514,7 @@ def process_voice_wav(
                 t_stt=t_stt,
                 extra={"session": session, "wake_ok": True, "wake_phrase": wake_phrase},
             )
-        logger.info(
-            "ASR_COMMAND session=wake device=%s text=%r",
-            device_id or "-",
-            user_text[:200],
-        )
+        logger.info("ASR_COMMAND session=wake text=%r", user_text[:200])
     else:
         if wake_found:
             logger.info(
