@@ -72,7 +72,16 @@ class ContinueListenGateTests(unittest.TestCase):
                 )
 
     def test_non_llm_paths_skip(self) -> None:
-        for path in ("volume", "alarm", "servo_360", "weather", "local_time", "face_registration"):
+        for path in (
+            "volume",
+            "alarm",
+            "servo_360",
+            "weather",
+            "local_time",
+            "face_registration",
+            "music_play",
+            "music_stop",
+        ):
             with self.subTest(path=path):
                 self.assertFalse(
                     should_continue_listen_after_reply(path, "set volume to 50")

@@ -1,8 +1,9 @@
 {
   "C_Cpp.intelliSenseEngine": "default",
-  "idf.currentSetup": "C:\\esp\\v5.5.2\\esp-idf",
+  "idf.currentSetup": "/home/sirena_dgx-1/esp/esp-idf",
   "idf.espIdfPathWin": "C:\\esp\\v5.5.2\\esp-idf",
-  "idf.buildPath": "C:\\esp\\sirena-p4-build",
+  "idf.buildPath": "${workspaceFolder}/build",
+  "idf.buildPathWin": "C:\\esp\\sirena-p4-build",
   "idf.openOcdConfigs": [
     "board/esp32p4-builtin.cfg"
   ],
@@ -14,7 +15,7 @@
   "idf.portWin": "COM4",
   "idf.flashType": "JTAG",
   "idf.extensionActivationMode": "always",
-  "idf.port": "/dev/ttyUSB0",
+  "idf.port": "/dev/ttyACM0",
   "terminal.integrated.profiles.windows": {
     "ESP-IDF 5.5": {
       "path": "powershell.exe",

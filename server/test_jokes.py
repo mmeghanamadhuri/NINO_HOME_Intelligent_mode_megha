@@ -6,12 +6,22 @@ import unittest
 
 import voice_service
 from voice_service import (
+    JOKE_CLOSERS,
+    JOKE_OPENERS,
     JOKES,
     is_football_joke_request,
     is_joke_request,
     random_joke_reply,
     should_continue_listen_after_reply,
 )
+
+
+def _split_joke_reply(reply: str) -> tuple[str, str, str]:
+    """Return (opener, joke, closer) from a spoken joke reply."""
+    opener = next(o for o in JOKE_OPENERS if reply.startswith(o))
+    closer = next(c for c in JOKE_CLOSERS if reply.endswith(c))
+    joke = reply[len(opener) : len(reply) - len(closer)].strip()
+    return opener, joke, closer
 
 
 class JokeRequestTests(unittest.TestCase):
@@ -56,21 +66,32 @@ class JokeRandomizationTests(unittest.TestCase):
     def setUp(self) -> None:
         voice_service._joke_deck = []
         voice_service._last_joke = None
+        voice_service._joke_opener_deck = []
+        voice_service._joke_closer_deck = []
 
     def test_reply_uses_known_joke(self) -> None:
         reply = random_joke_reply()
-        self.assertTrue(reply.startswith("Sure! "))
-        self.assertIn(reply.removeprefix("Sure! "), JOKES)
+        _opener, joke, _closer = _split_joke_reply(reply)
+        self.assertIn(joke, JOKES)
+
+    def test_reply_is_enthusiastic_and_joyful(self) -> None:
+        for _ in range(len(JOKES)):
+            opener, _joke, closer = _split_joke_reply(random_joke_reply())
+            self.assertIn(opener, JOKE_OPENERS)
+            self.assertIn(closer, JOKE_CLOSERS)
+
+    def test_openers_vary_between_jokes(self) -> None:
+        openers = {_split_joke_reply(random_joke_reply())[0] for _ in range(6)}
+        self.assertGreater(len(openers), 1)
 
     def test_no_immediate_repeat_across_full_deck(self) -> None:
         seen: list[str] = []
         for _ in range(len(JOKES)):
-            joke = random_joke_reply().removeprefix("Sure! ")
-            seen.append(joke)
+            seen.append(_split_joke_reply(random_joke_reply())[1])
         self.assertEqual(sorted(seen), sorted(JOKES))
 
         # Next cycle should not start with the last joke from the previous deck.
-        next_joke = random_joke_reply().removeprefix("Sure! ")
+        next_joke = _split_joke_reply(random_joke_reply())[1]
         self.assertNotEqual(next_joke, seen[-1])
 
     def test_continue_listen_after_joke(self) -> None:

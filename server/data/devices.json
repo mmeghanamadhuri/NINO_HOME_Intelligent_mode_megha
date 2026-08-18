@@ -1,38 +1,38 @@
 {
   "devices": [
     {
-      "device_id": "nino-000000",
-      "display_name": "NINO - HOME",
-      "camera_url": "http://192.168.0.207/stream",
-      "play_wav_url": "http://192.168.0.207/play_wav",
-      "base_url": "http://192.168.0.207",
+      "device_id": "nino-home-147",
+      "display_name": "NINO - HOME BOT",
+      "camera_url": "http://192.168.1.147/stream",
+      "play_wav_url": "http://192.168.1.147/play_wav",
+      "base_url": "http://192.168.1.147",
       "camera_rotation": "none",
       "latitude": null,
       "longitude": null,
       "location_name": "",
       "location_updated_at": "",
-      "wifi_ssid": "GOSPAZE Premium Connect",
-      "wifi_bssid": "BC:07:1D:67:1B:60",
-      "wifi_rssi": -42,
-      "wifi_channel": 11,
-      "wifi_updated_at": "2026-07-29T15:06:32.943210+00:00"
+      "wifi_ssid": "okgoogle",
+      "wifi_bssid": "30:23:03:C2:AD:5B",
+      "wifi_rssi": -52,
+      "wifi_channel": 13,
+      "wifi_updated_at": "2026-08-18T14:43:28.109799+00:00"
     },
     {
-      "device_id": "nino-home",
-      "display_name": "NINO-P4",
-      "camera_url": "http://192.168.0.87/stream",
-      "play_wav_url": "http://192.168.0.87/play_wav",
-      "base_url": "http://192.168.0.87",
-      "camera_rotation": "cw90",
+      "device_id": "ninofarfromhome",
+      "display_name": "NINO far from HOME",
+      "camera_url": "http://192.168.1.169/stream",
+      "play_wav_url": "http://192.168.1.169/play_wav",
+      "base_url": "http://192.168.1.169",
+      "camera_rotation": "none",
       "latitude": null,
       "longitude": null,
       "location_name": "",
       "location_updated_at": "",
-      "wifi_ssid": "GOSPAZE Premium Connect",
-      "wifi_bssid": "BC:07:1D:67:1B:60",
-      "wifi_rssi": -33,
-      "wifi_channel": 11,
-      "wifi_updated_at": "2026-07-29T14:02:54.385656+00:00"
+      "wifi_ssid": "okgoogle",
+      "wifi_bssid": "30:23:03:C2:AD:5B",
+      "wifi_rssi": -50,
+      "wifi_channel": 13,
+      "wifi_updated_at": "2026-08-18T13:36:48.640067+00:00"
     }
   ]
 }

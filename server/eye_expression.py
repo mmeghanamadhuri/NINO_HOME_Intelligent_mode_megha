@@ -18,7 +18,20 @@ EYE_EXPRESSIONS: tuple[str, ...] = (
 )
 
 LLM_RESPONSE_PATHS: frozenset[str] = frozenset(
-    {"llm", "identity_llm", "recap", "recap_blocked_no_face"}
+    {
+        "llm",
+        "identity_llm",
+        "recap",
+        "recap_blocked_no_face",
+        "joke",
+        "joke_and_time",
+        "football_joke",
+    }
+)
+
+# Joke paths always show happy eyes, whatever words the punchline uses.
+ALWAYS_HAPPY_PATHS: frozenset[str] = frozenset(
+    {"joke", "joke_and_time", "football_joke"}
 )
 _VALID = frozenset(EYE_EXPRESSIONS)
 
@@ -635,6 +648,9 @@ def infer_eye_expression(
 ) -> str:
     reply = _normalize_text(reply_text)
     user = _normalize_text(user_text)
+
+    if reply_path in ALWAYS_HAPPY_PATHS:
+        return "happy"
 
     if not reply:
         return _fallback_from_reply("", user, reply_path)

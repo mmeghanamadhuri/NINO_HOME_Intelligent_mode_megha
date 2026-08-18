@@ -162,9 +162,55 @@ JOKES: tuple[str, ...] = (
     "My phone battery lasts longer than my motivation.",
     "I finally cleaned my room. Now I can't find anything.",
     "Why was the calendar so popular? Because it had so many dates.",
+    # Short, plain-spoken one-liners — easy to follow the first time you hear them.
+    "Why did the banana go to the doctor? Because it was not peeling well.",
+    "What do you call a sleeping dinosaur? A dino-snore.",
+    "Why did the teddy bear stop eating? Because it was already stuffed.",
+    "What do you call a bear with no teeth? A gummy bear.",
+    "Why did the picture go to jail? Because it was framed.",
+    "What did the ocean say to the beach? Nothing, it just waved.",
+    "Why are elevator jokes so good? They work on so many levels.",
+    "How does the moon cut his hair? Eclipse it.",
+    "Why did the orange stop rolling down the hill? It ran out of juice.",
+    "What do clouds wear under their shorts? Thunderpants.",
+    "Why did the belt go to jail? Because it held up a pair of trousers.",
+    "What do you call a pig that does karate? A pork chop.",
+    "Why did the barber win the race? Because he took a short cut.",
+    "Why was the broom late? Because it over-swept.",
+    "What is a computer's favourite snack? Microchips.",
+    "Why do bees have sticky hair? Because they use honeycombs.",
+    "What do you call two birds in love? Tweethearts.",
+    "Why did the egg hide? Because it was a little chicken.",
+    "What did one wall say to the other wall? I will meet you at the corner.",
+    "Why did the cow go to space? To see the Milky Way.",
+    "What do you call a duck that gets all A's? A wise quacker.",
+    "Why did the sun go to school? To get a little brighter.",
 )
 _joke_deck: list[str] = []
 _last_joke: str | None = None
+
+# Spoken lead-ins / sign-offs so every joke lands as excited and playful
+# instead of the flat "Sure! <joke>" the device used to say every time.
+JOKE_OPENERS: tuple[str, ...] = (
+    "Ooh, I love this one!",
+    "Yes! Get ready to laugh!",
+    "Ha, okay, here we go!",
+    "Oh, this is my favourite one!",
+    "Right, brace yourself!",
+    "Coming right up!",
+    "This one always gets me!",
+    "Oh yes, I have a good one!",
+)
+JOKE_CLOSERS: tuple[str, ...] = (
+    "Ha ha! I love that one.",
+    "Ha! Classic.",
+    "Ha ha! Got you there.",
+    "Ha! That one always makes me giggle.",
+    "Ha ha! Tell me that was not funny!",
+    "Ha! Want another one?",
+)
+_joke_opener_deck: list[str] = []
+_joke_closer_deck: list[str] = []
 _WORLD_CUP_FAVOURITE_PATTERN = re.compile(
     r"\b(?:fifa\s+)?world\s+cup\b.{0,80}\b(?:favo(?:u)?rite|rooting for|"
     r"supporting)\b|\b(?:favo(?:u)?rite|rooting for|supporting)\b.{0,80}\b"
@@ -259,8 +305,15 @@ CONTINUE_LISTEN_REPLY_PATHS = frozenset(
         "joke_and_time",
         "greeting",
         "smalltalk",
+        "math",
     }
 )
+
+# Music replies are one-shot: "Playing X." / "Okay, stopping the music."
+# Do not reopen the mic or they turn into a conversation.
+
+# Turns stored in the per-device session buffer until the user says goodbye.
+DEVICE_SESSION_LOG_PATHS = CONTINUE_LISTEN_REPLY_PATHS | {"goodbye", "math"}
 
 # Pure time-of-day / hello greetings — answered from the PC clock, not echoed from STT.
 _TIME_OF_DAY_GREETING_RE = re.compile(
@@ -644,6 +697,59 @@ def _recent_assistant_replies(
     return [str(assistant_text or "").strip() for _user, assistant_text in recent_history]
 
 
+def _voice_memory_context(
+    *,
+    device_id: str,
+    memory_name: str | None,
+    memory_ctx: Any,
+    user_text: str,
+    viewer_name: str | None,
+    effective_viewer: str | None,
+) -> tuple[str | None, list[tuple[str, str]], bool]:
+    """Merge PostgreSQL memory with the active device session (until goodbye)."""
+    from device_session import (
+        format_device_session_prompt,
+        get_device_session_turns,
+        merge_prompt_blocks,
+    )
+    from memory_filters import query_needs_recent_context
+    from memory_service import get_memory_service
+
+    session_turns = get_device_session_turns(device_id)
+    follow_up = bool(session_turns) or query_needs_recent_context(user_text)
+
+    session_block = (
+        format_device_session_prompt(
+            session_turns,
+            viewer_name=effective_viewer or memory_name or viewer_name,
+        )
+        if session_turns
+        else None
+    )
+
+    memory_block: str | None = None
+    db_history: list[tuple[str, str]] = []
+    if memory_name:
+        memory_svc = get_memory_service()
+        if session_turns:
+            facts_ctx = memory_svc.load_context(
+                memory_name,
+                query_text=user_text,
+                include_recent=False,
+            )
+            memory_block = facts_ctx.prompt_block if facts_ctx else None
+        elif memory_ctx:
+            memory_block = memory_ctx.prompt_block or None
+            db_history = list(memory_ctx.recent_history)
+        else:
+            loaded = memory_svc.load_context(memory_name, query_text=user_text)
+            memory_block = loaded.prompt_block if loaded else None
+            db_history = list(loaded.recent_history) if loaded else []
+
+    recent_history = session_turns or db_history
+    return merge_prompt_blocks(memory_block, session_block), recent_history, follow_up
+
+
 def _live_memory_viewer_name(
     camera_identity_name: str | None,
     camera_identity_state: CameraIdentityState,
@@ -788,6 +894,24 @@ def is_joke_request(user_text: str) -> bool:
     return any(p.search(text) for p in _JOKE_REQUEST_PATTERNS)
 
 
+def _draw_from_deck(deck: list[str], source: tuple[str, ...]) -> str:
+    """Pop one shuffled entry, refilling the deck when it runs out."""
+    if not deck:
+        deck.extend(source)
+        random.shuffle(deck)
+    return deck.pop()
+
+
+def random_joke_opener() -> str:
+    """Return an excited lead-in, cycling a shuffled deck to avoid repeats."""
+    return _draw_from_deck(_joke_opener_deck, JOKE_OPENERS)
+
+
+def random_joke_closer() -> str:
+    """Return a joyful sign-off so the punchline is clearly a laugh cue."""
+    return _draw_from_deck(_joke_closer_deck, JOKE_CLOSERS)
+
+
 def random_joke_reply() -> str:
     """Return a randomized joke, cycling a shuffled deck to avoid repeats."""
     global _joke_deck, _last_joke
@@ -798,7 +922,7 @@ def random_joke_reply() -> str:
             _joke_deck[0], _joke_deck[-1] = _joke_deck[-1], _joke_deck[0]
     joke = _joke_deck.pop()
     _last_joke = joke
-    return f"Sure! {joke}"
+    return f"{random_joke_opener()} {joke} {random_joke_closer()}"
 
 
 def is_world_cup_favourite_question(user_text: str) -> bool:
@@ -1359,6 +1483,7 @@ def process_voice_wav(
     *,
     camera_identity_name: str | None = None,
     camera_identity_state: CameraIdentityState = "no_face",
+    camera_scene: str | None = None,
     device_id: str = "",
     session_kind: str = "wake",
 ) -> tuple[bytes, VoiceReplyMeta]:
@@ -1690,6 +1815,21 @@ def process_voice_wav(
                 }
                 return b"", meta
 
+    # Music stop must beat goodbye / LLM: while a track is playing, "stop",
+    # "shut up", and STT mashups like "shupupo" should only stop the song.
+    if reply_path == "llm":
+        from music_voice import handle_music_voice
+
+        music_result = handle_music_voice(user_text, device_id=device_id)
+        if music_result.handled:
+            reply_path = music_result.reply_path
+            reply = music_result.reply
+            logger.info(
+                "Voice music command | path=%s heard: %s",
+                reply_path,
+                user_text[:120],
+            )
+
     if reply_path == "llm" and is_conversation_goodbye(user_text):
         reply_path = "goodbye"
         reply = conversation_goodbye_reply()
@@ -1815,7 +1955,10 @@ def process_voice_wav(
 
     if reply_path == "llm" and is_football_joke_request(user_text):
         reply_path = "football_joke"
-        reply = "I was going to tell you an offside joke, but you probably wouldn't get it."
+        reply = (
+            f"{random_joke_opener()} I was going to tell you an offside joke, "
+            f"but you probably wouldn't get it. {random_joke_closer()}"
+        )
         logger.info("Voice football joke query | heard: %s", user_text[:120])
 
     if reply_path == "llm" and is_joke_request(user_text):
@@ -2059,34 +2202,50 @@ def process_voice_wav(
             )
         else:
             logger.info("Voice query (no recognized viewer) | heard: %s", user_text[:120])
-        topic_text = non_time_question_text(user_text)
-        append_clock = topic_text is not None
-        llm_text = topic_text or user_text
-        if append_clock:
-            logger.info(
-                "Voice compound topic + time | topic=%s heard: %s",
-                llm_text[:80],
-                user_text[:120],
+        from device_session import get_device_session_turns
+        from math_voice import try_spoken_math_reply
+
+        session_turns = get_device_session_turns(device_id)
+        math_reply = try_spoken_math_reply(user_text, session_turns=session_turns)
+        if math_reply:
+            reply_path = "math"
+            reply = math_reply
+            logger.info("Voice spoken math | heard: %s reply: %s", user_text[:80], reply[:80])
+        else:
+            topic_text = non_time_question_text(user_text)
+            append_clock = topic_text is not None
+            llm_text = topic_text or user_text
+            if append_clock:
+                logger.info(
+                    "Voice compound topic + time | topic=%s heard: %s",
+                    llm_text[:80],
+                    user_text[:120],
+                )
+            memory_context, recent_history, follow_up = _voice_memory_context(
+                device_id=device_id,
+                memory_name=memory_name,
+                memory_ctx=memory_ctx,
+                user_text=llm_text,
+                viewer_name=viewer_name,
+                effective_viewer=effective_viewer,
             )
-        follow_up = query_needs_recent_context(llm_text)
-        reply = answer_voice_query(
-            llm_text,
-            viewer_name=effective_viewer,
-            model=SETTINGS.ollama_model,
-            api_url=SETTINGS.ollama_url,
-            max_words=(
-                max(SETTINGS.max_words_reply, 60)
-                if follow_up or append_clock
-                else SETTINGS.max_words_reply
-            ),
-            memory_context=memory_ctx.prompt_block if memory_ctx else None,
-            recent_assistant_replies=_recent_assistant_replies(
-                memory_ctx.recent_history if memory_ctx else None
-            ),
-            is_follow_up=follow_up,
-        )
-        if append_clock:
-            reply = f"{reply.rstrip()} {local_server_time_reply()}"
+            reply = answer_voice_query(
+                llm_text,
+                viewer_name=effective_viewer,
+                model=SETTINGS.ollama_model,
+                api_url=SETTINGS.ollama_url,
+                max_words=(
+                    max(SETTINGS.max_words_reply, 60)
+                    if follow_up or append_clock
+                    else SETTINGS.max_words_reply
+                ),
+                memory_context=memory_context,
+                recent_assistant_replies=_recent_assistant_replies(recent_history),
+                is_follow_up=follow_up,
+                vision_context=camera_scene,
+            )
+            if append_clock:
+                reply = f"{reply.rstrip()} {local_server_time_reply()}"
     t_reply = time.perf_counter()
 
     memory_store = "skipped"
@@ -2158,6 +2317,21 @@ def process_voice_wav(
     # wake_reject never starts a session. Alarm medical-ack may already be set.
     _mark_continue_listen(meta, reply_path, user_text)
     meta.timings["continue_listen"] = bool(meta.prompt_medical_ack)
+
+    from device_session import (
+        append_device_session_turn,
+        clear_device_session,
+        get_device_session_turns,
+    )
+
+    if reply_path in DEVICE_SESSION_LOG_PATHS:
+        append_device_session_turn(device_id, user_text, reply)
+    if is_conversation_goodbye(user_text) or reply_path == "goodbye":
+        clear_device_session(device_id)
+    else:
+        session_turns = get_device_session_turns(device_id)
+        if session_turns:
+            meta.timings["device_session_turns"] = len(session_turns)
 
     logger.info(
         "VOICE_OUT session=%s path=%s continue=%s heard=%r reply=%r",

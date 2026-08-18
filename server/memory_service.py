@@ -355,7 +355,11 @@ class MemoryService:
         return {"ready": True, "table_counts": self._fetch_table_counts()}
 
     def load_context(
-        self, display_name: str | None, *, query_text: str = ""
+        self,
+        display_name: str | None,
+        *,
+        query_text: str = "",
+        include_recent: bool | None = None,
     ) -> LoadedMemoryContext | None:
         if not self._ready or not display_name:
             return None
@@ -378,12 +382,14 @@ class MemoryService:
             )
 
             memories = filter_memories_for_query(memories, query_text)
+            if include_recent is None:
+                include_recent = query_needs_recent_context(query_text)
             block = self._format_prompt_block(
                 name=display_name.strip(),
                 recent=recent,
                 memories=memories,
                 summary=summary,
-                include_recent=query_needs_recent_context(query_text),
+                include_recent=include_recent,
             )
             return LoadedMemoryContext(
                 user_id=user_id,

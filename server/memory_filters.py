@@ -894,6 +894,29 @@ def _looks_like_topic_fragment(user_text: str) -> bool:
     return True
 
 
+_SHORT_NUMERIC_ANSWER = re.compile(
+    r"^\s*(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|"
+    r"eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|"
+    r"eighty|ninety|hundred|thousand)\s+(?:and|,|plus|with|by|over|divided by)\s+"
+    r"(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|"
+    r"eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|"
+    r"eighty|ninety|hundred|thousand)\s*[.!?…]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_short_session_answer(user_text: str) -> bool:
+    """Short replies that only make sense after the previous assistant turn."""
+    text = user_text.strip()
+    if not text:
+        return False
+    if _NOT_TOPIC_FRAGMENT.match(text.rstrip(".!?…")):
+        return True
+    return bool(_SHORT_NUMERIC_ANSWER.match(text))
+
+
 def query_needs_recent_context(user_text: str) -> bool:
     """True only when the query is a follow-up that references prior turns.
 
@@ -916,6 +939,8 @@ def query_needs_recent_context(user_text: str) -> bool:
     if word_count <= 8 and _ANAPHORA.search(text):
         return True
     if _looks_like_topic_fragment(text):
+        return True
+    if _looks_like_short_session_answer(text):
         return True
     return False
 

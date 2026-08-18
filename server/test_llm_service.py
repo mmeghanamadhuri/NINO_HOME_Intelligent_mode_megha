@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import os
 import unittest
 from unittest.mock import patch
 
 from llm_service import (
+    DEFAULT_LLM_GREETING_ONE_IN,
     _defers_to_recognized_speaker,
     answer_voice_query,
+    greeting_allowed_for_llm_turn,
+    llm_greeting_one_in,
     resolve_ollama_api_url,
+    strip_leading_greeting,
 )
 
 
@@ -76,6 +81,57 @@ class VoiceReplyTests(unittest.TestCase):
             "I am sorry, I cannot answer that reliably right now.",
         )
         self.assertEqual(generate.call_count, 2)
+
+
+class ChatGreetingRateTests(unittest.TestCase):
+    def test_default_rate_is_one_in_twenty(self) -> None:
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("LLM_GREETING_ONE_IN", None)
+            self.assertEqual(llm_greeting_one_in(), 20)
+        self.assertEqual(DEFAULT_LLM_GREETING_ONE_IN, 20)
+
+    def test_rate_is_configurable(self) -> None:
+        with patch.dict("os.environ", {"LLM_GREETING_ONE_IN": "5"}, clear=False):
+            self.assertEqual(llm_greeting_one_in(), 5)
+        with patch.dict("os.environ", {"LLM_GREETING_ONE_IN": "nope"}, clear=False):
+            self.assertEqual(llm_greeting_one_in(), DEFAULT_LLM_GREETING_ONE_IN)
+
+    def test_greeting_is_rare_but_possible(self) -> None:
+        with patch("llm_service.random.randrange", return_value=0):
+            self.assertTrue(greeting_allowed_for_llm_turn())
+        with patch("llm_service.random.randrange", return_value=7):
+            self.assertFalse(greeting_allowed_for_llm_turn())
+
+    def test_strip_leading_greeting(self) -> None:
+        for raw, expected in (
+            ("Good evening! Paris is the capital of France.", "Paris is the capital of France."),
+            ("Hi there, the capital of France is Paris.", "The capital of France is Paris."),
+            ("Hello Avery! Mars is the fourth planet.", "Mars is the fourth planet."),
+            ("Mars is the fourth planet.", "Mars is the fourth planet."),
+            ("Good evening!", "Good evening!"),
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(strip_leading_greeting(raw), expected)
+
+    @patch("llm_service.ollama_generate")
+    def test_chat_reply_drops_greeting_when_not_allowed(self, generate) -> None:
+        generate.return_value = "Good evening! Mars is the fourth planet."
+
+        with patch("llm_service.greeting_allowed_for_llm_turn", return_value=False):
+            reply = answer_voice_query("Tell me about Mars")
+
+        self.assertEqual(reply, "Mars is the fourth planet.")
+        self.assertIn("Do NOT greet at all", generate.call_args.args[0])
+
+    @patch("llm_service.ollama_generate")
+    def test_chat_reply_keeps_greeting_when_allowed(self, generate) -> None:
+        generate.return_value = "Good evening! Mars is the fourth planet."
+
+        with patch("llm_service.greeting_allowed_for_llm_turn", return_value=True):
+            reply = answer_voice_query("Tell me about Mars")
+
+        self.assertEqual(reply, "Good evening! Mars is the fourth planet.")
+        self.assertNotIn("Do NOT greet at all", generate.call_args.args[0])
 
 
 if __name__ == "__main__":

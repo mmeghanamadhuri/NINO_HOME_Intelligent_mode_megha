@@ -1040,6 +1040,48 @@ def _voice_reply_top_p() -> float:
         return 0.92
 
 
+# Chat replies used to open with hello / good evening on almost every turn.
+# A greeting is now allowed roughly once every LLM_GREETING_ONE_IN chat turns.
+DEFAULT_LLM_GREETING_ONE_IN = 20
+
+
+def llm_greeting_one_in() -> int:
+    raw = os.environ.get("LLM_GREETING_ONE_IN", str(DEFAULT_LLM_GREETING_ONE_IN)).strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_LLM_GREETING_ONE_IN
+
+
+def greeting_allowed_for_llm_turn() -> bool:
+    """True about once every llm_greeting_one_in() chat turns."""
+    return random.randrange(llm_greeting_one_in()) == 0
+
+
+_LEADING_GREETING_RE = re.compile(
+    r"^\s*(?:hey|hi|hiya|hello|yo|good\s+(?:morning|afternoon|evening|day))"
+    r"(?:\s+(?:there|again))?"
+    r"(?:\s*,?\s*[a-z]+)?"
+    r"\s*[,!.…-]+\s*",
+    re.IGNORECASE,
+)
+
+
+def strip_leading_greeting(reply: str) -> str:
+    """Drop a hello / good-evening opener so the answer starts on the content."""
+    text = (reply or "").strip()
+    for _ in range(2):
+        stripped = _LEADING_GREETING_RE.sub("", text, count=1).strip()
+        if not stripped or stripped == text:
+            break
+        text = stripped
+    if not text:
+        return reply
+    if text[0].islower():
+        text = text[0].upper() + text[1:]
+    return text
+
+
 def _anti_repetition_block(recent_assistant_replies: list[str] | None) -> str:
     if not recent_assistant_replies:
         return ""
@@ -1571,6 +1613,7 @@ def answer_voice_query(
     memory_context: str | None = None,
     recent_assistant_replies: list[str] | None = None,
     is_follow_up: bool = False,
+    vision_context: str | None = None,
 ) -> str:
     if viewer_name:
         who = (
@@ -1590,12 +1633,31 @@ def answer_voice_query(
     now = system_now()
     part = day_part(now)
     tod_greeting = day_part_greeting(now)
+    allow_greeting = greeting_allowed_for_llm_turn()
+    if allow_greeting:
+        greeting_line = (
+            f"If they greeted you, say \"{tod_greeting}\" — never the wrong period. "
+        )
+    else:
+        greeting_line = (
+            "Do NOT greet at all: no hi, hello, hey, good morning, good afternoon, "
+            "or good evening. Start straight with the answer or your reaction. "
+        )
     clock_line = (
         f"Current local time is {now.strftime('%I:%M %p').lstrip('0')} ({part}). "
         "Use this clock only if they asked the time. "
-        f"If they greeted you, say \"{tod_greeting}\" — never the wrong period. "
+        f"{greeting_line}"
         "If they asked a factual question, do NOT greet; answer the question first.\n"
     )
+    vision_rules = ""
+    scene = (vision_context or "").strip()
+    if scene:
+        vision_rules = (
+            f"Your camera can see right now: {scene}. "
+            "Use this only when they ask what you can see or about objects around them. "
+            "Describe it naturally in a sentence; never read it out as a list of labels, "
+            "and never claim to see anything that is not listed.\n"
+        )
     memory_rules = ""
     if memory_context:
         name_hint = viewer_name.strip() if viewer_name else "them"
@@ -1613,6 +1675,8 @@ def answer_voice_query(
         follow_up_rules = (
             "- This is a follow-up. Continue the MOST RECENT topic in the conversation, "
             "not an older one and not both at once.\n"
+            "- If the user gives numbers or a math expression, compute the answer immediately — "
+            "do not ask for more numbers.\n"
             "- Give a real enthusiastic answer with a new interesting detail. "
             "Do not ask what they want to know first, and do not restart with hi/hello.\n"
             "- If they said a short topic like \"the Mars\", treat it as continue that topic.\n"
@@ -1622,6 +1686,7 @@ def answer_voice_query(
         "You are NiNO, an enthusiastic voice assistant for a smart home with a camera.\n"
         f"{who}\n"
         f"{clock_line}"
+        f"{vision_rules}"
         f"{memory_rules}"
         f"{_memory_context_block(memory_context)}"
         "Style rules:\n"
@@ -1653,8 +1718,11 @@ def answer_voice_query(
         temperature=_voice_reply_temperature(),
         top_p=_voice_reply_top_p(),
     )
+    def finalize(text: str) -> str:
+        return text if allow_greeting else strip_leading_greeting(text)
+
     if not _defers_to_recognized_speaker(reply, viewer_name):
-        return reply
+        return finalize(reply)
 
     logger.warning(
         "Discarding voice reply that defers to recognized speaker | viewer=%s question=%s",
@@ -1680,7 +1748,7 @@ def answer_voice_query(
         top_p=_voice_reply_top_p(),
     )
     if not _defers_to_recognized_speaker(retried_reply, viewer_name):
-        return retried_reply
+        return finalize(retried_reply)
     return "I am sorry, I cannot answer that reliably right now."
 
 

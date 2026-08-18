@@ -43,6 +43,7 @@ from esp_playback import (
     esp_play_wav_url,
 )
 from emotion_service import EmotionService
+from object_detection_service import ObjectDetectionService, summarize_detections
 from tts_service import (
     TTSService,
     preload_piper_voice,
@@ -184,6 +185,7 @@ face_registration = configure_face_registration(
     faces, cameras.frame_getter(registry.ui_device_id())
 )
 emotion = EmotionService()
+objects = ObjectDetectionService()
 _tts_face_interval = float(os.environ.get("FACE_GREETING_INTERVAL_SECONDS", "600"))
 tts = TTSService(cooldown_seconds=0.0, face_greeting_interval_seconds=_tts_face_interval)
 tts.set_playback_device_id(registry.ui_device_id())
@@ -334,6 +336,13 @@ def startup() -> None:
         target=_multi_device_vision_loop,
         daemon=True,
         name="multi-device-vision",
+    ).start()
+
+    # Loading YOLO weights takes a few seconds; keep it off the first camera frame.
+    threading.Thread(
+        target=objects.warmup,
+        daemon=True,
+        name="yolo-warmup",
     ).start()
 
     from llm_service import warm_ollama_model
@@ -636,6 +645,92 @@ def current_weather(device_id: str | None = None) -> dict:
     }
 
 
+class MusicPlayRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=200)
+    device_id: str | None = None
+    # False arms the stream without calling the robot, for PC-side testing
+    # before the /music firmware lands.
+    push_to_device: bool = True
+
+
+@app.get("/music/stream.wav")
+def music_stream(device_id: str | None = None) -> StreamingResponse:
+    """Continuous mono 16-bit PCM the robot pulls while a track is playing."""
+    from music_service import MusicNoDeviceError, get_music_service
+
+    service = get_music_service()
+    try:
+        chunks = service.iter_stream(device_id)
+    except MusicNoDeviceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return StreamingResponse(
+        chunks,
+        media_type="audio/wav",
+        headers={"Cache-Control": "no-store", "Accept-Ranges": "none"},
+    )
+
+
+@app.post("/api/music/play")
+def music_play(req: MusicPlayRequest) -> dict:
+    from music_service import MusicNoDeviceError, get_music_service
+    from music_source import (
+        MusicNotConfiguredError,
+        MusicNotFoundError,
+        MusicUnavailableError,
+    )
+
+    service = get_music_service()
+    try:
+        track = service.play(
+            req.device_id, req.query, notify_device=req.push_to_device
+        )
+    except MusicNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except MusicNotConfiguredError as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
+    except MusicNoDeviceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except MusicUnavailableError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "track": {
+            "title": track.title,
+            "artist": track.artist,
+            "duration_seconds": track.duration_seconds,
+            "page_url": track.page_url,
+        },
+        "stream_url": service.stream_url_for(req.device_id),
+    }
+
+
+@app.post("/api/music/stop")
+def music_stop(device_id: str | None = None) -> dict:
+    from music_service import get_music_service
+
+    return {"ok": True, "was_playing": get_music_service().stop(device_id)}
+
+
+@app.get("/api/music/status")
+def music_status(device_id: str | None = None) -> dict:
+    from music_service import get_music_service
+    from music_source import ffmpeg_path
+
+    try:
+        import yt_dlp  # noqa: F401
+
+        ytdlp_ready = True
+    except ImportError:
+        ytdlp_ready = False
+
+    return {
+        "ok": True,
+        "ffmpeg": bool(ffmpeg_path()),
+        "yt_dlp": ytdlp_ready,
+        **get_music_service().status(device_id),
+    }
+
+
 @app.get("/api/latency-log")
 def latency_log(limit: int = 50) -> dict:
     """Return recent voice latency records (newest last)."""
@@ -668,6 +763,7 @@ def status(device_id: str | None = None) -> dict:
         "cameras": cameras.status(),
         "faces": faces.stats(),
         "emotion": emotion.stats(),
+        "objects": objects.stats(),
         "voice_pipeline_active": voice_pipeline_active(),
         "tts": tts.status(),
         "stt": _stt_status(),
@@ -679,6 +775,24 @@ def status(device_id: str | None = None) -> dict:
         "memory": get_memory_service().status(),
         "face_registration": face_registration.status(),
         "latest_results": _latest_results_by_device.get(active, latest_results),
+    }
+
+
+@app.get("/api/objects")
+def detected_objects(device_id: str | None = None, refresh: bool = False) -> dict:
+    """Objects YOLO26 currently sees for a device."""
+    active = resolve_device_id(device_id)
+    if refresh:
+        frame = cameras.read(active)
+        detections = _detect_objects(frame, active) if frame is not None else []
+    else:
+        detections = objects.latest(active)
+    return {
+        "ok": True,
+        "device_id": active,
+        "objects": detections,
+        "summary": summarize_detections(detections),
+        "detector": objects.stats(),
     }
 
 
@@ -787,6 +901,15 @@ def retrain() -> dict:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+def _detect_objects(frame, device_id: str) -> list[dict]:
+    """YOLO26 detections for a frame; never let object detection break the feed."""
+    try:
+        return objects.detect(frame, device_id=device_id)
+    except Exception:
+        logger.debug("Object detection failed for %s", device_id, exc_info=True)
+        return []
+
+
 @app.get("/snapshot.jpg")
 def snapshot(device_id: str | None = None) -> Response:
     active = resolve_device_id(device_id)
@@ -799,7 +922,9 @@ def snapshot(device_id: str | None = None) -> Response:
         emotion.attach_emotions(frame, results)
     except Exception:
         logger.exception("Emotion detection failed for snapshot")
+    detections = _detect_objects(frame, active)
     annotated, _ = faces.annotate(frame, results=results)
+    objects.annotate(annotated, detections)
     ok, encoded = cv2.imencode(".jpg", annotated)
     if not ok:
         raise HTTPException(status_code=500, detail="Could not encode snapshot")
@@ -834,7 +959,9 @@ def _mjpeg_generator(device_id: str):
                 emotion.attach_emotions(frame, results)
             except Exception:
                 logger.exception("Emotion detection failed; continuing MJPEG")
+            detections = _detect_objects(frame, device_id)
             annotated, results = faces.annotate(frame, results=results)
+            objects.annotate(annotated, detections)
             _latest_results_by_device[device_id] = results
             if is_ui_device:
                 latest_results = results
@@ -886,6 +1013,8 @@ def _vision_tick_device(
         emotion.attach_emotions(frame, results)
     except Exception:
         logger.debug("Emotion tick failed for %s", device_id, exc_info=True)
+    # Keeps the object cache warm for voice queries with no browser attached.
+    _detect_objects(frame, device_id)
     _latest_results_by_device[device_id] = results
     if is_ui_device:
         # The background loop is the normal source of emotion results. Without
@@ -1031,6 +1160,20 @@ def _camera_identity_snapshot(
             return recalled, "recognized"
         return None, "no_face"
     return None, "unknown"
+
+
+def _camera_scene_snapshot(device_id: str | None = None) -> str:
+    """What the camera can see right now, phrased for the LLM prompt."""
+    if not objects.enabled:
+        return ""
+    active = resolve_device_id(device_id)
+    detections = objects.latest(active)
+    if not detections:
+        # No background tick yet (or nothing seen last pass) — try a live frame.
+        frame = cameras.read(active)
+        if frame is not None:
+            detections = _detect_objects(frame, active)
+    return summarize_detections(detections)
 
 
 async def _delayed_esp_servo_360(
@@ -1243,12 +1386,17 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                         )
                     identity_seconds = round(time.perf_counter() - t_ident, 3)
 
+                    camera_scene = await run_in_threadpool(
+                        _camera_scene_snapshot, device_id
+                    )
+
                     def _run_voice() -> tuple[bytes, VoiceReplyMeta]:
                         return process_voice_wav(
                             wav_in,
                             active_viewer,
                             camera_identity_name=identity_name,
                             camera_identity_state=identity_state,
+                            camera_scene=camera_scene,
                             device_id=device_id,
                             session_kind=session_kind,
                         )
