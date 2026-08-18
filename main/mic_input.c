@@ -1,6 +1,7 @@
 #include "mic_input.h"
 
 #include "audio_playback.h"
+#include "music_stream.h"
 
 #include "bsp/esp32_p4_function_ev_board.h"
 #include "driver/i2c_master.h"
@@ -152,6 +153,9 @@ const char *nino_mic_source_name(nino_mic_source_t source) {
 }
 
 bool nino_mic_available(void) {
+  if (nino_music_blocks_mic()) {
+    return false;
+  }
   nino_audio_bus_lock();
   const esp_err_t err = open_es8311_aux_locked();
   nino_audio_bus_unlock();
@@ -161,6 +165,9 @@ bool nino_mic_available(void) {
 esp_err_t nino_mic_read(int16_t *samples, int sample_count) {
   if (samples == NULL || sample_count <= 0) {
     return ESP_ERR_INVALID_ARG;
+  }
+  if (nino_music_blocks_mic()) {
+    return ESP_ERR_INVALID_STATE;
   }
 
   nino_audio_bus_lock();

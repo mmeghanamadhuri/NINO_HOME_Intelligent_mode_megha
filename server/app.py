@@ -1276,6 +1276,26 @@ def _session_kind_from_websocket(websocket: WebSocket) -> str:
     return "wake"
 
 
+def _aux_energy_from_websocket(websocket: WebSocket) -> int | None:
+    raw = (websocket.query_params.get("energy") or "").strip()
+    if not raw:
+        return None
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return None
+
+
+def _voice_turn_from_websocket(websocket: WebSocket) -> int | None:
+    raw = (websocket.query_params.get("turn") or "").strip()
+    if not raw:
+        return None
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return None
+
+
 def _device_id_from_websocket(websocket: WebSocket) -> str:
     """Resolve device_id from query param or X-Nino-Device-Id header."""
     raw = (websocket.query_params.get("device_id") or "").strip()
@@ -1305,19 +1325,24 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
     from voice_service import (
         SERVO_360_TRIGGER_DELAY_SECONDS,
         VoiceReplyMeta,
+        log_nino_voice,
         minimal_voice_reply_wav,
         process_voice_wav,
     )
 
     session_kind = _session_kind_from_websocket(websocket)
+    aux_energy = _aux_energy_from_websocket(websocket)
+    voice_turn = _voice_turn_from_websocket(websocket)
     session_queries = 0
     session_started = time.perf_counter()
     client_label = _ws_client_label(websocket)
-    logger.info(
-        "Voice WS open device_id=%s session=%s client=%s",
-        device_id,
-        session_kind,
-        client_label,
+    log_nino_voice(
+        "WS_OPEN",
+        turn=voice_turn,
+        device=device_id,
+        session=session_kind,
+        client=client_label,
+        energy=aux_energy,
     )
     await run_in_threadpool(
         _append_latency_record,
@@ -1399,6 +1424,8 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                             camera_scene=camera_scene,
                             device_id=device_id,
                             session_kind=session_kind,
+                            aux_energy=aux_energy,
+                            voice_turn=voice_turn,
                         )
 
                     wav_out, reply_meta = await run_in_threadpool(_run_voice)
@@ -1444,25 +1471,24 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                 timings["overhead_seconds"] = round(
                     max(0.0, server_total - process_total), 3
                 )
-                logger.info(
-                    "WS_VOICE_DONE device=%s session=%s path=%s wake_ok=%s continue=%s "
-                    "heard=%r reply=%r stt=%.3fs reply=%.3fs tts=%.3fs process=%.3fs "
-                    "identity=%.3fs server=%.3fs in=%.2fs out=%.2fs",
-                    device_id,
-                    session_kind,
-                    timings.get("reply_path"),
-                    timings.get("wake_ok"),
-                    bool(reply_meta.prompt_medical_ack),
-                    str(timings.get("heard") or "")[:120],
-                    str(timings.get("reply_text") or "")[:120],
-                    float(timings.get("stt_seconds") or 0),
-                    float(timings.get("reply_seconds") or 0),
-                    float(timings.get("tts_seconds") or 0),
-                    process_total,
-                    identity_seconds,
-                    server_total,
-                    float(timings.get("audio_in_seconds") or 0),
-                    float(timings.get("audio_out_seconds") or 0),
+                log_nino_voice(
+                    "DONE",
+                    turn=timings.get("turn", voice_turn),
+                    device=device_id,
+                    session=session_kind,
+                    path=timings.get("reply_path"),
+                    wake_ok=timings.get("wake_ok"),
+                    continue_listen=int(bool(reply_meta.prompt_medical_ack)),
+                    heard=str(timings.get("heard") or "")[:120] or "(empty)",
+                    reply=str(timings.get("reply_text") or "")[:120],
+                    stt=float(timings.get("stt_seconds") or 0),
+                    llm=float(timings.get("reply_seconds") or 0),
+                    tts=float(timings.get("tts_seconds") or 0),
+                    process=process_total,
+                    identity=identity_seconds,
+                    server=server_total,
+                    in_s=float(timings.get("audio_in_seconds") or 0),
+                    out_s=float(timings.get("audio_out_seconds") or 0),
                 )
                 record = _latency_log_record(
                     event="voice_query",
@@ -1603,9 +1629,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--whisper-device",
-        default=os.environ.get("WHISPER_DEVICE", "auto"),
+        default=os.environ.get("WHISPER_DEVICE", "cuda"),
         choices=["", "auto", "cuda", "gpu", "cpu"],
-        help="faster-whisper device: auto (CUDA if CTranslate2 sees a GPU), cuda, or cpu.",
+        help="faster-whisper device: cuda (default), auto, gpu, or cpu.",
     )
     parser.add_argument(
         "--whisper-compute-type",

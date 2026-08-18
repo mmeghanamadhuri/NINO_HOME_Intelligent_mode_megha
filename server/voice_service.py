@@ -299,6 +299,10 @@ SESSION_END_REPLY_PATHS = frozenset(
     {
         "goodbye",
         "wake_reject",
+        "stt_empty",
+        "stt_silent",
+        "stt_rejected",
+        "silent_skip",
     }
 ) | MUSIC_SESSION_END_REPLY_PATHS
 
@@ -400,11 +404,28 @@ def extract_wake_and_command(text: str) -> tuple[bool, str, str]:
     return True, rest, _normalize_wake_text(match.group("phrase"))
 
 
-def _log_voice_banner(title: str, **fields: object) -> None:
-    logger.info("========== %s ==========", title)
+def log_nino_voice(stage: str, *, turn: object = None, **fields: object) -> None:
+    """One-line P4/server log. Grep: NINO VOICE"""
+    parts: list[str] = []
     for key, value in fields.items():
-        logger.info("  %-10s %s", key, value)
-    logger.info("================================")
+        if value is None:
+            continue
+        text = str(value)
+        if text == "" or any(ch.isspace() for ch in text):
+            text = repr(text)
+        parts.append(f"{key}={text}")
+    logger.info(
+        "NINO VOICE | turn=%s | %-8s | %s",
+        "-" if turn is None else turn,
+        stage[:8],
+        " ".join(parts),
+    )
+
+
+def _log_voice_banner(title: str, **fields: object) -> None:
+    stage = str(title or "INFO").replace(" ", "_")
+    turn = fields.pop("turn", None)
+    log_nino_voice(stage, turn=turn, **fields)
 
 
 _REJECTED_WAKE_PATH = Path(__file__).resolve().parent / "data" / "rejected_wake.log"
@@ -418,12 +439,12 @@ def _record_rejected_wake(
     audio_s: float = 0.0,
 ) -> None:
     heard_s = str(heard or "").strip()
-    logger.warning("********** REJECTED WAKE **********")
-    logger.warning("  device   %s", device_id or "-")
-    logger.warning("  heard    %r", heard_s or "(empty STT)")
-    logger.warning("  reason   %s", reason)
-    logger.warning("  log      %s", _REJECTED_WAKE_PATH)
-    logger.warning("***********************************")
+    logger.warning(
+        "NINO VOICE | turn=- | REJECT   | device=%s heard=%r reason=%s",
+        device_id or "-",
+        heard_s or "(empty STT)",
+        reason,
+    )
     try:
         _REJECTED_WAKE_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(_REJECTED_WAKE_PATH, "a", encoding="utf-8") as f:
@@ -472,17 +493,22 @@ def should_continue_listen_after_reply(reply_path: str, user_text: str) -> bool:
 
 
 def _mark_continue_listen(meta: VoiceReplyMeta, reply_path: str, user_text: str) -> None:
+    turn = meta.timings.get("turn")
     if should_continue_listen_after_reply(reply_path, user_text):
         meta.prompt_medical_ack = True
-        _log_voice_banner(
-            "SESSION OPEN",
+        log_nino_voice(
+            "SESSION",
+            turn=turn,
+            state="open",
             path=reply_path,
             heard=str(user_text or "")[:120],
             next="mic stays open until goodbye",
         )
     else:
-        _log_voice_banner(
-            "SESSION END",
+        log_nino_voice(
+            "SESSION",
+            turn=turn,
+            state="end",
             path=reply_path,
             heard=str(user_text or "")[:120],
             next="waiting for a new Ok Nino",
@@ -497,10 +523,10 @@ DEFAULT_VOICE_PERSONALIZE_PROB = 0.18
 class VoiceSettings:
     ollama_url: str = DEFAULT_OLLAMA_URL
     ollama_model: str = DEFAULT_MODEL
-    whisper_model: str = "tiny"
+    whisper_model: str = "small"
     whisper_language: str | None = "en"
     # auto | cuda | cpu — resolved at load time against CTranslate2 CUDA.
-    whisper_device: str = "auto"
+    whisper_device: str = "cuda"
     whisper_compute_type: str = "auto"
     whisper_device_index: int = 0
     whisper_runtime_device: str = ""
@@ -521,6 +547,57 @@ class VoiceSettings:
 SETTINGS = VoiceSettings()
 _WHISPER_MODEL: Any = None
 _CTRANSLATE2_CUDA_COUNT: int | None = None
+
+
+DEFAULT_MIN_SPEECH_ENERGY = 5
+
+
+def min_speech_energy() -> int:
+    raw = os.environ.get("VOICE_MIN_ENERGY", str(DEFAULT_MIN_SPEECH_ENERGY)).strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_MIN_SPEECH_ENERGY
+
+
+def wav_peak_frame_energy(wav_bytes: bytes, frame_ms: int = 20) -> int:
+    """Mean-abs peak over 20 ms frames — same units as the P4 Aux energy gate."""
+    if not wav_bytes or len(wav_bytes) <= 44:
+        return 0
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            nch = wf.getnchannels()
+            sw = wf.getsampwidth()
+            sr = wf.getframerate()
+            raw = wf.readframes(wf.getnframes())
+    except Exception:
+        return 0
+    if sw != 2 or nch < 1 or sr <= 0 or not raw:
+        return 0
+    pcm = np.frombuffer(raw, dtype=np.int16)
+    if nch > 1:
+        pcm = pcm.reshape(-1, nch).mean(axis=1).astype(np.int32)
+    else:
+        pcm = pcm.astype(np.int32)
+    frame = max(1, int(sr * frame_ms / 1000))
+    peak = 0
+    for i in range(0, len(pcm) - frame + 1, frame):
+        energy = int(np.mean(np.abs(pcm[i : i + frame])))
+        if energy > peak:
+            peak = energy
+    if peak == 0 and len(pcm) > 0:
+        peak = int(np.mean(np.abs(pcm)))
+    return peak
+
+
+def clip_peak_energy(wav_bytes: bytes, reported: int | None = None) -> int:
+    measured = wav_peak_frame_energy(wav_bytes)
+    if reported is None:
+        return measured
+    try:
+        return max(measured, int(reported))
+    except (TypeError, ValueError):
+        return measured
 
 
 def minimal_voice_reply_wav() -> bytes:
@@ -636,8 +713,8 @@ def configure_from_environ() -> None:
     global _WHISPER_MODEL
     SETTINGS.ollama_url = os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL).strip()
     SETTINGS.ollama_model = os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL).strip()
-    SETTINGS.whisper_model = os.environ.get("WHISPER_MODEL", "tiny").strip()
-    SETTINGS.whisper_device = os.environ.get("WHISPER_DEVICE", "auto").strip() or "auto"
+    SETTINGS.whisper_model = os.environ.get("WHISPER_MODEL", "small").strip()
+    SETTINGS.whisper_device = os.environ.get("WHISPER_DEVICE", "cuda").strip() or "cuda"
     SETTINGS.whisper_compute_type = (
         os.environ.get("WHISPER_COMPUTE_TYPE", "auto").strip() or "auto"
     )
@@ -665,8 +742,8 @@ def configure_from_environ() -> None:
     ).strip()
     provider = os.environ.get("STT_PROVIDER", "").strip().lower()
     if not provider:
-        # Default to ElevenLabs whenever a key is available, else local Whisper.
-        provider = "elevenlabs" if SETTINGS.elevenlabs_api_key else "whisper"
+        # Local GPU Whisper is the stable default; cloud STT is opt-in.
+        provider = "whisper"
     SETTINGS.stt_provider = provider
     if provider == "elevenlabs" and not SETTINGS.elevenlabs_api_key:
         logger.warning(
@@ -687,6 +764,15 @@ def configure_from_environ() -> None:
     SETTINGS.recap_max_words = max(
         30,
         min(80, int(os.environ.get("VOICE_RECAP_MAX_WORDS", "55"))),
+    )
+    status = whisper_runtime_status()
+    logger.info(
+        "Voice STT provider=%s whisper=%s requested=%s runtime=%s cuda=%s",
+        SETTINGS.stt_provider,
+        SETTINGS.whisper_model,
+        SETTINGS.whisper_device,
+        status["device"],
+        status["cuda_available"],
     )
 
 
@@ -1453,6 +1539,8 @@ def _speak_short_reply(
     t_stt: float,
     extra: dict[str, Any] | None = None,
 ) -> tuple[bytes, VoiceReplyMeta]:
+    if extra:
+        meta.timings.update(extra)
     _mark_continue_listen(meta, reply_path, heard)
     t_reply = time.perf_counter()
     wav, _voice = synthesize_sapi_wav_bytes(reply)
@@ -1480,12 +1568,64 @@ def _speak_short_reply(
     }
     if extra:
         meta.timings.update(extra)
-    logger.info(
-        "VOICE_OUT path=%s continue=%s heard=%r reply=%r",
-        reply_path,
-        bool(meta.prompt_medical_ack),
-        heard[:120],
-        reply[:120],
+    log_nino_voice(
+        "SEND",
+        turn=meta.timings.get("turn"),
+        path=reply_path,
+        continue_listen=int(bool(meta.prompt_medical_ack)),
+        heard=heard[:120] or "(empty)",
+        reply=reply[:120],
+        stt=meta.timings.get("stt_seconds"),
+        tts=meta.timings.get("tts_seconds"),
+    )
+    return wav_out, meta
+
+
+def _silent_close(
+    meta: VoiceReplyMeta,
+    *,
+    reply_path: str,
+    heard: str,
+    audio_input_format: str,
+    audio_in_seconds: float,
+    wav_bytes: bytes,
+    stt_engine: str,
+    t_start: float,
+    t_stt: float,
+    extra: dict[str, Any] | None = None,
+) -> tuple[bytes, VoiceReplyMeta]:
+    """Close the mic with no spoken reply — stops the sorry / listen loop."""
+    meta.prompt_medical_ack = False
+    t_done = time.perf_counter()
+    wav_out = minimal_voice_reply_wav()
+    meta.timings = {
+        "heard": str(heard or "")[:200],
+        "reply_text": "",
+        "reply_path": reply_path,
+        "audio_input_format": audio_input_format,
+        "audio_in_seconds": round(audio_in_seconds, 2),
+        "audio_in_bytes": len(wav_bytes),
+        "audio_out_seconds": round(_wav_seconds(wav_out), 2),
+        "audio_out_bytes": len(wav_out),
+        "stt_engine": stt_engine,
+        "tts_provider": "none",
+        "tts_voice": "",
+        "stt_seconds": round(max(0.0, t_stt - t_start), 3),
+        "reply_seconds": 0.0,
+        "tts_seconds": 0.0,
+        "process_total_seconds": round(t_done - t_start, 3),
+        "continue_listen": False,
+        "wake_ok": False,
+    }
+    if extra:
+        meta.timings.update(extra)
+    log_nino_voice(
+        "SKIP",
+        turn=meta.timings.get("turn"),
+        path=reply_path,
+        heard=str(heard or "")[:120] or "(empty)",
+        continue_listen=0,
+        next="waiting for a new Ok Nino",
     )
     return wav_out, meta
 
@@ -1499,6 +1639,8 @@ def process_voice_wav(
     camera_scene: str | None = None,
     device_id: str = "",
     session_kind: str = "wake",
+    aux_energy: int | None = None,
+    voice_turn: int | None = None,
 ) -> tuple[bytes, VoiceReplyMeta]:
     meta = VoiceReplyMeta(device_id=device_id or "")
     session = "continue" if str(session_kind or "").strip().lower() in {
@@ -1519,19 +1661,51 @@ def process_voice_wav(
 
     t_start = time.perf_counter()
     audio_in_seconds = _wav_seconds(wav_bytes)
-    _log_voice_banner(
-        "VOICE IN",
+    peak_energy = clip_peak_energy(wav_bytes, aux_energy)
+    energy_gate = min_speech_energy()
+    meta.timings["turn"] = voice_turn
+    log_nino_voice(
+        "RECV",
+        turn=voice_turn,
         session=session,
         device=device_id or "-",
         audio_s=f"{audio_in_seconds:.2f}",
         bytes=len(wav_bytes),
         format=audio_input_format,
+        energy=peak_energy,
+        energy_th=energy_gate,
     )
+
+    if peak_energy < energy_gate:
+        return _silent_close(
+            meta,
+            reply_path="stt_silent",
+            heard="",
+            audio_input_format=audio_input_format,
+            audio_in_seconds=audio_in_seconds,
+            wav_bytes=wav_bytes,
+            stt_engine="skipped",
+            t_start=t_start,
+            t_stt=t_start,
+            extra={
+                "session": session,
+                "wake_ok": False,
+                "energy": peak_energy,
+                "energy_th": energy_gate,
+                "turn": voice_turn,
+            },
+        )
 
     user_text, stt_engine = transcribe_wav(wav_bytes)
     t_stt = time.perf_counter()
     reply_path = "llm"
-    logger.info("STT_DONE engine=%s text=%r", stt_engine, user_text[:200])
+    log_nino_voice(
+        "STT",
+        turn=voice_turn,
+        engine=stt_engine,
+        energy=peak_energy,
+        text=user_text[:200] or "(empty)",
+    )
 
     if not user_text.strip():
         if session == "wake":
@@ -1541,36 +1715,8 @@ def process_voice_wav(
                 reason="STT empty",
                 audio_s=audio_in_seconds,
             )
-            _log_voice_banner(
-                "WAKE REJECT",
-                device=device_id or "-",
-                heard="(empty STT)",
-                reason="STT empty",
-                audio_s=f"{audio_in_seconds:.2f}",
-                next="waiting for a new Ok Nino",
-            )
-            return _speak_short_reply(
-                meta,
-                reply=_WAKE_REJECT_REPLY,
-                reply_path="wake_reject",
-                heard="",
-                audio_input_format=audio_input_format,
-                audio_in_seconds=audio_in_seconds,
-                wav_bytes=wav_bytes,
-                stt_engine=stt_engine,
-                t_start=t_start,
-                t_stt=t_stt,
-                extra={"session": session, "wake_ok": False},
-            )
-        logger.info(
-            "Voice STT empty | session=continue format=%s audio=%.2fs bytes=%s",
-            audio_input_format,
-            audio_in_seconds,
-            len(wav_bytes),
-        )
-        return _speak_short_reply(
+        return _silent_close(
             meta,
-            reply="Sorry, I didn't catch that. Could you say that again?",
             reply_path="stt_empty",
             heard="",
             audio_input_format=audio_input_format,
@@ -1579,24 +1725,32 @@ def process_voice_wav(
             stt_engine=stt_engine,
             t_start=t_start,
             t_stt=t_stt,
-            extra={"session": session},
+            extra={
+                "session": session,
+                "wake_ok": False,
+                "energy": peak_energy,
+                "turn": voice_turn,
+            },
         )
 
     wake_found, command_text, wake_phrase = extract_wake_and_command(user_text)
     heard_raw = user_text
     if session == "wake":
         if not wake_found:
-            # Sirena + P4 energy already triggered this clip. If STT heard a
-            # real command, do not drop the session just because Whisper
-            # missed "Ok Nino".
-            if heard_raw.strip() and not is_unintelligible_stt(heard_raw):
-                _log_voice_banner(
-                    "WAKE OK (device energy)",
+            # Trust a missing wake phrase only when Aux actually carried speech.
+            if (
+                peak_energy >= energy_gate
+                and heard_raw.strip()
+                and not is_unintelligible_stt(heard_raw)
+            ):
+                log_nino_voice(
+                    "WAKE",
+                    turn=voice_turn,
+                    ok=1,
                     device=device_id or "-",
-                    stt=heard_raw[:200],
-                    phrase="(not in STT — Aux energy trigger)",
+                    phrase="(energy)",
                     command=heard_raw[:200],
-                    next="ASR / LLM — session open until goodbye",
+                    energy=peak_energy,
                 )
                 user_text = heard_raw
             else:
@@ -1606,12 +1760,13 @@ def process_voice_wav(
                     reason="no wake phrase and no usable command",
                     audio_s=audio_in_seconds,
                 )
-                _log_voice_banner(
-                    "WAKE REJECT",
+                log_nino_voice(
+                    "WAKE",
+                    turn=voice_turn,
+                    ok=0,
                     device=device_id or "-",
                     heard=heard_raw[:200],
                     reason="no wake phrase and no usable command",
-                    next="waiting for a new Ok Nino",
                 )
                 return _speak_short_reply(
                     meta,
@@ -1624,21 +1779,27 @@ def process_voice_wav(
                     stt_engine=stt_engine,
                     t_start=t_start,
                     t_stt=t_stt,
-                    extra={"session": session, "wake_ok": False},
+                    extra={"session": session, "wake_ok": False, "turn": voice_turn},
                 )
         else:
             user_text = command_text
-            _log_voice_banner(
-                "WAKE OK",
+            log_nino_voice(
+                "WAKE",
+                turn=voice_turn,
+                ok=1,
                 device=device_id or "-",
-                stt=heard_raw[:200],
                 phrase=wake_phrase,
-                command=user_text[:200] or "(none — will listen)",
-                next="ASR / LLM — session open until goodbye",
+                command=user_text[:200] or "(none)",
             )
         if not user_text.strip():
             meta.prompt_medical_ack = True
-            logger.info("WAKE_OK_LISTEN — wake only, opening conversation mic")
+            log_nino_voice(
+                "WAKE",
+                turn=voice_turn,
+                ok=1,
+                listen=1,
+                next="opening conversation mic",
+            )
             return _speak_short_reply(
                 meta,
                 reply=_WAKE_LISTEN_REPLY,
@@ -1650,35 +1811,35 @@ def process_voice_wav(
                 stt_engine=stt_engine,
                 t_start=t_start,
                 t_stt=t_stt,
-                extra={"session": session, "wake_ok": True, "wake_phrase": wake_phrase},
+                extra={
+                    "session": session,
+                    "wake_ok": True,
+                    "wake_phrase": wake_phrase,
+                    "turn": voice_turn,
+                },
             )
-        logger.info("ASR_COMMAND session=wake text=%r", user_text[:200])
+        log_nino_voice("CMD", turn=voice_turn, session="wake", text=user_text[:200])
     else:
         if wake_found:
-            logger.info(
-                "CONV_TURN device=%s stripped_wake=%r command=%r raw=%r — not a new wake",
-                device_id or "-",
-                wake_phrase,
-                command_text[:200],
-                heard_raw[:200],
+            log_nino_voice(
+                "CONV",
+                turn=voice_turn,
+                device=device_id or "-",
+                stripped_wake=wake_phrase,
+                command=command_text[:200],
             )
             if command_text.strip():
                 user_text = command_text
         else:
-            logger.info(
-                "CONV_TURN device=%s command=%r",
-                device_id or "-",
-                user_text[:200],
+            log_nino_voice(
+                "CONV",
+                turn=voice_turn,
+                device=device_id or "-",
+                command=user_text[:200],
             )
         if not user_text.strip():
-            logger.info(
-                "CONV_TURN empty after strip device=%s raw=%r",
-                device_id or "-",
-                heard_raw[:200],
-            )
-            return _speak_short_reply(
+            return _silent_close(
                 meta,
-                reply="Sorry, I didn't catch that. Could you say that again?",
                 reply_path="stt_empty",
                 heard=heard_raw,
                 audio_input_format=audio_input_format,
@@ -1687,7 +1848,11 @@ def process_voice_wav(
                 stt_engine=stt_engine,
                 t_start=t_start,
                 t_stt=t_stt,
-                extra={"session": session, "wake_in_speech": wake_found},
+                extra={
+                    "session": session,
+                    "wake_in_speech": wake_found,
+                    "turn": voice_turn,
+                },
             )
 
     handled_volume, volume_reply = apply_volume_command(
@@ -1747,35 +1912,19 @@ def process_voice_wav(
         not awaiting_face_reg
         and (is_likely_tts_echo(user_text) or is_unintelligible_stt(user_text))
     ):
-        reply_path = "stt_rejected"
         logger.info("Voice STT rejected (echo/garbled) | heard: %s", user_text[:120])
-        reply = "Sorry, I didn't catch that. Could you say that again?"
-        t_reply = time.perf_counter()
-        wav, _voice = synthesize_sapi_wav_bytes(reply)
-        tts_info = last_tts_synthesis_info()
-        wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
-        t_tts = time.perf_counter()
-        audio_out_seconds = _wav_seconds(wav_out)
-        _mark_continue_listen(meta, reply_path, user_text)
-        meta.timings = {
-            "heard": user_text[:200],
-            "reply_text": reply[:200],
-            "reply_path": reply_path,
-            "audio_input_format": audio_input_format,
-            "audio_in_seconds": round(audio_in_seconds, 2),
-            "audio_in_bytes": len(wav_bytes),
-            "audio_out_seconds": round(audio_out_seconds, 2),
-            "audio_out_bytes": len(wav_out),
-            "stt_engine": stt_engine,
-            "tts_provider": tts_info["provider"],
-            "tts_voice": tts_info["voice"],
-            "stt_seconds": round(t_stt - t_start, 3),
-            "reply_seconds": round(t_reply - t_stt, 3),
-            "tts_seconds": round(t_tts - t_reply, 3),
-            "process_total_seconds": round(t_tts - t_start, 3),
-            "continue_listen": bool(meta.prompt_medical_ack),
-        }
-        return wav_out, meta
+        return _silent_close(
+            meta,
+            reply_path="stt_rejected",
+            heard=user_text,
+            audio_input_format=audio_input_format,
+            audio_in_seconds=audio_in_seconds,
+            wav_bytes=wav_bytes,
+            stt_engine=stt_engine,
+            t_start=t_start,
+            t_stt=t_stt,
+            extra={"session": session, "energy": peak_energy, "turn": voice_turn},
+        )
 
     from alarm_voice import handle_alarm_voice
 
@@ -2318,6 +2467,8 @@ def process_voice_wav(
         "session": session,
         "wake_ok": True if session == "wake" else None,
         "heard_raw": heard_raw[:200],
+        "turn": voice_turn,
+        "energy": peak_energy,
     }
     if memory_ctx:
         meta.timings["memory_turns"] = memory_ctx.recent_turns
@@ -2346,24 +2497,21 @@ def process_voice_wav(
         if session_turns:
             meta.timings["device_session_turns"] = len(session_turns)
 
-    logger.info(
-        "VOICE_OUT session=%s path=%s continue=%s heard=%r reply=%r",
-        session,
-        reply_path,
-        bool(meta.prompt_medical_ack),
-        user_text[:120],
-        (reply or "")[:120],
-    )
-    logger.info(
-        "Latency | stt(%s)=%.2fs reply(%s)=%.2fs tts=%.2fs total=%.2fs | in=%.1fs out=%.1fs%s",
-        stt_engine,
-        meta.timings["stt_seconds"],
-        reply_path,
-        meta.timings["reply_seconds"],
-        meta.timings["tts_seconds"],
-        meta.timings["process_total_seconds"],
-        audio_in_seconds,
-        audio_out_seconds,
-        f" | eye={meta.eye_expression}" if meta.eye_expression else "",
+    log_nino_voice(
+        "SEND",
+        turn=voice_turn,
+        session=session,
+        path=reply_path,
+        continue_listen=int(bool(meta.prompt_medical_ack)),
+        heard=user_text[:120],
+        reply=(reply or "")[:120],
+        engine=stt_engine,
+        stt=meta.timings["stt_seconds"],
+        llm=meta.timings["reply_seconds"],
+        tts=meta.timings["tts_seconds"],
+        total=meta.timings["process_total_seconds"],
+        in_s=round(audio_in_seconds, 2),
+        out_s=round(audio_out_seconds, 2),
+        eye=meta.eye_expression or "",
     )
     return wav_out, meta

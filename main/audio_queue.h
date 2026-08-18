@@ -48,3 +48,6 @@ void nino_audio_queue_wait_idle(uint32_t timeout_ms);
 
 /** Stop any interruptible normal clip so the wake beep can take the speaker. */
 void nino_audio_queue_preempt_for_wake(void);
+
+/** True while a queued clip is pending, playing, or suspended. */
+bool nino_audio_queue_busy(void);

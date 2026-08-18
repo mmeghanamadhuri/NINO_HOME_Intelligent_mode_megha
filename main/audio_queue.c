@@ -15,6 +15,7 @@
 #include "servo_dxl.h"
 #include "servo_motion.h"
 #include "voice_assist.h"
+#include "music_stream.h"
 
 static const char *TAG = "audio_q";
 
@@ -145,6 +146,7 @@ static bool play_normal_job(audio_play_job_t *job) {
       nino_eye_idle();
     }
     (void)nino_rgb_led_show(NINO_RGB_SHOW_ERROR);
+    nino_music_pause_for_speech(false);
     return true;
   }
   free(job->data);
@@ -155,6 +157,7 @@ static bool play_normal_job(audio_play_job_t *job) {
   }
 
   s_normal_playing = true;
+  nino_music_pause_for_speech(true);
   ESP_LOGI(TAG, "Playing server WAV %u bytes @ %u Hz", (unsigned)decoded.num_bytes,
            (unsigned)decoded.sample_rate_hz);
   size_t offset = 0;
@@ -193,6 +196,7 @@ static bool play_normal_job(audio_play_job_t *job) {
     nino_voice_assist_prompt_medical_ack();
   } else {
     (void)nino_rgb_led_show(NINO_RGB_SHOW_DONE);
+    nino_music_pause_for_speech(false);
   }
   nino_decoded_wav_free(&decoded);
   s_normal_playing = false;
@@ -240,6 +244,7 @@ static bool play_suspended(void) {
     nino_voice_assist_prompt_medical_ack();
   } else {
     (void)nino_rgb_led_show(NINO_RGB_SHOW_DONE);
+    nino_music_pause_for_speech(false);
   }
   nino_decoded_wav_free(&snap.decoded);
   s_normal_playing = false;
@@ -423,7 +428,10 @@ void nino_audio_queue_wait_idle(uint32_t timeout_ms) {
   ESP_LOGW(TAG, "Audio queue wait_idle timed out after %u ms", (unsigned)timeout_ms);
 }
 
+bool nino_audio_queue_busy(void) { return !audio_queue_is_idle(); }
+
 void nino_audio_queue_preempt_for_wake(void) {
+  nino_music_pause_for_speech(true);
   if (s_normal_queue == NULL) {
     return;
   }
