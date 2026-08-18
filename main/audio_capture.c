@@ -204,7 +204,7 @@ esp_err_t nino_audio_capture_wav_until_quiet(
     }
     if (energy >= speech_th) {
       if (!heard_speech) {
-        ESP_LOGI(TAG, "Question energy after gap: energy=%u th=%u at %u ms",
+        ESP_LOGI(TAG, "NINO VOICE | QUESTION | energy=%u th=%u at=%u ms",
                  (unsigned)energy, (unsigned)speech_th, (unsigned)elapsed_ms);
       }
       heard_speech = true;
@@ -215,14 +215,14 @@ esp_err_t nino_audio_capture_wav_until_quiet(
       if (wait_speech_ms == 0) {
         quiet_ms += 20;
         if (quiet_end_ms > 0 && quiet_ms >= quiet_end_ms) {
-          ESP_LOGI(TAG, "Sentence end (no extra question wait) after %u ms",
+          ESP_LOGI(TAG, "NINO VOICE | SENTENCE | reason=quiet_no_wait live=%u ms",
                    (unsigned)elapsed_ms);
           break;
         }
         continue;
       }
       if ((elapsed_ms - min_ms) >= wait_speech_ms) {
-        ESP_LOGI(TAG, "No question after %u ms gap wait — sending wake clip",
+        ESP_LOGI(TAG, "NINO VOICE | NO_Q     | waited=%u ms — wake clip only",
                  (unsigned)wait_speech_ms);
         break;
       }
@@ -230,7 +230,8 @@ esp_err_t nino_audio_capture_wav_until_quiet(
     }
     quiet_ms += 20;
     if (quiet_end_ms > 0 && quiet_ms >= quiet_end_ms) {
-      ESP_LOGI(TAG, "Sentence end: quiet %u ms after %u ms live (energy=%u th=%u)",
+      ESP_LOGI(TAG,
+               "NINO VOICE | SENTENCE | quiet=%u ms live=%u ms energy=%u th=%u",
                (unsigned)quiet_ms, (unsigned)elapsed_ms, (unsigned)energy,
                (unsigned)quiet_energy);
       break;
@@ -253,7 +254,7 @@ esp_err_t nino_audio_capture_wav_until_quiet(
   const unsigned total_ms =
       (unsigned)((got / CAP_BYTES_PER_SAMPLE) * 1000U / CAP_SAMPLE_RATE);
   ESP_LOGI(TAG,
-           "Captured VAD WAV %u ms total (%u ms live + preroll), %u bytes (%s)",
+           "NINO VOICE | WAV      | total=%u ms live=%u ms bytes=%u src=%s",
            total_ms, (unsigned)elapsed_ms, (unsigned)*out_len,
            nino_mic_source_name(nino_mic_preferred_source()));
   return ESP_OK;

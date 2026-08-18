@@ -56,6 +56,7 @@
 #include "servo_recplay.h"
 #include "push_buttons.h"
 #include "voice_assist.h"
+#include "music_stream.h"
 #include "wifi_config.h"
 #include "wifi_prov_ble.h"
 #if CONFIG_ESP_HOSTED_ENABLED
@@ -378,7 +379,7 @@ static void finish_boot_greeting_and_enable_wake(void) {
     ESP_LOGI(TAG, "Voice assistant URL: %s — Aux-in listen arms after greeting", s_voice_ws_url);
   }
   nino_voice_assist_start_listen_loop();
-  ESP_LOGI(TAG, "Aux-in listen on — Sirena wake-word audio triggers 5 s capture");
+  ESP_LOGI(TAG, "Aux-in listen on — Sirena energy starts VAD capture (not a fixed 5 s)");
 }
 
 static void hello_home_task(void *arg) {
@@ -2095,6 +2096,100 @@ static esp_err_t play_wav_handler(httpd_req_t *req) {
                          HTTPD_RESP_USE_STRLEN);
 }
 
+static bool parse_json_string_field(const char *body, const char *key, char *out,
+                                    size_t out_len);
+
+static esp_err_t music_json_error(httpd_req_t *req, const char *status,
+                                  const char *error) {
+  httpd_resp_set_status(req, status);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  char body[128];
+  int n = snprintf(body, sizeof(body), "{\"ok\":false,\"error\":\"%s\"}", error);
+  if (n <= 0 || n >= (int)sizeof(body)) {
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"failed\"}",
+                           HTTPD_RESP_USE_STRLEN);
+  }
+  return httpd_resp_send(req, body, n);
+}
+
+static esp_err_t music_play_handler(httpd_req_t *req) {
+  if (req->method != HTTP_POST) {
+    return music_json_error(req, "405 Method Not Allowed", "POST only");
+  }
+  if (req->content_len <= 0 || req->content_len > 640) {
+    return music_json_error(req, "400 Bad Request", "bad_body");
+  }
+
+  char body[641] = {0};
+  int received = 0;
+  while (received < req->content_len) {
+    int r = httpd_req_recv(req, body + received, req->content_len - received);
+    if (r <= 0) {
+      return music_json_error(req, "400 Bad Request", "recv");
+    }
+    received += r;
+  }
+  body[received] = '\0';
+
+  char url[512] = {0};
+  if (!parse_json_string_field(body, "url", url, sizeof(url))) {
+    return music_json_error(req, "400 Bad Request", "missing url");
+  }
+
+  esp_err_t err = nino_music_start(url);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "HTTP /music/play failed: %s", esp_err_to_name(err));
+    if (err == ESP_ERR_INVALID_ARG) {
+      return music_json_error(req, "400 Bad Request", "bad url");
+    }
+    if (err == ESP_ERR_NO_MEM) {
+      return music_json_error(req, "503 Service Unavailable", "no_mem");
+    }
+    return music_json_error(req, "503 Service Unavailable", "start_failed");
+  }
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, "{\"ok\":true,\"queued\":true}",
+                         HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t music_stop_handler(httpd_req_t *req) {
+  if (req->method != HTTP_POST) {
+    return music_json_error(req, "405 Method Not Allowed", "POST only");
+  }
+  int remaining = req->content_len;
+  while (remaining > 0) {
+    char discard[64];
+    int chunk = remaining > (int)sizeof(discard) ? (int)sizeof(discard) : remaining;
+    int r = httpd_req_recv(req, discard, chunk);
+    if (r <= 0) {
+      break;
+    }
+    remaining -= r;
+  }
+  nino_music_stop();
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t music_status_handler(httpd_req_t *req) {
+  if (req->method != HTTP_GET) {
+    return music_json_error(req, "405 Method Not Allowed", "GET only");
+  }
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  char body[64];
+  int n = snprintf(body, sizeof(body), "{\"ok\":true,\"playing\":%s}",
+                   nino_music_is_playing() ? "true" : "false");
+  if (n <= 0 || n >= (int)sizeof(body)) {
+    return httpd_resp_send_500(req);
+  }
+  return httpd_resp_send(req, body, n);
+}
+
 static bool parse_volume_percent_value(const char *text, int *out) {
   if (text == NULL || out == NULL || *text == '\0') {
     return false;
@@ -2166,6 +2261,48 @@ static bool parse_json_bool_field(const char *body, const char *key, bool *out) 
     return true;
   }
   return false;
+}
+
+static bool parse_json_string_field(const char *body, const char *key, char *out,
+                                    size_t out_len) {
+  if (body == NULL || key == NULL || out == NULL || out_len == 0) {
+    return false;
+  }
+  out[0] = '\0';
+  char pattern[24];
+  int pn = snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+  if (pn <= 0 || pn >= (int)sizeof(pattern)) {
+    return false;
+  }
+  const char *p = strstr(body, pattern);
+  if (p == NULL) {
+    return false;
+  }
+  p = strchr(p + pn, ':');
+  if (p == NULL) {
+    return false;
+  }
+  p++;
+  while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+    p++;
+  }
+  if (*p != '"') {
+    return false;
+  }
+  p++;
+  size_t n = 0;
+  while (p[n] != '\0' && p[n] != '"') {
+    n++;
+  }
+  if (p[n] != '"') {
+    return false;
+  }
+  if (n >= out_len) {
+    n = out_len - 1;
+  }
+  memcpy(out, p, n);
+  out[n] = '\0';
+  return n > 0;
 }
 
 static esp_err_t eye_expression_handler(httpd_req_t *req) {
@@ -3025,7 +3162,7 @@ static int cmd_voice(int argc, char **argv) {
            nino_voice_assist_aux_listen_is_running() ? "armed" : "busy");
     printf("device_id: %s\n", s_device_id);
     printf("voice url: \"%s\"\n", s_voice_ws_url[0] ? s_voice_ws_url : "(not set)");
-    printf("Aux-in energy starts a 5 s capture after Sirena wake; or type start [seconds]\n");
+    printf("Aux-in energy starts a VAD capture after Sirena wake; or type start [seconds]\n");
     return 0;
   }
   printf("Usage: voice connect <ip> [port] | voice url [<ws-uri>] | voice status\n");
@@ -3426,7 +3563,7 @@ static void start_http_server(void) {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = HTTP_SERVER_PORT;
   config.stack_size = 8192;
-  config.max_uri_handlers = 40;
+  config.max_uri_handlers = 48;
   config.max_open_sockets = 7; /* ESP-IDF max on this target (httpd reserves 3 internally) */
   config.lru_purge_enable = true;
   config.recv_wait_timeout = 45;
@@ -3469,6 +3606,24 @@ static void start_http_server(void) {
       .uri = "/play_wav",
       .method = HTTP_POST,
       .handler = play_wav_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t music_play_uri = {
+      .uri = "/music/play",
+      .method = HTTP_POST,
+      .handler = music_play_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t music_stop_uri = {
+      .uri = "/music/stop",
+      .method = HTTP_POST,
+      .handler = music_stop_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t music_status_uri = {
+      .uri = "/music/status",
+      .method = HTTP_GET,
+      .handler = music_status_handler,
       .user_ctx = NULL,
   };
   const httpd_uri_t servo_360_uri = {
@@ -3591,6 +3746,9 @@ static void start_http_server(void) {
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &stream_mjpeg_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &snapshot_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &play_wav_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &music_play_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &music_stop_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &music_status_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &servo_360_uri));
   ESP_ERROR_CHECK(nino_servo_recplay_register_http(s_http_server));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &eye_expression_uri));
@@ -3941,6 +4099,9 @@ void app_main(void) {
     ESP_LOGW(TAG,
              "Speaker (BSP audio) init failed; POST /play_wav may not work");
   }
+  if (nino_music_init() != ESP_OK) {
+    ESP_LOGW(TAG, "Music stream init failed; POST /music/play will not work");
+  }
   (void)nino_audio_load_saved_volume();
   if (nino_voice_preload_wake_chime() != ESP_OK) {
     ESP_LOGW(TAG, "Wake chime preload failed — first beep may be slower");
@@ -4008,7 +4169,7 @@ void app_main(void) {
   ESP_ERROR_CHECK(uvc_host_install(&uvc_driver_config));
 
   ESP_LOGI(TAG, "J18: powered USB hub -> UVC camera + FTDI U2D2 (Dynamixel)");
-  ESP_LOGI(TAG, "Audio: ES8311 Aux-in (Sirena) → 5 s capture after energy; speaker is playback only");
+  ESP_LOGI(TAG, "Audio: ES8311 Aux-in (Sirena) → energy VAD capture; speaker is playback only");
   ESP_LOGI(
       TAG,
       "Open / in a browser on your camera's IP address (check 'wifi status')");

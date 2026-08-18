@@ -39,8 +39,9 @@ esp_err_t nino_voice_assist_run_query(uint32_t duration_ms);
 esp_err_t nino_voice_assist_run_query_only(void);
 
 /**
- * Watch ES8311 Aux-in for Sirena wake-word energy, keep 500 ms preroll,
+ * Watch ES8311 Aux-in for Sirena wake energy, keep 500 ms preroll,
  * record a 1 s gap plus until sentence-end quiet, upload as session=wake.
+ * Silent clips (peak energy below the upload gate) are not sent.
  * Call after nino_audio_init() / greeting so speaker clips own I2S first.
  */
 void nino_voice_assist_start_listen_loop(void);
@@ -57,6 +58,9 @@ void nino_voice_assist_prompt_medical_ack(void);
  * chime sets this false so only one beep plays before the mic opens.
  */
 void nino_voice_assist_set_next_prompt_ack_chime(bool play_chime);
+
+/** True while a voice query (capture or WS job) is in flight. */
+bool nino_voice_assist_query_is_busy(void);
 
 #ifdef __cplusplus
 }

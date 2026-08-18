@@ -550,6 +550,49 @@ esp_err_t nino_audio_play_decoded(const nino_decoded_wav_t *decoded, size_t *pcm
   return ESP_OK;
 }
 
+#define NINO_AUDIO_WRITE_CHUNK 4096
+
+esp_err_t nino_audio_write_pcm16_mono_locked(const int16_t *samples, size_t sample_count,
+                                             uint32_t sample_rate_hz) {
+  if (!s_ready) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  if (s_spk == NULL) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  if (sample_rate_hz < 8000 || sample_rate_hz > 48000) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  if (sample_count > 0 && samples == NULL) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  esp_err_t err = spk_stream_open_locked(sample_rate_hz, true);
+  if (err != ESP_OK) {
+    return err;
+  }
+  if (sample_count == 0) {
+    return ESP_OK;
+  }
+
+  const size_t play_len = sample_count * sizeof(int16_t);
+  const uint8_t *play_ptr = (const uint8_t *)samples;
+  size_t offset = 0;
+  while (offset < play_len) {
+    int block = (int)(play_len - offset);
+    if (block > NINO_AUDIO_WRITE_CHUNK) {
+      block = NINO_AUDIO_WRITE_CHUNK;
+    }
+    const int cr = esp_codec_dev_write(s_spk, (void *)(play_ptr + offset), block);
+    if (cr != ESP_CODEC_DEV_OK) {
+      ESP_LOGE(TAG, "esp_codec_dev_write failed: %d", cr);
+      return ESP_FAIL;
+    }
+    offset += (size_t)block;
+  }
+  return ESP_OK;
+}
+
 esp_err_t nino_audio_play_wav(const uint8_t *wav_bytes, size_t wav_len) {
   nino_decoded_wav_t decoded = {};
   esp_err_t err = nino_audio_decode_wav(wav_bytes, wav_len, &decoded);
