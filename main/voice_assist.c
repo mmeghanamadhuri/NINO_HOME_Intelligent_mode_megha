@@ -852,7 +852,8 @@ static bool copy_ws_uri(char *uri, size_t uri_sz) {
 
 /* USB UVC + ESP-Hosted SDIO Wi-Fi contend if UVC starts on the same tick as
  * the first PCM send. Start the camera (and wait until it streams) before
- * opening the voice WS. */
+ * opening the voice WS. Stay on through GREET / listen / TTS until true
+ * session end (goodbye + GPIO5, or WS fully closed with no retry). */
 static void session_camera_on(void) {
   nino_camera_set_session_active(true);
   if (!nino_camera_wait_streaming(CAMERA_STREAM_WAIT_MS)) {
@@ -862,6 +863,10 @@ static void session_camera_on(void) {
   } else {
     voice_log(ESP_LOG_INFO, s_voice_turn, "CAMERA", "streaming");
   }
+}
+
+static void session_camera_off(void) {
+  nino_camera_set_session_active(false);
 }
 
 /* Takes ownership of @p resp (queue frees it after playback, or on queue fail). */
@@ -976,8 +981,9 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
     if (preroll != NULL && preroll_samples > 0) {
       if (nino_voice_ws_session_send_pcm(ws, preroll,
                                          preroll_samples * sizeof(int16_t)) != ESP_OK) {
-        if (!nino_voice_ws_session_should_pause(ws) ||
-            !nino_voice_ws_session_is_open(ws)) {
+        if (!nino_voice_ws_session_should_pause(ws) &&
+            !nino_voice_ws_session_is_open(ws) &&
+            !nino_voice_ws_session_socket_connected(ws)) {
           voice_log(ESP_LOG_ERROR, turn, "FAIL", "stage=stream err=preroll");
           (void)nino_rgb_led_show(NINO_RGB_SHOW_ERROR);
           break;
@@ -1004,9 +1010,17 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
       }
       if (nino_voice_ws_session_send_pcm(ws, frame, sizeof(frame)) != ESP_OK) {
         if (nino_voice_ws_session_should_pause(ws) &&
-            nino_voice_ws_session_is_open(ws)) {
+            (nino_voice_ws_session_is_open(ws) ||
+             nino_voice_ws_session_socket_connected(ws))) {
           voice_log(ESP_LOG_INFO, turn, "STREAM",
                     "paused because EOS/skip after %u ms", (unsigned)streamed_ms);
+          break;
+        }
+        if (nino_voice_ws_session_socket_connected(ws)) {
+          voice_log(ESP_LOG_WARN, turn, "STREAM",
+                    "write-0 after %u ms — wait for server, camera stays on",
+                    (unsigned)streamed_ms);
+          tx_failed = true;
           break;
         }
         tx_failed = true;
@@ -1023,14 +1037,21 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
     nino_mic_close();
     /* Keep solid blue through STT/LLM until TTS actually starts. */
     nino_eye_thinking();
-    if (tx_failed || !nino_voice_ws_session_is_open(ws)) {
+    if (!nino_voice_ws_session_is_open(ws) &&
+        !nino_voice_ws_session_socket_connected(ws)) {
       voice_log(ESP_LOG_ERROR, turn, "FAIL",
                 "stage=stream err=ESP_FAIL after %u ms", (unsigned)streamed_ms);
       (void)nino_rgb_led_show(NINO_RGB_SHOW_ERROR);
       break;
     }
-    voice_log(ESP_LOG_INFO, turn, "WAIT_PC", "paused TX after %u ms",
-              (unsigned)streamed_ms);
+    if (tx_failed) {
+      voice_log(ESP_LOG_WARN, turn, "STREAM",
+                "write glitch after %u ms — wait for server, camera stays on",
+                (unsigned)streamed_ms);
+    } else {
+      voice_log(ESP_LOG_INFO, turn, "WAIT_PC", "paused TX after %u ms",
+                (unsigned)streamed_ms);
+    }
 
     uint8_t *resp = NULL;
     size_t resp_len = 0;
@@ -1070,7 +1091,6 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
   }
 
 session_done:
-  nino_camera_set_session_active(false);
   /* Clear busy before WS teardown so listen cannot stay wedged if destroy lags. */
   s_query_busy = false;
   nino_music_pause_for_speech(false);
@@ -1087,6 +1107,9 @@ session_done:
     voice_log(ESP_LOG_INFO, s_voice_turn, "GPIO5",
               "low — Sirena mics stay open (not goodbye)");
   }
+  /* Camera off only after goodbye GPIO5 or a fully closed WS — not after hunt,
+   * GREET, EOS/WAIT_PC, or a recoverable STREAM write-0. */
+  session_camera_off();
   aux_ignore_energy_for_ms(AUX_POST_SPEAKER_IGNORE_MS);
 }
 

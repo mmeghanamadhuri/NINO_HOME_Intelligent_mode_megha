@@ -4082,6 +4082,8 @@ static void uvc_stream_task(void *arg) {
           continue;
         }
       } else if (!s_camera_session_active && streaming) {
+        /* Idle only — never stop UVC on frame timeout / missed EoF / HTTP
+         * /stream idle while the voice session is still active. */
         s_uvc_streaming = false;
         (void)uvc_host_stream_stop(stream);
         uvc_host_frame_t *queued = NULL;
@@ -4101,6 +4103,10 @@ static void uvc_stream_task(void *arg) {
 
       uvc_host_frame_t *frame = NULL;
       if (xQueueReceive(s_frame_queue, &frame, pdMS_TO_TICKS(2000)) != pdPASS) {
+        /* Keep the ISOC stream running for the whole conversation. */
+        if (!s_camera_session_active) {
+          continue;
+        }
         const int64_t now_us = esp_timer_get_time();
         if (s_last_uvc_timeout_log_us == 0 ||
             (now_us - s_last_uvc_timeout_log_us) >=

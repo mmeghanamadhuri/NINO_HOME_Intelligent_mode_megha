@@ -350,22 +350,18 @@ def startup() -> None:
     import threading
 
     def _multi_device_vision_loop() -> None:
-        """Emotion / TTS / face-reg / result cache for every device (throttled).
+        """Emotion / TTS / result cache for every device (throttled).
 
-        UI device always runs face_reg here so voice registration works even when
-        no browser is consuming /video_feed. MJPEG may also call on_frame; the
-        registration service is locked and idempotent.
+        Identity greet + register live on the stream session (session_identity),
+        not this MJPEG loop. Camera auto-welcome and auto-register are off.
         """
         interval = float(os.environ.get("MULTI_DEVICE_VISION_INTERVAL_S", "0.5"))
         while True:
             try:
-                ui_id = registry.ui_device_id()
                 for record in registry.list_devices():
-                    is_ui = record.device_id == ui_id
                     _vision_tick_device(
                         record.device_id,
                         update_tts=True,
-                        face_reg=is_ui,
                     )
             except Exception:
                 logger.debug("multi-device vision tick failed", exc_info=True)
@@ -1081,14 +1077,6 @@ def _mjpeg_generator(device_id: str):
             _latest_results_by_device[device_id] = results
             if is_ui_device:
                 latest_results = results
-            try:
-                if is_ui_device:
-                    face_registration.on_frame(
-                        results,
-                        voice_active=voice_pipeline_active(),
-                    )
-            except Exception:
-                logger.exception("Face registration frame hook failed")
             now = time.time()
             if now - last_tts_update_at >= TTS_UPDATE_INTERVAL_SECONDS:
                 tts.set_playback_device_id(device_id)
@@ -1115,7 +1103,7 @@ def _mjpeg_generator(device_id: str):
 
 
 def _vision_tick_device(
-    device_id: str, *, update_tts: bool = True, face_reg: bool = False
+    device_id: str, *, update_tts: bool = True
 ) -> None:
     """One recognition/emotion pass for a device (used by the background vision loop)."""
     is_ui_device = device_id == registry.ui_device_id()
@@ -1145,11 +1133,6 @@ def _vision_tick_device(
         finally:
             if prev:
                 tts.set_playback_device_id(prev)
-    if face_reg:
-        try:
-            face_registration.on_frame(results, voice_active=voice_pipeline_active())
-        except Exception:
-            logger.debug("Face reg tick failed for %s", device_id, exc_info=True)
 
 
 def _remember_voice_viewer(name: str | None, device_id: str | None = None) -> None:
@@ -1292,6 +1275,57 @@ def _camera_scene_snapshot(device_id: str | None = None) -> str:
     return summarize_detections(detections)
 
 
+def _session_open_identity_snapshot(
+    device_id: str | None = None,
+) -> tuple[str | None, Literal["recognized", "unknown", "no_face"]]:
+    """Live identity for stream GREET after face hunt.
+
+    Do not treat a cached unstabilized face as unknown (that skipped the
+    multi-frame vote and sent known people down register-offer). Do not
+    recall the previous session's viewer — greet only who is in frame now.
+    """
+    active = resolve_device_id(device_id)
+    cached = _latest_results_by_device.get(active) or (
+        latest_results if active == registry.ui_device_id() else []
+    )
+    if cached:
+        primary = _primary_recognized_viewer(cached)
+        if primary:
+            _remember_voice_viewer(primary, active)
+            logger.info(
+                "session-open identity cache name=%s device=%s", primary, active
+            )
+            return primary, "recognized"
+
+    frame = cameras.read(active)
+    if frame is not None:
+        results = faces.recognize(frame)
+        primary = _primary_recognized_viewer(results)
+        if primary:
+            _remember_voice_viewer(primary, active)
+            logger.info(
+                "session-open identity frame name=%s device=%s", primary, active
+            )
+            return primary, "recognized"
+
+    name, state = faces.recognize_identity(
+        cameras.frame_getter(active),
+        allow_session_hint=False,
+    )
+    if state == "recognized" and name:
+        cleaned = str(name).strip()
+        if cleaned and cleaned.lower() not in {"unknown", "face"}:
+            _remember_voice_viewer(cleaned, active)
+            logger.info(
+                "session-open identity vote name=%s device=%s", cleaned, active
+            )
+            return cleaned, "recognized"
+    logger.info("session-open identity state=%s device=%s", state, active)
+    if state == "unknown":
+        return None, "unknown"
+    return None, "no_face"
+
+
 async def _delayed_esp_servo_360(
     delay_seconds: float, device_id: str | None = None
 ) -> None:
@@ -1308,13 +1342,6 @@ async def _delayed_esp_servo_360(
             device_id,
             err or "unknown",
         )
-
-
-async def _delayed_face_reg_relisten(delay_seconds: float) -> None:
-    wait = max(0.0, delay_seconds)
-    if wait:
-        await asyncio.sleep(wait)
-    await run_in_threadpool(face_registration.relisten_after_missed_name)
 
 
 LATENCY_LOG_PATH = BASE_DIR / "data" / "latency_log.json"
@@ -1499,7 +1526,6 @@ async def _process_voice_query_audio(
     t_query_start = time.perf_counter()
     identity_seconds = 0.0
     await run_in_threadpool(begin_voice_query)
-    await run_in_threadpool(face_registration.on_voice_query_started)
     try:
         try:
             t_ident = time.perf_counter()
@@ -1679,8 +1705,6 @@ async def _voice_ws_send_reply(
 
     from voice_service import SERVO_360_TRIGGER_DELAY_SECONDS
 
-    if meta.face_reg_relisten:
-        asyncio.create_task(_delayed_face_reg_relisten(0.5))
     if meta.trigger_servo_360:
         asyncio.create_task(
             _delayed_esp_servo_360(SERVO_360_TRIGGER_DELAY_SECONDS, device_id)
@@ -1744,7 +1768,7 @@ async def _voice_ws_stream_pipeline(
 
     try:
         identity_name, identity_state = await run_in_threadpool(
-            _camera_identity_snapshot, True, device_id
+            _session_open_identity_snapshot, device_id
         )
         ident = get_session_identity()
         if ident is not None:
@@ -2209,7 +2233,6 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                 energy=aux_energy,
             )
             await run_in_threadpool(begin_voice_query)
-            await run_in_threadpool(face_registration.on_voice_query_started)
             try:
                 try:
                     t_ident = time.perf_counter()
@@ -2388,9 +2411,6 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                         continue_listen=int(bool(reply_meta.prompt_medical_ack)),
                         stage_s=time.perf_counter() - t_send,
                     )
-
-                if reply_meta.face_reg_relisten:
-                    asyncio.create_task(_delayed_face_reg_relisten(0.5))
 
                 if reply_meta.trigger_servo_360:
                     asyncio.create_task(

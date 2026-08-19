@@ -670,6 +670,11 @@ bool nino_voice_ws_session_is_open(nino_voice_ws_session_t *session) {
          esp_websocket_client_is_connected(session->client);
 }
 
+bool nino_voice_ws_session_socket_connected(nino_voice_ws_session_t *session) {
+  return session != NULL && session->client != NULL &&
+         esp_websocket_client_is_connected(session->client);
+}
+
 static bool stream_pause_flags(const nino_voice_ws_session_t *session) {
   return session != NULL && (session->eos || session->skip || session->reply_ready);
 }
@@ -729,6 +734,19 @@ esp_err_t nino_voice_ws_session_send_pcm(nino_voice_ws_session_t *session,
     if (stream_pause_flags(session)) {
       return ESP_ERR_INVALID_STATE;
     }
+  }
+
+  if (stream_pause_flags(session)) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  /* write-0 while the socket is still up is usually VAD EOS racing send_bin,
+   * not a dead conversation. Pause TX and wait for the server instead of
+   * failing the session (that turned the camera off mid-chat). */
+  if (nino_voice_ws_session_socket_connected(session) && !session->error) {
+    session->eos = true;
+    stream_signal(session);
+    ESP_LOGW(TAG, "send_bin write-0 — pause TX, session stays open");
+    return ESP_ERR_INVALID_STATE;
   }
 
   session->error = true;

@@ -173,7 +173,9 @@ class FaceRegistrationService:
         self._read_frame = read_frame
 
     def apply_settings_from_environ(self) -> None:
-        self.enabled = os.environ.get("FACE_REG_ENABLED", "1").strip().lower() in {
+        # Off by default: stream session_identity owns register/guest.
+        # The old "mystery guest / after the beep" HTTP prompt races GREET.
+        self.enabled = os.environ.get("FACE_REG_ENABLED", "0").strip().lower() in {
             "1",
             "true",
             "yes",
@@ -704,4 +706,8 @@ def configure_face_registration(
 ) -> FaceRegistrationService:
     global _service
     _service = FaceRegistrationService(faces, read_frame)
+    if not _service.enabled:
+        logger.info(
+            "Legacy auto face-registration is off — session GREET / register-offer owns identity"
+        )
     return _service

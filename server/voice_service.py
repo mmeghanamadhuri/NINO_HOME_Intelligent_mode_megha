@@ -2100,7 +2100,6 @@ def process_voice_wav(
         )
         return wav_out, meta
 
-    from face_registration_service import get_face_registration_service
     from session_identity import get_session_identity
 
     ident = get_session_identity()
@@ -2141,17 +2140,8 @@ def process_voice_wav(
                 }
                 return b"", meta
 
-    face_reg = get_face_registration_service()
-    awaiting_face_reg = (
-        (not ident_handled)
-        and face_reg is not None
-        and face_reg.accepts_registration_voice(user_text)
-    )
-
-    if (
-        not awaiting_face_reg
-        and not ident_handled
-        and (is_likely_tts_echo(user_text) or is_unintelligible_stt(user_text))
+    if not ident_handled and (
+        is_likely_tts_echo(user_text) or is_unintelligible_stt(user_text)
     ):
         logger.info("Voice STT rejected (echo/garbled) | heard: %s", user_text[:120])
         return _silent_close(
@@ -2196,38 +2186,6 @@ def process_voice_wav(
         camera_identity_state,
     )
     t_memory = time.perf_counter()
-
-    face_reg = get_face_registration_service()
-    if (
-        not ident_handled
-        and face_reg is not None
-        and face_reg.accepts_registration_voice(user_text)
-    ):
-        reg_result = face_reg.handle_voice(user_text)
-        if reg_result.handled:
-            reply_path = "face_registration"
-            reply = reg_result.reply
-            if reg_result.registered_name:
-                meta.registered_face_name = reg_result.registered_name
-            if reg_result.relisten_after_reply:
-                meta.face_reg_relisten = True
-            logger.info(
-                "Voice face registration | registered=%s heard: %s",
-                reg_result.registered_name or "(none)",
-                user_text[:120],
-            )
-            if reg_result.relisten_after_reply:
-                meta.timings = {
-                    "heard": user_text[:200],
-                    "reply_text": "(face registration relisten scheduled)",
-                    "reply_path": reply_path,
-                    "audio_input_format": audio_input_format,
-                    "audio_in_seconds": round(audio_in_seconds, 2),
-                    "audio_in_bytes": len(wav_bytes),
-                    "stt_engine": stt_engine,
-                    "stt_seconds": round(t_stt - t_start, 3),
-                }
-                return b"", meta
 
     # Music stop must beat goodbye / LLM: while a track is playing, "stop",
     # "shut up", and STT mashups like "shupupo" should only stop the song.

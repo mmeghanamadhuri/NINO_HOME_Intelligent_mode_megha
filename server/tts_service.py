@@ -886,6 +886,16 @@ def _greeting_continue_listen_enabled() -> bool:
     }
 
 
+def _vision_face_greeting_enabled() -> bool:
+    """Legacy camera auto-welcome. Off: session GREET owns identified users."""
+    return os.environ.get("VISION_FACE_GREETING_ENABLED", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 # Synthetic user side when logging a face-recognition welcome to conversations.
 VISION_GREETING_USER_TEXT = "[face recognized]"
 
@@ -933,6 +943,8 @@ class TTSService:
         self._voice_cooldown_seconds: float = float(
             os.environ.get("VISION_GREETING_AFTER_VOICE_SECONDS", "90")
         )
+        # Product greets via stream session-open TTS, not MJPEG auto-welcome.
+        self.vision_greeting_enabled = _vision_face_greeting_enabled()
         self._ollama_url = (ollama_url or "").strip()
         self._ollama_model = (ollama_model or "").strip()
         self._enabled = True
@@ -1071,9 +1083,9 @@ class TTSService:
             primary_re_entered = primary not in prev_present
             self._present_known_names = current_known
 
-            if now >= self._suppress_vision_until:
-                # First sight after boot: speak Phase C "Yesterday we discussed…" greeting.
-                # Regular welcome-back is used only after that startup greeting has run.
+            if self.vision_greeting_enabled and now >= self._suppress_vision_until:
+                # Legacy path: "Yesterday we discussed…" / welcome-back over HTTP play_wav.
+                # Disabled by default so identified users only get session GREET.
                 if primary not in self._startup_greeted:
                     self._enqueue_startup_greeting_locked(primary, now)
                 else:

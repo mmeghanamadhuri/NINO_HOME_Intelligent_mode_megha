@@ -139,6 +139,11 @@ class SessionIdentityFlow:
             }:
                 self._state = "identified"
                 self._user_name = name
+                logger.info(
+                    "Session identity: identified greet name=%s session=%s",
+                    name,
+                    session_id,
+                )
                 return SessionOpenResult(
                     reply=greet_recognized_user(name),
                     reply_path="session_greet",
@@ -148,6 +153,11 @@ class SessionIdentityFlow:
                 )
             self._state = "offer_register"
             self._user_name = None
+            logger.info(
+                "Session identity: register-offer state=%s session=%s",
+                identity_state,
+                session_id,
+            )
             return SessionOpenResult(
                 reply=OFFER_REGISTER_PROMPT,
                 reply_path="session_register_offer",

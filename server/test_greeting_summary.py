@@ -68,6 +68,7 @@ class StartupGreetingTests(unittest.TestCase):
 
     def test_first_sight_queues_startup_summary_greeting(self) -> None:
         svc = TTSService(cooldown_seconds=0.0, face_greeting_interval_seconds=999.0)
+        svc.vision_greeting_enabled = True
         try:
             with patch.object(svc, "_ollama_configured", return_value=True):
                 with patch("tts_service._pick_include_db_context", return_value=True):
@@ -85,6 +86,7 @@ class StartupGreetingTests(unittest.TestCase):
 
     def test_first_sight_can_queue_plain_greeting(self) -> None:
         svc = TTSService(cooldown_seconds=0.0, face_greeting_interval_seconds=999.0)
+        svc.vision_greeting_enabled = True
         try:
             with patch.object(svc, "_ollama_configured", return_value=True):
                 with patch("tts_service._pick_include_db_context", return_value=False):
@@ -101,6 +103,7 @@ class StartupGreetingTests(unittest.TestCase):
 
     def test_reentry_greeting_randomizes_db_mode(self) -> None:
         svc = TTSService(cooldown_seconds=0.0, face_greeting_interval_seconds=1.0)
+        svc.vision_greeting_enabled = True
         try:
             with patch.object(svc, "_ollama_configured", return_value=True):
                 with patch("tts_service._pick_include_db_context", return_value=False):
@@ -130,6 +133,7 @@ class StartupGreetingTests(unittest.TestCase):
 
     def test_voice_does_not_skip_startup_summary_greeting(self) -> None:
         svc = TTSService(cooldown_seconds=0.0, face_greeting_interval_seconds=999.0)
+        svc.vision_greeting_enabled = True
         try:
             svc.notify_voice_interaction("RecognizedUser")
             self.assertTrue(svc.needs_startup_summary_greeting("RecognizedUser"))
@@ -144,6 +148,20 @@ class StartupGreetingTests(unittest.TestCase):
             with svc._lock:
                 self.assertTrue(svc._pending_jobs)
                 self.assertTrue(svc._pending_jobs[0].is_startup_greeting)
+        finally:
+            svc.stop()
+
+    def test_default_skips_legacy_vision_greeting(self) -> None:
+        svc = TTSService(cooldown_seconds=0.0, face_greeting_interval_seconds=999.0)
+        try:
+            self.assertFalse(svc.vision_greeting_enabled)
+            with patch.object(svc, "_ollama_configured", return_value=True):
+                svc.update_face_state(
+                    ["RecognizedUser"], primary_name="RecognizedUser"
+                )
+            with svc._lock:
+                self.assertEqual(svc._pending_jobs, [])
+            self.assertEqual(svc.current_viewer_name(), "RecognizedUser")
         finally:
             svc.stop()
 

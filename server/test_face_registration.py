@@ -127,6 +127,7 @@ class FaceRegistrationServiceTests(unittest.TestCase):
         self.faces.match_soft_threshold = 0.42
         self.read_frame = MagicMock(return_value=None)
         self.svc = FaceRegistrationService(self.faces, self.read_frame)
+        self.svc.enabled = True
         self.svc.unknown_seconds = 1.0
         self.svc.prompt_cooldown_seconds = 0.0
         self.svc.unknown_confirm_frames = 1
@@ -415,6 +416,33 @@ class FaceRegistrationServiceTests(unittest.TestCase):
         self.assertTrue(result.handled)
         self.assertEqual(result.registered_name, "Samira")
         self.assertEqual(self.svc.state, "idle")
+
+
+class LegacyAutoRegisterDisabledTests(unittest.TestCase):
+    def test_default_does_not_prompt(self) -> None:
+        faces = MagicMock()
+        svc = FaceRegistrationService(faces, MagicMock(return_value=None))
+        self.assertFalse(svc.enabled)
+        results = [
+            {
+                "primary": True,
+                "recognized": False,
+                "stabilized": False,
+                "name": "Unknown",
+                "detection_valid": True,
+                "registration_eligible": True,
+                "detection_score": 0.85,
+                "box": {"x": 10, "y": 10, "w": 80, "h": 80},
+            }
+        ]
+        with patch(
+            "face_registration_service.FaceRegistrationService._send_listen_prompt"
+        ) as send:
+            svc.on_frame(results)
+            svc.on_frame(results)
+            send.assert_not_called()
+        self.assertEqual(svc.state, "idle")
+        self.assertFalse(svc.accepts_registration_voice("My name is Alex"))
 
 
 if __name__ == "__main__":

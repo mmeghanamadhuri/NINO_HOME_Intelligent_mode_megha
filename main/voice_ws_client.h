@@ -37,6 +37,8 @@ typedef struct nino_voice_ws_session nino_voice_ws_session_t;
 esp_err_t nino_voice_ws_session_open(const char *ws_uri,
                                      nino_voice_ws_session_t **out);
 bool nino_voice_ws_session_is_open(nino_voice_ws_session_t *session);
+/** True while the ESP-IDF websocket transport is still connected. */
+bool nino_voice_ws_session_socket_connected(nino_voice_ws_session_t *session);
 esp_err_t nino_voice_ws_session_send_pcm(nino_voice_ws_session_t *session,
                                          const void *pcm, size_t len);
 bool nino_voice_ws_session_should_pause(nino_voice_ws_session_t *session);

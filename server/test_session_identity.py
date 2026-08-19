@@ -77,6 +77,11 @@ class SessionIdentityFlowTests(unittest.TestCase):
         self.assertTrue(result.identified)
         self.assertEqual(result.eye_expression, "heart")
         self.assertFalse(self.flow.in_registration())
+        self.assertNotIn("new user", result.reply.lower())
+        self.assertEqual(result.reply_path, "session_greet")
+        user, guest = self.flow.current_user()
+        self.assertEqual(user, "Hari")
+        self.assertFalse(guest)
 
     def test_unknown_offer_then_no_guest(self) -> None:
         open_result = self.flow.start_session(
