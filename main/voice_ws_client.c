@@ -17,6 +17,8 @@ static const char *TAG = "nino_vws";
 
 #define MAX_VOICE_WAV (4 * 1024 * 1024)
 #define EYE_EXPR_MAX 16
+/* write-0 can race EOS JSON still in the WS event task. */
+#define STREAM_WRITE_FAIL_WAIT_MS 400
 
 typedef struct {
   SemaphoreHandle_t done;
@@ -606,17 +608,52 @@ bool nino_voice_ws_session_is_open(nino_voice_ws_session_t *session) {
          esp_websocket_client_is_connected(session->client);
 }
 
+static bool stream_pause_flags(const nino_voice_ws_session_t *session) {
+  return session != NULL && (session->eos || session->skip || session->reply_ready);
+}
+
+static void stream_wait_pause_flags(nino_voice_ws_session_t *session, int timeout_ms) {
+  if (session == NULL || timeout_ms <= 0) {
+    return;
+  }
+  const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+  while (!stream_pause_flags(session) && !session->error) {
+    TickType_t now = xTaskGetTickCount();
+    if (now >= deadline) {
+      break;
+    }
+    TickType_t wait = deadline - now;
+    if (session->evt != NULL) {
+      xSemaphoreTake(session->evt, wait);
+    } else {
+      vTaskDelay(wait);
+    }
+  }
+}
+
 esp_err_t nino_voice_ws_session_send_pcm(nino_voice_ws_session_t *session,
                                          const void *pcm, size_t len) {
   if (session == NULL || pcm == NULL || len == 0 || session->client == NULL) {
     return ESP_ERR_INVALID_ARG;
   }
-  if (session->eos || session->error || !session->connected) {
+  /* EOS/skip/reply means pause TX for WAIT_PC — not a dead session. */
+  if (stream_pause_flags(session)) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  if (session->error || !session->connected) {
     return ESP_ERR_INVALID_STATE;
   }
   int sent = esp_websocket_client_send_bin(session->client, (const char *)pcm, (int)len,
                                            pdMS_TO_TICKS(1000));
   if (sent < 0 || (size_t)sent != len) {
+    /* Server may stop reading after VAD EOS while send_bin is in flight. */
+    if (stream_pause_flags(session)) {
+      return ESP_ERR_INVALID_STATE;
+    }
+    stream_wait_pause_flags(session, STREAM_WRITE_FAIL_WAIT_MS);
+    if (stream_pause_flags(session)) {
+      return ESP_ERR_INVALID_STATE;
+    }
     session->error = true;
     session->connected = false;
     return ESP_FAIL;

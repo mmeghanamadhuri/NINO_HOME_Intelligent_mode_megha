@@ -890,8 +890,13 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
     if (preroll != NULL && preroll_samples > 0) {
       if (nino_voice_ws_session_send_pcm(ws, preroll,
                                          preroll_samples * sizeof(int16_t)) != ESP_OK) {
-        voice_log(ESP_LOG_ERROR, turn, "FAIL", "stage=stream err=preroll");
-        break;
+        if (!nino_voice_ws_session_should_pause(ws)) {
+          vTaskDelay(pdMS_TO_TICKS(400));
+        }
+        if (!nino_voice_ws_session_should_pause(ws)) {
+          voice_log(ESP_LOG_ERROR, turn, "FAIL", "stage=stream err=preroll");
+          break;
+        }
       }
       preroll = NULL;
       preroll_samples = 0;
@@ -911,6 +916,17 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
         continue;
       }
       if (nino_voice_ws_session_send_pcm(ws, frame, sizeof(frame)) != ESP_OK) {
+        if (!nino_voice_ws_session_should_pause(ws)) {
+          /* write-0 can race EOS JSON; WS event task may still deliver it. */
+          vTaskDelay(pdMS_TO_TICKS(400));
+        }
+        if (nino_voice_ws_session_should_pause(ws)) {
+          if (nino_voice_ws_session_is_open(ws)) {
+            voice_log(ESP_LOG_INFO, turn, "STREAM",
+                      "paused because EOS/skip after %u ms", (unsigned)streamed_ms);
+          }
+          break;
+        }
         tx_failed = true;
         break;
       }

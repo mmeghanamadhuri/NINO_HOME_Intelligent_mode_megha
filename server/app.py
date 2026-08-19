@@ -1632,8 +1632,9 @@ async def _voice_ws_stream_pipeline(
 ) -> None:
     """Stream Aux-in PCM until ASR end-of-speech, then TTS; loop until goodbye.
 
-    A background task always calls websocket.receive() so STT/LLM cannot stall
-    TCP and drop the P4 (esp_transport_write returned 0).
+    Only this task calls websocket.receive() / send_*. Starlette shares one lock
+    between send and receive; a background drain task stalls during STT/TTS,
+    the P4 TCP window fills, and esp_transport_write returns 0.
     """
     if not already_accepted:
         await websocket.accept()
@@ -1645,44 +1646,15 @@ async def _voice_ws_stream_pipeline(
     voice_turn = _voice_turn_from_websocket(websocket) or 0
     client_label = _ws_client_label(websocket)
 
-    incoming: asyncio.Queue = asyncio.Queue(maxsize=256)
     buf = UtteranceBuffer()
     accepting = True
     first_turn = True
     session_queries = 0
     session_started = time.perf_counter()
     pcm_frames = 0
+    receive_task: asyncio.Task | None = None
+    stt_task: asyncio.Task | None = None
 
-    async def receiver() -> None:
-        try:
-            while True:
-                try:
-                    message = await websocket.receive()
-                except WebSocketDisconnect:
-                    break
-                if message.get("type") == "websocket.disconnect":
-                    break
-                if not accepting:
-                    continue
-                try:
-                    incoming.put_nowait(message)
-                except asyncio.QueueFull:
-                    logger.warning(
-                        "stream WS PCM queue full device=%s session=%s — dropping frame",
-                        device_id,
-                        session_id,
-                    )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("stream WS receiver failed device=%s", device_id)
-        finally:
-            try:
-                incoming.put_nowait(None)
-            except asyncio.QueueFull:
-                pass
-
-    recv_task = asyncio.create_task(receiver())
     begin_voice_session(session_id, device_id=device_id)
     log_nino_voice(
         "WS_OPEN",
@@ -1696,49 +1668,44 @@ async def _voice_ws_stream_pipeline(
     await websocket.send_json({"type": "session", "session_id": session_id})
     logger.info("stream WS ready device=%s session=%s", device_id, session_id)
 
-    async def finish_utterance(reason: str) -> bool:
-        """Process buffered PCM. Returns False when the session should close."""
-        nonlocal accepting, first_turn, session_queries, voice_turn, aux_energy
-        pcm = bytes(buf.pcm)
-        buf.reset()
-        accepting = False
-        await websocket.send_json({"type": "end_of_speech", "reason": reason})
-        if reason == "timeout" or len(pcm) < 1600:
-            await websocket.send_json(
-                {
-                    "type": "skip",
-                    "skip": True,
-                    "reason": reason or "too_short",
-                    "session_id": session_id,
-                    "end_session": False,
-                }
-            )
-            accepting = True
-            return True
-        try:
-            wav_in = pcm if is_wav_bytes(pcm) else pcm16_mono_to_wav(pcm)
-        except ValueError:
-            await websocket.send_json(
-                {
-                    "type": "skip",
-                    "skip": True,
-                    "reason": "bad_pcm",
-                    "session_id": session_id,
-                    "end_session": False,
-                }
-            )
-            accepting = True
-            return True
+    async def send_skip(reason: str) -> None:
+        await websocket.send_json(
+            {
+                "type": "skip",
+                "skip": True,
+                "reason": reason,
+                "session_id": session_id,
+                "end_session": False,
+            }
+        )
 
-        session_kind = "wake" if first_turn else "continue"
-        first_turn = False
-        voice_turn += 1
+    async def take_or_cancel_receive() -> dict | None:
+        """Finish or cancel receive so send_* is never concurrent with receive()."""
+        nonlocal receive_task
+        task = receive_task
+        receive_task = None
+        if task is None:
+            return None
+        if not task.done():
+            task.cancel()
+        try:
+            return await task
+        except (asyncio.CancelledError, WebSocketDisconnect):
+            return None
+        except Exception:
+            logger.exception("stream WS receive failed device=%s", device_id)
+            return None
+
+    async def build_reply(
+        wav_in: bytes, session_kind: str, this_turn: int
+    ) -> tuple:
+        """STT/LLM/TTS only — must not touch the websocket."""
         try:
             saved = await run_in_threadpool(
                 lambda audio=wav_in: save_aux_wav(
                     audio,
                     device_id=device_id,
-                    turn=voice_turn,
+                    turn=this_turn,
                     energy=aux_energy,
                     session=session_id[:16],
                     source="stream",
@@ -1752,32 +1719,36 @@ async def _voice_ws_stream_pipeline(
             )
         except Exception:
             logger.exception("Failed to save stream utterance device=%s", device_id)
-
-        wav_out, reply_meta, _err = await _process_voice_query_audio(
-            wav_in,
-            device_id=device_id,
-            session_kind=session_kind,
-            session_id=session_id,
-            aux_energy=aux_energy,
-            voice_turn=voice_turn,
-            client_label=client_label,
-        )
-        session_queries += 1
+        try:
+            wav_out, reply_meta, _err = await _process_voice_query_audio(
+                wav_in,
+                device_id=device_id,
+                session_kind=session_kind,
+                session_id=session_id,
+                aux_energy=aux_energy,
+                voice_turn=this_turn,
+                client_label=client_label,
+            )
+        except Exception:
+            logger.exception("stream STT/TTS failed device=%s", device_id)
+            return ("skip", "error")
         path = str(getattr(reply_meta, "timings", {}).get("reply_path") or "")
         if path in {"stt_silent", "stt_empty", "silent_skip", "stt_rejected"} and not getattr(
             reply_meta, "end_session", False
         ):
-            await websocket.send_json(
-                {
-                    "type": "skip",
-                    "skip": True,
-                    "reason": path,
-                    "session_id": session_id,
-                    "end_session": False,
-                }
-            )
+            return ("skip", path)
+        return ("reply", wav_out, reply_meta)
+
+    async def apply_stt_result(result: tuple) -> bool:
+        """Send skip or WAV. Receive must not be in flight. False closes the session."""
+        nonlocal accepting, session_queries
+        session_queries += 1
+        kind = result[0]
+        if kind == "skip":
+            await send_skip(str(result[1] or "skip"))
             accepting = True
             return True
+        wav_out, reply_meta = result[1], result[2]
         await _voice_ws_send_reply(
             websocket,
             device_id=device_id,
@@ -1791,19 +1762,34 @@ async def _voice_ws_stream_pipeline(
         accepting = True
         return True
 
-    async def drain_queued_pcm() -> bool:
-        """Drop frames that arrived during STT. False if the socket already closed."""
-        while True:
-            try:
-                leftover = incoming.get_nowait()
-            except asyncio.QueueEmpty:
-                return True
-            if leftover is None:
-                return False
+    async def finish_utterance(reason: str) -> bool:
+        """Send EOS (receive not in flight). Skip now or start STT off-websocket."""
+        nonlocal accepting, first_turn, voice_turn, stt_task
+        pcm = bytes(buf.pcm)
+        buf.reset()
+        accepting = False
+        await websocket.send_json({"type": "end_of_speech", "reason": reason})
+        if reason == "timeout" or len(pcm) < 1600:
+            await send_skip(reason or "too_short")
+            accepting = True
+            return True
+        try:
+            wav_in = pcm if is_wav_bytes(pcm) else pcm16_mono_to_wav(pcm)
+        except ValueError:
+            await send_skip("bad_pcm")
+            accepting = True
+            return True
+        session_kind = "wake" if first_turn else "continue"
+        first_turn = False
+        voice_turn += 1
+        stt_task = asyncio.create_task(build_reply(wav_in, session_kind, voice_turn))
+        return True
 
     async def handle_chunk(chunk: bytes) -> bool:
         nonlocal pcm_frames
         if not chunk:
+            return True
+        if not accepting:
             return True
         pcm_frames += 1
         if pcm_frames == 1 or pcm_frames % 50 == 0:
@@ -1817,40 +1803,83 @@ async def _voice_ws_stream_pipeline(
         if is_wav_bytes(chunk) and len(chunk) > 4096:
             buf.reset()
             buf.pcm.extend(chunk)
-            keep = await finish_utterance("wav")
-            if keep and not await drain_queued_pcm():
-                return False
-            return keep
+            return await finish_utterance("wav")
         state = buf.feed(chunk)
         if state in {"end_of_speech", "timeout"}:
-            keep = await finish_utterance(state)
-            if keep and not await drain_queued_pcm():
-                return False
-            return keep
+            return await finish_utterance(state)
         return True
 
+    async def handle_message(message: dict | None) -> bool:
+        if message is None:
+            return False
+        if message.get("type") == "websocket.disconnect":
+            return False
+        if message.get("text") is not None:
+            return True
+        chunk = message.get("bytes")
+        if not chunk:
+            return True
+        return await handle_chunk(chunk)
+
+    async def cancel_task(task: asyncio.Task | None) -> None:
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, WebSocketDisconnect, Exception):
+            pass
+
     try:
-        if first_chunk is not None:
-            if not await handle_chunk(first_chunk):
-                return
+        if first_chunk is not None and not await handle_chunk(first_chunk):
+            return
+        receive_task = asyncio.create_task(websocket.receive())
         while True:
-            message = await incoming.get()
-            if message is None:
-                break
-            if message.get("text") is not None:
+            if receive_task is None:
+                receive_task = asyncio.create_task(websocket.receive())
+            wait_set = {receive_task}
+            if stt_task is not None:
+                wait_set.add(stt_task)
+            done, _pending = await asyncio.wait(
+                wait_set, return_when=asyncio.FIRST_COMPLETED
+            )
+            if stt_task is not None and stt_task in done:
+                try:
+                    result = stt_task.result()
+                except Exception:
+                    logger.exception("stream STT task failed device=%s", device_id)
+                    result = ("skip", "error")
+                stt_task = None
+                leftover = await take_or_cancel_receive()
+                if leftover is not None and leftover.get("type") == "websocket.disconnect":
+                    break
+                try:
+                    keep = await apply_stt_result(result)
+                except (WebSocketDisconnect, Exception):
+                    logger.exception(
+                        "stream WS send failed after STT device=%s", device_id
+                    )
+                    break
+                if not keep:
+                    break
+                receive_task = asyncio.create_task(websocket.receive())
                 continue
-            chunk = message.get("bytes")
-            if not chunk:
-                continue
-            if not await handle_chunk(chunk):
+            try:
+                message = receive_task.result()
+            except WebSocketDisconnect:
                 break
+            except Exception:
+                logger.exception("stream WS receive failed device=%s", device_id)
+                break
+            receive_task = None
+            if not await handle_message(message):
+                break
+            receive_task = asyncio.create_task(websocket.receive())
     finally:
         accepting = False
-        recv_task.cancel()
-        try:
-            await recv_task
-        except (asyncio.CancelledError, Exception):
-            pass
+        await cancel_task(receive_task)
+        await cancel_task(stt_task)
         await run_in_threadpool(
             _append_latency_record,
             _latency_log_record(
