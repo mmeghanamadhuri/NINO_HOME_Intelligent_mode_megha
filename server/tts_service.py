@@ -23,7 +23,6 @@ import requests
 from esp_wav_chunking import chunk_text_for_esp_limit
 from pipeline_log import log_http, pipeline_log
 from tts_prosody import (
-    infer_speech_prosody,
     piper_pitch_offset,
     piper_prosody_enabled,
     piper_robotic_amount,
@@ -325,6 +324,48 @@ def _keep_tts_style() -> str:
     return last_tts_synthesis_info().get("style", "")
 
 
+def piper_synthesis_config_kwargs(
+    text: str = "", *, volume: float = 0.75
+) -> dict[str, float]:
+    """Amy SynthesisConfig knobs used for every spoken line (greet/register/replies).
+
+    Mood styles do not change length_scale — registration prompts must not
+    render slower than a normal reply.
+    """
+    del text
+    length_scale = max(0.5, min(2.0, _piper_length_scale()))
+    robotic = piper_robotic_amount()
+    # Warm-neutral Amy body (same as the default preset), not mood length_mul.
+    if robotic >= 0.05:
+        noise_scale = max(0.10, min(1.4, 0.667 * 0.48))
+        noise_w_scale = max(0.10, min(1.4, 0.80 * 0.38))
+    else:
+        noise_scale = max(0.10, min(1.4, 0.667 * 1.08))
+        noise_w_scale = max(0.10, min(1.4, 0.80 * 1.06))
+    spoken_volume = max(0.0, min(1.0, volume))
+    return {
+        "length_scale": length_scale,
+        "noise_scale": noise_scale,
+        "noise_w_scale": noise_w_scale,
+        "volume": spoken_volume,
+    }
+
+
+def last_piper_synthesis_kwargs() -> dict[str, float]:
+    """SynthesisConfig fields from this thread's latest Piper call."""
+    info = getattr(_SYNTHESIS_INFO, "value", {}) or {}
+    out: dict[str, float] = {}
+    for key in ("length_scale", "noise_scale", "noise_w_scale", "volume"):
+        raw = info.get(key)
+        if raw is None:
+            continue
+        try:
+            out[key] = float(raw)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def _synthesize_piper_wav_bytes(
     text: str, rate: int = 135, volume: float = 0.75
 ) -> tuple[bytes, str]:
@@ -340,19 +381,9 @@ def _synthesize_piper_wav_bytes(
     except ImportError as exc:
         raise RuntimeError("Piper Python package is not installed.") from exc
 
-    prosody = infer_speech_prosody(clean)
-    length_scale = max(0.5, min(2.0, _piper_length_scale() * prosody.length_mul))
-    spoken_volume = max(0.0, min(1.0, volume * prosody.volume_mul))
-    pitch = prosody.pitch_semitones + piper_pitch_offset()
+    cfg = piper_synthesis_config_kwargs(clean, volume=volume)
+    pitch = piper_pitch_offset()
     robotic = piper_robotic_amount()
-    if robotic >= 0.05:
-        noise_scale = max(0.10, min(1.4, prosody.noise_scale * 0.48))
-        noise_w_scale = max(0.10, min(1.4, prosody.noise_w_scale * 0.38))
-        length_scale = max(0.5, min(2.0, length_scale * 0.94))
-    else:
-        # A little extra breath and body so Amy reads warm, not thin.
-        noise_scale = max(0.10, min(1.4, prosody.noise_scale * 1.08))
-        noise_w_scale = max(0.10, min(1.4, prosody.noise_w_scale * 1.06))
     voice = _load_piper_voice()
     output = io.BytesIO()
     with _PIPER_LOCK:
@@ -361,10 +392,10 @@ def _synthesize_piper_wav_bytes(
                 clean,
                 wav_file,
                 SynthesisConfig(
-                    length_scale=length_scale,
-                    noise_scale=noise_scale,
-                    noise_w_scale=noise_w_scale,
-                    volume=spoken_volume,
+                    length_scale=cfg["length_scale"],
+                    noise_scale=cfg["noise_scale"],
+                    noise_w_scale=cfg["noise_w_scale"],
+                    volume=cfg["volume"],
                 ),
             )
     wav = output.getvalue()
@@ -375,15 +406,17 @@ def _synthesize_piper_wav_bytes(
     if robotic >= 0.05:
         wav = robotic_color_wav_bytes(wav, robotic)
     logger.info(
-        "Piper prosody style=%s length=%.2f noise=%.2f volume=%.2f pitch=%+.1f robotic=%.2f",
-        prosody.style,
-        length_scale,
-        noise_scale,
-        spoken_volume,
+        "Piper Amy length=%.2f noise=%.2f volume=%.2f pitch=%+.1f robotic=%.2f",
+        cfg["length_scale"],
+        cfg["noise_scale"],
+        cfg["volume"],
         pitch,
         robotic,
     )
-    _set_tts_synthesis_info("piper", model_path.stem, style=prosody.style)
+    _set_tts_synthesis_info("piper", model_path.stem, style="neutral")
+    info = getattr(_SYNTHESIS_INFO, "value", None)
+    if isinstance(info, dict):
+        info.update(cfg)
     return wav, model_path.stem
 
 

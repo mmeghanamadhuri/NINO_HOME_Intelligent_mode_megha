@@ -440,6 +440,34 @@ def is_face_reg_prompt_echo(user_text: str) -> bool:
     return any(p.search(text) for p in _FACE_REG_ECHO_PATTERNS)
 
 
+_SESSION_END_RE = re.compile(
+    r"\b(?:"
+    r"good\s*bye|goodbye|bye[\s-]*bye|bye|"
+    r"see\s+you(?:\s+(?:later|soon|tomorrow))?|"
+    r"talk\s+(?:to\s+you\s+)?later|"
+    r"that(?:'s| is)\s+all|"
+    r"i(?:'m| am)\s+done|"
+    r"stop\s+listening|"
+    r"end\s+(?:the\s+)?(?:conversation|chat)"
+    r")\b",
+    re.IGNORECASE,
+)
+_SESSION_STOP_RE = re.compile(
+    r"^\s*(?:please\s+)?stop(?:\s+(?:now|please))?[.!?]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def is_session_end_utterance(user_text: str) -> bool:
+    """Goodbye / stop — end the session; do not convert register silence to guest."""
+    text = (user_text or "").strip()
+    if not text:
+        return False
+    if _SESSION_STOP_RE.match(text):
+        return True
+    return bool(_SESSION_END_RE.search(text))
+
+
 def is_registration_cancel(user_text: str) -> bool:
     """True when the user declines / cancels face registration."""
     text = _strip_trailing_punct(user_text or "")

@@ -36,6 +36,7 @@ from stream_asr import (
     UtteranceBuffer,
     looks_like_stream_pcm_frame,
     stream_idle_timeout_ends_session,
+    stream_listen_max_ms,
 )
 from alarm_service import get_alarm_service
 from camera import CameraPool, normalize_camera_rotation
@@ -1719,6 +1720,13 @@ async def _voice_ws_stream_pipeline(
     receive_task: asyncio.Task | None = None
     stt_task: asyncio.Task | None = None
 
+    def apply_listen_timeout() -> None:
+        ident = get_session_identity()
+        registering = ident is not None and ident.in_registration()
+        buf.set_listen_max_ms(stream_listen_max_ms(in_registration=registering))
+
+    apply_listen_timeout()
+
     begin_voice_session(session_id, device_id=device_id)
     log_nino_voice(
         "WS_OPEN",
@@ -1772,6 +1780,7 @@ async def _voice_ws_stream_pipeline(
                 reply_meta=reply_meta,
                 client_label=client_label,
             )
+            apply_listen_timeout()
     except Exception:
         logger.exception("stream session-open greeting failed device=%s", device_id)
 
@@ -1853,6 +1862,7 @@ async def _voice_ws_stream_pipeline(
         session_queries += 1
         kind = result[0]
         if kind == "skip":
+            apply_listen_timeout()
             await send_skip(str(result[1] or "skip"))
             accepting = True
             return True
@@ -1867,18 +1877,39 @@ async def _voice_ws_stream_pipeline(
         )
         if getattr(reply_meta, "end_session", False) or not sent:
             return False
+        apply_listen_timeout()
         accepting = True
         return True
 
     async def finish_utterance(reason: str) -> bool:
         """Send EOS (receive not in flight). Skip now or start STT off-websocket."""
         nonlocal accepting, first_turn, voice_turn, stt_task
+        ident = get_session_identity()
+        registering = ident is not None and ident.in_registration()
         pcm = bytes(buf.pcm)
         buf.reset()
         accepting = False
         if not await _ws_send_json(websocket, {"type": "end_of_speech", "reason": reason}):
             return False
-        if stream_idle_timeout_ends_session(reason):
+        if reason == "timeout" and registering and ident is not None:
+            guest_result = ident.timeout_to_guest()
+            guest = guest_result.registered_name
+            if guest:
+                bind_session_user(
+                    session_id, device_id=device_id, user_name=guest
+                )
+            logger.info(
+                "stream register silence — guest device=%s session=%s user=%s",
+                device_id,
+                session_id,
+                guest or "(none)",
+            )
+            apply_listen_timeout()
+            await send_skip("register_timeout_guest")
+            accepting = True
+            first_turn = False
+            return True
+        if stream_idle_timeout_ends_session(reason, in_registration=registering):
             from voice_service import (
                 VoiceReplyMeta,
                 minimal_voice_reply_wav,
@@ -1913,6 +1944,7 @@ async def _voice_ws_stream_pipeline(
                 client_label=client_label,
             )
             return False
+        apply_listen_timeout()
         if len(pcm) < 1600:
             await send_skip(reason or "too_short")
             accepting = True

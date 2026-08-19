@@ -23,9 +23,11 @@ from face_registration_voice import (
     is_registration_cancel,
     is_registration_offer_no,
     is_registration_offer_yes,
+    is_session_end_utterance,
     parse_spelled_name,
     spell_name_aloud,
 )
+from stream_asr import DEFAULT_REGISTER_MAX_MS
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,8 @@ OFFER_REGISTER_PROMPT = "Looks like you are a new user, can I register you"
 ASK_NAME_PROMPT = "What should I call you?"
 ASK_SPELL_PROMPT = "Please spell that name for me."
 GUEST_REPLY = "No problem. I'll keep this as a guest chat. How can I help you?"
+# Silence during register → guest (same as saying "no"). Skip extra TTS.
+REGISTER_SILENCE_MS = DEFAULT_REGISTER_MAX_MS
 NAME_RETRY_PROMPT = "I didn't catch your name. Please say your name."
 SPELL_RETRY_PROMPT = "I didn't catch the spelling. Please spell the name."
 CONFIRM_RETRY_PROMPT = "Okay, let's try again. What should I call you?"
@@ -169,6 +173,10 @@ class SessionIdentityFlow:
         if is_face_reg_prompt_echo(text):
             return FaceRegVoiceResult(handled=True, reply="", relisten_after_reply=True)
 
+        # Goodbye / stop still end the session — do not convert to guest.
+        if is_session_end_utterance(text):
+            return FaceRegVoiceResult(handled=False)
+
         if state == "offer_register":
             return self._handle_offer(text)
         if state == "awaiting_name":
@@ -188,6 +196,18 @@ class SessionIdentityFlow:
             self._pending_name = ""
         logger.info("Session identity: guest %s", guest)
         return FaceRegVoiceResult(handled=True, reply=GUEST_REPLY, registered_name=guest)
+
+    def timeout_to_guest(self) -> FaceRegVoiceResult:
+        """60s of no speech during register: same as declining — guest, keep STREAM."""
+        if not self.in_registration():
+            return FaceRegVoiceResult(handled=False)
+        result = self._become_guest()
+        # Skip the spoken guest line so listen resumes immediately.
+        return FaceRegVoiceResult(
+            handled=True,
+            reply="",
+            registered_name=result.registered_name,
+        )
 
     def _handle_offer(self, text: str) -> FaceRegVoiceResult:
         if is_registration_offer_no(text) or is_registration_cancel(text):

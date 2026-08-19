@@ -144,5 +144,44 @@ class SpeechStyleTests(unittest.TestCase):
                 os.environ["PIPER_PROSODY"] = previous
 
 
+class UnifiedAmyTtsTests(unittest.TestCase):
+    def test_greet_register_same_piper_kwargs_as_replies(self) -> None:
+        from session_identity import OFFER_REGISTER_PROMPT, greet_recognized_user
+        from tts_service import piper_synthesis_config_kwargs
+
+        offer = piper_synthesis_config_kwargs(OFFER_REGISTER_PROMPT)
+        greet = piper_synthesis_config_kwargs(greet_recognized_user("Hari"))
+        normal = piper_synthesis_config_kwargs("The weather is mild today.")
+        question = piper_synthesis_config_kwargs(
+            "Looks like you are a new user, can I register you?"
+        )
+        self.assertEqual(offer, greet)
+        self.assertEqual(offer, normal)
+        self.assertEqual(offer, question)
+        self.assertGreaterEqual(offer["length_scale"], 0.5)
+        self.assertLessEqual(offer["length_scale"], 2.0)
+
+    def test_session_open_wav_is_16k_not_22050(self) -> None:
+        from unittest.mock import patch
+
+        from session_identity import OFFER_REGISTER_PROMPT
+        from voice_service import VOICE_ASSIST_PLAYBACK_HZ, synthesize_session_open_wav
+
+        src = _sine_wav(seconds=0.4, rate=22050)
+        with patch(
+            "voice_service.synthesize_sapi_wav_bytes",
+            return_value=(src, "en_US-amy-medium"),
+        ):
+            out, meta = synthesize_session_open_wav(
+                OFFER_REGISTER_PROMPT,
+                reply_path="session_register_offer",
+            )
+        with wave.open(io.BytesIO(out), "rb") as wf:
+            self.assertEqual(wf.getframerate(), VOICE_ASSIST_PLAYBACK_HZ)
+            duration = wf.getnframes() / float(wf.getframerate())
+        self.assertAlmostEqual(duration, 0.4, delta=0.05)
+        self.assertFalse(meta.end_session)
+
+
 if __name__ == "__main__":
     unittest.main()

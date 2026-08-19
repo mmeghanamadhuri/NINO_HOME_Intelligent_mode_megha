@@ -10,6 +10,7 @@ from face_registration_voice import (
     is_confirm_yes,
     is_registration_offer_no,
     is_registration_offer_yes,
+    is_session_end_utterance,
     parse_spelled_name,
     spell_name_aloud,
 )
@@ -34,6 +35,12 @@ class RegistrationOfferTests(unittest.TestCase):
             self.assertTrue(is_registration_offer_no(text), text)
         self.assertFalse(is_registration_offer_yes("My name is Hari"))
         self.assertFalse(is_registration_offer_no("My name is Nora"))
+
+    def test_goodbye_and_stop_end_session_not_guest(self) -> None:
+        for text in ("goodbye", "bye", "stop", "please stop"):
+            self.assertTrue(is_session_end_utterance(text), text)
+        self.assertFalse(is_session_end_utterance("yes"))
+        self.assertFalse(is_session_end_utterance("Hari"))
 
     def test_confirm_yes_good(self) -> None:
         for text in ("yes", "yeah", "that's right", "good", "okay", "correct"):
@@ -122,6 +129,60 @@ class SessionIdentityFlowTests(unittest.TestCase):
         retry = self.flow.handle_voice("no")
         self.assertIn("try again", retry.reply.lower())
         self.assertTrue(self.flow.in_registration())
+
+    def test_register_silence_timeout_becomes_guest(self) -> None:
+        self.flow.start_session(
+            session_id="s1",
+            device_id="nino-home",
+            identity_name=None,
+            identity_state="unknown",
+        )
+        self.assertTrue(self.flow.in_registration())
+        handled = self.flow.timeout_to_guest()
+        self.assertTrue(handled.handled)
+        self.assertEqual(handled.reply, "")
+        self.assertTrue(is_guest_name(handled.registered_name))
+        self.assertFalse(self.flow.in_registration())
+        user, guest = self.flow.current_user()
+        self.assertTrue(guest)
+        self.assertTrue(is_guest_name(user))
+
+    def test_timeout_during_name_step_becomes_guest(self) -> None:
+        self.flow.start_session(
+            session_id="s1",
+            device_id="nino-home",
+            identity_name=None,
+            identity_state="no_face",
+        )
+        self.flow.handle_voice("yes")
+        self.assertTrue(self.flow.in_registration())
+        handled = self.flow.timeout_to_guest()
+        self.assertTrue(is_guest_name(handled.registered_name))
+        self.assertFalse(self.flow.in_registration())
+
+    def test_timeout_after_guest_is_noop(self) -> None:
+        self.flow.start_session(
+            session_id="s1",
+            device_id="nino-home",
+            identity_name=None,
+            identity_state="unknown",
+        )
+        self.flow.handle_voice("no")
+        self.assertFalse(self.flow.in_registration())
+        handled = self.flow.timeout_to_guest()
+        self.assertFalse(handled.handled)
+
+    def test_goodbye_during_offer_not_guest(self) -> None:
+        self.flow.start_session(
+            session_id="s1",
+            device_id="nino-home",
+            identity_name=None,
+            identity_state="unknown",
+        )
+        handled = self.flow.handle_voice("goodbye")
+        self.assertFalse(handled.handled)
+        self.assertTrue(self.flow.in_registration())
+        self.assertIsNone(self.flow.current_user()[0])
 
 
 class NameInjectionTests(unittest.TestCase):

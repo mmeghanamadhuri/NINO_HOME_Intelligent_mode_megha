@@ -17,6 +17,8 @@ DEFAULT_QUIET_ENERGY = 20
 DEFAULT_SPEECH_MS = 160
 DEFAULT_SILENCE_MS = 450
 DEFAULT_MAX_MS = 30000
+# Registration yes/no/name/spell/confirm: 60s of no speech → guest, not goodbye.
+DEFAULT_REGISTER_MAX_MS = 60000
 DEFAULT_MIN_SPEECH_MS = 200
 SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2
@@ -122,9 +124,20 @@ class StreamEndOfSpeech:
         return "speech" if self.heard_speech else "idle"
 
 
-def stream_idle_timeout_ends_session(reason: str) -> bool:
-    """True when a listen turn hit max_ms with no speech — goodbye, not skip."""
-    return reason == "timeout"
+def stream_listen_max_ms(*, in_registration: bool) -> int:
+    """VAD listen cap: 60s while registering, 30s idle-goodbye afterwards."""
+    return DEFAULT_REGISTER_MAX_MS if in_registration else DEFAULT_MAX_MS
+
+
+def stream_idle_timeout_ends_session(
+    reason: str, *, in_registration: bool = False
+) -> bool:
+    """True when a listen turn hit max_ms with no speech — goodbye, not skip.
+
+    During registration, the same timeout converts the user to a guest and
+    keeps the session open.
+    """
+    return reason == "timeout" and not in_registration
 
 
 def stream_vad_from_environ() -> StreamEndOfSpeech:
@@ -150,6 +163,9 @@ class UtteranceBuffer:
     def reset(self) -> None:
         self.pcm.clear()
         self.vad.reset()
+
+    def set_listen_max_ms(self, max_ms: int) -> None:
+        self.vad.max_ms = max(1, int(max_ms))
 
     def feed(self, chunk: bytes) -> str:
         if chunk:

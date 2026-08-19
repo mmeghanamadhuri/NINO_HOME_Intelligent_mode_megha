@@ -42,7 +42,8 @@ esp_err_t nino_voice_assist_run_query_only(void);
 /**
  * Watch ES8311 Aux-in for Sirena wake energy, then stream PCM to the PC
  * until ASR end-of-speech. The session stays open through LLM/TTS turns
- * until the user says goodbye or stop, or 30s of no speech. After that TTS,
+ * until the user says goodbye or stop, or 30s of no speech after identity
+ * is settled (60s of no speech during registration becomes a guest). After that TTS,
  * GPIO 5 goes high so Sirena can close its mics. Stream or WS failures leave
  * GPIO 5 low.
  */

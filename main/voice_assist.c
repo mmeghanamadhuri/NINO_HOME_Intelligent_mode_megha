@@ -56,7 +56,7 @@ static const char *TAG = "voice_ast";
 #define AUX_POST_SPEAKER_IGNORE_MS 1500
 #define AUX_STATUS_LOG_MS 1000
 #define AUX_REPLY_WAIT_MS 180000
-#define STREAM_LISTEN_CAP_MS 32000
+#define STREAM_LISTEN_CAP_MS 65000
 #define CAMERA_STREAM_WAIT_MS 2500
 #define FACE_HUNT_MS 5000
 #define SESSION_GREET_WAIT_MS 15000
@@ -1015,7 +1015,7 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
       streamed_ms += AUX_DETECT_FRAME_MS;
       if (streamed_ms >= STREAM_LISTEN_CAP_MS) {
         voice_log(ESP_LOG_WARN, turn, "STREAM",
-                  "cap=%u ms waiting for ASR EOS/goodbye", (unsigned)streamed_ms);
+                  "cap=%u ms waiting for ASR EOS/guest/goodbye", (unsigned)streamed_ms);
         break;
       }
     }

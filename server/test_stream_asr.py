@@ -7,10 +7,12 @@ import unittest
 
 from stream_asr import (
     DEFAULT_MAX_MS,
+    DEFAULT_REGISTER_MAX_MS,
     StreamEndOfSpeech,
     UtteranceBuffer,
     pcm_frame_energy,
     stream_idle_timeout_ends_session,
+    stream_listen_max_ms,
 )
 
 
@@ -76,10 +78,18 @@ class StreamEndOfSpeechTests(unittest.TestCase):
     def test_default_max_ms_is_30s(self) -> None:
         self.assertEqual(DEFAULT_MAX_MS, 30000)
 
+    def test_register_max_ms_is_60s(self) -> None:
+        self.assertEqual(DEFAULT_REGISTER_MAX_MS, 60000)
+        self.assertEqual(stream_listen_max_ms(in_registration=True), 60000)
+        self.assertEqual(stream_listen_max_ms(in_registration=False), 30000)
+
     def test_idle_timeout_ends_session_not_skip(self) -> None:
         self.assertTrue(stream_idle_timeout_ends_session("timeout"))
         self.assertFalse(stream_idle_timeout_ends_session("end_of_speech"))
         self.assertFalse(stream_idle_timeout_ends_session("skip"))
+        self.assertFalse(
+            stream_idle_timeout_ends_session("timeout", in_registration=True)
+        )
 
     def test_30s_silence_times_out(self) -> None:
         vad = StreamEndOfSpeech(start_energy=50, max_ms=30000, frame_ms=20)
@@ -87,6 +97,18 @@ class StreamEndOfSpeechTests(unittest.TestCase):
             self.assertEqual(vad.feed(_frame(1)), "idle")
         self.assertEqual(vad.feed(_frame(1)), "timeout")
         self.assertFalse(vad.heard_speech)
+
+    def test_60s_register_silence_times_out(self) -> None:
+        vad = StreamEndOfSpeech(start_energy=50, max_ms=60000, frame_ms=20)
+        for _ in range((60000 // 20) - 1):
+            self.assertEqual(vad.feed(_frame(1)), "idle")
+        self.assertEqual(vad.feed(_frame(1)), "timeout")
+        self.assertFalse(vad.heard_speech)
+
+    def test_buffer_listen_max_ms(self) -> None:
+        buf = UtteranceBuffer()
+        buf.set_listen_max_ms(60000)
+        self.assertEqual(buf.vad.max_ms, 60000)
 
     def test_buffer_accumulates_pcm(self) -> None:
         buf = UtteranceBuffer()
