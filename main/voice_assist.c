@@ -981,15 +981,13 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
     if (preroll != NULL && preroll_samples > 0) {
       if (nino_voice_ws_session_send_pcm(ws, preroll,
                                          preroll_samples * sizeof(int16_t)) != ESP_OK) {
-        if (!nino_voice_ws_session_should_pause(ws) &&
-            !nino_voice_ws_session_is_open(ws) &&
-            !nino_voice_ws_session_socket_connected(ws)) {
-          voice_log(ESP_LOG_ERROR, turn, "FAIL", "stage=stream err=preroll");
-          (void)nino_rgb_led_show(NINO_RGB_SHOW_ERROR);
-          break;
+        if (nino_voice_ws_session_should_pause(ws)) {
+          voice_log(ESP_LOG_INFO, turn, "STREAM",
+                    "paused because EOS/skip during preroll");
+        } else {
+          voice_log(ESP_LOG_WARN, turn, "STREAM",
+                    "preroll write-0 — wait for server, camera stays on");
         }
-        voice_log(ESP_LOG_INFO, turn, "STREAM",
-                  "paused because EOS/skip during preroll");
       }
       preroll = NULL;
       preroll_samples = 0;
@@ -1009,20 +1007,14 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
         continue;
       }
       if (nino_voice_ws_session_send_pcm(ws, frame, sizeof(frame)) != ESP_OK) {
-        if (nino_voice_ws_session_should_pause(ws) &&
-            (nino_voice_ws_session_is_open(ws) ||
-             nino_voice_ws_session_socket_connected(ws))) {
+        if (nino_voice_ws_session_should_pause(ws)) {
           voice_log(ESP_LOG_INFO, turn, "STREAM",
                     "paused because EOS/skip after %u ms", (unsigned)streamed_ms);
           break;
         }
-        if (nino_voice_ws_session_socket_connected(ws)) {
-          voice_log(ESP_LOG_WARN, turn, "STREAM",
-                    "write-0 after %u ms — wait for server, camera stays on",
-                    (unsigned)streamed_ms);
-          tx_failed = true;
-          break;
-        }
+        voice_log(ESP_LOG_WARN, turn, "STREAM",
+                  "write-0 after %u ms — wait for server, camera stays on",
+                  (unsigned)streamed_ms);
         tx_failed = true;
         break;
       }
@@ -1037,13 +1029,6 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
     nino_mic_close();
     /* Keep solid blue through STT/LLM until TTS actually starts. */
     nino_eye_thinking();
-    if (!nino_voice_ws_session_is_open(ws) &&
-        !nino_voice_ws_session_socket_connected(ws)) {
-      voice_log(ESP_LOG_ERROR, turn, "FAIL",
-                "stage=stream err=ESP_FAIL after %u ms", (unsigned)streamed_ms);
-      (void)nino_rgb_led_show(NINO_RGB_SHOW_ERROR);
-      break;
-    }
     if (tx_failed) {
       voice_log(ESP_LOG_WARN, turn, "STREAM",
                 "write glitch after %u ms — wait for server, camera stays on",

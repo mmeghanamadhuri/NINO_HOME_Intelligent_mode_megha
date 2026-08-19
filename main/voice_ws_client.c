@@ -22,6 +22,8 @@ static const char *TAG = "nino_vws";
  * while the socket is still up — do not auto-reconnect (that hung query_busy). */
 #define STREAM_WRITE_FAIL_WAIT_MS 1000
 #define STREAM_WRITE_RETRIES 2
+/* After the peer closes, drain in-flight EOS/WAV before failing wait_reply. */
+#define STREAM_RX_CLOSED_GRACE_MS 4000
 
 typedef struct {
   SemaphoreHandle_t done;
@@ -423,6 +425,8 @@ struct nino_voice_ws_session {
   bool wav_msg_open;
   bool reply_ready;
   bool greet_pending;
+  bool rx_closed;
+  int64_t rx_closed_us;
   char eye_expr[EYE_EXPR_MAX];
   char motion_json[MOTION_JSON_MAX];
 };
@@ -593,13 +597,22 @@ static void stream_on_event(void *handler_args, esp_event_base_t base, int32_t e
       stream_signal(s);
     }
     break;
+  case WEBSOCKET_EVENT_ERROR:
+    /* write-0 / poll timeout: pause TX so WAIT_PC can still take EOS/WAV.
+     * Do not mark the session failed — that turned the camera off mid-chat. */
+    ESP_LOGW(TAG, "stream WS error — pause TX, session stays open");
+    s->eos = true;
+    stream_signal(s);
+    break;
   case WEBSOCKET_EVENT_DISCONNECTED:
   case WEBSOCKET_EVENT_CLOSED:
-  case WEBSOCKET_EVENT_ERROR:
-    ESP_LOGW(TAG, "stream WS %s — failing session (no auto-reconnect)",
-             event_id == WEBSOCKET_EVENT_ERROR ? "error" : "disconnected");
-    s->error = true;
+    ESP_LOGW(TAG, "stream WS disconnected");
     s->connected = false;
+    s->rx_closed = true;
+    s->rx_closed_us = esp_timer_get_time();
+    if (!s->eos && !s->skip && !s->reply_ready && !s->wav_msg_open) {
+      s->error = true;
+    }
     stream_signal(s);
     break;
   default:
@@ -742,7 +755,9 @@ esp_err_t nino_voice_ws_session_send_pcm(nino_voice_ws_session_t *session,
   /* write-0 while the socket is still up is usually VAD EOS racing send_bin,
    * not a dead conversation. Pause TX and wait for the server instead of
    * failing the session (that turned the camera off mid-chat). */
-  if (nino_voice_ws_session_socket_connected(session) && !session->error) {
+  if (!session->error &&
+      (nino_voice_ws_session_socket_connected(session) || session->eos ||
+       session->skip || session->reply_ready)) {
     session->eos = true;
     stream_signal(session);
     ESP_LOGW(TAG, "send_bin write-0 — pause TX, session stays open");
@@ -769,6 +784,8 @@ void nino_voice_ws_session_begin_turn(nino_voice_ws_session_t *session) {
   session->end_session = false;
   session->wav_msg_open = false;
   session->reply_ready = false;
+  session->rx_closed = false;
+  session->rx_closed_us = 0;
   session->len = 0;
   session->eye_expr[0] = '\0';
   session->motion_json[0] = '\0';
@@ -798,6 +815,12 @@ esp_err_t nino_voice_ws_session_wait_reply(nino_voice_ws_session_t *session,
     TickType_t now = xTaskGetTickCount();
     if (now >= deadline) {
       return ESP_ERR_TIMEOUT;
+    }
+    if (session->rx_closed && !session->wav_msg_open) {
+      const int64_t closed_for_us = esp_timer_get_time() - session->rx_closed_us;
+      if (closed_for_us >= (int64_t)STREAM_RX_CLOSED_GRACE_MS * 1000LL) {
+        return ESP_ERR_TIMEOUT;
+      }
     }
     TickType_t wait = deadline - now;
     if (wait > pdMS_TO_TICKS(200)) {

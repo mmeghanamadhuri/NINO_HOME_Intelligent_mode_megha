@@ -1,3 +1,17 @@
+if(NOT DEFINED PYTHON)
+    set(PYTHON python3)
+endif()
+set(_nino_ws_c "${CMAKE_SOURCE_DIR}/managed_components/espressif__esp_websocket_client/esp_websocket_client.c")
+if(EXISTS "${_nino_ws_c}")
+    execute_process(
+        COMMAND ${PYTHON} "${CMAKE_CURRENT_LIST_DIR}/patches/esp_websocket_client_write0.py" "${_nino_ws_c}"
+        RESULT_VARIABLE _nino_ws_patch
+    )
+    if(NOT _nino_ws_patch EQUAL 0)
+        message(FATAL_ERROR "esp_websocket_client write-0 patch failed")
+    endif()
+endif()
+
 set(main_requires esp_psram esp_wifi esp_event esp_netif nvs_flash esp_http_server esp_http_client mdns
     console esp32_p4_function_ev_board esp_websocket_client driver usb
     esp_hosted fatfs sdmmc)
