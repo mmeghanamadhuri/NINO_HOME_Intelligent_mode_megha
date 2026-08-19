@@ -31,17 +31,23 @@ typedef struct {
   bool wav_msg_open;
 } vws_ctx_t;
 
-static esp_websocket_client_config_t make_ws_cfg(const char *uri) {
+static esp_websocket_client_config_t make_ws_cfg(const char *uri, bool stream_session) {
   esp_websocket_client_config_t ws_cfg = {
       .uri = uri,
       .buffer_size = 65536,
-      .network_timeout_ms = 300000,
-      .reconnect_timeout_ms = 10000,
+      /* Stream teardown used to block 300 s on a dead socket. */
+      .network_timeout_ms = stream_session ? 4000 : 300000,
       .task_stack = 12288,
       .task_prio = 5,
       .disable_pingpong_discon = true,
       .ping_interval_sec = 30,
+      /* Stream sessions must fail closed. Auto-reconnect leaves s_query_busy set
+       * while stop() waits on "Reconnect after 10000 ms". */
+      .disable_auto_reconnect = stream_session,
   };
+  if (!stream_session) {
+    ws_cfg.reconnect_timeout_ms = 10000;
+  }
   return ws_cfg;
 }
 
@@ -263,7 +269,7 @@ esp_err_t nino_voice_ws_exchange(const char *ws_uri, const uint8_t *wav_in,
     return ESP_ERR_NO_MEM;
   }
 
-  esp_websocket_client_config_t ws_cfg = make_ws_cfg(ws_uri);
+  esp_websocket_client_config_t ws_cfg = make_ws_cfg(ws_uri, false);
   ctx->client = esp_websocket_client_init(&ws_cfg);
   if (ctx->client == NULL) {
     vSemaphoreDelete(ctx->done);
@@ -525,7 +531,10 @@ static void stream_on_event(void *handler_args, esp_event_base_t base, int32_t e
     }
     break;
   case WEBSOCKET_EVENT_DISCONNECTED:
+  case WEBSOCKET_EVENT_CLOSED:
   case WEBSOCKET_EVENT_ERROR:
+    ESP_LOGW(TAG, "stream WS %s — failing session (no auto-reconnect)",
+             event_id == WEBSOCKET_EVENT_ERROR ? "error" : "disconnected");
     s->error = true;
     s->connected = false;
     stream_signal(s);
@@ -557,7 +566,7 @@ esp_err_t nino_voice_ws_session_open(const char *ws_uri,
     free(s);
     return ESP_ERR_NO_MEM;
   }
-  esp_websocket_client_config_t ws_cfg = make_ws_cfg(ws_uri);
+  esp_websocket_client_config_t ws_cfg = make_ws_cfg(ws_uri, true);
   s->client = esp_websocket_client_init(&ws_cfg);
   if (s->client == NULL) {
     vSemaphoreDelete(s->evt);
@@ -566,6 +575,7 @@ esp_err_t nino_voice_ws_session_open(const char *ws_uri,
     return ESP_ERR_NO_MEM;
   }
   esp_websocket_register_events(s->client, WEBSOCKET_EVENT_ANY, stream_on_event, s);
+  ESP_LOGI(TAG, "connecting %s", ws_uri);
   esp_err_t err = esp_websocket_client_start(s->client);
   if (err != ESP_OK) {
     esp_websocket_unregister_events(s->client, WEBSOCKET_EVENT_ANY, stream_on_event);
@@ -605,8 +615,10 @@ esp_err_t nino_voice_ws_session_send_pcm(nino_voice_ws_session_t *session,
     return ESP_ERR_INVALID_STATE;
   }
   int sent = esp_websocket_client_send_bin(session->client, (const char *)pcm, (int)len,
-                                           pdMS_TO_TICKS(200));
+                                           pdMS_TO_TICKS(1000));
   if (sent < 0 || (size_t)sent != len) {
+    session->error = true;
+    session->connected = false;
     return ESP_FAIL;
   }
   return ESP_OK;
@@ -694,10 +706,13 @@ void nino_voice_ws_session_close(nino_voice_ws_session_t *session) {
     return;
   }
   if (session->client != NULL) {
-    esp_websocket_unregister_events(session->client, WEBSOCKET_EVENT_ANY, stream_on_event);
-    esp_websocket_client_stop(session->client);
-    esp_websocket_client_destroy(session->client);
+    esp_websocket_client_handle_t client = session->client;
     session->client = NULL;
+    session->connected = false;
+    esp_websocket_unregister_events(client, WEBSOCKET_EVENT_ANY, stream_on_event);
+    (void)esp_websocket_client_close(client, pdMS_TO_TICKS(250));
+    /* destroy() without stop(): stop() can block on a reconnect wait. */
+    esp_websocket_client_destroy(client);
   }
   free(session->buf);
   if (session->evt) {

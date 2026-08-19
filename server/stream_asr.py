@@ -20,6 +20,21 @@ DEFAULT_MAX_MS = 15000
 DEFAULT_MIN_SPEECH_MS = 200
 SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2
+# P4 stream frames are 20 ms / 640 bytes. Allow a little jitter either side.
+STREAM_PCM_FRAME_MIN = 320
+STREAM_PCM_FRAME_MAX = 2048
+
+
+def looks_like_stream_pcm_frame(data: bytes | None) -> bool:
+    """True for a short raw PCM websocket frame, not a complete WAV clip."""
+    if not data:
+        return False
+    n = len(data)
+    if n < STREAM_PCM_FRAME_MIN or n > STREAM_PCM_FRAME_MAX or n % 2:
+        return False
+    if n >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WAVE":
+        return False
+    return True
 
 
 def pcm_frame_energy(pcm: bytes) -> int:

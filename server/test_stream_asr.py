@@ -60,5 +60,29 @@ class StreamEndOfSpeechTests(unittest.TestCase):
         self.assertLess(pcm_frame_energy(_frame(3)), 10)
 
 
+class StreamPcmFrameDetectTests(unittest.TestCase):
+    def test_640_byte_pcm_is_stream_frame(self) -> None:
+        from stream_asr import looks_like_stream_pcm_frame
+
+        self.assertTrue(looks_like_stream_pcm_frame(_frame(80)))
+
+    def test_wav_header_is_not_stream_frame(self) -> None:
+        from stream_asr import looks_like_stream_pcm_frame
+
+        wav = b"RIFF" + b"\x00" * 4 + b"WAVE" + b"\x00" * 640
+        self.assertFalse(looks_like_stream_pcm_frame(wav))
+
+    def test_full_clip_is_not_stream_frame(self) -> None:
+        from stream_asr import looks_like_stream_pcm_frame
+
+        self.assertFalse(looks_like_stream_pcm_frame(_frame(80, samples=8000)))
+
+    def test_empty_is_not_stream_frame(self) -> None:
+        from stream_asr import looks_like_stream_pcm_frame
+
+        self.assertFalse(looks_like_stream_pcm_frame(b""))
+        self.assertFalse(looks_like_stream_pcm_frame(None))
+
+
 if __name__ == "__main__":
     unittest.main()

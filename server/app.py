@@ -30,7 +30,7 @@ from conversation_sessions import (
     list_sessions_for_user,
     new_session_id,
 )
-from stream_asr import UtteranceBuffer
+from stream_asr import UtteranceBuffer, looks_like_stream_pcm_frame
 from alarm_service import get_alarm_service
 from camera import CameraPool, normalize_camera_rotation
 from device_discovery import (
@@ -1623,9 +1623,20 @@ async def _voice_ws_send_reply(
         )
 
 
-async def _voice_ws_stream_pipeline(websocket: WebSocket, device_id: str) -> None:
-    """Stream Aux-in PCM until ASR end-of-speech, then TTS; loop until goodbye."""
-    await websocket.accept()
+async def _voice_ws_stream_pipeline(
+    websocket: WebSocket,
+    device_id: str,
+    *,
+    already_accepted: bool = False,
+    first_chunk: bytes | None = None,
+) -> None:
+    """Stream Aux-in PCM until ASR end-of-speech, then TTS; loop until goodbye.
+
+    A background task always calls websocket.receive() so STT/LLM cannot stall
+    TCP and drop the P4 (esp_transport_write returned 0).
+    """
+    if not already_accepted:
+        await websocket.accept()
     from voice_service import log_nino_voice
     from wav_resample import is_wav_bytes, pcm16_mono_to_wav
 
@@ -1633,6 +1644,45 @@ async def _voice_ws_stream_pipeline(websocket: WebSocket, device_id: str) -> Non
     aux_energy = _aux_energy_from_websocket(websocket)
     voice_turn = _voice_turn_from_websocket(websocket) or 0
     client_label = _ws_client_label(websocket)
+
+    incoming: asyncio.Queue = asyncio.Queue(maxsize=256)
+    buf = UtteranceBuffer()
+    accepting = True
+    first_turn = True
+    session_queries = 0
+    session_started = time.perf_counter()
+    pcm_frames = 0
+
+    async def receiver() -> None:
+        try:
+            while True:
+                try:
+                    message = await websocket.receive()
+                except WebSocketDisconnect:
+                    break
+                if message.get("type") == "websocket.disconnect":
+                    break
+                if not accepting:
+                    continue
+                try:
+                    incoming.put_nowait(message)
+                except asyncio.QueueFull:
+                    logger.warning(
+                        "stream WS PCM queue full device=%s session=%s — dropping frame",
+                        device_id,
+                        session_id,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("stream WS receiver failed device=%s", device_id)
+        finally:
+            try:
+                incoming.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
+
+    recv_task = asyncio.create_task(receiver())
     begin_voice_session(session_id, device_id=device_id)
     log_nino_voice(
         "WS_OPEN",
@@ -1644,12 +1694,7 @@ async def _voice_ws_stream_pipeline(websocket: WebSocket, device_id: str) -> Non
         energy=aux_energy,
     )
     await websocket.send_json({"type": "session", "session_id": session_id})
-
-    buf = UtteranceBuffer()
-    accepting = True
-    first_turn = True
-    session_queries = 0
-    session_started = time.perf_counter()
+    logger.info("stream WS ready device=%s session=%s", device_id, session_id)
 
     async def finish_utterance(reason: str) -> bool:
         """Process buffered PCM. Returns False when the session should close."""
@@ -1746,36 +1791,66 @@ async def _voice_ws_stream_pipeline(websocket: WebSocket, device_id: str) -> Non
         accepting = True
         return True
 
-    try:
+    async def drain_queued_pcm() -> bool:
+        """Drop frames that arrived during STT. False if the socket already closed."""
         while True:
             try:
-                message = await websocket.receive()
-            except WebSocketDisconnect:
-                break
-            if message.get("type") == "websocket.disconnect":
+                leftover = incoming.get_nowait()
+            except asyncio.QueueEmpty:
+                return True
+            if leftover is None:
+                return False
+
+    async def handle_chunk(chunk: bytes) -> bool:
+        nonlocal pcm_frames
+        if not chunk:
+            return True
+        pcm_frames += 1
+        if pcm_frames == 1 or pcm_frames % 50 == 0:
+            logger.info(
+                "stream PCM device=%s session=%s frames=%d bytes=%d",
+                device_id,
+                session_id,
+                pcm_frames,
+                len(chunk),
+            )
+        if is_wav_bytes(chunk) and len(chunk) > 4096:
+            buf.reset()
+            buf.pcm.extend(chunk)
+            keep = await finish_utterance("wav")
+            if keep and not await drain_queued_pcm():
+                return False
+            return keep
+        state = buf.feed(chunk)
+        if state in {"end_of_speech", "timeout"}:
+            keep = await finish_utterance(state)
+            if keep and not await drain_queued_pcm():
+                return False
+            return keep
+        return True
+
+    try:
+        if first_chunk is not None:
+            if not await handle_chunk(first_chunk):
+                return
+        while True:
+            message = await incoming.get()
+            if message is None:
                 break
             if message.get("text") is not None:
                 continue
             chunk = message.get("bytes")
             if not chunk:
                 continue
-            if not accepting:
-                continue
-            from wav_resample import is_wav_bytes
-
-            if is_wav_bytes(chunk) and len(chunk) > 4096:
-                buf.reset()
-                buf.pcm.extend(chunk)
-                keep = await finish_utterance("wav")
-                if not keep:
-                    break
-                continue
-            state = buf.feed(chunk)
-            if state in {"end_of_speech", "timeout"}:
-                keep = await finish_utterance(state)
-                if not keep:
-                    break
+            if not await handle_chunk(chunk):
+                break
     finally:
+        accepting = False
+        recv_task.cancel()
+        try:
+            await recv_task
+        except (asyncio.CancelledError, Exception):
+            pass
         await run_in_threadpool(
             _append_latency_record,
             _latency_log_record(
@@ -1866,6 +1941,20 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                     ),
                 )
                 continue
+
+            if looks_like_stream_pcm_frame(wav_in):
+                logger.info(
+                    "Voice WS upgrading to stream pipeline (%d byte PCM frame) device=%s",
+                    len(wav_in),
+                    device_id,
+                )
+                await _voice_ws_stream_pipeline(
+                    websocket,
+                    device_id,
+                    already_accepted=True,
+                    first_chunk=wav_in,
+                )
+                return
 
             try:
                 saved = await run_in_threadpool(
