@@ -422,6 +422,7 @@ struct nino_voice_ws_session {
   bool end_session;
   bool wav_msg_open;
   bool reply_ready;
+  bool greet_pending;
   char eye_expr[EYE_EXPR_MAX];
   char motion_json[MOTION_JSON_MAX];
 };
@@ -551,7 +552,13 @@ static void stream_on_event(void *handler_args, esp_event_base_t base, int32_t e
           }
           s->eye_expr[out] = '\0';
           if (s->eye_expr[0] != '\0') {
-            nino_eye_apply_expression(s->eye_expr);
+            nino_eye_state_t st = nino_eye_state_from_name(s->eye_expr);
+            if (s->greet_pending && st != NINO_EYE_HAPPY) {
+              /* Session-open hunt / register: ignore random curious/tired/etc. */
+              s->eye_expr[0] = '\0';
+            } else {
+              nino_eye_apply_expression(s->eye_expr);
+            }
           }
           break;
         }
@@ -610,6 +617,7 @@ esp_err_t nino_voice_ws_session_open(const char *ws_uri,
   if (s == NULL) {
     return ESP_ERR_NO_MEM;
   }
+  s->greet_pending = true;
   s->evt = xSemaphoreCreateBinary();
   s->mu = xSemaphoreCreateMutex();
   if (s->evt == NULL || s->mu == NULL) {
@@ -737,6 +745,7 @@ void nino_voice_ws_session_begin_turn(nino_voice_ws_session_t *session) {
   if (session == NULL) {
     return;
   }
+  session->greet_pending = false;
   session->eos = false;
   session->skip = false;
   session->end_session = false;

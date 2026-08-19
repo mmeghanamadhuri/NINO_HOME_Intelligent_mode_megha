@@ -11,7 +11,8 @@
 extern "C" {
 #endif
 
-/** Queues WAV on the shared speaker FIFO (see audio_queue.c). */
+/** Queues WAV on the shared speaker FIFO (see audio_queue.c).
+ *  Takes ownership of @p pcm_wav (freed after play or on queue fail). */
 void nino_main_queue_audio_wav(uint8_t *pcm_wav, size_t len, bool play_done_chime,
                                bool prompt_ack_after, nino_eye_state_t eye_state);
 

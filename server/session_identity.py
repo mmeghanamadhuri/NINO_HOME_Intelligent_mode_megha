@@ -147,7 +147,6 @@ class SessionIdentityFlow:
             return SessionOpenResult(
                 reply=OFFER_REGISTER_PROMPT,
                 reply_path="session_register_offer",
-                eye_expression="curious",
             )
 
     def end_session(self) -> None:

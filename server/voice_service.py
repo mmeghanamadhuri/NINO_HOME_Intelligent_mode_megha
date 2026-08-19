@@ -546,7 +546,12 @@ def synthesize_session_open_wav(
     meta = VoiceReplyMeta(session_id=session_id, device_id=device_id)
     meta.end_session = False
     meta.prompt_medical_ack = False
-    meta.eye_expression = eye_expression
+    # Identified greet -> heart; hunt / register-offer -> no LCD emoji.
+    inferred = infer_eye_expression_for_response(reply, reply_path=reply_path)
+    if inferred == "heart" or (eye_expression or "").strip().lower() == "heart":
+        meta.eye_expression = "heart"
+    else:
+        meta.eye_expression = None
     meta.motion = motion_actions_for_reply(reply, reply_path=reply_path)
     wav, _voice = synthesize_sapi_wav_bytes(reply)
     wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
@@ -2691,6 +2696,16 @@ def process_voice_wav(
         and not ident_guest
     ):
         meta.eye_expression = "heart"
+    elif reply_path in {
+        "session_register_offer",
+        "session_ask_name",
+        "session_spell",
+        "session_confirm",
+        "face_registration",
+    }:
+        # Keep idle through hunt / "can I register you" / name prompts.
+        if meta.eye_expression != "heart":
+            meta.eye_expression = None
     from servo_tts_motion import motion_actions_for_reply
 
     meta.motion = motion_actions_for_reply(reply, reply_path=reply_path)

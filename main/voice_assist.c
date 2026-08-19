@@ -415,6 +415,7 @@ static void voice_ws_job_task(void *pv) {
   nino_eye_state_t eye_state = nino_eye_state_from_name(eye_expr);
   const bool play_done_chime = false;
   nino_main_queue_audio_wav(resp, resp_len, play_done_chime, prompt_after, eye_state);
+  resp = NULL; /* queue owns the WAV */
   voice_log(ESP_LOG_INFO, turn, "REPLY",
             "bytes=%u ws=%" PRId64 " ms continue=%d eye=%s led=off",
             (unsigned)resp_len, ws_ms, prompt_after ? 1 : 0,
@@ -863,17 +864,26 @@ static void session_camera_on(void) {
   }
 }
 
+/* Takes ownership of @p resp (queue frees it after playback, or on queue fail). */
 static void play_ws_reply_wav(uint8_t *resp, size_t resp_len, const char *eye_expr,
-                              const char *motion_json) {
+                              const char *motion_json, bool session_open) {
   nino_eye_state_t eye_state = nino_eye_state_from_name(eye_expr);
+  /* Hunt / register prompt: heart only when the person was identified. */
+  if (session_open && eye_state != NINO_EYE_HAPPY) {
+    eye_state = NINO_EYE_STATE_COUNT;
+  }
   bool scripted = false;
   if (motion_json != NULL && motion_json[0] != '\0') {
-    esp_err_t merr = nino_servo_recplay_play_motion_json(motion_json);
-    if (merr == ESP_OK) {
-      scripted = true;
-    } else if (merr != ESP_ERR_NOT_FOUND) {
-      voice_log(ESP_LOG_WARN, s_voice_turn, "MOTION", "play err=%s json=%s",
-                esp_err_to_name(merr), motion_json);
+    const bool skip_curious_greet =
+        session_open && strstr(motion_json, "curious") != NULL;
+    if (!skip_curious_greet) {
+      esp_err_t merr = nino_servo_recplay_play_motion_json(motion_json);
+      if (merr == ESP_OK) {
+        scripted = true;
+      } else if (merr != ESP_ERR_NOT_FOUND) {
+        voice_log(ESP_LOG_WARN, s_voice_turn, "MOTION", "play err=%s json=%s",
+                  esp_err_to_name(merr), motion_json);
+      }
     }
   }
   if (scripted) {
@@ -935,7 +945,8 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
                                            &skip, &end_session, eye_expr,
                                            sizeof(eye_expr), motion, sizeof(motion));
     if (err == ESP_OK && !skip && resp != NULL && resp_len > 0) {
-      play_ws_reply_wav(resp, resp_len, eye_expr, motion);
+      play_ws_reply_wav(resp, resp_len, eye_expr, motion, true);
+      resp = NULL; /* queue owns the WAV; do not free after playback */
       voice_log(ESP_LOG_INFO, s_voice_turn, "GREET",
                 "bytes=%u end_session=%d eye=%s", (unsigned)resp_len,
                 end_session ? 1 : 0, eye_expr[0] ? eye_expr : "idle");
@@ -943,7 +954,6 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
       aux_ignore_energy_for_ms(AUX_POST_SPEAKER_IGNORE_MS);
       if (end_session) {
         session_end = true;
-        free(resp);
         goto session_done;
       }
     } else if (err == ESP_ERR_TIMEOUT) {
@@ -1044,7 +1054,8 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
       continue;
     }
 
-    play_ws_reply_wav(resp, resp_len, eye_expr, motion);
+    play_ws_reply_wav(resp, resp_len, eye_expr, motion, false);
+    resp = NULL; /* queue owns the WAV; do not free after playback */
     voice_log(ESP_LOG_INFO, turn, "REPLY",
               "bytes=%u end_session=%d eye=%s", (unsigned)resp_len,
               end_session ? 1 : 0, eye_expr[0] ? eye_expr : "idle");

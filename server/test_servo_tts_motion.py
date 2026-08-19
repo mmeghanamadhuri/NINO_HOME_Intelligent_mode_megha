@@ -26,8 +26,18 @@ class ServoTtsMotionTests(unittest.TestCase):
     def test_no_shakes(self) -> None:
         self.assertEqual(motion_actions_for_reply("No, I cannot do that.", reply_path="llm"), ["shake"])
 
-    def test_default_talk(self) -> None:
-        self.assertEqual(motion_actions_for_reply("Iron is a metal.", reply_path="llm"), ["talk"])
+    def test_register_offer_has_no_curious_motion(self) -> None:
+        self.assertEqual(
+            motion_actions_for_reply(
+                "Looks like you are a new user, can I register you",
+                reply_path="session_register_offer",
+            ),
+            [],
+        )
+        self.assertEqual(
+            motion_actions_for_reply("What should I call you?", reply_path="face_registration"),
+            [],
+        )
 
 
 if __name__ == "__main__":

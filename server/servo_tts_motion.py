@@ -28,8 +28,14 @@ def motion_actions_for_reply(
         return ["nod"]
     if path in {"session_greet", "greeting"} or _GREET_RE.search(text):
         return ["greet"]
-    if path in {"session_register_offer", "session_ask_name", "session_spell", "session_confirm"}:
-        return ["curious"]
+    if path in {
+        "session_register_offer",
+        "session_ask_name",
+        "session_spell",
+        "session_confirm",
+        "face_registration",
+    }:
+        return []
     if _QUESTION_RE.search(text):
         return ["look_left", "look_right", "nod"]
     if _NEG_RE.search(text) and not _YES_RE.search(text):

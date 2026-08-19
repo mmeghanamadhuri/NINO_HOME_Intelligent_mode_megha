@@ -499,6 +499,16 @@ def normalize_eye_expression(value: str | None) -> str | None:
 
 
 IDENTIFY_HEART_PATHS: frozenset[str] = frozenset({"session_greet"})
+# Hunt / "can I register you" / name-spell-confirm: no LCD emoji until identified.
+IDENTIFY_IDLE_PATHS: frozenset[str] = frozenset(
+    {
+        "session_register_offer",
+        "session_ask_name",
+        "session_spell",
+        "session_confirm",
+        "face_registration",
+    }
+)
 
 
 def infer_eye_expression_for_response(
@@ -510,6 +520,8 @@ def infer_eye_expression_for_response(
     """Return an expression for LLM replies only; None leaves the bot on idle."""
     if reply_path in IDENTIFY_HEART_PATHS:
         return "heart"
+    if reply_path in IDENTIFY_IDLE_PATHS:
+        return None
     if reply_path not in LLM_RESPONSE_PATHS:
         return None
     try:

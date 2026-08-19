@@ -79,6 +79,8 @@ class SessionIdentityFlowTests(unittest.TestCase):
             identity_state="unknown",
         )
         self.assertEqual(open_result.reply, OFFER_REGISTER_PROMPT)
+        self.assertIsNone(open_result.eye_expression)
+        self.assertFalse(open_result.identified)
         self.assertTrue(self.flow.in_registration())
         handled = self.flow.handle_voice("no")
         self.assertTrue(handled.handled)

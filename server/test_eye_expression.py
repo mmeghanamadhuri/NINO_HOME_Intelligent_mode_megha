@@ -34,6 +34,20 @@ class EyeExpressionTests(unittest.TestCase):
         self.assertIsNone(normalize_eye_expression("thinking"))
         self.assertIsNone(normalize_eye_expression(""))
 
+    def test_session_register_offer_has_no_eye(self) -> None:
+        self.assertIsNone(
+            infer_eye_expression_for_response(
+                "Looks like you are a new user, can I register you",
+                reply_path="session_register_offer",
+            )
+        )
+        self.assertIsNone(
+            infer_eye_expression_for_response(
+                "What should I call you?",
+                reply_path="face_registration",
+            )
+        )
+
     def test_non_llm_paths_omit_tag(self) -> None:
         self.assertIsNone(
             infer_eye_expression_for_response("Volume set.", reply_path="volume")

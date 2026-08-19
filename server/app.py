@@ -1639,6 +1639,9 @@ async def _voice_ws_send_reply(
         "skip": False,
     }
     eye_tag = normalize_eye_expression(meta.eye_expression)
+    if meta.timings.get("session_open") and eye_tag != "heart":
+        # Hunt / register prompt: do not send curious/tired/etc. on session-open.
+        eye_tag = None
     if eye_tag:
         ws_meta["eye_expression"] = eye_tag
         logger.info(
@@ -1648,6 +1651,8 @@ async def _voice_ws_send_reply(
             client_label,
         )
     motion = getattr(meta, "motion", None) or meta.timings.get("motion")
+    if meta.timings.get("session_open") and list(motion or []) == ["curious"]:
+        motion = None
     if motion:
         ws_meta["motion"] = list(motion)
         ws_meta["type"] = "reply"
