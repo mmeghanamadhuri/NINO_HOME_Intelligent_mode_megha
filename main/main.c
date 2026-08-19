@@ -46,6 +46,7 @@
 #include "audio_capture.h"
 #include "audio_queue.h"
 #include "camera_orientation.h"
+#include "camera_stream.h"
 #include "face_detect.hpp"
 #include "face_tracker.h"
 #include "mic_input.h"
@@ -87,7 +88,6 @@
 #define STA_RECONNECT_DELAY_MS 5000
 #define SERVER_WATCH_TICK_MS 1000
 #define SERVER_PROBE_MS 10000
-#define SERVER_ANNOUNCE_MS 60000
 static char s_sta_ssid[WIFI_CONFIG_STA_SSID_MAX] = "";
 static char s_sta_pass[WIFI_CONFIG_STA_PASS_MAX] = "";
 
@@ -173,6 +173,7 @@ static TaskHandle_t s_face_track_task_handle;
 static QueueHandle_t s_frame_queue;
 static volatile bool s_device_connected;
 static volatile bool s_stream_task_created;
+static volatile bool s_camera_session_active;
 static selected_stream_t s_selected_stream;
 static uvc_host_frame_info_t *s_frame_info_list;
 static size_t s_frame_info_count;
@@ -195,9 +196,6 @@ extern const uint8_t hello_home_wav_end[] asm("_binary_Hello_home_wav_end");
 
 extern const uint8_t wifi_unable_wav_start[] asm("_binary_Wifi_Unable_wav_start");
 extern const uint8_t wifi_unable_wav_end[] asm("_binary_Wifi_Unable_wav_end");
-
-extern const uint8_t server_unable_wav_start[] asm("_binary_Server_Unable_wav_start");
-extern const uint8_t server_unable_wav_end[] asm("_binary_Server_Unable_wav_end");
 
 extern const uint8_t go_app_wav_start[] asm("_binary_NiNO_Home_Wifi_wav_start");
 extern const uint8_t go_app_wav_end[] asm("_binary_NiNO_Home_Wifi_wav_end");
@@ -849,33 +847,12 @@ static bool probe_voice_server(void) {
     return false;
   }
   ESP_LOGI(TAG, "Voice server probe HTTP %d (%s)", status, url);
-  return status > 0;
+  return status >= 200 && status < 300;
 }
 
-static bool play_server_unable_clip(void) {
-  const size_t wav_len = (size_t)(server_unable_wav_end - server_unable_wav_start);
-  if (wav_len < 44) {
-    ESP_LOGW(TAG, "Embedded Server_Unable.wav missing or too small");
-    return false;
-  }
-  if (nino_voice_assist_query_is_busy() || nino_audio_queue_busy() ||
-      nino_music_blocks_mic()) {
-    return false;
-  }
-  esp_err_t err = nino_audio_queue_wav_copy(server_unable_wav_start, wav_len, false,
-                                            NINO_AUDIO_SERVO_PRIORITY_NONE, false);
-  if (err != ESP_OK) {
-    ESP_LOGW(TAG, "Failed to queue Server_Unable.wav: %s", esp_err_to_name(err));
-    return false;
-  }
-  ESP_LOGI(TAG, "Queued Server_Unable.wav (%u bytes): voice server unreachable",
-           (unsigned)wav_len);
-  return true;
-}
-
-static bool server_fail_led_can_takeover(nino_rgb_show_t cur) {
-  return cur == NINO_RGB_SHOW_IDLE || cur == NINO_RGB_SHOW_DONE ||
-         cur == NINO_RGB_SHOW_WIFI_OK || cur == NINO_RGB_SHOW_SERVER_FAIL;
+static bool server_watch_led_can_takeover(nino_rgb_show_t cur) {
+  return cur == NINO_RGB_SHOW_IDLE || cur == NINO_RGB_SHOW_WIFI_WAIT ||
+         cur == NINO_RGB_SHOW_SERVER_WAIT;
 }
 
 static void apply_server_watch_led(bool reachable) {
@@ -883,24 +860,26 @@ static void apply_server_watch_led(bool reachable) {
     return;
   }
   const nino_rgb_show_t cur = nino_rgb_led_current();
+  if (!server_watch_led_can_takeover(cur)) {
+    return;
+  }
   if (reachable) {
-    if (cur == NINO_RGB_SHOW_SERVER_FAIL) {
-      (void)nino_rgb_led_show(NINO_RGB_SHOW_WIFI_OK);
+    if (cur != NINO_RGB_SHOW_IDLE) {
+      (void)nino_rgb_led_show(NINO_RGB_SHOW_IDLE);
     }
     return;
   }
-  if (server_fail_led_can_takeover(cur) && cur != NINO_RGB_SHOW_SERVER_FAIL) {
-    (void)nino_rgb_led_show(NINO_RGB_SHOW_SERVER_FAIL);
+  if (cur != NINO_RGB_SHOW_SERVER_WAIT) {
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_SERVER_WAIT);
   }
 }
 
 static void server_watch_task(void *arg) {
   (void)arg;
   int64_t last_probe_us = 0;
-  int64_t last_announce_us = 0;
   bool reachable = true;
-  ESP_LOGI(TAG, "Voice server watch started (announce every %d s while down)",
-           SERVER_ANNOUNCE_MS / 1000);
+  ESP_LOGI(TAG, "Voice server watch started (probe every %d s)",
+           SERVER_PROBE_MS / 1000);
   while (true) {
     vTaskDelay(pdMS_TO_TICKS(SERVER_WATCH_TICK_MS));
     if (!s_sta_connected || !s_boot_greeting_done) {
@@ -911,20 +890,8 @@ static void server_watch_task(void *arg) {
         (now - last_probe_us) >= (int64_t)SERVER_PROBE_MS * 1000) {
       reachable = probe_voice_server();
       last_probe_us = now;
-      if (reachable) {
-        last_announce_us = 0;
-      }
     }
     apply_server_watch_led(reachable);
-    if (reachable) {
-      continue;
-    }
-    if (last_announce_us == 0 ||
-        (now - last_announce_us) >= (int64_t)SERVER_ANNOUNCE_MS * 1000) {
-      if (play_server_unable_clip()) {
-        last_announce_us = now;
-      }
-    }
   }
 }
 
@@ -1693,7 +1660,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     s_sta_connected = false;
     wifi_prov_ble_on_sta_ip_changed(false);
     mdns_stop_service();
-    (void)nino_rgb_led_show(NINO_RGB_SHOW_WIFI_FAIL);
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_WIFI_WAIT);
     wifi_event_sta_disconnected_t *ev =
         (wifi_event_sta_disconnected_t *)event_data;
     ESP_LOGW(TAG, "STA: Disconnected (reason %d)", ev->reason);
@@ -1715,7 +1682,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
     s_sta_connected = true;
     s_wifi_unable_chimed = false;
-    (void)nino_rgb_led_show(NINO_RGB_SHOW_WIFI_OK);
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_SERVER_WAIT);
     ESP_LOGI(TAG, "STA: Got IP " IPSTR, IP2STR(&event->ip_info.ip));
     mdns_start_service();
     wifi_prov_ble_on_sta_ip_changed(true);
@@ -4007,7 +3974,24 @@ static void stream_event_callback(const uvc_host_stream_event_data_t *event,
   }
 }
 
+void nino_camera_set_session_active(bool active) {
+  if (s_camera_session_active == active) {
+    return;
+  }
+  s_camera_session_active = active;
+  ESP_LOGI(TAG, "Camera session %s", active ? "on" : "off");
+}
+
+bool nino_camera_session_is_active(void) { return s_camera_session_active; }
+
 static bool frame_callback(const uvc_host_frame_t *frame, void *user_ctx) {
+  /* Gate: grab/log/HTTP-stream frames only during a voice session. USB host
+   * and the opened UVC device stay up so the next session can start again. */
+  if (!s_camera_session_active) {
+    (void)frame;
+    (void)user_ctx;
+    return true;
+  }
   QueueHandle_t frame_queue = (QueueHandle_t)user_ctx;
   BaseType_t sent = xQueueSendToBack(frame_queue, &frame, 0);
   if (sent != pdPASS) {
@@ -4122,10 +4106,38 @@ static void uvc_stream_task(void *arg) {
     }
 
     uvc_host_desc_print(stream);
-    ESP_ERROR_CHECK(uvc_host_stream_start(stream));
-    ESP_LOGI(TAG, "Camera stream started");
+    bool streaming = false;
+    ESP_LOGI(TAG, "UVC opened — streaming waits for a voice session");
 
     while (s_device_connected) {
+      if (s_camera_session_active && !streaming) {
+        err = uvc_host_stream_start(stream);
+        if (err == ESP_OK) {
+          streaming = true;
+          s_last_uvc_timeout_log_us = 0;
+          ESP_LOGI(TAG, "Camera stream started (voice session)");
+        } else {
+          ESP_LOGW(TAG, "uvc_host_stream_start: %s", esp_err_to_name(err));
+          vTaskDelay(pdMS_TO_TICKS(200));
+          continue;
+        }
+      } else if (!s_camera_session_active && streaming) {
+        (void)uvc_host_stream_stop(stream);
+        uvc_host_frame_t *queued = NULL;
+        while (xQueueReceive(s_frame_queue, &queued, 0) == pdPASS) {
+          if (queued != NULL) {
+            (void)uvc_host_frame_return(stream, queued);
+          }
+        }
+        streaming = false;
+        ESP_LOGI(TAG, "Camera stream stopped (idle)");
+      }
+
+      if (!streaming) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        continue;
+      }
+
       uvc_host_frame_t *frame = NULL;
       if (xQueueReceive(s_frame_queue, &frame, pdMS_TO_TICKS(2000)) != pdPASS) {
         const int64_t now_us = esp_timer_get_time();
@@ -4150,6 +4162,9 @@ static void uvc_stream_task(void *arg) {
       ESP_ERROR_CHECK(uvc_host_frame_return(stream, frame));
     }
 
+    if (streaming) {
+      (void)uvc_host_stream_stop(stream);
+    }
     ESP_LOGI(TAG, "Stream loop exiting");
     vTaskDelay(pdMS_TO_TICKS(500));
   }
@@ -4257,6 +4272,8 @@ void app_main(void) {
 
   if (nino_rgb_led_init() != ESP_OK) {
     ESP_LOGW(TAG, "RGB LED init failed (GPIO 2/3/4)");
+  } else {
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_WIFI_WAIT);
   }
 
   /* Wi-Fi init brings Hosted SDIO transport up. BLE must start AFTER that —

@@ -77,20 +77,14 @@ const char *nino_rgb_led_show_name(nino_rgb_show_t show)
     return "idle";
   case NINO_RGB_SHOW_LISTEN:
     return "listen";
-  case NINO_RGB_SHOW_DONE:
-    return "done";
-  case NINO_RGB_SHOW_BATTERY:
-    return "battery";
-  case NINO_RGB_SHOW_OTA:
-    return "ota";
+  case NINO_RGB_SHOW_TTS:
+    return "tts";
   case NINO_RGB_SHOW_ERROR:
     return "error";
   case NINO_RGB_SHOW_WIFI_WAIT:
     return "wifi-wait";
-  case NINO_RGB_SHOW_WIFI_OK:
-    return "wifi-ok";
-  case NINO_RGB_SHOW_WIFI_FAIL:
-    return "wifi-fail";
+  case NINO_RGB_SHOW_SERVER_WAIT:
+    return "server-wait";
   default:
     return "unknown";
   }
@@ -187,6 +181,8 @@ static esp_err_t blink_timer_start(uint64_t period_us, int on_count)
   return esp_timer_start_periodic(s_blink_timer, period_us);
 }
 
+nino_rgb_show_t nino_rgb_led_current(void) { return s_show; }
+
 esp_err_t nino_rgb_led_show(nino_rgb_show_t show)
 {
   if (s_blink_timer == NULL) {
@@ -200,29 +196,13 @@ esp_err_t nino_rgb_led_show(nino_rgb_show_t show)
     nino_rgb_led_all_off();
     break;
   case NINO_RGB_SHOW_LISTEN:
+    (void)nino_rgb_led_set_named("blue", RGB_LED_LEVEL_MAX);
+    break;
+  case NINO_RGB_SHOW_TTS:
     (void)nino_rgb_led_set_named("green", RGB_LED_LEVEL_MAX);
     break;
-  case NINO_RGB_SHOW_DONE:
-    s_blink_r = 0;
-    s_blink_g = 255;
-    s_blink_b = 0;
-    ESP_RETURN_ON_ERROR(blink_timer_start(350 * 1000, 3), TAG, "done blink failed");
-    break;
-  case NINO_RGB_SHOW_BATTERY:
-    /* Slow orange — must not look like error (fast red). */
-    s_blink_r = 255;
-    s_blink_g = 102;
-    s_blink_b = 0;
-    ESP_RETURN_ON_ERROR(blink_timer_start(800 * 1000, -1), TAG, "battery blink failed");
-    break;
-  case NINO_RGB_SHOW_OTA:
-    (void)nino_rgb_led_set_named("purple", RGB_LED_LEVEL_MAX);
-    break;
   case NINO_RGB_SHOW_ERROR:
-    s_blink_r = 255;
-    s_blink_g = 0;
-    s_blink_b = 0;
-    ESP_RETURN_ON_ERROR(blink_timer_start(200 * 1000, -1), TAG, "error blink failed");
+    (void)nino_rgb_led_set_named("red", RGB_LED_LEVEL_MAX);
     break;
   case NINO_RGB_SHOW_WIFI_WAIT:
     s_blink_r = 255;
@@ -230,11 +210,12 @@ esp_err_t nino_rgb_led_show(nino_rgb_show_t show)
     s_blink_b = 255;
     ESP_RETURN_ON_ERROR(blink_timer_start(400 * 1000, -1), TAG, "wifi blink failed");
     break;
-  case NINO_RGB_SHOW_WIFI_OK:
-    (void)nino_rgb_led_set_named("cyan", RGB_LED_LEVEL_MAX);
-    break;
-  case NINO_RGB_SHOW_WIFI_FAIL:
-    (void)nino_rgb_led_set_named("orange", RGB_LED_LEVEL_MAX);
+  case NINO_RGB_SHOW_SERVER_WAIT:
+    s_blink_r = 0;
+    s_blink_g = 255;
+    s_blink_b = 0;
+    ESP_RETURN_ON_ERROR(blink_timer_start(400 * 1000, -1), TAG,
+                        "server blink failed");
     break;
   default:
     return ESP_ERR_INVALID_ARG;
@@ -398,15 +379,12 @@ static void print_help(void) {
   printf("  rgb status\n");
   printf("  rgb off\n");
   printf("  rgb show <scene>   — preview / force a status light\n");
-  printf("      listen     solid green     (Ok Nino — user can speak)\n");
-  printf("      done       blink green x3  (answer finished, then off)\n");
-  printf("      idle       off\n");
-      printf("      battery    slow blink orange (low battery)\n");
-      printf("      ota        solid purple      (firmware update)\n");
-      printf("      error      fast blink red    (capture/WS/error)\n");
-  printf("      wifi-wait  blink white     (Wi-Fi connecting)\n");
-  printf("      wifi-ok    solid cyan      (Wi-Fi connected)\n");
-  printf("      wifi-fail  solid orange    (Wi-Fi not connected)\n");
+  printf("      listen       solid blue      (STREAM / listen)\n");
+  printf("      tts          solid green     (voice reply playing)\n");
+  printf("      idle         off\n");
+  printf("      error        solid red       (capture/WS/error)\n");
+  printf("      wifi-wait    blink white     (boot / Wi-Fi connecting)\n");
+  printf("      server-wait  blink green     (Wi-Fi up, voice server down)\n");
   printf("  rgb brightness [0-255]\n");
   printf("  rgb red|green|blue [0-255|on|off|max]\n");
   printf("  rgb color <name> [0-255]   — yellow cyan magenta white orange ...\n");
@@ -445,22 +423,16 @@ static int cmd_rgb(int argc, char **argv) {
     nino_rgb_show_t show = NINO_RGB_SHOW_IDLE;
     if (strcmp(argv[2], "listen") == 0) {
       show = NINO_RGB_SHOW_LISTEN;
-    } else if (strcmp(argv[2], "done") == 0) {
-      show = NINO_RGB_SHOW_DONE;
+    } else if (strcmp(argv[2], "tts") == 0) {
+      show = NINO_RGB_SHOW_TTS;
     } else if (strcmp(argv[2], "idle") == 0) {
       show = NINO_RGB_SHOW_IDLE;
-    } else if (strcmp(argv[2], "battery") == 0) {
-      show = NINO_RGB_SHOW_BATTERY;
-    } else if (strcmp(argv[2], "ota") == 0) {
-      show = NINO_RGB_SHOW_OTA;
     } else if (strcmp(argv[2], "error") == 0) {
       show = NINO_RGB_SHOW_ERROR;
     } else if (strcmp(argv[2], "wifi-wait") == 0) {
       show = NINO_RGB_SHOW_WIFI_WAIT;
-    } else if (strcmp(argv[2], "wifi-ok") == 0) {
-      show = NINO_RGB_SHOW_WIFI_OK;
-    } else if (strcmp(argv[2], "wifi-fail") == 0) {
-      show = NINO_RGB_SHOW_WIFI_FAIL;
+    } else if (strcmp(argv[2], "server-wait") == 0) {
+      show = NINO_RGB_SHOW_SERVER_WAIT;
     } else {
       printf("Unknown scene '%s'\n", argv[2]);
       print_help();
@@ -613,7 +585,7 @@ void nino_rgb_led_cli_register(void) {
   const esp_console_cmd_t cmd = {
       .command = "rgb",
       .help =
-          "rgb show listen|done|idle|battery|ota|error|wifi-wait|wifi-ok|wifi-fail | "
+          "rgb show listen|tts|idle|error|wifi-wait|server-wait | "
           "rgb off | rgb status",
       .hint = NULL,
       .func = &cmd_rgb,

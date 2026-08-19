@@ -16,7 +16,7 @@ DEFAULT_START_ENERGY = 50
 DEFAULT_QUIET_ENERGY = 20
 DEFAULT_SPEECH_MS = 160
 DEFAULT_SILENCE_MS = 700
-DEFAULT_MAX_MS = 15000
+DEFAULT_MAX_MS = 30000
 DEFAULT_MIN_SPEECH_MS = 200
 SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2
@@ -119,6 +119,11 @@ class StreamEndOfSpeech:
             self.ended = True
             return "end_of_speech" if self.heard_speech else "timeout"
         return "speech" if self.heard_speech else "idle"
+
+
+def stream_idle_timeout_ends_session(reason: str) -> bool:
+    """True when a listen turn hit max_ms with no speech — goodbye, not skip."""
+    return reason == "timeout"
 
 
 def stream_vad_from_environ() -> StreamEndOfSpeech:

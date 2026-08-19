@@ -156,6 +156,10 @@ static bool play_normal_job(audio_play_job_t *job) {
     nino_eye_set_state(job->eye_state);
   }
 
+  if (nino_voice_assist_query_is_busy()) {
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_TTS);
+  }
+
   s_normal_playing = true;
   nino_music_pause_for_speech(true);
   ESP_LOGI(TAG, "Playing server WAV %u bytes @ %u Hz", (unsigned)decoded.num_bytes,
@@ -195,7 +199,6 @@ static bool play_normal_job(audio_play_job_t *job) {
     }
     nino_voice_assist_prompt_medical_ack();
   } else {
-    (void)nino_rgb_led_show(NINO_RGB_SHOW_DONE);
     nino_music_pause_for_speech(false);
   }
   nino_decoded_wav_free(&decoded);
@@ -214,6 +217,9 @@ static bool play_suspended(void) {
   memset(&s_suspended, 0, sizeof(s_suspended));
 
   s_normal_playing = true;
+  if (nino_voice_assist_query_is_busy()) {
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_TTS);
+  }
   const nino_audio_servo_mode_t servo_mode = effective_servo_mode(snap.servo_mode);
   const bool completed =
       play_decoded_job(&snap.decoded, &snap.pcm_offset, servo_mode, true);
@@ -243,7 +249,6 @@ static bool play_suspended(void) {
     }
     nino_voice_assist_prompt_medical_ack();
   } else {
-    (void)nino_rgb_led_show(NINO_RGB_SHOW_DONE);
     nino_music_pause_for_speech(false);
   }
   nino_decoded_wav_free(&snap.decoded);

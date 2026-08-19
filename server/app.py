@@ -30,7 +30,11 @@ from conversation_sessions import (
     list_sessions_for_user,
     new_session_id,
 )
-from stream_asr import UtteranceBuffer, looks_like_stream_pcm_frame
+from stream_asr import (
+    UtteranceBuffer,
+    looks_like_stream_pcm_frame,
+    stream_idle_timeout_ends_session,
+)
 from alarm_service import get_alarm_service
 from camera import CameraPool, normalize_camera_rotation
 from device_discovery import (
@@ -1769,7 +1773,42 @@ async def _voice_ws_stream_pipeline(
         buf.reset()
         accepting = False
         await websocket.send_json({"type": "end_of_speech", "reason": reason})
-        if reason == "timeout" or len(pcm) < 1600:
+        if stream_idle_timeout_ends_session(reason):
+            from voice_service import (
+                VoiceReplyMeta,
+                minimal_voice_reply_wav,
+                synthesize_idle_goodbye_wav,
+            )
+
+            logger.info(
+                "stream idle timeout — goodbye device=%s session=%s",
+                device_id,
+                session_id,
+            )
+            try:
+                wav_out, reply_meta = await run_in_threadpool(
+                    lambda: synthesize_idle_goodbye_wav(
+                        session_id=session_id, device_id=device_id
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "stream idle goodbye TTS failed device=%s", device_id
+                )
+                reply_meta = VoiceReplyMeta(
+                    end_session=True, session_id=session_id, device_id=device_id
+                )
+                wav_out = minimal_voice_reply_wav()
+            await _voice_ws_send_reply(
+                websocket,
+                device_id=device_id,
+                session_id=session_id,
+                wav_out=wav_out,
+                reply_meta=reply_meta,
+                client_label=client_label,
+            )
+            return False
+        if len(pcm) < 1600:
             await send_skip(reason or "too_short")
             accepting = True
             return True

@@ -497,6 +497,53 @@ def conversation_goodbye_reply() -> str:
     return random.choice(_GOODBYE_REPLIES)
 
 
+def synthesize_idle_goodbye_wav(
+    *,
+    session_id: str = "",
+    device_id: str = "",
+) -> tuple[bytes, VoiceReplyMeta]:
+    """Farewell TTS after 30s of no speech on an open stream session."""
+    reply = conversation_goodbye_reply()
+    meta = VoiceReplyMeta(
+        end_session=True,
+        session_id=session_id,
+        device_id=device_id,
+    )
+    meta.prompt_medical_ack = False
+    wav, _voice = synthesize_sapi_wav_bytes(reply)
+    wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
+    meta.timings = {
+        "heard": "",
+        "reply_text": reply[:200],
+        "reply_path": "goodbye",
+        "idle_timeout": True,
+        "audio_out_seconds": round(_wav_seconds(wav_out), 2),
+        "audio_out_bytes": len(wav_out),
+    }
+    log_nino_voice(
+        "SESSION",
+        state="end",
+        path="goodbye",
+        reason="idle_timeout",
+        device=device_id or "-",
+        session_id=session_id,
+        next="GPIO 5 after TTS, then wait for Ok Nino",
+    )
+    from conversation_sessions import end_session as persist_end_session
+    from device_session import clear_device_session
+    from math_voice import clear_math_quiz
+
+    clear_device_session(device_id)
+    clear_math_quiz(device_id)
+    if session_id:
+        persist_end_session(
+            session_id,
+            device_id=device_id,
+            reason="idle_timeout",
+        )
+    return wav_out, meta
+
+
 def should_continue_listen_after_reply(reply_path: str, user_text: str) -> bool:
     """Keep the conversation open until the user says goodbye."""
     enabled = os.environ.get("VOICE_CONTINUE_LISTEN", "1").strip().lower() not in {

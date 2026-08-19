@@ -7,17 +7,14 @@
 
 #define RGB_LED_LEVEL_MAX 255
 
-/** Runtime LED scenes: wake/listen, TTS done, Wi-Fi, battery, error. */
+/** Runtime LED scenes. Idle is always off. */
 typedef enum {
-  NINO_RGB_SHOW_IDLE = 0,   /* no light */
-  NINO_RGB_SHOW_LISTEN,     /* solid green — user may speak */
-  NINO_RGB_SHOW_DONE,       /* blink green a few times, then off */
-  NINO_RGB_SHOW_BATTERY,    /* slow orange blink — low battery */
-  NINO_RGB_SHOW_OTA,        /* solid purple — firmware update */
-  NINO_RGB_SHOW_ERROR,      /* fast red blink — capture/WS/error */
-  NINO_RGB_SHOW_WIFI_WAIT,  /* white blink — connecting */
-  NINO_RGB_SHOW_WIFI_OK,    /* solid cyan — connected */
-  NINO_RGB_SHOW_WIFI_FAIL,  /* solid orange — not connected */
+  NINO_RGB_SHOW_IDLE = 0,       /* no light */
+  NINO_RGB_SHOW_LISTEN,         /* solid blue — STREAM / listen until TTS */
+  NINO_RGB_SHOW_TTS,            /* solid green — voice reply playing */
+  NINO_RGB_SHOW_ERROR,          /* solid red — WS/capture/query fail */
+  NINO_RGB_SHOW_WIFI_WAIT,      /* blink white — boot / no Wi-Fi */
+  NINO_RGB_SHOW_SERVER_WAIT,    /* blink green — Wi-Fi up, voice server not OK */
 } nino_rgb_show_t;
 
 /** Common-anode RGB on GPIO 2 (red), 3 (green), 4 (blue). Black -> 3.3 V. */
@@ -25,6 +22,8 @@ esp_err_t nino_rgb_led_init(void);
 
 /** Start a named scene (stops any previous blink). Safe from console or tasks. */
 esp_err_t nino_rgb_led_show(nino_rgb_show_t show);
+
+nino_rgb_show_t nino_rgb_led_current(void);
 
 const char *nino_rgb_led_show_name(nino_rgb_show_t show);
 

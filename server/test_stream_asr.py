@@ -5,7 +5,13 @@ from __future__ import annotations
 import array
 import unittest
 
-from stream_asr import StreamEndOfSpeech, UtteranceBuffer, pcm_frame_energy
+from stream_asr import (
+    DEFAULT_MAX_MS,
+    StreamEndOfSpeech,
+    UtteranceBuffer,
+    pcm_frame_energy,
+    stream_idle_timeout_ends_session,
+)
 
 
 def _frame(energy: int, samples: int = 320) -> bytes:
@@ -47,6 +53,21 @@ class StreamEndOfSpeechTests(unittest.TestCase):
         self.assertEqual(vad.feed(_frame(1)), "idle")
         self.assertEqual(vad.feed(_frame(1)), "idle")
         self.assertEqual(vad.feed(_frame(1)), "timeout")
+
+    def test_default_max_ms_is_30s(self) -> None:
+        self.assertEqual(DEFAULT_MAX_MS, 30000)
+
+    def test_idle_timeout_ends_session_not_skip(self) -> None:
+        self.assertTrue(stream_idle_timeout_ends_session("timeout"))
+        self.assertFalse(stream_idle_timeout_ends_session("end_of_speech"))
+        self.assertFalse(stream_idle_timeout_ends_session("skip"))
+
+    def test_30s_silence_times_out(self) -> None:
+        vad = StreamEndOfSpeech(start_energy=50, max_ms=30000, frame_ms=20)
+        for _ in range((30000 // 20) - 1):
+            self.assertEqual(vad.feed(_frame(1)), "idle")
+        self.assertEqual(vad.feed(_frame(1)), "timeout")
+        self.assertFalse(vad.heard_speech)
 
     def test_buffer_accumulates_pcm(self) -> None:
         buf = UtteranceBuffer()

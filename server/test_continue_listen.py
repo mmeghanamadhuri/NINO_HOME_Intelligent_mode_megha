@@ -98,6 +98,36 @@ class ContinueListenGateTests(unittest.TestCase):
         self.assertFalse(should_continue_listen_after_reply("llm", "Bye"))
         self.assertFalse(should_continue_listen_after_reply("goodbye", "bye"))
 
+    def test_idle_timeout_goodbye_ends_session(self) -> None:
+        from voice_service import VoiceReplyMeta, synthesize_idle_goodbye_wav
+
+        dummy = b"RIFF" + b"\x00" * 40
+        with patch(
+            "voice_service.synthesize_sapi_wav_bytes",
+            return_value=(dummy, "mock"),
+        ), patch(
+            "voice_service.resample_wav_bytes_to_mono_16bit",
+            return_value=dummy,
+        ), patch(
+            "voice_service._wav_seconds",
+            return_value=0.5,
+        ), patch(
+            "device_session.clear_device_session",
+        ), patch(
+            "math_voice.clear_math_quiz",
+        ), patch(
+            "conversation_sessions.end_session",
+        ) as persist:
+            wav, meta = synthesize_idle_goodbye_wav(
+                session_id="sid-idle", device_id="nino-home"
+            )
+        self.assertEqual(wav, dummy)
+        self.assertIsInstance(meta, VoiceReplyMeta)
+        self.assertTrue(meta.end_session)
+        self.assertEqual(meta.timings.get("reply_path"), "goodbye")
+        persist.assert_called_once()
+        self.assertEqual(persist.call_args.kwargs.get("reason"), "idle_timeout")
+
     def test_env_disable(self) -> None:
         with patch.dict(os.environ, {"VOICE_CONTINUE_LISTEN": "0"}):
             self.assertFalse(

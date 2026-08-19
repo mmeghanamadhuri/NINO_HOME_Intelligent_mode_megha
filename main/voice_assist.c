@@ -20,6 +20,7 @@
 #include "music_stream.h"
 #include "nino_eye.h"
 #include "rgb_led.h"
+#include "camera_stream.h"
 #include "voice_ws_client.h"
 #include "wifi_config.h"
 
@@ -53,6 +54,7 @@ static const char *TAG = "voice_ast";
 #define AUX_POST_SPEAKER_IGNORE_MS 1500
 #define AUX_STATUS_LOG_MS 1000
 #define AUX_REPLY_WAIT_MS 180000
+#define STREAM_LISTEN_CAP_MS 32000
 #define AUX_MUSIC_LISTEN_MS 200
 #define AUX_MUSIC_PLAY_SLICE_MS 800
 #define AUX_WAKE_GAP_MS 1000
@@ -493,7 +495,7 @@ static esp_err_t run_ws_and_queue_ex(
   esp_err_t e;
   if (quiet_end_ms > 0) {
     voice_log(ESP_LOG_INFO, turn, "CAPTURE",
-              "session=%s preroll=%u gap=%u ms wait=%u ms max=%u ms led=green",
+              "session=%s preroll=%u gap=%u ms wait=%u ms max=%u ms led=blue",
               session_query_name(session), (unsigned)preroll_samples,
               (unsigned)min_ms, (unsigned)wait_speech_ms, (unsigned)max_ms);
     e = nino_audio_capture_wav_until_quiet(
@@ -501,7 +503,7 @@ static esp_err_t run_ws_and_queue_ex(
         quiet_energy, speech_energy, wait_speech_ms, flush_first);
   } else {
     voice_log(ESP_LOG_INFO, turn, "CAPTURE",
-              "session=%s fixed=%u ms led=green", session_query_name(session),
+              "session=%s fixed=%u ms led=blue", session_query_name(session),
               (unsigned)max_ms);
     e = nino_audio_capture_wav(&cap, &cap_len, max_ms);
   }
@@ -579,7 +581,7 @@ static void prompt_listen_task(void *arg) {
   }
   const uint32_t turn = voice_begin_turn();
   voice_log(ESP_LOG_INFO, turn, "CONV",
-            "fixed=%u ms chime=%d led=green", (unsigned)MED_ACK_CAPTURE_MS,
+            "fixed=%u ms chime=%d led=blue", (unsigned)MED_ACK_CAPTURE_MS,
             (int)play_chime);
   (void)nino_rgb_led_show(NINO_RGB_SHOW_LISTEN);
   if (play_chime) {
@@ -873,11 +875,13 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
   if (err != ESP_OK || ws == NULL) {
     voice_log(ESP_LOG_ERROR, s_voice_turn, "FAIL", "stage=ws_open err=%s",
               esp_err_to_name(err));
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_ERROR);
     goto session_done;
   }
 
   voice_log(ESP_LOG_INFO, s_voice_turn, "SESSION",
             "id=%s stream=1 gpio5=low", session_id);
+  nino_camera_set_session_active(true);
 
   while (!session_end && nino_voice_ws_session_is_open(ws)) {
     const uint32_t turn = first_turn ? s_voice_turn : voice_begin_turn();
@@ -895,6 +899,7 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
         }
         if (!nino_voice_ws_session_should_pause(ws)) {
           voice_log(ESP_LOG_ERROR, turn, "FAIL", "stage=stream err=preroll");
+          (void)nino_rgb_led_show(NINO_RGB_SHOW_ERROR);
           break;
         }
       }
@@ -931,18 +936,20 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
         break;
       }
       streamed_ms += AUX_DETECT_FRAME_MS;
-      if (streamed_ms >= 30000) {
-        voice_log(ESP_LOG_WARN, turn, "STREAM", "cap=30s waiting for ASR EOS");
+      if (streamed_ms >= STREAM_LISTEN_CAP_MS) {
+        voice_log(ESP_LOG_WARN, turn, "STREAM",
+                  "cap=%u ms waiting for ASR EOS/goodbye", (unsigned)streamed_ms);
         break;
       }
     }
 
     nino_mic_close();
-    (void)nino_rgb_led_show(NINO_RGB_SHOW_IDLE);
+    /* Keep solid blue through STT/LLM until TTS actually starts. */
     nino_eye_thinking();
     if (tx_failed || !nino_voice_ws_session_is_open(ws)) {
       voice_log(ESP_LOG_ERROR, turn, "FAIL",
                 "stage=stream err=ESP_FAIL after %u ms", (unsigned)streamed_ms);
+      (void)nino_rgb_led_show(NINO_RGB_SHOW_ERROR);
       break;
     }
     voice_log(ESP_LOG_INFO, turn, "WAIT_PC", "paused TX after %u ms",
@@ -959,6 +966,7 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
     if (err != ESP_OK) {
       voice_log(ESP_LOG_ERROR, turn, "FAIL", "stage=reply err=%s",
                 esp_err_to_name(err));
+      (void)nino_rgb_led_show(NINO_RGB_SHOW_ERROR);
       free(resp);
       break;
     }
@@ -978,10 +986,13 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
     if (end_session) {
       session_end = true;
       voice_log(ESP_LOG_INFO, turn, "SESSION", "ended after TTS id=%s", session_id);
+    } else {
+      (void)nino_rgb_led_show(NINO_RGB_SHOW_LISTEN);
     }
   }
 
 session_done:
+  nino_camera_set_session_active(false);
   /* Clear busy before WS teardown so listen cannot stay wedged if destroy lags. */
   s_query_busy = false;
   nino_music_pause_for_speech(false);
@@ -1030,7 +1041,7 @@ static void aux_listen_task(void *arg) {
       continue;
     }
 
-    voice_log(ESP_LOG_INFO, s_voice_turn, "WAKE", "stream session led=green");
+    voice_log(ESP_LOG_INFO, s_voice_turn, "WAKE", "stream session led=blue");
     run_conversation_session(NULL, 0);
 
     wait_aux_quiet();
