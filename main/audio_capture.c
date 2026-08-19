@@ -5,13 +5,26 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "mic_input.h"
+#include "sd_record.h"
 
 static const char *TAG = "nino_cap";
 
 #define CAP_SAMPLE_RATE 16000
 #define CAP_BYTES_PER_SAMPLE 2
 #define CAP_MAX_MS 10000
+
+static SemaphoreHandle_t s_last_mu;
+static uint8_t *s_last_wav;
+static size_t s_last_len;
+
+static void last_lock_init(void) {
+  if (s_last_mu == NULL) {
+    s_last_mu = xSemaphoreCreateMutex();
+  }
+}
 
 static void write_le32(uint8_t *p, uint32_t v) {
   p[0] = (uint8_t)(v & 0xff);
@@ -132,6 +145,74 @@ out:
   return err;
 }
 
+esp_err_t nino_audio_capture_save_to_sd(const uint8_t *wav, size_t wav_len,
+                                        char *path, size_t path_size) {
+  if (wav == NULL || wav_len < 44 || path == NULL || path_size == 0) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  esp_err_t err = nino_sd_record_init();
+  if (err != ESP_OK) {
+    return err;
+  }
+  return nino_sd_record_save_wav(wav, wav_len, path, path_size);
+}
+
+esp_err_t nino_audio_capture_keep_last(const uint8_t *wav, size_t wav_len) {
+  if (wav == NULL || wav_len < 44) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  last_lock_init();
+  if (s_last_mu == NULL) {
+    return ESP_ERR_NO_MEM;
+  }
+  uint8_t *copy = heap_caps_malloc(wav_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (copy == NULL) {
+    copy = malloc(wav_len);
+  }
+  if (copy == NULL) {
+    return ESP_ERR_NO_MEM;
+  }
+  memcpy(copy, wav, wav_len);
+
+  xSemaphoreTake(s_last_mu, portMAX_DELAY);
+  free(s_last_wav);
+  s_last_wav = copy;
+  s_last_len = wav_len;
+  xSemaphoreGive(s_last_mu);
+  return ESP_OK;
+}
+
+esp_err_t nino_audio_capture_copy_last(uint8_t **out_wav, size_t *out_len) {
+  if (out_wav == NULL || out_len == NULL) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  *out_wav = NULL;
+  *out_len = 0;
+  last_lock_init();
+  if (s_last_mu == NULL) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  xSemaphoreTake(s_last_mu, portMAX_DELAY);
+  esp_err_t err = ESP_ERR_NOT_FOUND;
+  if (s_last_wav != NULL && s_last_len >= 44) {
+    uint8_t *copy =
+        heap_caps_malloc(s_last_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (copy == NULL) {
+      copy = malloc(s_last_len);
+    }
+    if (copy == NULL) {
+      err = ESP_ERR_NO_MEM;
+    } else {
+      memcpy(copy, s_last_wav, s_last_len);
+      *out_wav = copy;
+      *out_len = s_last_len;
+      err = ESP_OK;
+    }
+  }
+  xSemaphoreGive(s_last_mu);
+  return err;
+}
+
 esp_err_t nino_audio_capture_wav_until_quiet(
     uint8_t **out_wav, size_t *out_len, const int16_t *preroll,
     size_t preroll_samples, uint32_t min_ms, uint32_t max_ms,
@@ -197,6 +278,21 @@ esp_err_t nino_audio_capture_wav_until_quiet(
     elapsed_ms += 20;
 
     const uint32_t energy = pcm_abs_mean(frame, CAP_FRAME_SAMPLES);
+    if (energy >= speech_th && (elapsed_ms % 200U) == 0U) {
+      int16_t mn = 32767;
+      int16_t mx = -32768;
+      for (int i = 0; i < CAP_FRAME_SAMPLES; i++) {
+        if (frame[i] < mn) {
+          mn = frame[i];
+        }
+        if (frame[i] > mx) {
+          mx = frame[i];
+        }
+      }
+      ESP_LOGI(TAG, "I2S IN audio energy=%u min=%d max=%d th=%u at=%u ms",
+               (unsigned)energy, (int)mn, (int)mx, (unsigned)speech_th,
+               (unsigned)elapsed_ms);
+    }
     if (elapsed_ms < min_ms) {
       /* Wake gap: keep recording, never end on quiet. */
       quiet_ms = 0;

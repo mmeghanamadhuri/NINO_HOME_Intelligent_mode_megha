@@ -152,6 +152,7 @@ async def _serve_uvicorn(host: str, port: int) -> None:
         log_level="info",
         log_config=uvicorn_log_config(),
         timeout_graceful_shutdown=3,
+        ws_max_queue=256,
     )
     server = uvicorn.Server(config)
     logging.getLogger("uvicorn.access").addFilter(UvicornPollFilter())
@@ -1829,6 +1830,7 @@ async def _voice_ws_stream_pipeline(
         if not chunk:
             return True
         if not accepting:
+            # Same-task drain: drop PCM so uvicorn max_queue cannot stall TCP.
             return True
         pcm_frames += 1
         if pcm_frames == 1 or pcm_frames % 50 == 0:

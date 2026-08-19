@@ -11,7 +11,7 @@
 static const char *TAG = "mic_input";
 
 #define NINO_MIC_SAMPLE_RATE_HZ 16000
-#define NINO_ES8311_AUX_GAIN_DB 24.0f
+#define NINO_ES8311_AUX_GAIN_DB 12.0f
 #define ES8311_I2C_ADDR 0x18
 #define ES8311_REG_ADC_ANALOG 0x14
 #define ES8311_LINSEL_MASK 0x0C

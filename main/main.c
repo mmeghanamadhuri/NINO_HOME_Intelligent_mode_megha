@@ -194,9 +194,6 @@ extern const uint8_t wifi_wav_end[] asm("_binary_WIFI_wav_end");
 extern const uint8_t hello_home_wav_start[] asm("_binary_Hello_home_wav_start");
 extern const uint8_t hello_home_wav_end[] asm("_binary_Hello_home_wav_end");
 
-extern const uint8_t wifi_unable_wav_start[] asm("_binary_Wifi_Unable_wav_start");
-extern const uint8_t wifi_unable_wav_end[] asm("_binary_Wifi_Unable_wav_end");
-
 extern const uint8_t go_app_wav_start[] asm("_binary_NiNO_Home_Wifi_wav_start");
 extern const uint8_t go_app_wav_end[] asm("_binary_NiNO_Home_Wifi_wav_end");
 
@@ -205,11 +202,6 @@ extern const uint8_t schedule_dinnner_wav_end[] asm("_binary_schedule_dinnner_wa
 
 extern const uint8_t bday_surprise_wav_start[] asm("_binary_Bday_Surprise_wav_start");
 extern const uint8_t bday_surprise_wav_end[] asm("_binary_Bday_Surprise_wav_end");
-
-/* Set once Wifi_Unable.wav has been played for the current connect attempt so
- * the prompt is not repeated on every reconnect retry. Reset on success and on
- * fresh credentials from GATT provisioning. */
-static volatile bool s_wifi_unable_chimed = false;
 
 static bool play_wifi_connected_clip(void) {
   const size_t wav_len = (size_t)(wifi_wav_end - wifi_wav_start);
@@ -310,25 +302,6 @@ static void schedule_provisioned_welcome(void) {
   }
 }
 
-static bool play_wifi_unable_clip(void) {
-  const size_t wav_len = (size_t)(wifi_unable_wav_end - wifi_unable_wav_start);
-  if (wav_len < 44) {
-    ESP_LOGW(TAG, "Embedded Wifi_Unable.wav missing or too small");
-    return false;
-  }
-
-  esp_err_t err = nino_audio_queue_wav_copy(wifi_unable_wav_start, wav_len, false,
-                                            NINO_AUDIO_SERVO_PRIORITY_NONE, false);
-  if (err != ESP_OK) {
-    ESP_LOGW(TAG, "Failed to queue Wifi_Unable.wav: %s", esp_err_to_name(err));
-    return false;
-  }
-
-  ESP_LOGI(TAG, "Queued Wifi_Unable.wav (%u bytes): STA connect failed",
-           (unsigned)wav_len);
-  return true;
-}
-
 static bool play_go_app_clip(void) {
   const size_t wav_len = (size_t)(go_app_wav_end - go_app_wav_start);
   if (wav_len < 44) {
@@ -348,28 +321,10 @@ static bool play_go_app_clip(void) {
   return true;
 }
 
-/* Disconnect reasons that mean "could not join the network" (wrong password,
- * auth/handshake failure, or SSID not found) rather than a transient drop. */
-static bool wifi_disconnect_is_connect_failure(uint8_t reason) {
-  switch (reason) {
-    case WIFI_REASON_AUTH_EXPIRE:
-    case WIFI_REASON_AUTH_FAIL:
-    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
-    case WIFI_REASON_HANDSHAKE_TIMEOUT:
-    case WIFI_REASON_NO_AP_FOUND:
-    case WIFI_REASON_ASSOC_FAIL:
-    case WIFI_REASON_CONNECTION_FAIL:
-      return true;
-    default:
-      return false;
-  }
-}
-
 /* Boot greeting:
  *  - No saved Wi-Fi network in NVS -> prompt with NiNO-Home_Wifi.wav.
  *  - Provisioned and connected -> greet with Hello-home after the WIFI.wav clip.
- *    Falls back to greeting anyway if Wi-Fi never connects within the timeout,
- *    unless we already played the "unable to connect" prompt. */
+ *    Falls back to greeting anyway if Wi-Fi never connects within the timeout. */
 static void finish_boot_greeting_and_enable_wake(void) {
   nino_audio_queue_wait_idle(45000);
   if (nino_voice_preload_wake_chime() == ESP_OK) {
@@ -400,7 +355,7 @@ static void hello_home_task(void *arg) {
 
   const int timeout_ms = 60000;
   int waited_ms = 0;
-  while (waited_ms < timeout_ms && !s_wifi_unable_chimed &&
+  while (waited_ms < timeout_ms &&
          !(s_sta_connected && !s_wifi_connected_chime_pending)) {
     vTaskDelay(pdMS_TO_TICKS(100));
     waited_ms += 100;
@@ -1203,9 +1158,6 @@ esp_err_t wifi_config_set_sta_credentials(const char *ssid, const char *pass) {
   } else {
     s_sta_pass[0] = '\0';
   }
-  /* New credentials: allow the "unable to connect" prompt to play again if
-   * this attempt also fails. */
-  s_wifi_unable_chimed = false;
   /* New network: allow the connected clip once after this attempt gets an IP. */
   s_wifi_connected_chime_played = false;
   s_wifi_connected_chime_pending = true;
@@ -1222,7 +1174,6 @@ esp_err_t wifi_config_enter_setup_mode(void) {
   memset(s_sta_ssid, 0, sizeof(s_sta_ssid));
   memset(s_sta_pass, 0, sizeof(s_sta_pass));
   s_sta_connected = false;
-  s_wifi_unable_chimed = false;
   s_wifi_connected_chime_pending = false;
   s_boot_unprovisioned = true;
 
@@ -1665,13 +1616,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         (wifi_event_sta_disconnected_t *)event_data;
     ESP_LOGW(TAG, "STA: Disconnected (reason %d)", ev->reason);
     if (strlen(s_sta_ssid) > 0 &&
-        wifi_disconnect_is_connect_failure(ev->reason) &&
-        !s_wifi_unable_chimed) {
-      if (play_wifi_unable_clip()) {
-        s_wifi_unable_chimed = true;
-      }
-    }
-    if (strlen(s_sta_ssid) > 0 &&
         (s_wifi_mode == WIFI_MODE_STA || s_wifi_mode == WIFI_MODE_APSTA)) {
       xTaskCreatePinnedToCore(sta_reconnect_task, "sta_reconn", 2048, NULL, 5,
                               NULL, APP_CORE_NET);
@@ -1681,7 +1625,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
   if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
     ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
     s_sta_connected = true;
-    s_wifi_unable_chimed = false;
     (void)nino_rgb_led_show(NINO_RGB_SHOW_SERVER_WAIT);
     ESP_LOGI(TAG, "STA: Got IP " IPSTR, IP2STR(&event->ip_info.ip));
     mdns_start_service();
@@ -4111,6 +4054,11 @@ static void uvc_stream_task(void *arg) {
 
     while (s_device_connected) {
       if (s_camera_session_active && !streaming) {
+        /* Do not start UVC on the same tick as STREAM PCM — USB + SDIO fight. */
+        vTaskDelay(pdMS_TO_TICKS(250));
+        if (!s_camera_session_active) {
+          continue;
+        }
         err = uvc_host_stream_start(stream);
         if (err == ESP_OK) {
           streaming = true;

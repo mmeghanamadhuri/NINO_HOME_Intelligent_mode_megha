@@ -17,8 +17,10 @@ static const char *TAG = "nino_vws";
 
 #define MAX_VOICE_WAV (4 * 1024 * 1024)
 #define EYE_EXPR_MAX 16
-/* write-0 can race EOS JSON still in the WS event task. */
-#define STREAM_WRITE_FAIL_WAIT_MS 400
+/* write-0 can race EOS JSON still in the WS event task. Wait, then retry
+ * while the socket is still up — do not auto-reconnect (that hung query_busy). */
+#define STREAM_WRITE_FAIL_WAIT_MS 1000
+#define STREAM_WRITE_RETRIES 2
 
 typedef struct {
   SemaphoreHandle_t done;
@@ -643,22 +645,35 @@ esp_err_t nino_voice_ws_session_send_pcm(nino_voice_ws_session_t *session,
   if (session->error || !session->connected) {
     return ESP_ERR_INVALID_STATE;
   }
-  int sent = esp_websocket_client_send_bin(session->client, (const char *)pcm, (int)len,
-                                           pdMS_TO_TICKS(1000));
-  if (sent < 0 || (size_t)sent != len) {
+
+  for (int attempt = 0; attempt <= STREAM_WRITE_RETRIES; ++attempt) {
+    if (stream_pause_flags(session)) {
+      return ESP_ERR_INVALID_STATE;
+    }
+    if (session->error || !session->connected ||
+        !esp_websocket_client_is_connected(session->client)) {
+      break;
+    }
+    int sent = esp_websocket_client_send_bin(session->client, (const char *)pcm,
+                                             (int)len, pdMS_TO_TICKS(1000));
+    if (sent >= 0 && (size_t)sent == len) {
+      return ESP_OK;
+    }
     /* Server may stop reading after VAD EOS while send_bin is in flight. */
     if (stream_pause_flags(session)) {
       return ESP_ERR_INVALID_STATE;
     }
+    ESP_LOGW(TAG, "send_bin incomplete sent=%d want=%u attempt=%d/%d", sent,
+             (unsigned)len, attempt + 1, STREAM_WRITE_RETRIES + 1);
     stream_wait_pause_flags(session, STREAM_WRITE_FAIL_WAIT_MS);
     if (stream_pause_flags(session)) {
       return ESP_ERR_INVALID_STATE;
     }
-    session->error = true;
-    session->connected = false;
-    return ESP_FAIL;
   }
-  return ESP_OK;
+
+  session->error = true;
+  session->connected = false;
+  return ESP_FAIL;
 }
 
 bool nino_voice_ws_session_should_pause(nino_voice_ws_session_t *session) {

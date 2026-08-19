@@ -55,6 +55,7 @@ static const char *TAG = "voice_ast";
 #define AUX_STATUS_LOG_MS 1000
 #define AUX_REPLY_WAIT_MS 180000
 #define STREAM_LISTEN_CAP_MS 32000
+#define CAMERA_AFTER_PCM_MS 160
 #define AUX_MUSIC_LISTEN_MS 200
 #define AUX_MUSIC_PLAY_SLICE_MS 800
 #define AUX_WAKE_GAP_MS 1000
@@ -850,6 +851,16 @@ static bool copy_ws_uri(char *uri, size_t uri_sz) {
   return uri[0] != '\0';
 }
 
+/* USB UVC + ESP-Hosted SDIO Wi-Fi contend if UVC starts on the same tick as
+ * the first PCM send. Wait until a few frames have gone out. */
+static void camera_enable_after_pcm(bool *camera_on, uint32_t pcm_ok_ms) {
+  if (camera_on == NULL || *camera_on || pcm_ok_ms < CAMERA_AFTER_PCM_MS) {
+    return;
+  }
+  nino_camera_set_session_active(true);
+  *camera_on = true;
+}
+
 static void run_conversation_session(const int16_t *preroll, size_t preroll_samples) {
   char uri[VOICE_WS_URI_MAX];
   char session_id[40];
@@ -880,8 +891,10 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
   }
 
   voice_log(ESP_LOG_INFO, s_voice_turn, "SESSION",
-            "id=%s stream=1 gpio5=low", session_id);
-  nino_camera_set_session_active(true);
+            "id=%s stream=1 gpio5=low camera=deferred", session_id);
+
+  bool camera_on = false;
+  uint32_t pcm_ok_ms = 0;
 
   while (!session_end && nino_voice_ws_session_is_open(ws)) {
     const uint32_t turn = first_turn ? s_voice_turn : voice_begin_turn();
@@ -894,14 +907,17 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
     if (preroll != NULL && preroll_samples > 0) {
       if (nino_voice_ws_session_send_pcm(ws, preroll,
                                          preroll_samples * sizeof(int16_t)) != ESP_OK) {
-        if (!nino_voice_ws_session_should_pause(ws)) {
-          vTaskDelay(pdMS_TO_TICKS(400));
-        }
-        if (!nino_voice_ws_session_should_pause(ws)) {
+        if (!nino_voice_ws_session_should_pause(ws) ||
+            !nino_voice_ws_session_is_open(ws)) {
           voice_log(ESP_LOG_ERROR, turn, "FAIL", "stage=stream err=preroll");
           (void)nino_rgb_led_show(NINO_RGB_SHOW_ERROR);
           break;
         }
+        voice_log(ESP_LOG_INFO, turn, "STREAM",
+                  "paused because EOS/skip during preroll");
+      } else {
+        pcm_ok_ms += (uint32_t)((preroll_samples * 1000u) / VOICE_MIC_RATE);
+        camera_enable_after_pcm(&camera_on, pcm_ok_ms);
       }
       preroll = NULL;
       preroll_samples = 0;
@@ -921,21 +937,18 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
         continue;
       }
       if (nino_voice_ws_session_send_pcm(ws, frame, sizeof(frame)) != ESP_OK) {
-        if (!nino_voice_ws_session_should_pause(ws)) {
-          /* write-0 can race EOS JSON; WS event task may still deliver it. */
-          vTaskDelay(pdMS_TO_TICKS(400));
-        }
-        if (nino_voice_ws_session_should_pause(ws)) {
-          if (nino_voice_ws_session_is_open(ws)) {
-            voice_log(ESP_LOG_INFO, turn, "STREAM",
-                      "paused because EOS/skip after %u ms", (unsigned)streamed_ms);
-          }
+        if (nino_voice_ws_session_should_pause(ws) &&
+            nino_voice_ws_session_is_open(ws)) {
+          voice_log(ESP_LOG_INFO, turn, "STREAM",
+                    "paused because EOS/skip after %u ms", (unsigned)streamed_ms);
           break;
         }
         tx_failed = true;
         break;
       }
       streamed_ms += AUX_DETECT_FRAME_MS;
+      pcm_ok_ms += AUX_DETECT_FRAME_MS;
+      camera_enable_after_pcm(&camera_on, pcm_ok_ms);
       if (streamed_ms >= STREAM_LISTEN_CAP_MS) {
         voice_log(ESP_LOG_WARN, turn, "STREAM",
                   "cap=%u ms waiting for ASR EOS/goodbye", (unsigned)streamed_ms);
