@@ -799,8 +799,7 @@ static bool copy_ws_uri(char *uri, size_t uri_sz) {
     return false;
   }
   xSemaphoreTake(s_ws_uri_mutex, portMAX_DELAY);
-  strncpy(uri, s_ws_uri, uri_sz - 1);
-  uri[uri_sz - 1] = '\0';
+  snprintf(uri, uri_sz, "%s", s_ws_uri);
   xSemaphoreGive(s_ws_uri_mutex);
   return uri[0] != '\0';
 }
