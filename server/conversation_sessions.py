@@ -123,6 +123,36 @@ def begin_session(
         return payload
 
 
+def bind_session_user(
+    session_id: str,
+    *,
+    device_id: str = "",
+    user_name: str,
+) -> dict[str, Any] | None:
+    """Move/rewrite a session under the given user once they are identified."""
+    name = (user_name or "").strip()
+    sid = (session_id or "").strip()
+    if not sid or not name:
+        return None
+    with _lock:
+        write_key, payload = _find_session(sid, device_id=device_id, user_name=name)
+        if payload is None:
+            payload = _empty_session(sid, device_id=device_id, user_name=name)
+        old_key = write_key
+        payload["user_name"] = name
+        new_key = safe_slug(name)
+        path = _write_session(new_key, payload)
+        if old_key != new_key:
+            old_path = _session_path(old_key, sid)
+            if old_path.is_file() and old_path.resolve() != path.resolve():
+                try:
+                    old_path.unlink()
+                except OSError:
+                    pass
+        logger.info("Voice session bound id=%s user=%s", sid, new_key)
+        return payload
+
+
 def append_session_turn(
     session_id: str,
     *,

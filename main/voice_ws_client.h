@@ -45,7 +45,8 @@ esp_err_t nino_voice_ws_session_wait_reply(nino_voice_ws_session_t *session,
                                            int timeout_ms, uint8_t **wav_out,
                                            size_t *wav_out_len, bool *skip,
                                            bool *end_session, char *eye_expr_out,
-                                           size_t eye_expr_cap);
+                                           size_t eye_expr_cap, char *motion_out,
+                                           size_t motion_cap);
 void nino_voice_ws_session_close(nino_voice_ws_session_t *session);
 
 #ifdef __cplusplus

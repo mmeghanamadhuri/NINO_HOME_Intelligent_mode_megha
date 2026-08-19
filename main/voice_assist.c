@@ -21,6 +21,8 @@
 #include "nino_eye.h"
 #include "rgb_led.h"
 #include "camera_stream.h"
+#include "face_tracker.h"
+#include "servo_recplay.h"
 #include "voice_ws_client.h"
 #include "wifi_config.h"
 
@@ -55,7 +57,9 @@ static const char *TAG = "voice_ast";
 #define AUX_STATUS_LOG_MS 1000
 #define AUX_REPLY_WAIT_MS 180000
 #define STREAM_LISTEN_CAP_MS 32000
-#define CAMERA_AFTER_PCM_MS 160
+#define CAMERA_STREAM_WAIT_MS 2500
+#define FACE_HUNT_MS 5000
+#define SESSION_GREET_WAIT_MS 15000
 #define AUX_MUSIC_LISTEN_MS 200
 #define AUX_MUSIC_PLAY_SLICE_MS 800
 #define AUX_WAKE_GAP_MS 1000
@@ -522,13 +526,7 @@ static esp_err_t run_ws_and_queue_ex(
   const uint32_t peak = wav_peak_frame_energy(cap, cap_len);
   uri_append_u32(uri, sizeof(uri), "energy", peak);
 
-  char sd_path[64] = "";
-  esp_err_t save_err =
-      nino_audio_capture_save_to_sd(cap, cap_len, sd_path, sizeof(sd_path));
-  if (save_err == ESP_OK) {
-    voice_log(ESP_LOG_INFO, turn, "SAVED", "peak=%" PRIu32 " bytes=%u file=%s",
-              peak, (unsigned)cap_len, sd_path);
-  }
+  (void)nino_audio_capture_keep_last(cap, cap_len);
   (void)post_aux_recording(uri, cap, cap_len);
   if (peak < (uint32_t)AUX_MIN_UPLOAD_ENERGY) {
     voice_log(ESP_LOG_WARN, turn, "SKIP",
@@ -852,13 +850,42 @@ static bool copy_ws_uri(char *uri, size_t uri_sz) {
 }
 
 /* USB UVC + ESP-Hosted SDIO Wi-Fi contend if UVC starts on the same tick as
- * the first PCM send. Wait until a few frames have gone out. */
-static void camera_enable_after_pcm(bool *camera_on, uint32_t pcm_ok_ms) {
-  if (camera_on == NULL || *camera_on || pcm_ok_ms < CAMERA_AFTER_PCM_MS) {
+ * the first PCM send. Start the camera (and wait until it streams) before
+ * opening the voice WS. */
+static void session_camera_on(void) {
+  nino_camera_set_session_active(true);
+  if (!nino_camera_wait_streaming(CAMERA_STREAM_WAIT_MS)) {
+    voice_log(ESP_LOG_WARN, s_voice_turn, "CAMERA",
+              "stream wait timeout %u ms — continuing",
+              (unsigned)CAMERA_STREAM_WAIT_MS);
+  } else {
+    voice_log(ESP_LOG_INFO, s_voice_turn, "CAMERA", "streaming");
+  }
+}
+
+static void play_ws_reply_wav(uint8_t *resp, size_t resp_len, const char *eye_expr,
+                              const char *motion_json) {
+  nino_eye_state_t eye_state = nino_eye_state_from_name(eye_expr);
+  bool scripted = false;
+  if (motion_json != NULL && motion_json[0] != '\0') {
+    esp_err_t merr = nino_servo_recplay_play_motion_json(motion_json);
+    if (merr == ESP_OK) {
+      scripted = true;
+    } else if (merr != ESP_ERR_NOT_FOUND) {
+      voice_log(ESP_LOG_WARN, s_voice_turn, "MOTION", "play err=%s json=%s",
+                esp_err_to_name(merr), motion_json);
+    }
+  }
+  if (scripted) {
+    esp_err_t qerr = nino_audio_queue_wav(resp, resp_len, false, NINO_AUDIO_SERVO_NONE,
+                                          false, eye_state);
+    if (qerr != ESP_OK) {
+      voice_log(ESP_LOG_WARN, s_voice_turn, "REPLY", "queue err=%s",
+                esp_err_to_name(qerr));
+    }
     return;
   }
-  nino_camera_set_session_active(true);
-  *camera_on = true;
+  nino_main_queue_audio_wav(resp, resp_len, false, false, eye_state);
 }
 
 static void run_conversation_session(const int16_t *preroll, size_t preroll_samples) {
@@ -881,7 +908,10 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
   nino_music_pause_for_speech(true);
 
   bool session_end = false;
-  bool first_turn = true;
+
+  session_camera_on();
+  (void)nino_face_hunt_for_person(FACE_HUNT_MS);
+
   esp_err_t err = nino_voice_ws_session_open(uri, &ws);
   if (err != ESP_OK || ws == NULL) {
     voice_log(ESP_LOG_ERROR, s_voice_turn, "FAIL", "stage=ws_open err=%s",
@@ -891,10 +921,39 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
   }
 
   voice_log(ESP_LOG_INFO, s_voice_turn, "SESSION",
-            "id=%s stream=1 gpio5=low camera=deferred", session_id);
+            "id=%s stream=1 gpio5=low camera=on", session_id);
 
-  bool camera_on = false;
-  uint32_t pcm_ok_ms = 0;
+  /* Optional greeting / register prompt before the first listen. */
+  {
+    uint8_t *resp = NULL;
+    size_t resp_len = 0;
+    bool skip = false;
+    bool end_session = false;
+    char eye_expr[16] = {0};
+    char motion[192] = {0};
+    err = nino_voice_ws_session_wait_reply(ws, SESSION_GREET_WAIT_MS, &resp, &resp_len,
+                                           &skip, &end_session, eye_expr,
+                                           sizeof(eye_expr), motion, sizeof(motion));
+    if (err == ESP_OK && !skip && resp != NULL && resp_len > 0) {
+      play_ws_reply_wav(resp, resp_len, eye_expr, motion);
+      voice_log(ESP_LOG_INFO, s_voice_turn, "GREET",
+                "bytes=%u end_session=%d eye=%s", (unsigned)resp_len,
+                end_session ? 1 : 0, eye_expr[0] ? eye_expr : "idle");
+      nino_audio_queue_wait_idle(AUX_REPLY_WAIT_MS);
+      aux_ignore_energy_for_ms(AUX_POST_SPEAKER_IGNORE_MS);
+      if (end_session) {
+        session_end = true;
+        free(resp);
+        goto session_done;
+      }
+    } else if (err == ESP_ERR_TIMEOUT) {
+      voice_log(ESP_LOG_INFO, s_voice_turn, "GREET", "no session-open TTS — listen");
+    }
+    free(resp);
+    nino_voice_ws_session_begin_turn(ws);
+  }
+
+  bool first_turn = true;
 
   while (!session_end && nino_voice_ws_session_is_open(ws)) {
     const uint32_t turn = first_turn ? s_voice_turn : voice_begin_turn();
@@ -915,9 +974,6 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
         }
         voice_log(ESP_LOG_INFO, turn, "STREAM",
                   "paused because EOS/skip during preroll");
-      } else {
-        pcm_ok_ms += (uint32_t)((preroll_samples * 1000u) / VOICE_MIC_RATE);
-        camera_enable_after_pcm(&camera_on, pcm_ok_ms);
       }
       preroll = NULL;
       preroll_samples = 0;
@@ -947,8 +1003,6 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
         break;
       }
       streamed_ms += AUX_DETECT_FRAME_MS;
-      pcm_ok_ms += AUX_DETECT_FRAME_MS;
-      camera_enable_after_pcm(&camera_on, pcm_ok_ms);
       if (streamed_ms >= STREAM_LISTEN_CAP_MS) {
         voice_log(ESP_LOG_WARN, turn, "STREAM",
                   "cap=%u ms waiting for ASR EOS/goodbye", (unsigned)streamed_ms);
@@ -973,9 +1027,10 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
     bool skip = false;
     bool end_session = false;
     char eye_expr[16] = {0};
+    char motion[192] = {0};
     err = nino_voice_ws_session_wait_reply(ws, AUX_REPLY_WAIT_MS, &resp, &resp_len,
                                            &skip, &end_session, eye_expr,
-                                           sizeof(eye_expr));
+                                           sizeof(eye_expr), motion, sizeof(motion));
     if (err != ESP_OK) {
       voice_log(ESP_LOG_ERROR, turn, "FAIL", "stage=reply err=%s",
                 esp_err_to_name(err));
@@ -989,8 +1044,7 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
       continue;
     }
 
-    nino_eye_state_t eye_state = nino_eye_state_from_name(eye_expr);
-    nino_main_queue_audio_wav(resp, resp_len, false, false, eye_state);
+    play_ws_reply_wav(resp, resp_len, eye_expr, motion);
     voice_log(ESP_LOG_INFO, turn, "REPLY",
               "bytes=%u end_session=%d eye=%s", (unsigned)resp_len,
               end_session ? 1 : 0, eye_expr[0] ? eye_expr : "idle");

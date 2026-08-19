@@ -59,8 +59,9 @@ bool nino_eye_apply_command(const char *line);
 
 /**
  * Map a lowercase expression name (as sent by the PC server, e.g. "sad",
- * "happy", "curious", "recalling", "sparkle", …) to a state. Returns
+ * "happy", "curious", "recalling", "sparkle", "heart", …) to a state. Returns
  * NINO_EYE_STATE_COUNT if the name is unknown / NULL / empty.
+ * "heart" is the red heart (identify). "happy" uses the coloured smile emoji.
  */
 nino_eye_state_t nino_eye_state_from_name(const char *name);
 
@@ -84,6 +85,8 @@ void nino_eye_set_demo_idle_pace(bool enabled);
 /* ---- Per-emotion triggers ---- */
 void nino_eye_idle(void);
 void nino_eye_happy(void);
+/** Red heart — same as nino_eye_happy(); used when a person is identified. */
+void nino_eye_heart(void);
 void nino_eye_tired(void);
 void nino_eye_thinking(void);
 void nino_eye_curious(void);

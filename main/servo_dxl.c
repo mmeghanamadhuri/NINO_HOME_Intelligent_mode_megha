@@ -1766,15 +1766,21 @@ static void usb_client_task(void *arg)
                     }
                     if (!sync_busy) {
                         err = dynamixel_ping_blocking(DXL_PRIMARY_ID, pdMS_TO_TICKS(400));
+                        if (err != ESP_OK) {
+                            ESP_LOGD(TAG, "PING ID%u failed (%s) — trying ID%u",
+                                     DXL_PRIMARY_ID, esp_err_to_name(err), DXL_SECONDARY_ID);
+                            vTaskDelay(pdMS_TO_TICKS(30));
+                            err = dynamixel_ping_blocking(DXL_SECONDARY_ID, pdMS_TO_TICKS(400));
+                        }
                     }
                     if (!sync_busy && err != ESP_OK) {
                         s_ping_fail_streak++;
                         if (s_ping_fail_streak == 1 || (s_ping_fail_streak % 4) == 0) {
                             if (err == ESP_ERR_TIMEOUT) {
                                 ESP_LOGW(TAG,
-                                         "No Dynamixel reply to PING ID%u (%d) — check servo "
+                                         "No Dynamixel reply to PING ID%u/%u (%d) — check servo "
                                          "power, TTL wiring, IDs 1&2, 1 Mbps baud, U2D2 on J18",
-                                         DXL_PRIMARY_ID, s_ping_fail_streak);
+                                         DXL_PRIMARY_ID, DXL_SECONDARY_ID, s_ping_fail_streak);
                             } else {
                                 ESP_LOGW(TAG, "PING failed (%d): %s", s_ping_fail_streak,
                                          esp_err_to_name(err));
@@ -1788,11 +1794,13 @@ static void usb_client_task(void *arg)
                         }
                     } else if (!sync_busy) {
                         s_ping_fail_streak = 0;
-                        ESP_LOGI(TAG, "Dynamixel ID%u responded to PING", DXL_PRIMARY_ID);
+                        ESP_LOGI(TAG, "Dynamixel servo responded to PING (IDs %u/%u)",
+                                 DXL_PRIMARY_ID, DXL_SECONDARY_ID);
                         err = dynamixel_set_joint_mode(&s_ftdi);
                         if (err == ESP_OK) {
                             s_position_speed_pending = true;
                             dynamixel_queue_goal_all(DXL_CENTER_POSITION);
+                            nino_servo_dxl_boot_nod();
                         }
                     }
                 } else if (has_torque_update_pending) {
@@ -1863,6 +1871,40 @@ static void usb_client_task(void *arg)
         if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
             ESP_LOGW(TAG, "usb_host_client_handle_events: %s", esp_err_to_name(err));
         }
+    }
+}
+
+static volatile bool s_boot_nod_started;
+
+static void boot_nod_task(void *arg)
+{
+    (void)arg;
+    for (int i = 0; i < 50 && !nino_servo_dxl_is_ready(); i++) {
+        vTaskDelay(pdMS_TO_TICKS(40));
+    }
+    if (!nino_servo_dxl_is_ready()) {
+        ESP_LOGW(TAG, "Boot nod skipped — no Dynamixel PING yet (U2D2/J18/IDs/baud?)");
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "Boot nod: tilt up then down (IDs 1&2, 1 Mbps)");
+    nino_servo_dxl_set_pan_tilt(NINO_SERVO_AXIS_CENTER, NINO_SERVO_TILT_UP);
+    vTaskDelay(pdMS_TO_TICKS(450));
+    nino_servo_dxl_set_pan_tilt(NINO_SERVO_AXIS_CENTER, NINO_SERVO_TILT_DOWN);
+    vTaskDelay(pdMS_TO_TICKS(450));
+    nino_servo_dxl_go_neutral();
+    vTaskDelete(NULL);
+}
+
+void nino_servo_dxl_boot_nod(void)
+{
+    if (s_boot_nod_started) {
+        return;
+    }
+    s_boot_nod_started = true;
+    if (xTaskCreate(boot_nod_task, "dxl_boot_nod", 3072, NULL, 4, NULL) != pdPASS) {
+        s_boot_nod_started = false;
+        ESP_LOGW(TAG, "Boot nod task not started");
     }
 }
 

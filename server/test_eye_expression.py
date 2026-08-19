@@ -18,7 +18,18 @@ class EyeExpressionTests(unittest.TestCase):
             self.assertEqual(normalize_eye_expression(tag), tag)
             self.assertEqual(normalize_eye_expression(f"  {tag.upper()}  "), tag)
 
-    def test_normalize_invalid(self) -> None:
+    def test_normalize_heart(self) -> None:
+        self.assertEqual(normalize_eye_expression("heart"), "heart")
+        self.assertEqual(normalize_eye_expression("  HEART  "), "heart")
+
+    def test_session_greet_is_heart(self) -> None:
+        self.assertEqual(
+            infer_eye_expression_for_response(
+                "Hey Hari, how can I help you",
+                reply_path="session_greet",
+            ),
+            "heart",
+        )
         self.assertIsNone(normalize_eye_expression("idle"))
         self.assertIsNone(normalize_eye_expression("thinking"))
         self.assertIsNone(normalize_eye_expression(""))

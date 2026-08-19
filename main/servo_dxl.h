@@ -7,6 +7,9 @@
 /** Register USB host client for U2D2 (FTDI) and start the Dynamixel worker task. */
 esp_err_t nino_servo_dxl_start(void);
 
+/** One up/down nod after joint mode comes up (boot). Safe if bus not ready. */
+void nino_servo_dxl_boot_nod(void);
+
 /** True after U2D2 is open, joint mode enabled, and servos are usable. */
 bool nino_servo_dxl_is_ready(void);
 

@@ -8,6 +8,8 @@
 #include "servo_dxl.h"
 #include "servo_motion.h"
 #include "servo_recplay.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "face_tracker";
 
@@ -237,4 +239,55 @@ void nino_face_tracker_get_status(nino_face_tracker_status_t *out) {
   out->last_face_cy = s_last_face_cy;
   out->last_frame_w = s_last_frame_w;
   out->last_frame_h = s_last_frame_h;
+}
+
+bool nino_face_tracker_face_seen(void) { return s_face_found; }
+
+bool nino_face_hunt_for_person(uint32_t timeout_ms) {
+  const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+  const int poses[] = {
+      NINO_SERVO_AXIS_CENTER,
+      NINO_SERVO_PAN_LEFT,
+      NINO_SERVO_AXIS_CENTER,
+      NINO_SERVO_PAN_RIGHT,
+      NINO_SERVO_AXIS_CENTER,
+      NINO_SERVO_PAN_LEFT,
+      NINO_SERVO_PAN_RIGHT,
+      NINO_SERVO_AXIS_CENTER,
+  };
+  const size_t nposes = sizeof(poses) / sizeof(poses[0]);
+  size_t pose_i = 0;
+  TickType_t pose_until = xTaskGetTickCount();
+
+  s_face_found = false;
+  ESP_LOGI(TAG, "Face hunt start (timeout %u ms)", (unsigned)timeout_ms);
+
+  if (nino_servo_dxl_is_ready() && !nino_servo_recplay_is_busy()) {
+    nino_servo_dxl_set_pan_tilt(poses[0], NINO_SERVO_AXIS_CENTER);
+    pose_until = xTaskGetTickCount() + pdMS_TO_TICKS(450);
+    pose_i = 1;
+  }
+
+  while (xTaskGetTickCount() < deadline) {
+    if (s_face_found) {
+      ESP_LOGI(TAG, "Face hunt found a person");
+      if (nino_servo_dxl_is_ready() && !nino_servo_recplay_is_busy()) {
+        nino_servo_dxl_go_neutral();
+      }
+      return true;
+    }
+    if (nino_servo_dxl_is_ready() && !nino_servo_recplay_is_busy() &&
+        xTaskGetTickCount() >= pose_until && pose_i < nposes) {
+      nino_servo_dxl_set_pan_tilt(poses[pose_i], NINO_SERVO_AXIS_CENTER);
+      pose_i++;
+      pose_until = xTaskGetTickCount() + pdMS_TO_TICKS(450);
+    }
+    vTaskDelay(pdMS_TO_TICKS(40));
+  }
+
+  ESP_LOGI(TAG, "Face hunt done (found=%d)", (int)s_face_found);
+  if (nino_servo_dxl_is_ready() && !nino_servo_recplay_is_busy()) {
+    nino_servo_dxl_go_neutral();
+  }
+  return s_face_found;
 }

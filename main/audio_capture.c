@@ -8,7 +8,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "mic_input.h"
-#include "sd_record.h"
 
 static const char *TAG = "nino_cap";
 
@@ -147,14 +146,13 @@ out:
 
 esp_err_t nino_audio_capture_save_to_sd(const uint8_t *wav, size_t wav_len,
                                         char *path, size_t path_size) {
-  if (wav == NULL || wav_len < 44 || path == NULL || path_size == 0) {
-    return ESP_ERR_INVALID_ARG;
+  (void)wav;
+  (void)wav_len;
+  if (path != NULL && path_size > 0) {
+    path[0] = '\0';
   }
-  esp_err_t err = nino_sd_record_init();
-  if (err != ESP_OK) {
-    return err;
-  }
-  return nino_sd_record_save_wav(wav, wav_len, path, path_size);
+  /* Aux-in clips stay in RAM (keep_last) / go to the PC. Do not mount SD. */
+  return ESP_ERR_NOT_SUPPORTED;
 }
 
 esp_err_t nino_audio_capture_keep_last(const uint8_t *wav, size_t wav_len) {

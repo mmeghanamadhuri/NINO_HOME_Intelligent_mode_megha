@@ -1682,8 +1682,8 @@ def answer_voice_query(
     if viewer_name:
         who = (
             f"You are speaking directly to {viewer_name.strip()}, identified by the home camera. "
-            "Use second person (you/we). Use their name at most once, naturally. "
-            "Never refer to them by name in third person."
+            "Use second person (you/we). Include their first name in about seven out of ten "
+            "replies, naturally — not every sentence, and never in third person."
         )
     else:
         who = (

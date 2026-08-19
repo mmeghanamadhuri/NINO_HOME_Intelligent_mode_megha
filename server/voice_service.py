@@ -276,6 +276,7 @@ class VoiceReplyMeta:
     end_session: bool = False
     session_id: str = ""
     eye_expression: str | None = None
+    motion: list[str] | None = None
     registered_face_name: str | None = None
     face_reg_relisten: bool = False
     device_id: str = ""
@@ -327,6 +328,9 @@ CONTINUE_LISTEN_REPLY_PATHS = frozenset(
         "greeting",
         "smalltalk",
         "math",
+        "session_greet",
+        "session_register_offer",
+        "face_registration",
     }
 )
 
@@ -495,6 +499,69 @@ def utterance_ends_session(reply_path: str, user_text: str) -> bool:
 def conversation_goodbye_reply() -> str:
     """Short farewell only — no follow-up question (conversation ends after this)."""
     return random.choice(_GOODBYE_REPLIES)
+
+
+NAME_INJECT_RATE = 0.7
+
+
+def maybe_address_by_name(
+    reply: str,
+    name: str | None,
+    *,
+    is_guest: bool = False,
+    rng: random.Random | None = None,
+    chance: float = NAME_INJECT_RATE,
+) -> str:
+    """Include the user's name in about 70% of replies (not every sentence)."""
+    text = str(reply or "").strip()
+    cleaned = (name or "").strip()
+    if not text or not cleaned or is_guest:
+        return text
+    if cleaned.lower().startswith("guest"):
+        return text
+    if re.search(rf"\b{re.escape(cleaned)}\b", text, re.I):
+        return text
+    pick = rng.random() if rng is not None else random.random()
+    if pick >= chance:
+        return text
+    if text[0].isupper() and len(text) > 1:
+        rest = text[0].lower() + text[1:]
+    else:
+        rest = text
+    return f"{cleaned}, {rest}"
+
+
+def synthesize_session_open_wav(
+    reply: str,
+    *,
+    session_id: str = "",
+    device_id: str = "",
+    reply_path: str = "session_greet",
+    eye_expression: str | None = None,
+    user_name: str | None = None,
+) -> tuple[bytes, VoiceReplyMeta]:
+    """Greeting / register-offer TTS at stream session open (end_session false)."""
+    from servo_tts_motion import motion_actions_for_reply
+
+    meta = VoiceReplyMeta(session_id=session_id, device_id=device_id)
+    meta.end_session = False
+    meta.prompt_medical_ack = False
+    meta.eye_expression = eye_expression
+    meta.motion = motion_actions_for_reply(reply, reply_path=reply_path)
+    wav, _voice = synthesize_sapi_wav_bytes(reply)
+    wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
+    meta.timings = {
+        "heard": "",
+        "reply_text": reply[:200],
+        "reply_path": reply_path,
+        "session_open": True,
+        "voice_viewer": user_name or "",
+        "audio_out_seconds": round(_wav_seconds(wav_out), 2),
+        "audio_out_bytes": len(wav_out),
+        "eye_expression": eye_expression or "",
+        "motion": meta.motion,
+    }
+    return wav_out, meta
 
 
 def synthesize_idle_goodbye_wav(
@@ -2029,14 +2096,56 @@ def process_voice_wav(
         return wav_out, meta
 
     from face_registration_service import get_face_registration_service
+    from session_identity import get_session_identity
+
+    ident = get_session_identity()
+    ident_handled = False
+    if ident is not None and ident.in_registration():
+        ident_result = ident.handle_voice(user_text)
+        if ident_result.handled:
+            ident_handled = True
+            reply_path = "face_registration"
+            reply = ident_result.reply
+            if ident_result.registered_name:
+                meta.registered_face_name = ident_result.registered_name
+                from conversation_sessions import bind_session_user
+
+                if meta.session_id:
+                    bind_session_user(
+                        meta.session_id,
+                        device_id=device_id,
+                        user_name=ident_result.registered_name,
+                    )
+            if ident_result.relisten_after_reply:
+                meta.face_reg_relisten = True
+            logger.info(
+                "Voice session identity | registered=%s heard: %s",
+                ident_result.registered_name or "(none)",
+                user_text[:120],
+            )
+            if ident_result.relisten_after_reply and not reply:
+                meta.timings = {
+                    "heard": user_text[:200],
+                    "reply_text": "(session identity relisten)",
+                    "reply_path": reply_path,
+                    "audio_input_format": audio_input_format,
+                    "audio_in_seconds": round(audio_in_seconds, 2),
+                    "audio_in_bytes": len(wav_bytes),
+                    "stt_engine": stt_engine,
+                    "stt_seconds": round(t_stt - t_start, 3),
+                }
+                return b"", meta
 
     face_reg = get_face_registration_service()
     awaiting_face_reg = (
-        face_reg is not None and face_reg.accepts_registration_voice(user_text)
+        (not ident_handled)
+        and face_reg is not None
+        and face_reg.accepts_registration_voice(user_text)
     )
 
     if (
         not awaiting_face_reg
+        and not ident_handled
         and (is_likely_tts_echo(user_text) or is_unintelligible_stt(user_text))
     ):
         logger.info("Voice STT rejected (echo/garbled) | heard: %s", user_text[:120])
@@ -2067,6 +2176,13 @@ def process_voice_wav(
         cleaned_viewer = viewer_name.strip()
         if cleaned_viewer and cleaned_viewer.lower() not in {"unknown", "face"}:
             memory_name = cleaned_viewer
+    ident_user = None
+    ident_guest = False
+    if ident is not None:
+        ident_user, ident_guest = ident.current_user()
+        if ident_user:
+            memory_name = ident_user
+            viewer_name = ident_user
     memory_ctx = None
     if memory_name:
         memory_ctx = memory_svc.load_context(memory_name, query_text=user_text)
@@ -2077,7 +2193,11 @@ def process_voice_wav(
     t_memory = time.perf_counter()
 
     face_reg = get_face_registration_service()
-    if face_reg is not None and face_reg.accepts_registration_voice(user_text):
+    if (
+        not ident_handled
+        and face_reg is not None
+        and face_reg.accepts_registration_voice(user_text)
+    ):
         reg_result = face_reg.handle_voice(user_text)
         if reg_result.handled:
             reply_path = "face_registration"
@@ -2541,6 +2661,12 @@ def process_voice_wav(
             )
             if append_clock:
                 reply = f"{reply.rstrip()} {local_server_time_reply()}"
+    if reply_path in {"llm", "identity_llm", "memory_llm_store", "memory_llm_recall", "greeting", "smalltalk"}:
+        reply = maybe_address_by_name(
+            reply,
+            memory_name or viewer_name,
+            is_guest=ident_guest,
+        )
     t_reply = time.perf_counter()
 
     memory_store = "skipped"
@@ -2559,6 +2685,15 @@ def process_voice_wav(
         user_text=user_text,
         reply_path=reply_path,
     )
+    if reply_path == "session_greet" or (
+        reply_path == "face_registration"
+        and meta.registered_face_name
+        and not ident_guest
+    ):
+        meta.eye_expression = "heart"
+    from servo_tts_motion import motion_actions_for_reply
+
+    meta.motion = motion_actions_for_reply(reply, reply_path=reply_path)
     t_pre_tts = time.perf_counter()
 
     wav, _voice = synthesize_sapi_wav_bytes(reply)
@@ -2612,6 +2747,8 @@ def process_voice_wav(
         meta.timings["memory_user"] = memory_ctx.name
     if meta.eye_expression:
         meta.timings["eye_expression"] = meta.eye_expression
+    if meta.motion:
+        meta.timings["motion"] = meta.motion
 
     # Session stays open after every reply until the user says goodbye.
     # wake_reject never starts a session. Alarm medical-ack may already be set.

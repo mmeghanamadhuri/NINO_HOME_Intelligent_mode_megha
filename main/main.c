@@ -174,6 +174,7 @@ static QueueHandle_t s_frame_queue;
 static volatile bool s_device_connected;
 static volatile bool s_stream_task_created;
 static volatile bool s_camera_session_active;
+static volatile bool s_uvc_streaming;
 static selected_stream_t s_selected_stream;
 static uvc_host_frame_info_t *s_frame_info_list;
 static size_t s_frame_info_count;
@@ -1548,7 +1549,12 @@ static void face_track_task(void *arg) {
 
     const int64_t now_us = esp_timer_get_time();
 
-    if (!nino_face_tracker_is_enabled() || !nino_face_detect_is_ready()) {
+    if (!nino_face_detect_is_ready()) {
+      continue;
+    }
+    /* Detect while a voice session is open even if pan/tilt tracking is off
+     * (session-start face hunt needs frames immediately). */
+    if (!nino_face_tracker_is_enabled() && !nino_camera_session_is_active()) {
       continue;
     }
 
@@ -3927,6 +3933,16 @@ void nino_camera_set_session_active(bool active) {
 
 bool nino_camera_session_is_active(void) { return s_camera_session_active; }
 
+bool nino_camera_is_streaming(void) { return s_uvc_streaming; }
+
+bool nino_camera_wait_streaming(uint32_t timeout_ms) {
+  const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+  while (!s_uvc_streaming && xTaskGetTickCount() < deadline) {
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+  return s_uvc_streaming;
+}
+
 static bool frame_callback(const uvc_host_frame_t *frame, void *user_ctx) {
   /* Gate: grab/log/HTTP-stream frames only during a voice session. USB host
    * and the opened UVC device stay up so the next session can start again. */
@@ -4054,14 +4070,10 @@ static void uvc_stream_task(void *arg) {
 
     while (s_device_connected) {
       if (s_camera_session_active && !streaming) {
-        /* Do not start UVC on the same tick as STREAM PCM — USB + SDIO fight. */
-        vTaskDelay(pdMS_TO_TICKS(250));
-        if (!s_camera_session_active) {
-          continue;
-        }
         err = uvc_host_stream_start(stream);
         if (err == ESP_OK) {
           streaming = true;
+          s_uvc_streaming = true;
           s_last_uvc_timeout_log_us = 0;
           ESP_LOGI(TAG, "Camera stream started (voice session)");
         } else {
@@ -4070,6 +4082,7 @@ static void uvc_stream_task(void *arg) {
           continue;
         }
       } else if (!s_camera_session_active && streaming) {
+        s_uvc_streaming = false;
         (void)uvc_host_stream_stop(stream);
         uvc_host_frame_t *queued = NULL;
         while (xQueueReceive(s_frame_queue, &queued, 0) == pdPASS) {
@@ -4110,6 +4123,7 @@ static void uvc_stream_task(void *arg) {
       ESP_ERROR_CHECK(uvc_host_frame_return(stream, frame));
     }
 
+    s_uvc_streaming = false;
     if (streaming) {
       (void)uvc_host_stream_stop(stream);
     }

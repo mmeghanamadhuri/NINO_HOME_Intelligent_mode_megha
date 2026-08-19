@@ -33,7 +33,7 @@ LLM_RESPONSE_PATHS: frozenset[str] = frozenset(
 ALWAYS_HAPPY_PATHS: frozenset[str] = frozenset(
     {"joke", "joke_and_time", "football_joke"}
 )
-_VALID = frozenset(EYE_EXPRESSIONS)
+_VALID = frozenset(EYE_EXPRESSIONS) | frozenset({"heart", "smile", "sparkle", "fire"})
 
 # User mood statements weigh more than incidental words in the assistant reply.
 _USER_SCORE_MULTIPLIER = 2
@@ -498,6 +498,9 @@ def normalize_eye_expression(value: str | None) -> str | None:
     return None
 
 
+IDENTIFY_HEART_PATHS: frozenset[str] = frozenset({"session_greet"})
+
+
 def infer_eye_expression_for_response(
     reply_text: str,
     *,
@@ -505,6 +508,8 @@ def infer_eye_expression_for_response(
     reply_path: str = "llm",
 ) -> str | None:
     """Return an expression for LLM replies only; None leaves the bot on idle."""
+    if reply_path in IDENTIFY_HEART_PATHS:
+        return "heart"
     if reply_path not in LLM_RESPONSE_PATHS:
         return None
     try:

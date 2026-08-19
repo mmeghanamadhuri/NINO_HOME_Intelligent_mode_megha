@@ -17,6 +17,7 @@ static const char *TAG = "nino_vws";
 
 #define MAX_VOICE_WAV (4 * 1024 * 1024)
 #define EYE_EXPR_MAX 16
+#define MOTION_JSON_MAX 192
 /* write-0 can race EOS JSON still in the WS event task. Wait, then retry
  * while the socket is still up — do not auto-reconnect (that hung query_busy). */
 #define STREAM_WRITE_FAIL_WAIT_MS 1000
@@ -39,8 +40,8 @@ static esp_websocket_client_config_t make_ws_cfg(const char *uri, bool stream_se
   esp_websocket_client_config_t ws_cfg = {
       .uri = uri,
       .buffer_size = 65536,
-      /* Stream teardown used to block 300 s on a dead socket. */
-      .network_timeout_ms = stream_session ? 4000 : 300000,
+      /* Keep the stream socket alive through long STT/LLM/TTS turns. */
+      .network_timeout_ms = 300000,
       .task_stack = 12288,
       .task_prio = 5,
       .disable_pingpong_discon = true,
@@ -83,6 +84,52 @@ static void parse_eye_expression(vws_ctx_t *ctx, const char *text, size_t len) {
     ctx->eye_expr[out++] = text[p++];
   }
   ctx->eye_expr[out] = '\0';
+}
+
+static size_t copy_json_array(const char *text, size_t len, size_t start, char *out,
+                              size_t out_cap) {
+  if (out == NULL || out_cap == 0 || start >= len) {
+    return 0;
+  }
+  while (start < len && text[start] != '[') {
+    start++;
+  }
+  if (start >= len || text[start] != '[') {
+    return 0;
+  }
+  int depth = 0;
+  size_t n = 0;
+  for (size_t i = start; i < len && n + 1 < out_cap; i++) {
+    char c = text[i];
+    out[n++] = c;
+    if (c == '[') {
+      depth++;
+    } else if (c == ']') {
+      depth--;
+      if (depth == 0) {
+        out[n] = '\0';
+        return n;
+      }
+    }
+  }
+  out[0] = '\0';
+  return 0;
+}
+
+static void parse_motion_into(char *dst, size_t dst_cap, const char *text, size_t len) {
+  static const char key[] = "\"motion\"";
+  const size_t key_len = sizeof(key) - 1;
+  if (dst == NULL || dst_cap == 0 || text == NULL || len < key_len) {
+    return;
+  }
+  for (size_t i = 0; i + key_len <= len; ++i) {
+    if (memcmp(text + i, key, key_len) != 0) {
+      continue;
+    }
+    if (copy_json_array(text, len, i + key_len, dst, dst_cap) > 0) {
+      return;
+    }
+  }
 }
 
 static void parse_metadata_text(vws_ctx_t *ctx, const char *text, size_t len) {
@@ -376,6 +423,7 @@ struct nino_voice_ws_session {
   bool wav_msg_open;
   bool reply_ready;
   char eye_expr[EYE_EXPR_MAX];
+  char motion_json[MOTION_JSON_MAX];
 };
 
 static bool json_has_key_true(const char *text, size_t len, const char *key) {
@@ -507,6 +555,10 @@ static void stream_on_event(void *handler_args, esp_event_base_t base, int32_t e
           }
           break;
         }
+      }
+      parse_motion_into(s->motion_json, sizeof(s->motion_json), text, tlen);
+      if (json_type_is(text, tlen, "motion") && s->motion_json[0] != '\0') {
+        /* Side-channel motion frame — still played with the next WAV. */
       }
       break;
     }
@@ -692,6 +744,7 @@ void nino_voice_ws_session_begin_turn(nino_voice_ws_session_t *session) {
   session->reply_ready = false;
   session->len = 0;
   session->eye_expr[0] = '\0';
+  session->motion_json[0] = '\0';
   while (xSemaphoreTake(session->evt, 0) == pdTRUE) {
   }
 }
@@ -700,7 +753,8 @@ esp_err_t nino_voice_ws_session_wait_reply(nino_voice_ws_session_t *session,
                                            int timeout_ms, uint8_t **wav_out,
                                            size_t *wav_out_len, bool *skip,
                                            bool *end_session, char *eye_expr_out,
-                                           size_t eye_expr_cap) {
+                                           size_t eye_expr_cap, char *motion_out,
+                                           size_t motion_cap) {
   if (session == NULL || wav_out == NULL || wav_out_len == NULL) {
     return ESP_ERR_INVALID_ARG;
   }
@@ -736,6 +790,10 @@ esp_err_t nino_voice_ws_session_wait_reply(nino_voice_ws_session_t *session,
   if (eye_expr_out != NULL && eye_expr_cap > 0) {
     strncpy(eye_expr_out, session->eye_expr, eye_expr_cap - 1);
     eye_expr_out[eye_expr_cap - 1] = '\0';
+  }
+  if (motion_out != NULL && motion_cap > 0) {
+    strncpy(motion_out, session->motion_json, motion_cap - 1);
+    motion_out[motion_cap - 1] = '\0';
   }
   if (session->skip || session->len == 0) {
     return ESP_OK;

@@ -26,7 +26,7 @@ esp_err_t nino_audio_capture_wav_until_quiet(
     uint32_t quiet_end_ms, uint32_t quiet_energy, uint32_t speech_energy,
     uint32_t wait_speech_ms, bool flush_first);
 
-/** Mount the BSP microSD card if needed and save a WAV under /sdcard. */
+/** No-op: Aux-in is not written to SD. HTTP keep-last stays in RAM. */
 esp_err_t nino_audio_capture_save_to_sd(const uint8_t *wav, size_t wav_len,
                                         char *path, size_t path_size);
 

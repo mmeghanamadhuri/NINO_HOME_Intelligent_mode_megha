@@ -68,6 +68,15 @@ _FACE_REG_ECHO_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"\bdrop your name\b",
         r"\bintroduce yourself\b",
         r"\btell me what to call you\b",
+        r"\blooks like you are a new user\b",
+        r"\bcan i register you\b",
+        r"\bwhat should i call you\b",
+        r"\bspell that name\b",
+        r"\bplease spell\b",
+        r"\bis that right\b",
+        r"\bkeep this as a guest\b",
+        r"\bi'?ve registered you\b",
+        r"\bhey\b.+\bhow can i help you\b",
     )
 )
 
@@ -472,3 +481,178 @@ def extract_registration_name(user_text: str) -> str | None:
             return candidate
 
     return None
+
+
+_OFFER_YES_RE = re.compile(
+    r"^\s*(?:yes|yeah|yep|yup|sure|ok|okay|please|please do|go ahead|"
+    r"register|i would|i'?d like to|let'?s do it)\b",
+    re.IGNORECASE,
+)
+_OFFER_NO_RE = re.compile(
+    r"^\s*(?:no|nope|nah|skip|later|not now|guest|maybe later)\b",
+    re.IGNORECASE,
+)
+_CONFIRM_YES_RE = re.compile(
+    r"^\s*(?:yes|yeah|yep|yup|that'?s right|that is right|correct|good|"
+    r"ok|okay|perfect|exactly|sounds good)\b",
+    re.IGNORECASE,
+)
+_CONFIRM_NO_RE = re.compile(
+    r"^\s*(?:no|nope|nah|wrong|try again|not quite|that'?s wrong|incorrect)\b",
+    re.IGNORECASE,
+)
+
+_LETTER_WORDS: dict[str, str] = {
+    "a": "A",
+    "ay": "A",
+    "eh": "A",
+    "alpha": "A",
+    "b": "B",
+    "be": "B",
+    "bee": "B",
+    "bravo": "B",
+    "c": "C",
+    "see": "C",
+    "sea": "C",
+    "charlie": "C",
+    "d": "D",
+    "dee": "D",
+    "delta": "D",
+    "e": "E",
+    "ee": "E",
+    "echo": "E",
+    "f": "F",
+    "ef": "F",
+    "foxtrot": "F",
+    "g": "G",
+    "gee": "G",
+    "golf": "G",
+    "h": "H",
+    "aitch": "H",
+    "ache": "H",
+    "hotel": "H",
+    "i": "I",
+    "eye": "I",
+    "india": "I",
+    "j": "J",
+    "jay": "J",
+    "juliet": "J",
+    "k": "K",
+    "kay": "K",
+    "kilo": "K",
+    "l": "L",
+    "el": "L",
+    "ell": "L",
+    "lima": "L",
+    "m": "M",
+    "em": "M",
+    "mike": "M",
+    "n": "N",
+    "en": "N",
+    "november": "N",
+    "o": "O",
+    "oh": "O",
+    "oscar": "O",
+    "p": "P",
+    "pee": "P",
+    "papa": "P",
+    "q": "Q",
+    "cue": "Q",
+    "quebec": "Q",
+    "r": "R",
+    "are": "R",
+    "ar": "R",
+    "romeo": "R",
+    "s": "S",
+    "ess": "S",
+    "as": "S",
+    "sierra": "S",
+    "t": "T",
+    "tee": "T",
+    "tea": "T",
+    "tango": "T",
+    "u": "U",
+    "you": "U",
+    "uniform": "U",
+    "v": "V",
+    "vee": "V",
+    "victor": "V",
+    "w": "W",
+    "doubleu": "W",
+    "whiskey": "W",
+    "x": "X",
+    "ex": "X",
+    "xray": "X",
+    "y": "Y",
+    "why": "Y",
+    "yankee": "Y",
+    "z": "Z",
+    "zed": "Z",
+    "zee": "Z",
+    "zulu": "Z",
+}
+
+
+def is_registration_offer_yes(user_text: str) -> bool:
+    text = _strip_trailing_punct(user_text or "")
+    if not text:
+        return False
+    if any(p.search(text) for p in _FRAMED_NAME_PATTERNS):
+        return False
+    return bool(_OFFER_YES_RE.match(text))
+
+
+def is_registration_offer_no(user_text: str) -> bool:
+    text = _strip_trailing_punct(user_text or "")
+    if not text:
+        return False
+    if any(p.search(text) for p in _FRAMED_NAME_PATTERNS):
+        return False
+    return bool(_OFFER_NO_RE.match(text))
+
+
+def is_confirm_yes(user_text: str) -> bool:
+    text = _strip_trailing_punct(user_text or "")
+    return bool(text) and bool(_CONFIRM_YES_RE.match(text))
+
+
+def is_confirm_no(user_text: str) -> bool:
+    text = _strip_trailing_punct(user_text or "")
+    return bool(text) and bool(_CONFIRM_NO_RE.match(text))
+
+
+def spell_name_aloud(name: str) -> str:
+    letters = [ch.upper() for ch in (name or "") if ch.isalpha()]
+    return ", ".join(letters) if letters else (name or "")
+
+
+def parse_spelled_name(user_text: str) -> str | None:
+    """Turn spoken spelling ('H A R I' / 'aitch ay ar eye') into a name."""
+    text = _strip_trailing_punct(user_text or "")
+    if not text:
+        return None
+    tokens = re.split(r"[\s,.\-/]+", text.lower())
+    letters: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if not tok:
+            i += 1
+            continue
+        if tok == "double" and i + 1 < len(tokens) and tokens[i + 1] in {"you", "u"}:
+            letters.append("W")
+            i += 2
+            continue
+        mapped = _LETTER_WORDS.get(tok)
+        if mapped:
+            letters.append(mapped)
+            i += 1
+            continue
+        if len(tok) == 1 and tok.isalpha():
+            letters.append(tok.upper())
+            i += 1
+            continue
+        i += 1
+    if len(letters) < 2:
+        return None
+    return "".join(letters).title()

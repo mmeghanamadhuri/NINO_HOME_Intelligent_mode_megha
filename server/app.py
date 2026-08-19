@@ -27,6 +27,7 @@ from starlette.websockets import WebSocketState
 from aux_recordings import list_aux_recordings, save_aux_wav, recordings_dir
 from conversation_sessions import (
     begin_session as begin_voice_session,
+    bind_session_user,
     list_recent_sessions,
     list_sessions_for_user,
     new_session_id,
@@ -47,6 +48,7 @@ from device_discovery import (
 from device_registry import get_device_registry, resolve_device_id
 from eye_expression import normalize_eye_expression
 from face_registration_service import capture_face_samples, configure_face_registration
+from session_identity import configure_session_identity, get_session_identity
 from face_service import FaceService
 from memory_service import configure_from_environ as configure_memory_from_environ
 from memory_service import get_memory_service, normalize_database_url
@@ -206,6 +208,9 @@ cameras = CameraPool()
 faces = FaceService(BASE_DIR / "data")
 # Face registration / UI enroll uses the selected UI device's camera.
 face_registration = configure_face_registration(
+    faces, cameras.frame_getter(registry.ui_device_id())
+)
+session_identity = configure_session_identity(
     faces, cameras.frame_getter(registry.ui_device_id())
 )
 emotion = EmotionService()
@@ -638,6 +643,9 @@ def select_device(req: DeviceSelectRequest) -> dict:
     device_id = registry.set_ui_device_id(req.device_id)
     tts.set_playback_device_id(device_id)
     face_registration.set_frame_getter(cameras.frame_getter(device_id))
+    ident = get_session_identity()
+    if ident is not None:
+        ident.set_frame_getter(cameras.frame_getter(device_id))
     return {"ok": True, "devices": registry.status()}
 
 
@@ -1639,6 +1647,10 @@ async def _voice_ws_send_reply(
             device_id,
             client_label,
         )
+    motion = getattr(meta, "motion", None) or meta.timings.get("motion")
+    if motion:
+        ws_meta["motion"] = list(motion)
+        ws_meta["type"] = "reply"
     if not await _ws_send_json(websocket, ws_meta):
         logger.info(
             "WS reply skipped, socket closed device=%s client=%s",
@@ -1716,6 +1728,47 @@ async def _voice_ws_stream_pipeline(
         logger.info("stream WS closed before session handshake device=%s", device_id)
     else:
         logger.info("stream WS ready device=%s session=%s", device_id, session_id)
+
+    try:
+        identity_name, identity_state = await run_in_threadpool(
+            _camera_identity_snapshot, True, device_id
+        )
+        ident = get_session_identity()
+        if ident is not None:
+            ident.set_frame_getter(cameras.frame_getter(device_id))
+            open_result = ident.start_session(
+                session_id=session_id,
+                device_id=device_id,
+                identity_name=identity_name,
+                identity_state=identity_state,
+            )
+            if open_result.user_name:
+                bind_session_user(
+                    session_id, device_id=device_id, user_name=open_result.user_name
+                )
+                _remember_voice_viewer(open_result.user_name, device_id)
+            from voice_service import synthesize_session_open_wav
+
+            wav_out, reply_meta = await run_in_threadpool(
+                lambda: synthesize_session_open_wav(
+                    open_result.reply,
+                    session_id=session_id,
+                    device_id=device_id,
+                    reply_path=open_result.reply_path,
+                    eye_expression=open_result.eye_expression,
+                    user_name=open_result.user_name,
+                )
+            )
+            await _voice_ws_send_reply(
+                websocket,
+                device_id=device_id,
+                session_id=session_id,
+                wav_out=wav_out,
+                reply_meta=reply_meta,
+                client_label=client_label,
+            )
+    except Exception:
+        logger.exception("stream session-open greeting failed device=%s", device_id)
 
     async def send_skip(reason: str) -> bool:
         return await _ws_send_json(
@@ -1982,6 +2035,9 @@ async def _voice_ws_stream_pipeline(
             await websocket.close()
         except Exception:
             pass
+        ident = get_session_identity()
+        if ident is not None:
+            ident.end_session()
 
 
 async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:

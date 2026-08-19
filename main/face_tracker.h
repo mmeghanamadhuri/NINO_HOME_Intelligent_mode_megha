@@ -32,6 +32,15 @@ void nino_face_tracker_update(bool face_found, int face_cx, int face_cy,
                               uint32_t frame_sequence);
 void nino_face_tracker_get_status(nino_face_tracker_status_t *out);
 
+/** Latest detector hit (updated even when pan/tilt tracking is off). */
+bool nino_face_tracker_face_seen(void);
+
+/**
+ * Pan left/right within servo_motion limits until a face is found or
+ * @p timeout_ms elapses. Camera session must already be streaming.
+ */
+bool nino_face_hunt_for_person(uint32_t timeout_ms);
+
 #ifdef __cplusplus
 }
 #endif

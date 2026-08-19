@@ -489,6 +489,11 @@ class FaceRegistrationService:
         )
 
     def _try_prompt_registration(self) -> None:
+        from session_identity import get_session_identity
+
+        ident = get_session_identity()
+        if ident is not None and ident.is_active():
+            return
         if device_base_url(None) is None:
             logger.debug("Face registration prompt skipped: no ESP play URL")
             return

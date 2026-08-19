@@ -39,6 +39,16 @@ class ConversationSessionStoreTests(unittest.TestCase):
         self.assertEqual(listed[0]["session_id"], sid)
         self.assertEqual(listed[0]["turns"], 1)
 
+    def test_bind_moves_to_user_folder(self) -> None:
+        sid = "bindsession01"
+        cs.begin_session(sid, device_id="nino-home")
+        bound = cs.bind_session_user(sid, device_id="nino-home", user_name="Hari")
+        self.assertIsNotNone(bound)
+        assert bound is not None
+        self.assertEqual(bound["user_name"], "Hari")
+        listed = cs.list_sessions_for_user("Hari")
+        self.assertEqual(listed[0]["session_id"], sid)
+
 
 if __name__ == "__main__":
     unittest.main()

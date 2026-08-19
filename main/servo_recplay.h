@@ -50,6 +50,13 @@ esp_err_t nino_servo_recplay_record_stop(void);
 esp_err_t nino_servo_recplay_play(const nino_servo_play_frame_t *frames, size_t count,
                                   int speed);
 
+/**
+ * Play a WS/HTTP motion script: named actions (nod, shake, look_left, …)
+ * and/or a recplay `frames` array. Clamps pan/tilt to servo_motion limits.
+ * Returns ESP_ERR_NOT_FOUND when @p json has no usable poses.
+ */
+esp_err_t nino_servo_recplay_play_motion_json(const char *json);
+
 esp_err_t nino_servo_recplay_play_stop(void);
 
 /** Fill status JSON fragment fields for embedding in /status. */

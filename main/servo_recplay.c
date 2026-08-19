@@ -462,6 +462,168 @@ static size_t parse_play_frames(const char *body, nino_servo_play_frame_t *frame
   return count;
 }
 
+static int clamp_pan_goal(int v) {
+  if (v < NINO_SERVO_PAN_LEFT) {
+    return NINO_SERVO_PAN_LEFT;
+  }
+  if (v > NINO_SERVO_PAN_RIGHT) {
+    return NINO_SERVO_PAN_RIGHT;
+  }
+  return v;
+}
+
+static int clamp_tilt_goal(int v) {
+  const int lo = (NINO_SERVO_TILT_UP < NINO_SERVO_TILT_DOWN) ? NINO_SERVO_TILT_UP
+                                                            : NINO_SERVO_TILT_DOWN;
+  const int hi = (NINO_SERVO_TILT_UP < NINO_SERVO_TILT_DOWN) ? NINO_SERVO_TILT_DOWN
+                                                            : NINO_SERVO_TILT_UP;
+  if (v < lo) {
+    return lo;
+  }
+  if (v > hi) {
+    return hi;
+  }
+  return v;
+}
+
+static void append_pose(nino_servo_play_frame_t *frames, size_t *count, size_t max,
+                        bool has_pan, int pan, bool has_tilt, int tilt, uint32_t hold_ms) {
+  if (frames == NULL || count == NULL || *count >= max) {
+    return;
+  }
+  nino_servo_play_frame_t f = {
+      .hold_ms = hold_ms,
+      .has_tilt = has_tilt,
+      .has_pan = has_pan,
+      .tilt = clamp_tilt_goal(tilt),
+      .pan = clamp_pan_goal(pan),
+  };
+  frames[(*count)++] = f;
+}
+
+static bool action_token_is(const char *p, size_t n, const char *want) {
+  const size_t w = strlen(want);
+  return n == w && memcmp(p, want, w) == 0;
+}
+
+static size_t append_named_action(nino_servo_play_frame_t *frames, size_t count, size_t max,
+                                  const char *name, size_t name_len, uint32_t hold_ms) {
+  const uint32_t hold = hold_ms > 0 ? hold_ms : 400;
+  const int c = NINO_SERVO_AXIS_CENTER;
+  if (action_token_is(name, name_len, "nod") || action_token_is(name, name_len, "nod_yes") ||
+      action_token_is(name, name_len, "yes")) {
+    append_pose(frames, &count, max, true, c, true, NINO_SERVO_TILT_UP, hold);
+    append_pose(frames, &count, max, true, c, true, NINO_SERVO_TILT_DOWN, hold);
+    append_pose(frames, &count, max, true, c, true, c, hold);
+  } else if (action_token_is(name, name_len, "shake") || action_token_is(name, name_len, "no") ||
+             action_token_is(name, name_len, "look_lr")) {
+    append_pose(frames, &count, max, true, NINO_SERVO_PAN_LEFT, true, c, hold);
+    append_pose(frames, &count, max, true, NINO_SERVO_PAN_RIGHT, true, c, hold);
+    append_pose(frames, &count, max, true, c, true, c, hold);
+  } else if (action_token_is(name, name_len, "look_left")) {
+    append_pose(frames, &count, max, true, NINO_SERVO_PAN_LEFT, true, c, hold);
+    append_pose(frames, &count, max, true, c, true, c, hold);
+  } else if (action_token_is(name, name_len, "look_right")) {
+    append_pose(frames, &count, max, true, NINO_SERVO_PAN_RIGHT, true, c, hold);
+    append_pose(frames, &count, max, true, c, true, c, hold);
+  } else if (action_token_is(name, name_len, "look_up")) {
+    append_pose(frames, &count, max, true, c, true, NINO_SERVO_TILT_UP, hold);
+    append_pose(frames, &count, max, true, c, true, c, hold);
+  } else if (action_token_is(name, name_len, "look_down")) {
+    append_pose(frames, &count, max, true, c, true, NINO_SERVO_TILT_DOWN, hold);
+    append_pose(frames, &count, max, true, c, true, c, hold);
+  } else if (action_token_is(name, name_len, "greet")) {
+    append_pose(frames, &count, max, true, c, true, NINO_SERVO_TILT_UP, hold);
+    append_pose(frames, &count, max, true, NINO_SERVO_PAN_LEFT, true, c, hold);
+    append_pose(frames, &count, max, true, NINO_SERVO_PAN_RIGHT, true, c, hold);
+    append_pose(frames, &count, max, true, c, true, c, hold);
+  } else if (action_token_is(name, name_len, "curious")) {
+    append_pose(frames, &count, max, true, NINO_SERVO_PAN_LEFT, true, NINO_SERVO_TILT_UP, hold);
+    append_pose(frames, &count, max, true, NINO_SERVO_PAN_RIGHT, true, NINO_SERVO_TILT_UP, hold);
+    append_pose(frames, &count, max, true, c, true, c, hold);
+  } else if (action_token_is(name, name_len, "talk") || action_token_is(name, name_len, "full")) {
+    append_pose(frames, &count, max, true, NINO_SERVO_PAN_RIGHT, true, c, hold);
+    append_pose(frames, &count, max, true, c, true, c, hold);
+    append_pose(frames, &count, max, true, NINO_SERVO_PAN_LEFT, true, c, hold);
+    append_pose(frames, &count, max, true, c, true, c, hold);
+    append_pose(frames, &count, max, true, c, true, NINO_SERVO_TILT_UP, hold);
+    append_pose(frames, &count, max, true, c, true, c, hold);
+    append_pose(frames, &count, max, true, c, true, NINO_SERVO_TILT_DOWN, hold);
+    append_pose(frames, &count, max, true, c, true, c, hold);
+  } else {
+    ESP_LOGW(TAG, "Unknown motion action '%.*s'", (int)name_len, name);
+  }
+  return count;
+}
+
+static size_t parse_named_actions(const char *body, nino_servo_play_frame_t *frames,
+                                  size_t max_frames) {
+  if (body == NULL || frames == NULL || max_frames == 0) {
+    return 0;
+  }
+  const char *arr = strstr(body, "\"motion\"");
+  if (arr == NULL) {
+    arr = strstr(body, "\"actions\"");
+  }
+  if (arr == NULL) {
+    arr = strchr(body, '[');
+  } else {
+    arr = strchr(arr, '[');
+  }
+  if (arr == NULL) {
+    return 0;
+  }
+  arr++;
+  size_t count = 0;
+  const char *p = arr;
+  while (*p && *p != ']' && count < max_frames) {
+    if (*p == '"') {
+      p++;
+      const char *start = p;
+      while (*p && *p != '"') {
+        p++;
+      }
+      size_t n = (size_t)(p - start);
+      if (n > 0 && n < 24 && memcmp(start, "action", n) != 0 &&
+          memcmp(start, "motion", n) != 0 && memcmp(start, "frames", n) != 0) {
+        count = append_named_action(frames, count, max_frames, start, n, 400);
+      }
+      if (*p == '"') {
+        p++;
+      }
+      continue;
+    }
+    p++;
+  }
+  return count;
+}
+
+esp_err_t nino_servo_recplay_play_motion_json(const char *json) {
+  if (json == NULL || json[0] == '\0') {
+    return ESP_ERR_INVALID_ARG;
+  }
+  nino_servo_play_frame_t frames[NINO_SERVO_PLAY_MAX_FRAMES];
+  size_t count = parse_play_frames(json, frames, NINO_SERVO_PLAY_MAX_FRAMES);
+  if (count == 0) {
+    count = parse_named_actions(json, frames, NINO_SERVO_PLAY_MAX_FRAMES);
+  }
+  if (count == 0) {
+    return ESP_ERR_NOT_FOUND;
+  }
+  for (size_t i = 0; i < count; i++) {
+    if (frames[i].has_pan) {
+      frames[i].pan = clamp_pan_goal(frames[i].pan);
+    }
+    if (frames[i].has_tilt) {
+      frames[i].tilt = clamp_tilt_goal(frames[i].tilt);
+    }
+  }
+  int speed = RECPLAY_DEFAULT_SPEED;
+  (void)json_get_int_after(json, NULL, "speed", &speed);
+  ESP_LOGI(TAG, "Motion JSON play (%u frames)", (unsigned)count);
+  return nino_servo_recplay_play(frames, count, speed);
+}
+
 static uint8_t parse_id_mask(const char *body) {
   uint8_t mask = 0;
   const char *ids = strstr(body, "\"ids\"");

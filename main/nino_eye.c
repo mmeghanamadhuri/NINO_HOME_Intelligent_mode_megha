@@ -155,7 +155,7 @@ static const nino_state_profile_t s_profiles[NINO_EYE_STATE_COUNT] = {
         .heart_min_scale = 20,
         .heart_max_scale = 20,
         .heart_frame_ms = 900,
-        .eye_r = 255, .eye_g = 40, .eye_b = 70,   /* happy = red heart (only coloured state) */
+        .eye_r = 255, .eye_g = 40, .eye_b = 70,   /* identify / heart */
     },
     /* tired: low eye with heavy lowered lid (bottom sliver visible). Slow blink
      * cadence via hold_ms; sweep paced at NINO_EYE_FRAME_MS for phone capture. */
@@ -170,7 +170,7 @@ static const nino_state_profile_t s_profiles[NINO_EYE_STATE_COUNT] = {
         .blink_step = 2,
         .blink_ms = NINO_EYE_FRAME_MS,
         .state_ms = 4000,
-        .eye_r = 0, .eye_g = 0, .eye_b = 0,
+        .eye_r = 70, .eye_g = 90, .eye_b = 170,
     },
     /* thinking: a normal solid eye like idle that slowly rolls around the top
      * (looking up + side to side). No blink. */
@@ -179,7 +179,7 @@ static const nino_state_profile_t s_profiles[NINO_EYE_STATE_COUNT] = {
         .rx = 24,
         .ry = 30,
         .state_ms = 4000,
-        .eye_r = 0, .eye_g = 0, .eye_b = 0,
+        .eye_r = 80, .eye_g = 140, .eye_b = 200,
     },
     /* curious: wide enlarged eye that tilts up + to a side and holds, then
      * blinks across to the other side (head-tilt, inquisitive). */
@@ -193,7 +193,7 @@ static const nino_state_profile_t s_profiles[NINO_EYE_STATE_COUNT] = {
         .blink_ms = NINO_EYE_FRAME_MS,
         .gaze_offsets = {0},
         .gaze_count = 1,
-        .eye_r = 0, .eye_g = 0, .eye_b = 0,
+        .eye_r = 0, .eye_g = 180, .eye_b = 190,
     },
     /* sad: heavy upper lid covering top 40% of eye. Slow ~6 s lidded blink. */
     [NINO_EYE_SAD] = {
@@ -207,7 +207,7 @@ static const nino_state_profile_t s_profiles[NINO_EYE_STATE_COUNT] = {
         .blink_step = 2,
         .blink_ms = NINO_EYE_FRAME_MS,
         .state_ms = 4000,
-        .eye_r = 0, .eye_g = 0, .eye_b = 0,
+        .eye_r = 50, .eye_g = 80, .eye_b = 210,
     },
     /* surprised: widest/tallest eye; one fast snap-open on entry, then hold wide
      * (no frantic blink). blink_step tunes snap geometry; pace is NINO_EYE_FRAME_MS. */
@@ -219,7 +219,7 @@ static const nino_state_profile_t s_profiles[NINO_EYE_STATE_COUNT] = {
         .blink_step = 4,
         .blink_ms = NINO_EYE_FRAME_MS,
         .state_ms = 5000,
-        .eye_r = 0, .eye_g = 0, .eye_b = 0,
+        .eye_r = 255, .eye_g = 140, .eye_b = 40,
     },
     /* listening: same wide enlarged eye as curious, but centered - it blinks in
      * place (no left/right tilt). ~3 s blink cycle. */
@@ -233,7 +233,7 @@ static const nino_state_profile_t s_profiles[NINO_EYE_STATE_COUNT] = {
         .blink_ms = NINO_EYE_FRAME_MS,
         .gaze_offsets = {0},
         .gaze_count = 1,
-        .eye_r = 0, .eye_g = 0, .eye_b = 0,
+        .eye_r = 40, .eye_g = 160, .eye_b = 220,
     },
     /* recalling: normal soft eye, slow upward memory-gaze path; slow blink when
      * shifting between look-points (calmer than thinking's roll). */
@@ -247,7 +247,7 @@ static const nino_state_profile_t s_profiles[NINO_EYE_STATE_COUNT] = {
         .blink_ms = NINO_EYE_FRAME_MS,
         .gaze_offsets = {0},
         .gaze_count = 1,
-        .eye_r = 0, .eye_g = 0, .eye_b = 0,
+        .eye_r = 150, .eye_g = 80, .eye_b = 210,
     },
     /* mad: idle-size eye that shakes frantically - 3 s fast left<->right, then
      * 2 s fast up<->down, repeating. hold_ms = horizontal phase, state_ms =
@@ -259,7 +259,7 @@ static const nino_state_profile_t s_profiles[NINO_EYE_STATE_COUNT] = {
         .hold_ms = 3000,
         .state_ms = 2000,
         .blink_ms = NINO_EYE_FRAME_MS,
-        .eye_r = 0, .eye_g = 0, .eye_b = 0,
+        .eye_r = 210, .eye_g = 40, .eye_b = 40,
     },
     /* med: red/white capsule pill, slanted (45 deg from vertical), static symbol. */
     [NINO_EYE_MED] = {
@@ -2367,6 +2367,7 @@ void nino_eye_set_demo_idle_pace(bool enabled)
 
 void nino_eye_idle(void)      { nino_eye_set_state(NINO_EYE_IDLE); }
 void nino_eye_happy(void)     { nino_eye_set_state(NINO_EYE_HAPPY); }
+void nino_eye_heart(void)     { nino_eye_set_state(NINO_EYE_HAPPY); }
 void nino_eye_tired(void)     { nino_eye_set_state(NINO_EYE_TIRED); }
 void nino_eye_thinking(void)  { nino_eye_set_state(NINO_EYE_THINKING); }
 void nino_eye_curious(void)   { nino_eye_set_state(NINO_EYE_CURIOUS_QUIZ); }
@@ -2418,6 +2419,9 @@ nino_eye_state_t nino_eye_state_from_name(const char *name)
         strcmp(token, "normal") == 0) {
         return NINO_EYE_IDLE;
     } else if (strcmp(token, "happy") == 0) {
+        /* Conversation "happy" uses the coloured smile emoji; heart is identify. */
+        return NINO_EYE_SMILE;
+    } else if (strcmp(token, "heart") == 0 || strcmp(token, "love") == 0) {
         return NINO_EYE_HAPPY;
     } else if (strcmp(token, "tired") == 0) {
         return NINO_EYE_TIRED;
@@ -2467,7 +2471,7 @@ const char *nino_eye_state_to_name(nino_eye_state_t state)
 {
     switch (state) {
     case NINO_EYE_IDLE:           return "idle";
-    case NINO_EYE_HAPPY:          return "happy";
+    case NINO_EYE_HAPPY:          return "heart";
     case NINO_EYE_TIRED:          return "tired";
     case NINO_EYE_THINKING:       return "thinking";
     case NINO_EYE_CURIOUS_QUIZ:   return "curious";
