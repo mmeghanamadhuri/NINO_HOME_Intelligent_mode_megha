@@ -11,8 +11,11 @@ import numpy as np
 
 from tts_prosody import (
     infer_speech_style,
+    piper_pitch_offset,
+    piper_robotic_amount,
     pitch_shift_wav_bytes,
     prosody_for_style,
+    robotic_color_wav_bytes,
 )
 
 
@@ -94,6 +97,38 @@ class SpeechStyleTests(unittest.TestCase):
             self.assertEqual(wf.getnframes(), src_frames)
             self.assertEqual(wf.getframerate(), src_rate)
             self.assertGreater(wf.getnframes(), 0)
+
+    def test_pitch_offset_defaults_to_a_robotic_lift(self) -> None:
+        previous = os.environ.get("PIPER_PITCH_SEMITONES")
+        try:
+            os.environ.pop("PIPER_PITCH_SEMITONES", None)
+            self.assertAlmostEqual(piper_pitch_offset(), 4.0)
+            os.environ["PIPER_PITCH_SEMITONES"] = "-1.5"
+            self.assertAlmostEqual(piper_pitch_offset(), -1.5)
+        finally:
+            if previous is None:
+                os.environ.pop("PIPER_PITCH_SEMITONES", None)
+            else:
+                os.environ["PIPER_PITCH_SEMITONES"] = previous
+
+    def test_robotic_color_keeps_duration(self) -> None:
+        wav = _sine_wav()
+        with wave.open(io.BytesIO(wav), "rb") as wf:
+            src_frames = wf.getnframes()
+        colored = robotic_color_wav_bytes(wav, 0.75)
+        with wave.open(io.BytesIO(colored), "rb") as wf:
+            self.assertEqual(wf.getnframes(), src_frames)
+            pcm = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+            self.assertGreater(int(np.max(np.abs(pcm))), 0)
+        previous = os.environ.get("PIPER_ROBOTIC")
+        try:
+            os.environ.pop("PIPER_ROBOTIC", None)
+            self.assertAlmostEqual(piper_robotic_amount(), 0.0)
+        finally:
+            if previous is None:
+                os.environ.pop("PIPER_ROBOTIC", None)
+            else:
+                os.environ["PIPER_ROBOTIC"] = previous
 
     def test_prosody_can_be_disabled(self) -> None:
         from tts_prosody import infer_speech_prosody

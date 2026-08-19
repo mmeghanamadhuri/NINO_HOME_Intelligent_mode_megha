@@ -15,7 +15,7 @@ DEFAULT_FRAME_MS = 20
 DEFAULT_START_ENERGY = 50
 DEFAULT_QUIET_ENERGY = 20
 DEFAULT_SPEECH_MS = 160
-DEFAULT_SILENCE_MS = 700
+DEFAULT_SILENCE_MS = 450
 DEFAULT_MAX_MS = 30000
 DEFAULT_MIN_SPEECH_MS = 200
 SAMPLE_RATE = 16000
@@ -103,10 +103,11 @@ class StreamEndOfSpeech:
                 self.heard_speech = True
         else:
             self.speech_streak_ms = 0
-            if self.heard_speech and energy < self.quiet_energy:
+            # Aux-in idle often sits between quiet_energy and start_energy
+            # (~20–50). Counting only < quiet_energy as silence reset the
+            # hangover on every mid-level noise frame and waited out max_ms.
+            if self.heard_speech:
                 self.silence_ms_run += self.frame_ms
-            elif self.heard_speech:
-                self.silence_ms_run = 0
 
         if (
             self.heard_speech

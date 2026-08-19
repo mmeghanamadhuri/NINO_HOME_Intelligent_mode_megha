@@ -22,7 +22,14 @@ import requests
 
 from esp_wav_chunking import chunk_text_for_esp_limit
 from pipeline_log import log_http, pipeline_log
-from tts_prosody import infer_speech_prosody, piper_prosody_enabled, pitch_shift_wav_bytes
+from tts_prosody import (
+    infer_speech_prosody,
+    piper_pitch_offset,
+    piper_prosody_enabled,
+    piper_robotic_amount,
+    pitch_shift_wav_bytes,
+    robotic_color_wav_bytes,
+)
 from wav_resample import ESP_PCM_SAMPLE_RATE_HZ, resample_wav_bytes_to_mono_16bit
 
 logger = logging.getLogger(__name__)
@@ -113,7 +120,7 @@ DEFAULT_ELEVENLABS_TTS_SAMPLE_RATE_HZ = 16000
 DEFAULT_PIPER_MODEL_PATH = (
     Path(__file__).resolve().parent
     / "models"
-    / "en_GB-southern_english_female-low.onnx"
+    / "en_US-amy-medium.onnx"
 )
 
 _ESPEAK_LOCK = threading.Lock()
@@ -336,6 +343,16 @@ def _synthesize_piper_wav_bytes(
     prosody = infer_speech_prosody(clean)
     length_scale = max(0.5, min(2.0, _piper_length_scale() * prosody.length_mul))
     spoken_volume = max(0.0, min(1.0, volume * prosody.volume_mul))
+    pitch = prosody.pitch_semitones + piper_pitch_offset()
+    robotic = piper_robotic_amount()
+    if robotic >= 0.05:
+        noise_scale = max(0.10, min(1.4, prosody.noise_scale * 0.48))
+        noise_w_scale = max(0.10, min(1.4, prosody.noise_w_scale * 0.38))
+        length_scale = max(0.5, min(2.0, length_scale * 0.94))
+    else:
+        # A little extra breath and body so Amy reads warm, not thin.
+        noise_scale = max(0.10, min(1.4, prosody.noise_scale * 1.08))
+        noise_w_scale = max(0.10, min(1.4, prosody.noise_w_scale * 1.06))
     voice = _load_piper_voice()
     output = io.BytesIO()
     with _PIPER_LOCK:
@@ -345,23 +362,26 @@ def _synthesize_piper_wav_bytes(
                 wav_file,
                 SynthesisConfig(
                     length_scale=length_scale,
-                    noise_scale=prosody.noise_scale,
-                    noise_w_scale=prosody.noise_w_scale,
+                    noise_scale=noise_scale,
+                    noise_w_scale=noise_w_scale,
                     volume=spoken_volume,
                 ),
             )
     wav = output.getvalue()
     if not wav:
         raise RuntimeError("Piper produced no audio.")
-    if abs(prosody.pitch_semitones) >= 0.05:
-        wav = pitch_shift_wav_bytes(wav, prosody.pitch_semitones)
+    if abs(pitch) >= 0.05:
+        wav = pitch_shift_wav_bytes(wav, pitch)
+    if robotic >= 0.05:
+        wav = robotic_color_wav_bytes(wav, robotic)
     logger.info(
-        "Piper prosody style=%s length=%.2f noise=%.2f volume=%.2f pitch=%+.1f",
+        "Piper prosody style=%s length=%.2f noise=%.2f volume=%.2f pitch=%+.1f robotic=%.2f",
         prosody.style,
         length_scale,
-        prosody.noise_scale,
+        noise_scale,
         spoken_volume,
-        prosody.pitch_semitones,
+        pitch,
+        robotic,
     )
     _set_tts_synthesis_info("piper", model_path.stem, style=prosody.style)
     return wav, model_path.stem
@@ -777,6 +797,8 @@ def tts_status() -> dict[str, Any]:
         "piper_model_path": str(model_path),
         "piper_preloaded": piper_preloaded,
         "piper_length_scale": _piper_length_scale(),
+        "piper_pitch_semitones": piper_pitch_offset(),
+        "piper_robotic": piper_robotic_amount(),
         "piper_prosody": piper_prosody_enabled(),
     }
     if provider == "elevenlabs":

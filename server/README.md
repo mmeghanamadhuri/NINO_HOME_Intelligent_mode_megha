@@ -159,7 +159,7 @@ voice wake on
 | `ESP_PLAY_WAV_URL` | derived from `CAMERA_SOURCE` | ESP `POST /play_wav` endpoint |
 | `ESP_MAX_PLAY_WAV_BYTES` | `389120` | Max WAV size (~384 KiB firmware limit) |
 | `TTS_PROVIDER` | auto | `elevenlabs`, `piper`, `sapi`, or `local` (espeak) |
-| `PIPER_MODEL_PATH` | `server/models/en_GB-southern_english_female-low.onnx` | Piper female British voice model; auto fallback after ElevenLabs |
+| `PIPER_MODEL_PATH` | `server/models/en_US-amy-medium.onnx` | Piper Amy (US English, medium) |
 | `PIPER_PRELOAD` | `1` | Load the Piper fallback at startup to avoid model-load latency on failure |
 | `PIPER_LENGTH_SCALE` | `1.0` | Piper speech rate; `>1.0` is slower, `<1.0` is faster |
 | `LOCAL_TTS_RATE` | derived | espeak rate tweak (see `tts_service.py`) |
@@ -172,16 +172,16 @@ voice wake on
 
 Piper is used automatically after an ElevenLabs TTS failure when its Python runtime
 and voice model are available. The server preloads it by default so fallback requests
-do not pay the model-load cost. The included configuration expects the female British
-`en_GB-southern_english_female-low` voice:
+do not pay the model-load cost. The included configuration expects Piper Amy
+(`en_US-amy-medium`):
 
 ```bash
 python -m pip install --user --break-system-packages piper-tts
 mkdir -p models
-curl -L -o models/en_GB-southern_english_female-low.onnx \
-  https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/southern_english_female/low/en_GB-southern_english_female-low.onnx
-curl -L -o models/en_GB-southern_english_female-low.onnx.json \
-  https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/southern_english_female/low/en_GB-southern_english_female-low.onnx.json
+curl -L -o models/en_US-amy-medium.onnx \
+  https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx
+curl -L -o models/en_US-amy-medium.onnx.json \
+  https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx.json
 ```
 
 Set `TTS_PROVIDER=elevenlabs` and `ELEVENLABS_TTS_MODEL=eleven_flash_v2_5` for a

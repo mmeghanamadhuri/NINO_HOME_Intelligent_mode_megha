@@ -142,6 +142,31 @@ def piper_prosody_enabled() -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
+def piper_pitch_offset() -> float:
+    """Standing pitch shift on top of mood, in semitones.
+
+    Default is +4 semitones on Amy. Override with ``PIPER_PITCH_SEMITONES``.
+    """
+    raw = os.environ.get("PIPER_PITCH_SEMITONES", "4.0").strip()
+    if not raw:
+        return 4.0
+    try:
+        return max(-12.0, min(12.0, float(raw)))
+    except ValueError:
+        return 4.0
+
+
+def piper_robotic_amount() -> float:
+    """0 = warm natural timbre, 1 = strongest cheap-robot AM / thinning."""
+    raw = os.environ.get("PIPER_ROBOTIC", "0").strip()
+    if not raw:
+        return 0.0
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except ValueError:
+        return 0.0
+
+
 def infer_speech_style(text: str) -> str:
     """Pick a delivery style from the sentence Piper is about to speak."""
     clean = (text or "").strip()
@@ -207,7 +232,57 @@ def pitch_shift_wav_bytes(wav_bytes: bytes, semitones: float) -> bytes:
         pitched = np.interp(x_pitched, x_src, pcm[:, ch])
         shifted[:, ch] = np.interp(x_out, x_pitched, pitched)
 
-    out_i16 = np.clip(shifted, -32768.0, 32767.0).astype(np.int16)
+    return _pcm16_to_wav(shifted, channels, sample_rate)
+
+
+def robotic_color_wav_bytes(wav_bytes: bytes, amount: float = 0.75) -> bytes:
+    """Thin the chest and add a light AM carrier so Piper sounds more mechanical."""
+    amount = max(0.0, min(1.0, float(amount)))
+    if not wav_bytes or amount < 0.05:
+        return wav_bytes
+    pcm, channels, sample_rate = _wav_to_pcm16(wav_bytes)
+    if pcm is None:
+        return wav_bytes
+
+    n = pcm.shape[0]
+    t = np.arange(n, dtype=np.float32) / float(sample_rate)
+    prev = np.vstack((pcm[:1], pcm[:-1]))
+    hp = pcm - prev
+    thinned = (1.0 - 0.55 * amount) * pcm + (0.55 * amount) * hp
+
+    # Soft square-ish AM around 58 Hz — classic toy-robot buzz without crushing words.
+    carrier = 0.58 + 0.42 * np.sign(np.sin(2.0 * np.pi * 58.0 * t))
+    carrier = carrier.reshape(-1, 1)
+    buzzed = thinned * ((1.0 - 0.42 * amount) + (0.42 * amount) * carrier)
+
+    delay = max(1, int(round(0.004 * sample_rate)))
+    echo = np.zeros_like(buzzed)
+    echo[delay:] = buzzed[:-delay]
+    mixed = buzzed + (0.22 * amount) * echo
+    peak = float(np.max(np.abs(mixed))) if mixed.size else 0.0
+    if peak > 32000.0:
+        mixed *= 32000.0 / peak
+    return _pcm16_to_wav(mixed, channels, sample_rate)
+
+
+def _wav_to_pcm16(wav_bytes: bytes) -> tuple[np.ndarray | None, int, int]:
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        channels = wf.getnchannels()
+        sample_width = wf.getsampwidth()
+        sample_rate = wf.getframerate()
+        frames = wf.readframes(wf.getnframes())
+    if sample_width != 2 or channels < 1 or not frames:
+        return None, 0, 0
+    pcm = np.frombuffer(frames, dtype=np.int16).astype(np.float32)
+    if channels > 1:
+        pcm = pcm.reshape(-1, channels)
+    else:
+        pcm = pcm.reshape(-1, 1)
+    return pcm, channels, sample_rate
+
+
+def _pcm16_to_wav(pcm: np.ndarray, channels: int, sample_rate: int) -> bytes:
+    out_i16 = np.clip(pcm, -32768.0, 32767.0).astype(np.int16)
     output = io.BytesIO()
     with wave.open(output, "wb") as wo:
         wo.setnchannels(channels)

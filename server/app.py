@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.staticfiles import StaticFiles as StarletteStaticFiles
+from starlette.websockets import WebSocketState
 
 from aux_recordings import list_aux_recordings, save_aux_wav, recordings_dir
 from conversation_sessions import (
@@ -1375,6 +1376,37 @@ def _ws_client_label(websocket: WebSocket) -> str:
     return f"{host}:{port}" if port is not None else str(host)
 
 
+def _ws_is_connected(websocket: WebSocket) -> bool:
+    return (
+        websocket.client_state == WebSocketState.CONNECTED
+        and websocket.application_state == WebSocketState.CONNECTED
+    )
+
+
+async def _ws_send_json(websocket: WebSocket, data: dict[str, object]) -> bool:
+    """Send JSON. False if the P4 already closed the socket (do not crash ASGI)."""
+    if not _ws_is_connected(websocket):
+        return False
+    try:
+        await websocket.send_json(data)
+        return True
+    except (WebSocketDisconnect, RuntimeError) as exc:
+        logger.info("WS send_json skipped: %s", exc)
+        return False
+
+
+async def _ws_send_bytes(websocket: WebSocket, data: bytes) -> bool:
+    """Send binary. False if the P4 already closed the socket (do not crash ASGI)."""
+    if not _ws_is_connected(websocket):
+        return False
+    try:
+        await websocket.send_bytes(data)
+        return True
+    except (WebSocketDisconnect, RuntimeError) as exc:
+        logger.info("WS send_bytes skipped: %s", exc)
+        return False
+
+
 def _session_kind_from_websocket(websocket: WebSocket) -> str:
     raw = (websocket.query_params.get("session") or "wake").strip().lower()
     if raw in {"continue", "conv", "followup", "ack"}:
@@ -1567,8 +1599,6 @@ async def _process_voice_query_audio(
             event="voice_query",
             client=client_label,
             device_id=device_id,
-            session=session_kind,
-            session_id=session_id,
             **timings,
         )
         if pipeline_error is not None:
@@ -1587,7 +1617,7 @@ async def _voice_ws_send_reply(
     wav_out: bytes | None,
     reply_meta: object,
     client_label: str,
-) -> None:
+) -> bool:
     from voice_service import VoiceReplyMeta
 
     meta = reply_meta if isinstance(reply_meta, VoiceReplyMeta) else VoiceReplyMeta()
@@ -1609,9 +1639,20 @@ async def _voice_ws_send_reply(
             device_id,
             client_label,
         )
-    await websocket.send_json(ws_meta)
-    if wav_out:
-        await websocket.send_bytes(wav_out)
+    if not await _ws_send_json(websocket, ws_meta):
+        logger.info(
+            "WS reply skipped, socket closed device=%s client=%s",
+            device_id,
+            client_label,
+        )
+        return False
+    if wav_out and not await _ws_send_bytes(websocket, wav_out):
+        logger.info(
+            "WS WAV skipped, socket closed device=%s client=%s",
+            device_id,
+            client_label,
+        )
+        return False
 
     if meta.registered_face_name:
         _remember_voice_viewer(meta.registered_face_name, device_id)
@@ -1626,6 +1667,7 @@ async def _voice_ws_send_reply(
         asyncio.create_task(
             _delayed_esp_servo_360(SERVO_360_TRIGGER_DELAY_SECONDS, device_id)
         )
+    return True
 
 
 async def _voice_ws_stream_pipeline(
@@ -1670,18 +1712,21 @@ async def _voice_ws_stream_pipeline(
         client=client_label,
         energy=aux_energy,
     )
-    await websocket.send_json({"type": "session", "session_id": session_id})
-    logger.info("stream WS ready device=%s session=%s", device_id, session_id)
+    if not await _ws_send_json(websocket, {"type": "session", "session_id": session_id}):
+        logger.info("stream WS closed before session handshake device=%s", device_id)
+    else:
+        logger.info("stream WS ready device=%s session=%s", device_id, session_id)
 
-    async def send_skip(reason: str) -> None:
-        await websocket.send_json(
+    async def send_skip(reason: str) -> bool:
+        return await _ws_send_json(
+            websocket,
             {
                 "type": "skip",
                 "skip": True,
                 "reason": reason,
                 "session_id": session_id,
                 "end_session": False,
-            }
+            },
         )
 
     async def take_or_cancel_receive() -> dict | None:
@@ -1754,7 +1799,7 @@ async def _voice_ws_stream_pipeline(
             accepting = True
             return True
         wav_out, reply_meta = result[1], result[2]
-        await _voice_ws_send_reply(
+        sent = await _voice_ws_send_reply(
             websocket,
             device_id=device_id,
             session_id=session_id,
@@ -1762,7 +1807,7 @@ async def _voice_ws_stream_pipeline(
             reply_meta=reply_meta,
             client_label=client_label,
         )
-        if getattr(reply_meta, "end_session", False):
+        if getattr(reply_meta, "end_session", False) or not sent:
             return False
         accepting = True
         return True
@@ -1773,7 +1818,8 @@ async def _voice_ws_stream_pipeline(
         pcm = bytes(buf.pcm)
         buf.reset()
         accepting = False
-        await websocket.send_json({"type": "end_of_speech", "reason": reason})
+        if not await _ws_send_json(websocket, {"type": "end_of_speech", "reason": reason}):
+            return False
         if stream_idle_timeout_ends_session(reason):
             from voice_service import (
                 VoiceReplyMeta,
@@ -2259,7 +2305,7 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                             SERVO_360_TRIGGER_DELAY_SECONDS, device_id
                         )
                     )
-            except WebSocketDisconnect:
+            except (WebSocketDisconnect, RuntimeError):
                 await run_in_threadpool(
                     _append_latency_record,
                     _latency_log_record(

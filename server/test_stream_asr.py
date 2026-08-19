@@ -47,6 +47,25 @@ class StreamEndOfSpeechTests(unittest.TestCase):
                 break
         self.assertTrue(ended)
 
+    def test_mid_energy_after_speech_still_ends(self) -> None:
+        """Aux idle often sits in 20–49; that band must not reset hangover."""
+        vad = StreamEndOfSpeech(
+            start_energy=50,
+            quiet_energy=20,
+            speech_ms=160,
+            silence_ms=200,
+            min_speech_ms=160,
+            max_ms=5000,
+        )
+        for _ in range(10):
+            vad.feed(_frame(200))
+        ended = False
+        for _ in range(20):
+            if vad.feed(_frame(30)) == "end_of_speech":
+                ended = True
+                break
+        self.assertTrue(ended)
+
     def test_timeout_without_speech(self) -> None:
         vad = StreamEndOfSpeech(start_energy=50, max_ms=80, frame_ms=20)
         self.assertEqual(vad.feed(_frame(1)), "idle")
