@@ -89,7 +89,7 @@ def test_speech_without_wake_phrase_is_answered() -> None:
     ):
         out, meta = process_voice_wav(
             wav,
-            session_kind="wake",
+            session_kind="continue",
             aux_energy=99,
             device_id="test",
             voice_turn=8,
@@ -98,7 +98,52 @@ def test_speech_without_wake_phrase_is_answered() -> None:
     assert out
     assert meta.timings["reply_path"] != "wake_reject"
     assert meta.timings["reply_path"] == "local_time"
+
+
+def test_wake_without_phrase_is_rejected() -> None:
+    os.environ["VOICE_MIN_ENERGY"] = "5"
+    tone = (8000 * np.sin(2 * np.pi * 220 * np.arange(16000) / 16000)).astype(np.int16)
+    wav = _mono_wav(tone)
+
+    from unittest.mock import patch
+
+    with patch("voice_service.transcribe_wav", return_value=("what time is it", "mock")):
+        out, meta = process_voice_wav(
+            wav,
+            session_kind="wake",
+            aux_energy=99,
+            device_id="test",
+            voice_turn=1,
+        )
+
+    assert meta.timings["reply_path"] == "wake_reject"
+    assert meta.timings["wake_ok"] is False
+    assert meta.end_session is True
+    assert not out or len(out) > 0
+
+
+def test_wake_with_ok_nino_is_accepted() -> None:
+    os.environ["VOICE_MIN_ENERGY"] = "5"
+    tone = (8000 * np.sin(2 * np.pi * 220 * np.arange(16000) / 16000)).astype(np.int16)
+    wav = _mono_wav(tone)
+
+    from unittest.mock import patch
+
+    with patch(
+        "voice_service.transcribe_wav", return_value=("ok nino what time is it", "mock")
+    ):
+        out, meta = process_voice_wav(
+            wav,
+            session_kind="wake",
+            aux_energy=99,
+            device_id="test",
+            voice_turn=1,
+        )
+
+    assert meta.timings["reply_path"] == "wake_ok"
     assert meta.timings["wake_ok"] is True
+    assert meta.end_session is False
+    assert out == b""
 
 
 def test_low_energy_skips_stt_and_does_not_reopen() -> None:

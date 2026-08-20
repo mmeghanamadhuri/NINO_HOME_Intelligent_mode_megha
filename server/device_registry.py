@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from user_devices import canonical_device_id, format_device_mac, normalize_device_mac
+
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -521,6 +523,14 @@ class DeviceRegistry:
         for stored_id, record in self._devices.items():
             if stored_id.casefold() == folded:
                 return record
+        mac = canonical_device_id(key)
+        if mac and mac != key:
+            found = self._devices.get(mac)
+            if found is not None:
+                return found
+            for stored_id, record in self._devices.items():
+                if canonical_device_id(stored_id) == mac:
+                    return record
         return None
 
     def get(self, device_id: str | None) -> DeviceRecord | None:
@@ -561,6 +571,41 @@ class DeviceRegistry:
         # Empty registry — synthesize legacy on the fly.
         legacy = self._legacy_from_environ()
         return legacy[0]
+
+    def ensure_registered(
+        self,
+        device_id: str,
+        *,
+        display_name: str = "",
+        base_url: str = "",
+    ) -> DeviceRecord:
+        """Create or return this device. Never remap a MAC onto another robot."""
+        key = canonical_device_id(device_id)
+        if not key:
+            key = LEGACY_DEVICE_ID
+        with self._lock:
+            found = self._find_locked(key)
+            if found is not None:
+                return found
+            pretty = format_device_mac(key)
+            record = DeviceRecord(
+                device_id=key,
+                display_name=(display_name or pretty or key).strip(),
+                base_url=(base_url or "").strip(),
+                camera_url=f"{base_url.rstrip('/')}/stream" if base_url.strip() else "",
+                play_wav_url=f"{base_url.rstrip('/')}/play_wav" if base_url.strip() else "",
+            )
+            updated = dict(self._devices)
+            updated[key] = record
+            self._write_devices_locked(updated.values())
+            self._devices = updated
+            self._persisted_device_ids = set(updated)
+            logger.info(
+                "Registered device mac=%s id=%s",
+                pretty or key,
+                key,
+            )
+            return record
 
     def set_ui_device_id(self, device_id: str) -> str:
         key = (device_id or "").strip()
@@ -612,12 +657,20 @@ def get_device_registry() -> DeviceRegistry:
 
 
 def resolve_device_id(raw: str | None) -> str:
-    """Normalize a client-provided device_id; empty → registry default."""
+    """Normalize a client device_id / MAC. New MACs are registered, not remapped."""
     reg = get_device_registry()
     cleaned = (raw or "").strip()
     if not cleaned:
         return reg.default_device_id()
-    return reg.resolve_or_default(cleaned).device_id
+    if cleaned.casefold() in {"default", "ui"}:
+        return reg.default_device_id()
+    mac = normalize_device_mac(cleaned)
+    if mac:
+        return reg.ensure_registered(mac).device_id
+    found = reg.get(cleaned)
+    if found is not None:
+        return found.device_id
+    return reg.ensure_registered(cleaned).device_id
 
 
 def _parse_coordinate(value: object, minimum: float, maximum: float) -> float | None:

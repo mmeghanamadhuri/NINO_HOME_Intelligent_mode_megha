@@ -43,12 +43,16 @@ esp_err_t nino_voice_ws_session_send_pcm(nino_voice_ws_session_t *session,
                                          const void *pcm, size_t len);
 bool nino_voice_ws_session_should_pause(nino_voice_ws_session_t *session);
 void nino_voice_ws_session_begin_turn(nino_voice_ws_session_t *session);
+/** Clear EOS/WAV flags without ending the session-open (GREET) window. */
+void nino_voice_ws_session_clear_reply(nino_voice_ws_session_t *session);
+esp_err_t nino_voice_ws_session_send_text(nino_voice_ws_session_t *session,
+                                          const char *text);
 esp_err_t nino_voice_ws_session_wait_reply(nino_voice_ws_session_t *session,
                                            int timeout_ms, uint8_t **wav_out,
                                            size_t *wav_out_len, bool *skip,
                                            bool *end_session, char *eye_expr_out,
                                            size_t eye_expr_cap, char *motion_out,
-                                           size_t motion_cap);
+                                           size_t motion_cap, bool *wake_ok);
 void nino_voice_ws_session_close(nino_voice_ws_session_t *session);
 
 #ifdef __cplusplus

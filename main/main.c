@@ -541,55 +541,76 @@ static bool is_legacy_placeholder_device_id(const char *id) {
   return id != NULL && strcmp(id, "nino-000000") == 0;
 }
 
-static void make_default_device_id_from_mac(char *dst, size_t dst_size) {
-  uint8_t mac[6] = {0};
+static bool is_legacy_nino_device_id(const char *id) {
+  return id != NULL && strncmp(id, "nino-", 5) == 0;
+}
+
+static void read_sta_mac_bytes(uint8_t mac[6]) {
+  if (mac == NULL) {
+    return;
+  }
+  memset(mac, 0, 6);
   if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) {
     (void)esp_wifi_get_mac(WIFI_IF_STA, mac);
   }
-  snprintf(dst, dst_size, "nino-%02x%02x%02x", mac[3], mac[4], mac[5]);
 }
 
-static bool make_device_id_from_name(char *dst, size_t dst_size) {
-  if (dst == NULL || dst_size < 2) {
+/** 12 lowercase hex, no colons — DNS-safe canonical device id. */
+static bool try_canonical_mac_id(char *dst, size_t dst_size, const char *src) {
+  if (dst == NULL || dst_size < 13 || src == NULL) {
     return false;
   }
-
-  char name[WIFI_PROV_BLE_DEVICE_NAME_MAX + 1] = "";
-  nvs_handle_t h;
-  if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
-    size_t len = sizeof(name);
-    if (nvs_get_str(h, NVS_KEY_DEVICE_NAME, name, &len) != ESP_OK ||
-        !is_valid_device_name(name)) {
-      name[0] = '\0';
+  const size_t len = strlen(src);
+  char hex[13];
+  size_t n = 0;
+  if (len == 12) {
+    for (size_t i = 0; i < 12; ++i) {
+      char c = src[i];
+      if (c >= 'A' && c <= 'F') {
+        c = (char)(c - 'A' + 'a');
+      }
+      if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+        return false;
+      }
+      hex[n++] = c;
     }
-    nvs_close(h);
-  }
-  if (name[0] == '\0') {
-    copy_device_name(name, sizeof(name), s_device_name);
-  }
-
-  size_t out = 0;
-  bool previous_dash = false;
-  for (size_t i = 0; name[i] != '\0' && out < dst_size - 1; ++i) {
-    char c = name[i];
-    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-        (c >= '0' && c <= '9')) {
-      dst[out++] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
-      previous_dash = false;
-    } else if (out > 0 && !previous_dash) {
-      dst[out++] = '-';
-      previous_dash = true;
+  } else if (len == 17) {
+    for (size_t i = 0; i < 17; ++i) {
+      char c = src[i];
+      if (i % 3 == 2) {
+        if (c != ':' && c != '-') {
+          return false;
+        }
+        continue;
+      }
+      if (c >= 'A' && c <= 'F') {
+        c = (char)(c - 'A' + 'a');
+      }
+      if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+        return false;
+      }
+      hex[n++] = c;
     }
+  } else {
+    return false;
   }
-  while (out > 0 && dst[out - 1] == '-') {
-    --out;
-  }
-  dst[out] = '\0';
-  return out > 0 && is_valid_device_id(dst);
+  hex[12] = '\0';
+  memcpy(dst, hex, 13);
+  return true;
+}
+
+static void make_default_device_id_from_mac(char *dst, size_t dst_size) {
+  uint8_t mac[6] = {0};
+  read_sta_mac_bytes(mac);
+  snprintf(dst, dst_size, "%02x%02x%02x%02x%02x%02x", mac[0], mac[1], mac[2],
+           mac[3], mac[4], mac[5]);
 }
 
 static void copy_device_id(char *dst, size_t dst_size, const char *src) {
   if (dst == NULL || dst_size == 0) {
+    return;
+  }
+  if (try_canonical_mac_id(dst, dst_size, src)) {
     return;
   }
   if (src == NULL || !is_valid_device_id(src)) {
@@ -618,28 +639,29 @@ static esp_err_t save_device_id_to_nvs(void) {
 static void load_device_id_from_nvs(void) {
   nvs_handle_t h;
   char stored[DEVICE_ID_MAX + 1] = "";
-  bool migrate_placeholder = false;
   if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
     size_t len = sizeof(stored);
     if (nvs_get_str(h, NVS_KEY_DEVICE_ID, stored, &len) != ESP_OK ||
         !is_valid_device_id(stored)) {
       stored[0] = '\0';
-    } else if (is_legacy_placeholder_device_id(stored)) {
-      stored[0] = '\0';
-      migrate_placeholder = true;
     }
     nvs_close(h);
   }
-  if (migrate_placeholder &&
-      make_device_id_from_name(s_device_id, sizeof(s_device_id))) {
-    ESP_LOGI(TAG, "Migrated legacy device_id from device name");
+  if (try_canonical_mac_id(s_device_id, sizeof(s_device_id), stored)) {
+    if (strcmp(stored, s_device_id) != 0) {
+      (void)save_device_id_to_nvs();
+      ESP_LOGI(TAG, "Normalized device_id MAC to %s", s_device_id);
+    }
   } else {
-    copy_device_id(s_device_id, sizeof(s_device_id), stored);
-  }
-  if (stored[0] == '\0') {
+    make_default_device_id_from_mac(s_device_id, sizeof(s_device_id));
     (void)save_device_id_to_nvs();
-    if (!migrate_placeholder) {
+    if (stored[0] == '\0') {
       ESP_LOGI(TAG, "Generated device_id from Wi-Fi MAC");
+    } else if (is_legacy_placeholder_device_id(stored) ||
+               is_legacy_nino_device_id(stored)) {
+      ESP_LOGI(TAG, "Migrated legacy device_id %s -> %s", stored, s_device_id);
+    } else {
+      ESP_LOGI(TAG, "Migrated name-based device_id %s -> %s", stored, s_device_id);
     }
   }
   ESP_LOGI(TAG, "device_id=%s", s_device_id);
@@ -2738,6 +2760,8 @@ static int app_status_json(char *buf, size_t buf_sz) {
   const char *fw_version = PROJECT_VER;
   nino_face_tracker_status_t face_track = {};
   nino_face_tracker_get_status(&face_track);
+  char mac_hex[13];
+  make_default_device_id_from_mac(mac_hex, sizeof(mac_hex));
   char servo_frag[128];
   int sn = nino_servo_recplay_status_json(servo_frag, sizeof(servo_frag));
   if (sn < 0 || sn >= (int)sizeof(servo_frag)) {
@@ -2746,14 +2770,14 @@ static int app_status_json(char *buf, size_t buf_sz) {
 
   return snprintf(
       buf, buf_sz,
-      "{\"ok\":true,\"device_name\":\"%s\",\"device_id\":\"%s\","
+      "{\"ok\":true,\"device_name\":\"%s\",\"device_id\":\"%s\",\"mac\":\"%s\","
       "\"wifi_ssid\":\"%s\","
       "\"volume\":%d,\"firmware\":\"%s\",\"sta_connected\":%s,"
       "\"ip\":\"%s\",\"mdns_host\":\"%s.local\","
       "\"face_track\":{\"enabled\":%s,\"detector_ready\":%s,"
       "\"face_found\":%s},"
       "\"servo\":{%s}}",
-      s_device_name, s_device_id, s_sta_ssid, nino_audio_get_volume_percent(),
+      s_device_name, s_device_id, mac_hex, s_sta_ssid, nino_audio_get_volume_percent(),
       fw_version, s_sta_connected ? "true" : "false", sta_ip, mdns_host,
       face_track.enabled ? "true" : "false",
       face_track.detector_ready ? "true" : "false",
@@ -2883,7 +2907,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
                            HTTPD_RESP_USE_STRLEN);
   }
 
-  char body[640];
+  char body[768];
   int n = app_status_json(body, sizeof(body));
   if (n < 0 || n >= (int)sizeof(body)) {
     return httpd_resp_send_500(req);
@@ -2896,7 +2920,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
 
 #if CONFIG_HTTPD_WS_SUPPORT
 static esp_err_t status_ws_send(httpd_req_t *req) {
-  char body[640];
+  char body[768];
   int n = app_status_json(body, sizeof(body));
   if (n < 0 || n >= (int)sizeof(body)) {
     return ESP_FAIL;

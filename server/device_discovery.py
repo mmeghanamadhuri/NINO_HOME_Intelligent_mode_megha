@@ -15,6 +15,7 @@ import requests
 
 from device_registry import DeviceRecord, DeviceRegistry, get_device_registry
 from pipeline_log import log_http, pipeline_log
+from user_devices import normalize_device_mac
 
 logger = logging.getLogger(__name__)
 
@@ -326,9 +327,12 @@ class DeviceDiscovery:
                 continue
             if not isinstance(payload, dict):
                 continue
-            device_id = str(payload.get("device_id") or "").strip()
+            mac_id = normalize_device_mac(payload.get("mac"))
+            device_id = mac_id or normalize_device_mac(payload.get("device_id"))
             if not device_id:
-                logger.debug("NiNO status at %s did not include device_id", base_url)
+                device_id = str(payload.get("device_id") or "").strip()
+            if not device_id:
+                logger.debug("NiNO status at %s did not include mac/device_id", base_url)
                 continue
             # Firmware reports the currently assigned address too. Prefer it
             # for persisted URLs when valid; the request itself always goes to

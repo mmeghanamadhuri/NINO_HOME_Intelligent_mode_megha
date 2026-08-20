@@ -1870,6 +1870,59 @@ def _silent_close(
     return wav_out, meta
 
 
+def _wake_gate_result(
+    meta: VoiceReplyMeta,
+    *,
+    ok: bool,
+    heard: str,
+    phrase: str,
+    audio_input_format: str,
+    audio_in_seconds: float,
+    wav_bytes: bytes,
+    stt_engine: str,
+    t_start: float,
+    t_stt: float,
+    extra: dict[str, Any] | None = None,
+) -> tuple[bytes, VoiceReplyMeta]:
+    """First idle-to-session clip: ASR must hear Ok Nino before GREET/LED."""
+    path = "wake_ok" if ok else "wake_reject"
+    meta.end_session = not ok
+    meta.prompt_medical_ack = False
+    t_done = time.perf_counter()
+    wav_out = b"" if ok else minimal_voice_reply_wav()
+    meta.timings = {
+        "heard": str(heard or "")[:200],
+        "reply_text": "",
+        "reply_path": path,
+        "audio_input_format": audio_input_format,
+        "audio_in_seconds": round(audio_in_seconds, 2),
+        "audio_in_bytes": len(wav_bytes),
+        "audio_out_seconds": round(_wav_seconds(wav_out), 2) if wav_out else 0.0,
+        "audio_out_bytes": len(wav_out),
+        "stt_engine": stt_engine,
+        "tts_provider": "none",
+        "tts_voice": "",
+        "stt_seconds": round(max(0.0, t_stt - t_start), 3),
+        "reply_seconds": 0.0,
+        "tts_seconds": 0.0,
+        "process_total_seconds": round(t_done - t_start, 3),
+        "continue_listen": ok,
+        "wake_ok": ok,
+        "wake_phrase": phrase,
+    }
+    if extra:
+        meta.timings.update(extra)
+    log_nino_voice(
+        "WAKE",
+        turn=meta.timings.get("turn"),
+        ok=1 if ok else 0,
+        phrase=phrase or "(none)",
+        heard=str(heard or "")[:120] or "(empty)",
+        next="GREET" if ok else "GPIO 5, ignore clip",
+    )
+    return wav_out, meta
+
+
 def process_voice_wav(
     wav_bytes: bytes,
     viewer_name: str | None = None,
@@ -1964,6 +2017,19 @@ def process_voice_wav(
                 reason="STT empty",
                 audio_s=audio_in_seconds,
             )
+            return _wake_gate_result(
+                meta,
+                ok=False,
+                heard="",
+                phrase="",
+                audio_input_format=audio_input_format,
+                audio_in_seconds=audio_in_seconds,
+                wav_bytes=wav_bytes,
+                stt_engine=stt_engine,
+                t_start=t_start,
+                t_stt=t_stt,
+                extra={"session": session, "energy": peak_energy, "turn": voice_turn},
+            )
         return _silent_close(
             meta,
             reply_path="stt_empty",
@@ -1982,14 +2048,53 @@ def process_voice_wav(
             },
         )
 
-    # Device Aux-in already decided this clip is a query. Do not require
-    # "Ok Nino" in the transcript; strip it when STT captured it anyway.
+    # Idle → session: ASR must hear Ok Nino. In-session turns do not.
     wake_found, command_text, wake_phrase = extract_wake_and_command(user_text)
     heard_raw = user_text
+    if session == "wake":
+        extra = {
+            "session": session,
+            "energy": peak_energy,
+            "turn": voice_turn,
+            "device": device_id or "-",
+        }
+        if not wake_found:
+            _record_rejected_wake(
+                device_id=device_id,
+                heard=heard_raw,
+                reason="no Ok Nino",
+                audio_s=audio_in_seconds,
+            )
+            return _wake_gate_result(
+                meta,
+                ok=False,
+                heard=heard_raw,
+                phrase="",
+                audio_input_format=audio_input_format,
+                audio_in_seconds=audio_in_seconds,
+                wav_bytes=wav_bytes,
+                stt_engine=stt_engine,
+                t_start=t_start,
+                t_stt=t_stt,
+                extra=extra,
+            )
+        return _wake_gate_result(
+            meta,
+            ok=True,
+            heard=heard_raw,
+            phrase=wake_phrase,
+            audio_input_format=audio_input_format,
+            audio_in_seconds=audio_in_seconds,
+            wav_bytes=wav_bytes,
+            stt_engine=stt_engine,
+            t_start=t_start,
+            t_stt=t_stt,
+            extra=extra,
+        )
     if wake_found:
         user_text = command_text
         log_nino_voice(
-            "WAKE",
+            "CONV",
             turn=voice_turn,
             ok=1,
             device=device_id or "-",
@@ -1999,7 +2104,7 @@ def process_voice_wav(
         )
     else:
         log_nino_voice(
-            "WAKE" if session == "wake" else "CONV",
+            "CONV",
             turn=voice_turn,
             ok=1,
             device=device_id or "-",
@@ -2008,33 +2113,6 @@ def process_voice_wav(
             session=session,
         )
     if not user_text.strip():
-        if session == "wake":
-            meta.prompt_medical_ack = True
-            log_nino_voice(
-                "WAKE",
-                turn=voice_turn,
-                ok=1,
-                listen=1,
-                next="opening conversation mic",
-            )
-            return _speak_short_reply(
-                meta,
-                reply=_WAKE_LISTEN_REPLY,
-                reply_path="wake_listen",
-                heard=heard_raw,
-                audio_input_format=audio_input_format,
-                audio_in_seconds=audio_in_seconds,
-                wav_bytes=wav_bytes,
-                stt_engine=stt_engine,
-                t_start=t_start,
-                t_stt=t_stt,
-                extra={
-                    "session": session,
-                    "wake_ok": True,
-                    "wake_phrase": wake_phrase,
-                    "turn": voice_turn,
-                },
-            )
         return _silent_close(
             meta,
             reply_path="stt_empty",

@@ -1481,7 +1481,11 @@ def _voice_wants_stream(websocket: WebSocket) -> bool:
 
 
 def _device_id_from_websocket(websocket: WebSocket) -> str:
-    """Resolve device_id from query param or X-Nino-Device-Id header."""
+    """Resolve device_id from query param or X-Nino-Device-Id header.
+
+    MACs are registered as 12 lowercase hex. Unknown ids are never remapped
+    onto another robot.
+    """
     raw = (websocket.query_params.get("device_id") or "").strip()
     if not raw:
         raw = (websocket.headers.get("x-nino-device-id") or "").strip()
@@ -1492,15 +1496,7 @@ def _device_id_from_websocket(websocket: WebSocket) -> str:
             registry.default_device_id(),
         )
         return registry.default_device_id()
-    resolved = resolve_device_id(raw)
-    if resolved != raw:
-        logger.warning(
-            "Voice WS unknown device_id=%r from %s — using %s",
-            raw,
-            _ws_client_label(websocket),
-            resolved,
-        )
-    return resolved
+    return resolve_device_id(raw)
 
 
 async def _process_voice_query_audio(
@@ -1743,6 +1739,8 @@ async def _voice_ws_stream_pipeline(
     pcm_frames = 0
     receive_task: asyncio.Task | None = None
     stt_task: asyncio.Task | None = None
+    greet_timeout_task: asyncio.Task | None = None
+    hunt_greet_timeout_s = 8.0
 
     def apply_listen_timeout() -> None:
         ident = get_session_identity()
@@ -1761,17 +1759,26 @@ async def _voice_ws_stream_pipeline(
         client=client_label,
         energy=aux_energy,
     )
-    if not await _ws_send_json(websocket, {"type": "session", "session_id": session_id}):
+    if not await _ws_send_json(websocket, {"type": "session", "session_id": session_id, "device_id": device_id}):
         logger.info("stream WS closed before session handshake device=%s", device_id)
     else:
         logger.info("stream WS ready device=%s session=%s", device_id, session_id)
 
-    try:
-        identity_name, identity_state = await run_in_threadpool(
-            _session_open_identity_snapshot, device_id
-        )
-        ident = get_session_identity()
-        if ident is not None:
+    greet_sent = False
+
+    async def send_session_greet() -> bool:
+        nonlocal greet_sent, accepting
+        if greet_sent:
+            return True
+        try:
+            identity_name, identity_state = await run_in_threadpool(
+                _session_open_identity_snapshot, device_id
+            )
+            ident = get_session_identity()
+            if ident is None:
+                greet_sent = True
+                accepting = True
+                return True
             ident.set_frame_getter(cameras.frame_getter(device_id))
             open_result = ident.start_session(
                 session_id=session_id,
@@ -1796,7 +1803,7 @@ async def _voice_ws_stream_pipeline(
                     user_name=open_result.user_name,
                 )
             )
-            await _voice_ws_send_reply(
+            ok = await _voice_ws_send_reply(
                 websocket,
                 device_id=device_id,
                 session_id=session_id,
@@ -1804,9 +1811,29 @@ async def _voice_ws_stream_pipeline(
                 reply_meta=reply_meta,
                 client_label=client_label,
             )
-            apply_listen_timeout()
-    except Exception:
-        logger.exception("stream session-open greeting failed device=%s", device_id)
+            if ok:
+                greet_sent = True
+                apply_listen_timeout()
+                accepting = True
+            return ok
+        except Exception:
+            logger.exception("stream session-open greeting failed device=%s", device_id)
+            greet_sent = True
+            accepting = True
+            return True
+
+    async def send_wake_result(detected: bool) -> bool:
+        return await _ws_send_json(
+            websocket,
+            {
+                "type": "wake",
+                "detected": detected,
+                "wake_ok": detected,
+                "session_id": session_id,
+                "device_id": device_id,
+                "end_session": not detected,
+            },
+        )
 
     async def send_skip(reason: str) -> bool:
         return await _ws_send_json(
@@ -1874,6 +1901,10 @@ async def _voice_ws_stream_pipeline(
             logger.exception("stream STT/TTS failed device=%s", device_id)
             return ("skip", "error")
         path = str(getattr(reply_meta, "timings", {}).get("reply_path") or "")
+        if path == "wake_ok":
+            return ("wake_ok",)
+        if path == "wake_reject":
+            return ("wake_reject",)
         if path in {"stt_silent", "stt_empty", "silent_skip", "stt_rejected"} and not getattr(
             reply_meta, "end_session", False
         ):
@@ -1882,9 +1913,25 @@ async def _voice_ws_stream_pipeline(
 
     async def apply_stt_result(result: tuple) -> bool:
         """Send skip or WAV. Receive must not be in flight. False closes the session."""
-        nonlocal accepting, session_queries
+        nonlocal accepting, session_queries, greet_timeout_task
         session_queries += 1
         kind = result[0]
+        if kind == "wake_ok":
+            if not await send_wake_result(True):
+                return False
+            accepting = False
+            await cancel_task(greet_timeout_task)
+            greet_timeout_task = asyncio.create_task(asyncio.sleep(hunt_greet_timeout_s))
+            logger.info(
+                "stream wake ok — hunt timeout %.0fs device=%s session=%s",
+                hunt_greet_timeout_s,
+                device_id,
+                session_id,
+            )
+            return True
+        if kind == "wake_reject":
+            await send_wake_result(False)
+            return False
         if kind == "skip":
             apply_listen_timeout()
             await send_skip(str(result[1] or "skip"))
@@ -2011,11 +2058,28 @@ async def _voice_ws_stream_pipeline(
         return True
 
     async def handle_message(message: dict | None) -> bool:
+        nonlocal greet_timeout_task
         if message is None:
             return False
         if message.get("type") == "websocket.disconnect":
             return False
         if message.get("text") is not None:
+            raw = str(message.get("text") or "").strip()
+            if not raw:
+                return True
+            try:
+                payload = json.loads(raw)
+            except ValueError:
+                return True
+            if str(payload.get("type") or "").strip().lower() == "ready":
+                logger.info(
+                    "stream hunt ready — GREET device=%s session=%s",
+                    device_id,
+                    session_id,
+                )
+                await cancel_task(greet_timeout_task)
+                greet_timeout_task = None
+                return await send_session_greet()
             return True
         chunk = message.get("bytes")
         if not chunk:
@@ -2042,9 +2106,35 @@ async def _voice_ws_stream_pipeline(
             wait_set = {receive_task}
             if stt_task is not None:
                 wait_set.add(stt_task)
+            if greet_timeout_task is not None:
+                wait_set.add(greet_timeout_task)
             done, _pending = await asyncio.wait(
                 wait_set, return_when=asyncio.FIRST_COMPLETED
             )
+            if greet_timeout_task is not None and greet_timeout_task in done:
+                greet_timeout_task = None
+                leftover = await take_or_cancel_receive()
+                if leftover is not None and leftover.get("type") == "websocket.disconnect":
+                    break
+                logger.info(
+                    "stream hunt timeout — GREET device=%s session=%s",
+                    device_id,
+                    session_id,
+                )
+                try:
+                    keep = await send_session_greet()
+                except (WebSocketDisconnect, Exception):
+                    logger.exception(
+                        "stream WS send failed after hunt timeout device=%s",
+                        device_id,
+                    )
+                    break
+                if leftover is not None and not await handle_message(leftover):
+                    break
+                if not keep:
+                    break
+                receive_task = asyncio.create_task(websocket.receive())
+                continue
             if stt_task is not None and stt_task in done:
                 try:
                     result = stt_task.result()
@@ -2081,6 +2171,7 @@ async def _voice_ws_stream_pipeline(
         accepting = False
         await cancel_task(receive_task)
         await cancel_task(stt_task)
+        await cancel_task(greet_timeout_task)
         await run_in_threadpool(
             _append_latency_record,
             _latency_log_record(

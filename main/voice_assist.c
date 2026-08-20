@@ -54,6 +54,8 @@ static const char *TAG = "voice_ast";
 #define AUX_QUIET_MAX_MS 4000
 #define AUX_REARM_DELAY_MS 1500
 #define AUX_POST_SPEAKER_IGNORE_MS 2500
+#define AUX_WAKE_PREROLL_MS 2000
+#define AUX_WAKE_PREROLL_SAMPLES ((VOICE_MIC_RATE * AUX_WAKE_PREROLL_MS) / 1000)
 #define AUX_STATUS_LOG_MS 1000
 #define AUX_REPLY_WAIT_MS 180000
 #define STREAM_LISTEN_CAP_MS 65000
@@ -86,6 +88,10 @@ static uint32_t s_aux_noise_floor = AUX_NOISE_FLOOR_DEFAULT;
 static uint32_t s_voice_turn;
 static bool s_voice_turn_ready;
 static int64_t s_aux_ignore_until_us;
+static int16_t s_idle_ring[AUX_WAKE_PREROLL_SAMPLES];
+static size_t s_idle_ring_write;
+static size_t s_idle_ring_count;
+static int16_t s_idle_preroll[AUX_WAKE_PREROLL_SAMPLES];
 
 static const char *session_query_name(voice_session_kind_t kind) {
   return kind == VOICE_SESSION_CONTINUE ? "continue" : "wake";
@@ -701,6 +707,42 @@ static bool aux_ignore_energy_now(void) {
   return esp_timer_get_time() < s_aux_ignore_until_us;
 }
 
+static void idle_ring_reset(void) {
+  s_idle_ring_write = 0;
+  s_idle_ring_count = 0;
+}
+
+static void idle_ring_push(const int16_t *frame, size_t n) {
+  if (frame == NULL || n == 0) {
+    return;
+  }
+  for (size_t i = 0; i < n; i++) {
+    s_idle_ring[s_idle_ring_write] = frame[i];
+    s_idle_ring_write++;
+    if (s_idle_ring_write >= AUX_WAKE_PREROLL_SAMPLES) {
+      s_idle_ring_write = 0;
+    }
+    if (s_idle_ring_count < AUX_WAKE_PREROLL_SAMPLES) {
+      s_idle_ring_count++;
+    }
+  }
+}
+
+static size_t idle_ring_copy(int16_t *dst, size_t dst_cap) {
+  size_t n = s_idle_ring_count;
+  if (dst == NULL || n == 0) {
+    return 0;
+  }
+  if (n > dst_cap) {
+    n = dst_cap;
+  }
+  size_t start = (s_idle_ring_write + AUX_WAKE_PREROLL_SAMPLES - n) % AUX_WAKE_PREROLL_SAMPLES;
+  for (size_t i = 0; i < n; i++) {
+    dst[i] = s_idle_ring[(start + i) % AUX_WAKE_PREROLL_SAMPLES];
+  }
+  return n;
+}
+
 static bool wait_aux_activity(void) {
   int16_t frame[AUX_DETECT_SAMPLES];
   uint32_t speech_streak = 0;
@@ -711,7 +753,7 @@ static bool wait_aux_activity(void) {
     if (s_force_session) {
       s_force_session = false;
       const uint32_t turn = voice_begin_turn();
-      voice_log(ESP_LOG_INFO, turn, "TRIGGER", "reason=cli stream session led=green");
+      voice_log(ESP_LOG_INFO, turn, "TRIGGER", "reason=cli stream session led=off");
       return true;
     }
     if (s_query_busy) {
@@ -721,6 +763,7 @@ static bool wait_aux_activity(void) {
       continue;
     }
     if (aux_ignore_energy_now()) {
+      idle_ring_reset();
       speech_streak = 0;
       music_listen_ms = 0;
       if (nino_audio_queue_busy()) {
@@ -762,6 +805,7 @@ static bool wait_aux_activity(void) {
     }
 
     const uint32_t energy = aux_frame_energy(frame, AUX_DETECT_SAMPLES);
+    idle_ring_push(frame, AUX_DETECT_SAMPLES);
     const uint32_t threshold = aux_start_threshold(s_aux_noise_floor);
     status_ms += AUX_DETECT_FRAME_MS;
     if (status_ms >= AUX_STATUS_LOG_MS) {
@@ -783,7 +827,7 @@ static bool wait_aux_activity(void) {
     if (speech_streak >= AUX_START_CONSECUTIVE_FRAMES) {
       const uint32_t turn = voice_begin_turn();
       voice_log(ESP_LOG_INFO, turn, "TRIGGER",
-                "energy=%" PRIu32 " noise=%" PRIu32 " th=%" PRIu32 " led=green",
+                "energy=%" PRIu32 " noise=%" PRIu32 " th=%" PRIu32 " led=off",
                 energy, s_aux_noise_floor, threshold);
       return true;
     }
@@ -903,6 +947,88 @@ static void play_ws_reply_wav(uint8_t *resp, size_t resp_len, const char *eye_ex
   nino_main_queue_audio_wav(resp, resp_len, false, false, eye_state);
 }
 
+static bool stream_aux_pcm(nino_voice_ws_session_t *ws, uint32_t turn,
+                           const int16_t *preroll, size_t preroll_samples,
+                           bool listen_led) {
+  if (listen_led) {
+    nino_eye_listening();
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_LISTEN);
+    voice_log(ESP_LOG_INFO, turn, "STREAM", "sending Aux-in PCM until ASR EOS");
+  } else {
+    voice_log(ESP_LOG_INFO, turn, "STREAM",
+              "wake clip until ASR EOS led=off preroll=%u",
+              (unsigned)preroll_samples);
+  }
+
+  if (preroll != NULL && preroll_samples > 0) {
+    size_t off = 0;
+    while (off < preroll_samples && !nino_voice_ws_session_should_pause(ws)) {
+      size_t n = AUX_DETECT_SAMPLES;
+      if (off + n > preroll_samples) {
+        n = preroll_samples - off;
+      }
+      if (nino_voice_ws_session_send_pcm(ws, preroll + off,
+                                         n * sizeof(int16_t)) != ESP_OK) {
+        break;
+      }
+      off += n;
+    }
+  }
+
+  int16_t frame[AUX_DETECT_SAMPLES];
+  uint32_t streamed_ms =
+      (uint32_t)((preroll_samples * 1000U) / (uint32_t)VOICE_MIC_RATE);
+  bool tx_failed = false;
+  while (!nino_voice_ws_session_should_pause(ws)) {
+    if (nino_music_blocks_mic()) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+    if (aux_ignore_energy_now()) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+    esp_err_t rr = nino_mic_read(frame, AUX_DETECT_SAMPLES);
+    if (rr != ESP_OK) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+    if (nino_voice_ws_session_send_pcm(ws, frame, sizeof(frame)) != ESP_OK) {
+      if (nino_voice_ws_session_should_pause(ws)) {
+        voice_log(ESP_LOG_INFO, turn, "STREAM",
+                  "paused because EOS/skip after %u ms", (unsigned)streamed_ms);
+        break;
+      }
+      voice_log(ESP_LOG_WARN, turn, "STREAM",
+                "write-0 after %u ms — wait for server, camera stays on",
+                (unsigned)streamed_ms);
+      tx_failed = true;
+      break;
+    }
+    streamed_ms += AUX_DETECT_FRAME_MS;
+    if (streamed_ms >= STREAM_LISTEN_CAP_MS) {
+      voice_log(ESP_LOG_WARN, turn, "STREAM",
+                "cap=%u ms waiting for ASR EOS/guest/goodbye",
+                (unsigned)streamed_ms);
+      break;
+    }
+  }
+
+  nino_mic_close();
+  if (listen_led) {
+    nino_eye_thinking();
+  }
+  if (tx_failed) {
+    voice_log(ESP_LOG_WARN, turn, "STREAM",
+              "write glitch after %u ms — wait for server",
+              (unsigned)streamed_ms);
+  } else {
+    voice_log(ESP_LOG_INFO, turn, "WAIT_PC", "paused TX after %u ms",
+              (unsigned)streamed_ms);
+  }
+  return true;
+}
+
 static void run_conversation_session(const int16_t *preroll, size_t preroll_samples) {
   char uri[VOICE_WS_URI_MAX];
   char session_id[40];
@@ -923,10 +1049,9 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
   nino_music_pause_for_speech(true);
 
   bool session_end = false;
+  bool camera_on = false;
 
-  session_camera_on();
-  (void)nino_face_hunt_for_person(FACE_HUNT_MS);
-
+  /* Energy trigger only: LED off, camera off until ASR confirms Ok Nino. */
   esp_err_t err = nino_voice_ws_session_open(uri, &ws);
   if (err != ESP_OK || ws == NULL) {
     voice_log(ESP_LOG_ERROR, s_voice_turn, "FAIL", "stage=ws_open err=%s",
@@ -936,9 +1061,68 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
   }
 
   voice_log(ESP_LOG_INFO, s_voice_turn, "SESSION",
-            "id=%s stream=1 gpio5=low camera=on", session_id);
+            "id=%s stream=1 gpio5=low camera=off led=off wait=wake", session_id);
 
-  /* Optional greeting / register prompt before the first listen. */
+  bool wake_confirmed = false;
+  bool sent_preroll = false;
+  while (!wake_confirmed && nino_voice_ws_session_is_open(ws)) {
+    nino_voice_ws_session_clear_reply(ws);
+    const int16_t *clip = sent_preroll ? NULL : preroll;
+    const size_t clip_n = sent_preroll ? 0 : preroll_samples;
+    sent_preroll = true;
+    (void)stream_aux_pcm(ws, s_voice_turn, clip, clip_n, false);
+
+    uint8_t *resp = NULL;
+    size_t resp_len = 0;
+    bool skip = false;
+    bool end_session = false;
+    bool wake_ok = false;
+    char eye_expr[16] = {0};
+    char motion[192] = {0};
+    err = nino_voice_ws_session_wait_reply(ws, AUX_REPLY_WAIT_MS, &resp, &resp_len,
+                                           &skip, &end_session, eye_expr,
+                                           sizeof(eye_expr), motion, sizeof(motion),
+                                           &wake_ok);
+    free(resp);
+    if (err != ESP_OK) {
+      voice_log(ESP_LOG_ERROR, s_voice_turn, "WAKE", "stage=wait err=%s",
+                esp_err_to_name(err));
+      (void)nino_rgb_led_show(NINO_RGB_SHOW_ERROR);
+      break;
+    }
+    if (skip && !wake_ok && !end_session) {
+      voice_log(ESP_LOG_INFO, s_voice_turn, "WAKE", "ASR skip — keep listening led=off");
+      continue;
+    }
+    if (wake_ok) {
+      wake_confirmed = true;
+      voice_log(ESP_LOG_INFO, s_voice_turn, "WAKE", "detected=1 led=blue camera=on");
+      break;
+    }
+    session_end = true;
+    voice_log(ESP_LOG_INFO, s_voice_turn, "WAKE",
+              "detected=0 gpio5=high led=off ignore clip");
+    goto session_done;
+  }
+
+  if (!wake_confirmed) {
+    goto session_done;
+  }
+
+  (void)nino_rgb_led_show(NINO_RGB_SHOW_LISTEN);
+  session_camera_on();
+  camera_on = true;
+  (void)nino_face_hunt_for_person(FACE_HUNT_MS);
+
+  nino_voice_ws_session_clear_reply(ws);
+  err = nino_voice_ws_session_send_text(ws, "{\"type\":\"ready\"}");
+  if (err != ESP_OK) {
+    voice_log(ESP_LOG_WARN, s_voice_turn, "READY", "send err=%s — wait GREET anyway",
+              esp_err_to_name(err));
+  } else {
+    voice_log(ESP_LOG_INFO, s_voice_turn, "READY", "hunt done — waiting GREET");
+  }
+
   {
     uint8_t *resp = NULL;
     size_t resp_len = 0;
@@ -948,7 +1132,8 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
     char motion[192] = {0};
     err = nino_voice_ws_session_wait_reply(ws, SESSION_GREET_WAIT_MS, &resp, &resp_len,
                                            &skip, &end_session, eye_expr,
-                                           sizeof(eye_expr), motion, sizeof(motion));
+                                           sizeof(eye_expr), motion, sizeof(motion),
+                                           NULL);
     if (err == ESP_OK && !skip && resp != NULL && resp_len > 0) {
       play_ws_reply_wav(resp, resp_len, eye_expr, motion, true);
       resp = NULL; /* queue owns the WAV; do not free after playback */
@@ -968,8 +1153,7 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
     nino_voice_ws_session_begin_turn(ws);
   }
 
-  /* Wake preroll is stale after hunt + GREET TTS; sending it is heard as
-   * another greeting. */
+  /* Wake preroll is stale after hunt + GREET TTS. */
   (void)preroll;
   (void)preroll_samples;
 
@@ -979,58 +1163,7 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
     const uint32_t turn = first_turn ? s_voice_turn : voice_begin_turn();
     first_turn = false;
     nino_voice_ws_session_begin_turn(ws);
-    nino_eye_listening();
-    (void)nino_rgb_led_show(NINO_RGB_SHOW_LISTEN);
-    voice_log(ESP_LOG_INFO, turn, "STREAM", "sending Aux-in PCM until ASR EOS");
-
-    int16_t frame[AUX_DETECT_SAMPLES];
-    uint32_t streamed_ms = 0;
-    bool tx_failed = false;
-    while (!nino_voice_ws_session_should_pause(ws)) {
-      if (nino_music_blocks_mic()) {
-        vTaskDelay(pdMS_TO_TICKS(20));
-        continue;
-      }
-      if (aux_ignore_energy_now()) {
-        vTaskDelay(pdMS_TO_TICKS(20));
-        continue;
-      }
-      esp_err_t rr = nino_mic_read(frame, AUX_DETECT_SAMPLES);
-      if (rr != ESP_OK) {
-        vTaskDelay(pdMS_TO_TICKS(20));
-        continue;
-      }
-      if (nino_voice_ws_session_send_pcm(ws, frame, sizeof(frame)) != ESP_OK) {
-        if (nino_voice_ws_session_should_pause(ws)) {
-          voice_log(ESP_LOG_INFO, turn, "STREAM",
-                    "paused because EOS/skip after %u ms", (unsigned)streamed_ms);
-          break;
-        }
-        voice_log(ESP_LOG_WARN, turn, "STREAM",
-                  "write-0 after %u ms — wait for server, camera stays on",
-                  (unsigned)streamed_ms);
-        tx_failed = true;
-        break;
-      }
-      streamed_ms += AUX_DETECT_FRAME_MS;
-      if (streamed_ms >= STREAM_LISTEN_CAP_MS) {
-        voice_log(ESP_LOG_WARN, turn, "STREAM",
-                  "cap=%u ms waiting for ASR EOS/guest/goodbye", (unsigned)streamed_ms);
-        break;
-      }
-    }
-
-    nino_mic_close();
-    /* Keep solid blue through STT/LLM until TTS actually starts. */
-    nino_eye_thinking();
-    if (tx_failed) {
-      voice_log(ESP_LOG_WARN, turn, "STREAM",
-                "write glitch after %u ms — wait for server, camera stays on",
-                (unsigned)streamed_ms);
-    } else {
-      voice_log(ESP_LOG_INFO, turn, "WAIT_PC", "paused TX after %u ms",
-                (unsigned)streamed_ms);
-    }
+    (void)stream_aux_pcm(ws, turn, NULL, 0, true);
 
     uint8_t *resp = NULL;
     size_t resp_len = 0;
@@ -1040,7 +1173,8 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
     char motion[192] = {0};
     err = nino_voice_ws_session_wait_reply(ws, AUX_REPLY_WAIT_MS, &resp, &resp_len,
                                            &skip, &end_session, eye_expr,
-                                           sizeof(eye_expr), motion, sizeof(motion));
+                                           sizeof(eye_expr), motion, sizeof(motion),
+                                           NULL);
     if (err != ESP_OK) {
       voice_log(ESP_LOG_ERROR, turn, "FAIL", "stage=reply err=%s",
                 esp_err_to_name(err));
@@ -1078,7 +1212,7 @@ session_done:
   if (ws != NULL) {
     nino_voice_ws_session_close(ws);
   }
-  /* GPIO 5 high only after goodbye TTS — keep mics open on stream/WS fail. */
+  /* GPIO 5 high after goodbye TTS or a false-wake reject — not on WS fail. */
   if (session_end) {
     sirena_mics_close_pulse();
   } else {
@@ -1086,9 +1220,9 @@ session_done:
     voice_log(ESP_LOG_INFO, s_voice_turn, "GPIO5",
               "low — Sirena mics stay open (not goodbye)");
   }
-  /* Camera off only after goodbye GPIO5 or a fully closed WS — not after hunt,
-   * GREET, EOS/WAIT_PC, or a recoverable STREAM write-0. */
-  session_camera_off();
+  if (camera_on) {
+    session_camera_off();
+  }
   aux_ignore_energy_for_ms(AUX_POST_SPEAKER_IGNORE_MS);
 }
 
@@ -1121,8 +1255,11 @@ static void aux_listen_task(void *arg) {
       continue;
     }
 
-    voice_log(ESP_LOG_INFO, s_voice_turn, "WAKE", "stream session led=blue");
-    run_conversation_session(NULL, 0);
+    const size_t preroll_n = idle_ring_copy(s_idle_preroll, AUX_WAKE_PREROLL_SAMPLES);
+    idle_ring_reset();
+    voice_log(ESP_LOG_INFO, s_voice_turn, "WAKE",
+              "stream session preroll=%u led=off", (unsigned)preroll_n);
+    run_conversation_session(s_idle_preroll, preroll_n);
 
     wait_aux_quiet();
     vTaskDelay(pdMS_TO_TICKS(AUX_REARM_DELAY_MS));

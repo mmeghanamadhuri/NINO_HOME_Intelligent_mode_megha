@@ -150,7 +150,13 @@ def bind_session_user(
                 except OSError:
                     pass
         logger.info("Voice session bound id=%s user=%s", sid, new_key)
-        return payload
+    try:
+        from user_devices import link_user_device
+
+        link_user_device(name, device_id)
+    except Exception:
+        logger.exception("Could not link user %s to device %s", name, device_id)
+    return payload
 
 
 def append_session_turn(

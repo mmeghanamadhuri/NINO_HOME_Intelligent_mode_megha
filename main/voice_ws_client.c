@@ -427,6 +427,8 @@ struct nino_voice_ws_session {
   bool greet_pending;
   bool rx_closed;
   int64_t rx_closed_us;
+  bool wake_received;
+  bool wake_ok;
   char eye_expr[EYE_EXPR_MAX];
   char motion_json[MOTION_JSON_MAX];
 };
@@ -513,6 +515,17 @@ static void stream_on_event(void *handler_args, esp_event_base_t base, int32_t e
     if (ws->op_code == 0x01) {
       const char *text = (const char *)ws->data_ptr;
       const size_t tlen = (size_t)ws->data_len;
+      if (json_type_is(text, tlen, "wake")) {
+        s->wake_received = true;
+        s->wake_ok = json_has_key_true(text, tlen, "\"detected\"") ||
+                     json_has_key_true(text, tlen, "\"wake_ok\"");
+        if (!s->wake_ok || json_has_key_true(text, tlen, "\"end_session\"")) {
+          s->end_session = true;
+        }
+        s->reply_ready = true;
+        stream_signal(s);
+        break;
+      }
       if (json_type_is(text, tlen, "end_of_speech")) {
         s->eos = true;
         stream_signal(s);
@@ -774,23 +787,47 @@ bool nino_voice_ws_session_should_pause(nino_voice_ws_session_t *session) {
          session->reply_ready;
 }
 
-void nino_voice_ws_session_begin_turn(nino_voice_ws_session_t *session) {
+void nino_voice_ws_session_clear_reply(nino_voice_ws_session_t *session) {
   if (session == NULL) {
     return;
   }
-  session->greet_pending = false;
   session->eos = false;
   session->skip = false;
   session->end_session = false;
   session->wav_msg_open = false;
   session->reply_ready = false;
+  session->wake_received = false;
+  session->wake_ok = false;
   session->rx_closed = false;
   session->rx_closed_us = 0;
   session->len = 0;
   session->eye_expr[0] = '\0';
   session->motion_json[0] = '\0';
-  while (xSemaphoreTake(session->evt, 0) == pdTRUE) {
+  while (session->evt != NULL && xSemaphoreTake(session->evt, 0) == pdTRUE) {
   }
+}
+
+void nino_voice_ws_session_begin_turn(nino_voice_ws_session_t *session) {
+  if (session == NULL) {
+    return;
+  }
+  session->greet_pending = false;
+  nino_voice_ws_session_clear_reply(session);
+}
+
+esp_err_t nino_voice_ws_session_send_text(nino_voice_ws_session_t *session,
+                                          const char *text) {
+  if (session == NULL || text == NULL || session->client == NULL) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  if (session->error || !session->connected ||
+      !esp_websocket_client_is_connected(session->client)) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  const int n = (int)strlen(text);
+  const int sent =
+      esp_websocket_client_send_text(session->client, text, n, pdMS_TO_TICKS(1000));
+  return (sent == n) ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t nino_voice_ws_session_wait_reply(nino_voice_ws_session_t *session,
@@ -798,7 +835,7 @@ esp_err_t nino_voice_ws_session_wait_reply(nino_voice_ws_session_t *session,
                                            size_t *wav_out_len, bool *skip,
                                            bool *end_session, char *eye_expr_out,
                                            size_t eye_expr_cap, char *motion_out,
-                                           size_t motion_cap) {
+                                           size_t motion_cap, bool *wake_ok) {
   if (session == NULL || wav_out == NULL || wav_out_len == NULL) {
     return ESP_ERR_INVALID_ARG;
   }
@@ -809,6 +846,9 @@ esp_err_t nino_voice_ws_session_wait_reply(nino_voice_ws_session_t *session,
   }
   if (end_session) {
     *end_session = false;
+  }
+  if (wake_ok) {
+    *wake_ok = false;
   }
   const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
   while (!session->reply_ready && !session->skip && !session->error) {
@@ -836,6 +876,9 @@ esp_err_t nino_voice_ws_session_wait_reply(nino_voice_ws_session_t *session,
   }
   if (end_session) {
     *end_session = session->end_session;
+  }
+  if (wake_ok) {
+    *wake_ok = session->wake_received && session->wake_ok;
   }
   if (eye_expr_out != NULL && eye_expr_cap > 0) {
     strncpy(eye_expr_out, session->eye_expr, eye_expr_cap - 1);

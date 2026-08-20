@@ -17,6 +17,9 @@ class ConversationSessionStoreTests(unittest.TestCase):
         self.patcher = patch.object(cs, "DEFAULT_SESSIONS_DIR", Path(self.tmp.name))
         self.patcher.start()
         self.addCleanup(self.patcher.stop)
+        self.link_patcher = patch("user_devices.link_user_device")
+        self.link_patcher.start()
+        self.addCleanup(self.link_patcher.stop)
 
     def test_begin_append_end(self) -> None:
         sid = "abc123session"
