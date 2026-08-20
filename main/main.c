@@ -628,6 +628,11 @@ static void make_default_device_id_from_mac(char *dst, size_t dst_size) {
            mac[3], mac[4], mac[5]);
 }
 
+/* Early builds stored this on every board. It is not a usable robot identity. */
+static bool is_legacy_placeholder_device_id(const char *id) {
+  return id != NULL && strcmp(id, "nino-000000") == 0;
+}
+
 static esp_err_t save_device_id_to_nvs(void) {
   nvs_handle_t h;
   esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);

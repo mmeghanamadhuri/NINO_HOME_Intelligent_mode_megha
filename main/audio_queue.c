@@ -52,6 +52,7 @@ static QueueHandle_t s_touch_queue;
 static volatile bool s_stop_requested;
 static volatile bool s_normal_playing;
 static volatile int s_normal_outstanding;
+static volatile bool s_user_paused;
 static suspended_playback_t s_suspended;
 static bool s_has_suspended;
 
@@ -95,7 +96,7 @@ static bool play_decoded_job(nino_decoded_wav_t *decoded, size_t *pcm_offset,
   volatile bool *stop_ptr = allow_interrupt ? &s_stop_requested : NULL;
   bool completed = false;
   esp_err_t err =
-      nino_audio_play_decoded(decoded, pcm_offset, stop_ptr, &completed);
+      nino_audio_play_decoded(decoded, pcm_offset, stop_ptr, &completed, false);
   servo_motion_for_mode(servo_mode, false);
 
   if (err != ESP_OK) {
@@ -268,6 +269,11 @@ static void audio_playback_task(void *arg) {
 
     if (try_receive_touch(&job)) {
       (void)play_touch_job(&job);
+      continue;
+    }
+
+    if (s_user_paused) {
+      vTaskDelay(pdMS_TO_TICKS(50));
       continue;
     }
 
@@ -452,4 +458,60 @@ void nino_audio_queue_preempt_for_wake(void) {
   if (!s_normal_playing) {
     s_stop_requested = false;
   }
+}
+
+esp_err_t nino_audio_queue_stream_wav(uint8_t *wav, size_t len, nino_eye_state_t eye_state) {
+  return nino_audio_queue_wav(wav, len, false, NINO_AUDIO_SERVO_NONE, false, eye_state);
+}
+
+void nino_audio_queue_pause(void) {
+  s_user_paused = true;
+  s_stop_requested = true;
+  nino_audio_cut_speaker();
+  ESP_LOGI(TAG, "Playback paused");
+}
+
+void nino_audio_queue_resume(void) {
+  s_user_paused = false;
+  s_stop_requested = false;
+  ESP_LOGI(TAG, "Playback resumed");
+}
+
+void nino_audio_queue_stop(void) {
+  s_user_paused = false;
+  s_stop_requested = true;
+  nino_audio_cut_speaker();
+
+  const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(250);
+  while (s_normal_playing && xTaskGetTickCount() < deadline) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+
+  audio_play_job_t job = {};
+  while (s_normal_queue != NULL && xQueueReceive(s_normal_queue, &job, 0) == pdPASS) {
+    free(job.data);
+    if (s_normal_outstanding > 0) {
+      s_normal_outstanding--;
+    }
+  }
+  if (s_has_suspended) {
+    nino_decoded_wav_free(&s_suspended.decoded);
+    memset(&s_suspended, 0, sizeof(s_suspended));
+    s_has_suspended = false;
+    if (s_normal_outstanding > 0) {
+      s_normal_outstanding--;
+    }
+  }
+  s_stop_requested = false;
+  ESP_LOGI(TAG, "Playback stopped");
+}
+
+void nino_audio_queue_get_status(nino_audio_queue_status_t *out) {
+  if (out == NULL) {
+    return;
+  }
+  out->playing = s_normal_playing;
+  out->paused = s_user_paused;
+  out->suspended = s_has_suspended;
+  out->queued = s_normal_outstanding;
 }
