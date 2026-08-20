@@ -377,9 +377,15 @@ _GOODBYE_REPLIES = (
 )
 
 # Wake session: STT often misspells Nino. Match near the start, then strip.
+# "Ok Nino" (and hey/hi/hello + name) or a leading "Hello" both start a session.
 _WAKE_RE = re.compile(
     r"\b(?P<phrase>(?:ok(?:ay)?|hey|hi|hello)\s+"
     r"(?:nino|nano|neno|nina|nenu|neeno|knee\s*no|you know))\b",
+    re.IGNORECASE,
+)
+_WAKE_HELLO_RE = re.compile(
+    r"^(?:(?:um+|uh+|er+|ah+|mm+)\s+){0,3}"
+    r"(?P<phrase>hell+o|hallo|hullo)(?:\s+there)?\b",
     re.IGNORECASE,
 )
 _WAKE_NAME_RE = re.compile(
@@ -407,6 +413,8 @@ def extract_wake_and_command(text: str) -> tuple[bool, str, str]:
     if not norm:
         return False, "", ""
     match = _WAKE_RE.search(norm)
+    if match is None:
+        match = _WAKE_HELLO_RE.search(norm)
     if match is None:
         # "nino" alone in the first few words still counts as the wake name.
         match = _WAKE_NAME_RE.search(norm)
@@ -1884,7 +1892,7 @@ def _wake_gate_result(
     t_stt: float,
     extra: dict[str, Any] | None = None,
 ) -> tuple[bytes, VoiceReplyMeta]:
-    """First idle-to-session clip: ASR must hear Ok Nino before GREET/LED."""
+    """First idle-to-session clip: ASR must hear Ok Nino or Hello before GREET/LED."""
     path = "wake_ok" if ok else "wake_reject"
     meta.end_session = not ok
     meta.prompt_medical_ack = False
@@ -2048,7 +2056,7 @@ def process_voice_wav(
             },
         )
 
-    # Idle → session: ASR must hear Ok Nino. In-session turns do not.
+    # Idle → session: ASR must hear Ok Nino or a leading Hello. In-session turns do not.
     wake_found, command_text, wake_phrase = extract_wake_and_command(user_text)
     heard_raw = user_text
     if session == "wake":
@@ -2062,7 +2070,7 @@ def process_voice_wav(
             _record_rejected_wake(
                 device_id=device_id,
                 heard=heard_raw,
-                reason="no Ok Nino",
+                reason="no Ok Nino/Hello",
                 audio_s=audio_in_seconds,
             )
             return _wake_gate_result(

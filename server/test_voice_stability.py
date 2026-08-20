@@ -69,6 +69,19 @@ def test_transcript_without_ok_nino_is_not_rejected() -> None:
     assert command == "what time is it"
     assert "nino" in phrase
 
+    found, command, phrase = extract_wake_and_command("hello")
+    assert found is True
+    assert command == ""
+    assert phrase.startswith("hell")
+
+    found, command, phrase = extract_wake_and_command("Hello, what time is it")
+    assert found is True
+    assert command == "what time is it"
+
+    found, command, phrase = extract_wake_and_command("please tell john hello later")
+    assert found is False
+    assert command == "please tell john hello later"
+
 
 def test_speech_without_wake_phrase_is_answered() -> None:
     os.environ["VOICE_MIN_ENERGY"] = "5"
@@ -132,6 +145,28 @@ def test_wake_with_ok_nino_is_accepted() -> None:
     with patch(
         "voice_service.transcribe_wav", return_value=("ok nino what time is it", "mock")
     ):
+        out, meta = process_voice_wav(
+            wav,
+            session_kind="wake",
+            aux_energy=99,
+            device_id="test",
+            voice_turn=1,
+        )
+
+    assert meta.timings["reply_path"] == "wake_ok"
+    assert meta.timings["wake_ok"] is True
+    assert meta.end_session is False
+    assert out == b""
+
+
+def test_wake_with_hello_is_accepted() -> None:
+    os.environ["VOICE_MIN_ENERGY"] = "5"
+    tone = (8000 * np.sin(2 * np.pi * 220 * np.arange(16000) / 16000)).astype(np.int16)
+    wav = _mono_wav(tone)
+
+    from unittest.mock import patch
+
+    with patch("voice_service.transcribe_wav", return_value=("hello", "mock")):
         out, meta = process_voice_wav(
             wav,
             session_kind="wake",
