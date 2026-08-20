@@ -289,27 +289,27 @@ def test_mentions_music_helper():
 
 
 def test_play_a_song_uses_last_track_for_that_device(fake_service):
-    handle_music_voice("play believer", device_id="nino-home-147")
-    result = handle_music_voice("play a song", device_id="nino-home-147")
+    handle_music_voice("play believer", device_id="30eda0e34fc4")
+    result = handle_music_voice("play a song", device_id="30eda0e34fc4")
     assert result.handled
     assert result.reply_path == "music_play"
     assert result.reply == "Playing Believer by Imagine Dragons."
-    assert fake_service.calls[-1] == "play:nino-home-147:Believer by Imagine Dragons"
+    assert fake_service.calls[-1] == "play:30eda0e34fc4:Believer by Imagine Dragons"
 
 
 def test_stop_is_per_device(monkeypatch):
     service = _FakeService()
     monkeypatch.setattr("music_service.get_music_service", lambda: service)
-    handle_music_voice("play believer", device_id="nino-home-147")
+    handle_music_voice("play believer", device_id="30eda0e34fc4")
     handle_music_voice("play believer", device_id="ninofarfromhome")
 
     idle = handle_music_voice("shut up", device_id="someone-else")
     assert idle.handled is False
 
-    home = handle_music_voice("shut up", device_id="nino-home-147")
+    home = handle_music_voice("shut up", device_id="30eda0e34fc4")
     assert home.handled
     assert home.reply == "Okay, stopping the music."
-    assert service.is_playing("nino-home-147") is False
+    assert service.is_playing("30eda0e34fc4") is False
     assert service.is_playing("ninofarfromhome") is True
 
 

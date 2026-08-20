@@ -33,9 +33,10 @@ class UserDeviceMacTests(unittest.TestCase):
         self.assertEqual(ud.format_device_mac("30:ed:a0:e3:4f:c4"), "30:ED:A0:E3:4F:C4")
         self.assertEqual(ud.format_device_mac("nino-home"), "")
 
-    def test_canonical_keeps_non_mac(self) -> None:
+    def test_canonical_rejects_non_mac(self) -> None:
         self.assertEqual(ud.canonical_device_id("30:ED:A0:E3:4F:C4"), "30eda0e34fc4")
-        self.assertEqual(ud.canonical_device_id("nino-home"), "nino-home")
+        self.assertEqual(ud.canonical_device_id("nino-home"), "")
+        self.assertEqual(ud.canonical_device_id("Nino-P4"), "")
 
     def test_link_and_lookup(self) -> None:
         ud.link_user_device("Hari", "30:ED:A0:E3:4F:C4")
@@ -59,6 +60,7 @@ class UserDeviceMacTests(unittest.TestCase):
         ud.link_user_device("guest-2", "aabbccddeeff")
         ud.link_user_device("unknown", "112233445566")
         ud.link_user_device("Face", "778899aabbcc")
+        ud.link_user_device("Hari", "nino-home")
         self.assertEqual(ud.devices_for_user("guest"), [])
         self.assertFalse(self.path.exists())
 

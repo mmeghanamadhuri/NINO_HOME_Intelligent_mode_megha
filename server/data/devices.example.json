@@ -1,14 +1,14 @@
 {
   "devices": [
     {
-      "device_id": "nino-01",
+      "device_id": "30eda0e34fc4",
       "display_name": "Living room",
       "camera_url": "http://192.168.1.10/stream",
       "play_wav_url": "http://192.168.1.10/play_wav",
       "base_url": "http://192.168.1.10"
     },
     {
-      "device_id": "nino-02",
+      "device_id": "aabbccddeeff",
       "display_name": "Desk",
       "camera_url": "http://192.168.1.11/stream",
       "play_wav_url": "http://192.168.1.11/play_wav",

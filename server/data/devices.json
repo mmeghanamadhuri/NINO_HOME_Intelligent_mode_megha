@@ -1,38 +1,3 @@
 {
-  "devices": [
-    {
-      "device_id": "Nino-P4",
-      "display_name": "NINO - HOME Vaseekaran",
-      "camera_url": "http://192.168.0.173/stream",
-      "play_wav_url": "http://192.168.0.173/play_wav",
-      "base_url": "http://192.168.0.173",
-      "camera_rotation": "none",
-      "latitude": null,
-      "longitude": null,
-      "location_name": "",
-      "location_updated_at": "",
-      "wifi_ssid": "NINO-Home",
-      "wifi_bssid": "98:BA:5F:95:FE:92",
-      "wifi_rssi": -51,
-      "wifi_channel": 4,
-      "wifi_updated_at": "2026-08-18T18:24:46.462012+00:00"
-    },
-    {
-      "device_id": "nino-home",
-      "display_name": "NINO - Home Gitam",
-      "camera_url": "http://192.168.0.83/stream",
-      "play_wav_url": "http://192.168.0.83/play_wav",
-      "base_url": "http://192.168.0.83",
-      "camera_rotation": "none",
-      "latitude": null,
-      "longitude": null,
-      "location_name": "",
-      "location_updated_at": "",
-      "wifi_ssid": "NINO-Home",
-      "wifi_bssid": "98:BA:5F:95:FE:92",
-      "wifi_rssi": -24,
-      "wifi_channel": 4,
-      "wifi_updated_at": "2026-08-18T17:23:39.602452+00:00"
-    }
-  ]
+  "devices": []
 }

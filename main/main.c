@@ -369,6 +369,7 @@ static void hello_home_task(void *arg) {
 }
 
 static bool is_valid_device_id(const char *id);
+static bool try_canonical_mac_id(char *dst, size_t dst_size, const char *src);
 
 /** DNS-safe mDNS hostname: prefer stable device_id (unique per robot on LAN). */
 static void mdns_hostname_for_device(char *dst, size_t dst_size) {
@@ -518,31 +519,8 @@ static bool is_valid_device_name(const char *name) {
 }
 
 static bool is_valid_device_id(const char *id) {
-  if (id == NULL || id[0] == '\0') {
-    return false;
-  }
-  size_t len = strnlen(id, DEVICE_ID_MAX + 1);
-  if (len == 0 || len > DEVICE_ID_MAX) {
-    return false;
-  }
-  for (size_t i = 0; i < len; ++i) {
-    char c = id[i];
-    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-          (c >= '0' && c <= '9') || c == '-' || c == '_')) {
-      return false;
-    }
-  }
-  return true;
-}
-
-/* Early multi-robot builds stored this placeholder on every board. It is a
- * syntactically valid ID, but cannot safely identify a robot on a shared LAN. */
-static bool is_legacy_placeholder_device_id(const char *id) {
-  return id != NULL && strcmp(id, "nino-000000") == 0;
-}
-
-static bool is_legacy_nino_device_id(const char *id) {
-  return id != NULL && strncmp(id, "nino-", 5) == 0;
+  char mac[13];
+  return try_canonical_mac_id(mac, sizeof(mac), id);
 }
 
 static void read_sta_mac_bytes(uint8_t mac[6]) {
@@ -606,22 +584,6 @@ static void make_default_device_id_from_mac(char *dst, size_t dst_size) {
            mac[3], mac[4], mac[5]);
 }
 
-static void copy_device_id(char *dst, size_t dst_size, const char *src) {
-  if (dst == NULL || dst_size == 0) {
-    return;
-  }
-  if (try_canonical_mac_id(dst, dst_size, src)) {
-    return;
-  }
-  if (src == NULL || !is_valid_device_id(src)) {
-    make_default_device_id_from_mac(dst, dst_size);
-    return;
-  }
-  size_t len = strnlen(src, dst_size - 1);
-  memcpy(dst, src, len);
-  dst[len] = '\0';
-}
-
 static esp_err_t save_device_id_to_nvs(void) {
   nvs_handle_t h;
   esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
@@ -641,8 +603,7 @@ static void load_device_id_from_nvs(void) {
   char stored[DEVICE_ID_MAX + 1] = "";
   if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
     size_t len = sizeof(stored);
-    if (nvs_get_str(h, NVS_KEY_DEVICE_ID, stored, &len) != ESP_OK ||
-        !is_valid_device_id(stored)) {
+    if (nvs_get_str(h, NVS_KEY_DEVICE_ID, stored, &len) != ESP_OK) {
       stored[0] = '\0';
     }
     nvs_close(h);
@@ -657,11 +618,9 @@ static void load_device_id_from_nvs(void) {
     (void)save_device_id_to_nvs();
     if (stored[0] == '\0') {
       ESP_LOGI(TAG, "Generated device_id from Wi-Fi MAC");
-    } else if (is_legacy_placeholder_device_id(stored) ||
-               is_legacy_nino_device_id(stored)) {
-      ESP_LOGI(TAG, "Migrated legacy device_id %s -> %s", stored, s_device_id);
     } else {
-      ESP_LOGI(TAG, "Migrated name-based device_id %s -> %s", stored, s_device_id);
+      ESP_LOGI(TAG, "Replaced stored device_id %s with Wi-Fi MAC %s", stored,
+               s_device_id);
     }
   }
   ESP_LOGI(TAG, "device_id=%s", s_device_id);
@@ -3280,42 +3239,15 @@ static int cmd_voice(int argc, char **argv) {
 
 static int cmd_device(int argc, char **argv) {
   if (argc >= 2 && strcmp(argv[1], "id") == 0) {
-    if (argc < 3) {
-      printf("device_id: %s\n", s_device_id);
-      return 0;
-    }
-    if (!is_valid_device_id(argv[2])) {
-      printf("Invalid device_id (use 1-%d chars: A-Z a-z 0-9 - _)\n", DEVICE_ID_MAX);
+    if (argc >= 3) {
+      printf("device_id is the Wi-Fi STA MAC and cannot be changed (%s)\n",
+             s_device_id);
       return 1;
     }
-    copy_device_id(s_device_id, sizeof(s_device_id), argv[2]);
-    esp_err_t err = save_device_id_to_nvs();
-    if (err != ESP_OK) {
-      printf("NVS save failed: %s\n", esp_err_to_name(err));
-      return 1;
-    }
-    ensure_voice_ws_url_has_device_id();
-    if (s_voice_ws_url[0] != '\0') {
-      nvs_handle_t h;
-      if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-        (void)nvs_set_str(h, NVS_KEY_VOICE_WS, s_voice_ws_url);
-        (void)nvs_commit(h);
-        nvs_close(h);
-      }
-      nino_voice_assist_set_ws_uri(s_voice_ws_url);
-    }
-    /* Hostname / TXT include device_id — refresh advertisement if online. */
-    if (s_mdns_started) {
-      mdns_stop_service();
-      mdns_start_service();
-    }
-    printf("device_id set to %s\n", s_device_id);
-    if (s_voice_ws_url[0] != '\0') {
-      printf("voice url updated: %s\n", s_voice_ws_url);
-    }
+    printf("device_id: %s\n", s_device_id);
     return 0;
   }
-  printf("Usage: device id [<id>]\n");
+  printf("Usage: device id\n");
   return 0;
 }
 
@@ -3368,7 +3300,7 @@ static void voice_cli_register(void) {
 static void device_cli_register(void) {
   const esp_console_cmd_t cmd = {
       .command = "device",
-      .help = "device id [<id>]  — print or set stable multi-robot device_id",
+      .help = "device id  — print this robot's Wi-Fi MAC device_id",
       .hint = NULL,
       .func = &cmd_device,
       .argtable = NULL,

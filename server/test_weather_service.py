@@ -17,10 +17,14 @@ from weather_service import (
 )
 
 
+MAC_A = "30eda0e34fc4"
+MAC_B = "aabbccddeeff"
+
+
 class WeatherServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.device = DeviceRecord(
-            device_id="nino-test",
+            device_id=MAC_A,
             display_name="Test NiNO",
             latitude=51.5072,
             longitude=-0.1276,
@@ -67,48 +71,44 @@ class WeatherServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "devices.json"
             path.write_text(
-                json.dumps({"devices": [{"device_id": "nino-test"}]}),
+                json.dumps({"devices": [{"device_id": MAC_A}]}),
                 encoding="utf-8",
             )
             registry = DeviceRegistry(path)
 
             for _ in range(3):
-                self.assertEqual(registry.resolve_or_default("default").device_id, "nino-test")
-                self.assertEqual(registry.resolve_or_default("").device_id, "nino-test")
+                self.assertEqual(registry.resolve_or_default("default").device_id, MAC_A)
+                self.assertEqual(registry.resolve_or_default("").device_id, MAC_A)
 
         warning.assert_not_called()
 
-    def test_unknown_device_warning_is_logged_once(self) -> None:
+    def test_unknown_name_is_not_remapped_to_another_robot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "devices.json"
             path.write_text(
-                json.dumps({"devices": [{"device_id": "nino-test"}]}),
+                json.dumps({"devices": [{"device_id": MAC_A}]}),
                 encoding="utf-8",
             )
             registry = DeviceRegistry(path)
             with patch("device_registry.logger.warning") as warning:
                 for _ in range(3):
-                    self.assertEqual(
-                        registry.resolve_or_default("ghost-bot").device_id, "nino-test"
-                    )
-                warning.assert_called_once_with(
-                    "Unknown device_id=%r — falling back to %s",
-                    "ghost-bot",
-                    "nino-test",
-                )
+                    self.assertEqual(registry.resolve_or_default("ghost-bot").device_id, "")
+                    self.assertEqual(registry.resolve_or_default("nino-home").device_id, "")
+                warning.assert_called()
+            self.assertEqual(registry.resolve_or_default(MAC_A).device_id, MAC_A)
 
-    def test_device_lookup_is_case_insensitive(self) -> None:
+    def test_device_lookup_normalizes_mac_case_and_colons(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "devices.json"
             path.write_text(
-                json.dumps({"devices": [{"device_id": "Nino-P4"}]}),
+                json.dumps({"devices": [{"device_id": "AA:BB:CC:DD:EE:FF"}]}),
                 encoding="utf-8",
             )
             registry = DeviceRegistry(path)
-            self.assertEqual(registry.get("nino-p4").device_id, "Nino-P4")
-            self.assertEqual(registry.resolve_or_default("NINO-P4").device_id, "Nino-P4")
+            self.assertEqual(registry.get("aabbccddeeff").device_id, MAC_B)
+            self.assertEqual(registry.resolve_or_default("AA:BB:CC:DD:EE:FF").device_id, MAC_B)
 
-    def test_empty_startup_discovery_keeps_persisted_devices(self) -> None:
+    def test_name_based_registry_rows_are_dropped(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "devices.json"
             path.write_text(
@@ -117,6 +117,42 @@ class WeatherServiceTests(unittest.TestCase):
                         "devices": [
                             {"device_id": "nino-home", "base_url": "http://192.168.0.83"},
                             {"device_id": "Nino-P4", "base_url": "http://192.168.0.173"},
+                            {
+                                "device_id": MAC_A,
+                                "base_url": "http://192.168.0.90",
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registry = DeviceRegistry(path)
+            ids = {record.device_id for record in registry.list_devices()}
+            saved = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(ids, {MAC_A})
+        self.assertEqual([item["device_id"] for item in saved["devices"]], [MAC_A])
+
+    def test_ensure_registered_requires_a_mac(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "devices.json"
+            path.write_text(json.dumps({"devices": []}), encoding="utf-8")
+            registry = DeviceRegistry(path)
+            with self.assertRaises(ValueError):
+                registry.ensure_registered("nino-home")
+            record = registry.ensure_registered("30:ED:A0:E3:4F:C4")
+            self.assertEqual(record.device_id, MAC_A)
+            self.assertEqual(registry.get("30eda0e34fc4").device_id, MAC_A)
+
+    def test_empty_startup_discovery_keeps_persisted_mac_devices(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "devices.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "devices": [
+                            {"device_id": MAC_A, "base_url": "http://192.168.0.83"},
+                            {"device_id": MAC_B, "base_url": "http://192.168.0.173"},
                         ]
                     }
                 ),
@@ -127,18 +163,18 @@ class WeatherServiceTests(unittest.TestCase):
             ids = {record.device_id for record in registry.list_devices()}
 
         self.assertEqual(changed, [])
-        self.assertEqual(ids, {"nino-home", "Nino-P4"})
+        self.assertEqual(ids, {MAC_A, MAC_B})
 
     def test_location_is_persisted_in_device_registry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "devices.json"
             path.write_text(
-                json.dumps({"devices": [{"device_id": "nino-test"}]}),
+                json.dumps({"devices": [{"device_id": MAC_A}]}),
                 encoding="utf-8",
             )
             registry = DeviceRegistry(path)
             updated = registry.set_location(
-                "nino-test",
+                MAC_A,
                 latitude=51.5072,
                 longitude=-0.1276,
                 location_name="London, UK",
@@ -157,12 +193,12 @@ class WeatherServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "devices.json"
             path.write_text(
-                json.dumps({"devices": [{"device_id": "nino-test"}]}),
+                json.dumps({"devices": [{"device_id": MAC_A}]}),
                 encoding="utf-8",
             )
             registry = DeviceRegistry(path)
             updated = registry.set_wifi_network(
-                "nino-test",
+                MAC_A,
                 ssid="NiNO Home",
                 bssid="aa:bb:cc:dd:ee:ff",
                 rssi=-54,
@@ -185,14 +221,14 @@ class WeatherServiceTests(unittest.TestCase):
                     {
                         "devices": [
                             {
-                                "device_id": "online",
+                                "device_id": MAC_A,
                                 "base_url": "http://192.168.1.10",
                                 "camera_rotation": "cw90",
                                 "latitude": 51.5072,
                                 "longitude": -0.1276,
                             },
                             {
-                                "device_id": "offline",
+                                "device_id": MAC_B,
                                 "base_url": "http://192.168.1.11",
                             },
                         ]
@@ -204,18 +240,18 @@ class WeatherServiceTests(unittest.TestCase):
             registry.replace_with_discovered(
                 [
                     DeviceRecord(
-                        device_id="online",
+                        device_id=MAC_A,
                         base_url="http://192.168.1.20",
                     )
                 ]
             )
             saved = json.loads(path.read_text(encoding="utf-8"))
 
-        self.assertEqual([record.device_id for record in registry.list_devices()], ["online"])
-        self.assertEqual(registry.get("online").base_url, "http://192.168.1.20")
-        self.assertEqual(registry.get("online").camera_rotation, "cw90")
-        self.assertEqual(registry.get("online").latitude, 51.5072)
-        self.assertEqual([item["device_id"] for item in saved["devices"]], ["online"])
+        self.assertEqual([record.device_id for record in registry.list_devices()], [MAC_A])
+        self.assertEqual(registry.get(MAC_A).base_url, "http://192.168.1.20")
+        self.assertEqual(registry.get(MAC_A).camera_rotation, "cw90")
+        self.assertEqual(registry.get(MAC_A).latitude, 51.5072)
+        self.assertEqual([item["device_id"] for item in saved["devices"]], [MAC_A])
 
 
 class WeatherVoiceRoutingTests(unittest.TestCase):

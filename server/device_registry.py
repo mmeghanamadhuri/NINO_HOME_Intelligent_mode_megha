@@ -12,16 +12,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from user_devices import canonical_device_id, format_device_mac, normalize_device_mac
+from user_devices import format_device_mac, normalize_device_mac
 
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DEVICES_PATH = BASE_DIR / "data" / "devices.json"
 LEGACY_DEVICE_ID = "default"
-# Reserved by early multi-robot firmware builds on every board. New firmware
-# migrates it to a sanitized device-name value, so it must not remain stale.
-LEGACY_PLACEHOLDER_DEVICE_ID = "nino-000000"
 
 
 @dataclass(frozen=True)
@@ -84,7 +81,9 @@ class DeviceRegistry:
         self.reload()
 
     def reload(self) -> None:
-        loaded = self._load_from_file()
+        file_records, dirty = self._load_from_file()
+        persisted_ids = {d.device_id for d in file_records}
+        loaded = file_records
         if not loaded:
             loaded = self._legacy_from_environ()
             if loaded:
@@ -94,10 +93,14 @@ class DeviceRegistry:
                     LEGACY_DEVICE_ID,
                 )
         with self._lock:
+            if dirty:
+                logger.info(
+                    "Dropping non-MAC device registry entries; keeping %s",
+                    list(persisted_ids) or ["(none)"],
+                )
+                self._write_devices_locked(file_records)
             self._devices = {d.device_id: d for d in loaded}
-            self._persisted_device_ids = {
-                d.device_id for d in self._load_from_file()
-            }
+            self._persisted_device_ids = persisted_ids
             if self._ui_device_id not in self._devices and self._devices:
                 self._ui_device_id = next(iter(self._devices))
             elif not self._devices:
@@ -126,13 +129,6 @@ class DeviceRegistry:
             # must not become a permanent device merely because discovery ran.
             if LEGACY_DEVICE_ID not in self._persisted_device_ids:
                 removed = merged.pop(LEGACY_DEVICE_ID, None) is not None
-            if any(device_id != LEGACY_PLACEHOLDER_DEVICE_ID for device_id in cleaned):
-                # Remove the stale route left by the placeholder ID once a
-                # migrated robot has been discovered.
-                removed = (
-                    merged.pop(LEGACY_PLACEHOLDER_DEVICE_ID, None) is not None
-                    or removed
-                )
 
             changed: list[DeviceRecord] = []
             for device_id, discovered in cleaned.items():
@@ -197,13 +193,29 @@ class DeviceRegistry:
 
     @staticmethod
     def _clean_discovered(devices: list[DeviceRecord]) -> dict[str, DeviceRecord]:
-        return {
-            device.device_id.strip(): device
-            for device in devices
-            if device.device_id
-            and device.device_id.strip()
-            and device.effective_base_url()
-        }
+        cleaned: dict[str, DeviceRecord] = {}
+        for device in devices:
+            mac = normalize_device_mac(device.device_id)
+            if not mac or not device.effective_base_url():
+                continue
+            cleaned[mac] = DeviceRecord(
+                device_id=mac,
+                display_name=device.display_name.strip() or format_device_mac(mac),
+                camera_url=device.camera_url,
+                play_wav_url=device.play_wav_url,
+                base_url=device.base_url,
+                camera_rotation=device.camera_rotation,
+                latitude=device.latitude,
+                longitude=device.longitude,
+                location_name=device.location_name,
+                location_updated_at=device.location_updated_at,
+                wifi_ssid=device.wifi_ssid,
+                wifi_bssid=device.wifi_bssid,
+                wifi_rssi=device.wifi_rssi,
+                wifi_channel=device.wifi_channel,
+                wifi_updated_at=device.wifi_updated_at,
+            )
+        return cleaned
 
     @staticmethod
     def _merge_discovered_record(
@@ -233,27 +245,13 @@ class DeviceRegistry:
 
     def set_camera_rotation(self, device_id: str, rotation: str) -> DeviceRecord:
         """Persist a validated per-device camera orientation."""
-        key = (device_id or "").strip() or LEGACY_DEVICE_ID
+        key = (device_id or "").strip()
+        if key.casefold() in {"", "default", "ui"}:
+            key = self.ui_device_id()
         with self._lock:
             existing = self._find_locked(key)
             if existing is None:
-                # UI often sends stale "default" after discovery, or the registry
-                # is only holding a CLI/env camera that was never persisted.
-                if self._devices:
-                    fallback_id = (
-                        self._ui_device_id
-                        if self._ui_device_id in self._devices
-                        else next(iter(self._devices))
-                    )
-                    existing = self._devices[fallback_id]
-                    key = fallback_id
-                else:
-                    legacy = self._legacy_from_environ()
-                    if not legacy:
-                        raise KeyError(key)
-                    existing = legacy[0]
-                    key = existing.device_id
-                    self._devices = {key: existing}
+                raise KeyError(key)
             record = DeviceRecord(
                 device_id=existing.device_id,
                 display_name=existing.display_name,
@@ -411,24 +409,31 @@ class DeviceRegistry:
         temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         temporary.replace(self._path)
 
-    def _load_from_file(self) -> list[DeviceRecord]:
+    def _load_from_file(self) -> tuple[list[DeviceRecord], bool]:
         if not self._path.is_file():
-            return []
+            return [], False
         try:
             raw = json.loads(self._path.read_text(encoding="utf-8"))
         except Exception as exc:
             logger.warning("Could not read %s: %s", self._path, exc)
-            return []
+            return [], False
         items = raw.get("devices", raw) if isinstance(raw, dict) else raw
         if not isinstance(items, list):
-            return []
+            return [], False
         out: list[DeviceRecord] = []
+        dirty = False
         for item in items:
             if not isinstance(item, dict):
+                dirty = True
                 continue
-            device_id = str(item.get("device_id") or "").strip()
+            raw_id = str(item.get("device_id") or item.get("mac") or "").strip()
+            device_id = normalize_device_mac(raw_id)
             if not device_id:
+                logger.warning("Dropping non-MAC device registry entry id=%r", raw_id)
+                dirty = True
                 continue
+            if device_id != raw_id:
+                dirty = True
             out.append(
                 DeviceRecord(
                     device_id=device_id,
@@ -453,7 +458,7 @@ class DeviceRegistry:
                     wifi_updated_at=str(item.get("wifi_updated_at") or "").strip(),
                 )
             )
-        return out
+        return out, dirty
 
     @staticmethod
     def _legacy_from_environ() -> list[DeviceRecord]:
@@ -523,13 +528,13 @@ class DeviceRegistry:
         for stored_id, record in self._devices.items():
             if stored_id.casefold() == folded:
                 return record
-        mac = canonical_device_id(key)
+        mac = normalize_device_mac(key)
         if mac and mac != key:
             found = self._devices.get(mac)
             if found is not None:
                 return found
             for stored_id, record in self._devices.items():
-                if canonical_device_id(stored_id) == mac:
+                if normalize_device_mac(stored_id) == mac:
                     return record
         return None
 
@@ -549,26 +554,35 @@ class DeviceRegistry:
             return LEGACY_DEVICE_ID
 
     def resolve_or_default(self, device_id: str | None) -> DeviceRecord:
-        """Return the named device, or the UI/default device. Never raises."""
+        """Return the MAC device, or the UI device for empty/default/ui.
+
+        Never remaps a name or unknown id onto another robot.
+        """
         with self._lock:
             key = (device_id or "").strip()
             alias = key.casefold() in {"", "default", "ui"}
-            if not alias:
-                found = self._find_locked(key)
-                if found is not None:
-                    return found
+            if alias:
+                fallback_id = self.default_device_id()
+                fallback = self._find_locked(fallback_id)
+                if fallback is not None:
+                    return fallback
+            else:
+                mac = normalize_device_mac(key)
+                if mac:
+                    found = self._find_locked(mac)
+                    if found is not None:
+                        return found
+                    if mac not in self._warned_unknown_device_ids:
+                        logger.warning("Unknown device mac=%s — not remapped", mac)
+                        self._warned_unknown_device_ids.add(mac)
+                    return DeviceRecord(device_id=mac)
                 if key not in self._warned_unknown_device_ids:
                     logger.warning(
-                        "Unknown device_id=%r — falling back to %s",
+                        "Rejected non-MAC device_id=%r — not remapped",
                         key,
-                        self.default_device_id(),
                     )
                     self._warned_unknown_device_ids.add(key)
-            fallback_id = self.default_device_id()
-            fallback = self._find_locked(fallback_id)
-            if fallback is not None:
-                return fallback
-        # Empty registry — synthesize legacy on the fly.
+                return DeviceRecord(device_id="")
         legacy = self._legacy_from_environ()
         return legacy[0]
 
@@ -579,10 +593,10 @@ class DeviceRegistry:
         display_name: str = "",
         base_url: str = "",
     ) -> DeviceRecord:
-        """Create or return this device. Never remap a MAC onto another robot."""
-        key = canonical_device_id(device_id)
+        """Create or return this MAC. Names are rejected; never remapped."""
+        key = normalize_device_mac(device_id)
         if not key:
-            key = LEGACY_DEVICE_ID
+            raise ValueError(f"device_id must be a MAC, got {device_id!r}")
         with self._lock:
             found = self._find_locked(key)
             if found is not None:
@@ -608,10 +622,11 @@ class DeviceRegistry:
             return record
 
     def set_ui_device_id(self, device_id: str) -> str:
-        key = (device_id or "").strip()
+        key = normalize_device_mac(device_id) or (device_id or "").strip()
         with self._lock:
-            if key and key in self._devices:
-                self._ui_device_id = key
+            found = self._find_locked(key) if key else None
+            if found is not None:
+                self._ui_device_id = found.device_id
             return self._ui_device_id
 
     def ui_device_id(self) -> str:
@@ -657,20 +672,16 @@ def get_device_registry() -> DeviceRegistry:
 
 
 def resolve_device_id(raw: str | None) -> str:
-    """Normalize a client device_id / MAC. New MACs are registered, not remapped."""
+    """Normalize a client MAC. Names are rejected; new MACs are registered."""
     reg = get_device_registry()
     cleaned = (raw or "").strip()
-    if not cleaned:
-        return reg.default_device_id()
-    if cleaned.casefold() in {"default", "ui"}:
+    if not cleaned or cleaned.casefold() in {"default", "ui"}:
         return reg.default_device_id()
     mac = normalize_device_mac(cleaned)
-    if mac:
-        return reg.ensure_registered(mac).device_id
-    found = reg.get(cleaned)
-    if found is not None:
-        return found.device_id
-    return reg.ensure_registered(cleaned).device_id
+    if not mac:
+        logger.warning("Rejected non-MAC device_id=%r", cleaned)
+        return ""
+    return reg.ensure_registered(mac).device_id
 
 
 def _parse_coordinate(value: object, minimum: float, maximum: float) -> float | None:

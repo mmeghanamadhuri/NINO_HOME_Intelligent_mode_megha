@@ -69,7 +69,7 @@ class SessionIdentityFlowTests(unittest.TestCase):
     def test_recognized_greet(self) -> None:
         result = self.flow.start_session(
             session_id="s1",
-            device_id="nino-home",
+            device_id="30eda0e34fc4",
             identity_name="Hari",
             identity_state="recognized",
         )
@@ -86,7 +86,7 @@ class SessionIdentityFlowTests(unittest.TestCase):
     def test_identified_greet_echo_is_skipped(self) -> None:
         self.flow.start_session(
             session_id="s1",
-            device_id="nino-home",
+            device_id="30eda0e34fc4",
             identity_name="Hari",
             identity_state="recognized",
         )
@@ -100,7 +100,7 @@ class SessionIdentityFlowTests(unittest.TestCase):
     def test_unknown_offer_then_no_guest(self) -> None:
         open_result = self.flow.start_session(
             session_id="s1",
-            device_id="nino-home",
+            device_id="30eda0e34fc4",
             identity_name=None,
             identity_state="unknown",
         )
@@ -120,7 +120,7 @@ class SessionIdentityFlowTests(unittest.TestCase):
     def test_yes_name_spell_confirm(self) -> None:
         self.flow.start_session(
             session_id="s1",
-            device_id="nino-home",
+            device_id="30eda0e34fc4",
             identity_name=None,
             identity_state="no_face",
         )
@@ -138,7 +138,7 @@ class SessionIdentityFlowTests(unittest.TestCase):
     def test_confirm_no_retries_name(self) -> None:
         self.flow.start_session(
             session_id="s1",
-            device_id="nino-home",
+            device_id="30eda0e34fc4",
             identity_name=None,
             identity_state="unknown",
         )
@@ -152,7 +152,7 @@ class SessionIdentityFlowTests(unittest.TestCase):
     def test_register_silence_timeout_becomes_guest(self) -> None:
         self.flow.start_session(
             session_id="s1",
-            device_id="nino-home",
+            device_id="30eda0e34fc4",
             identity_name=None,
             identity_state="unknown",
         )
@@ -169,7 +169,7 @@ class SessionIdentityFlowTests(unittest.TestCase):
     def test_timeout_during_name_step_becomes_guest(self) -> None:
         self.flow.start_session(
             session_id="s1",
-            device_id="nino-home",
+            device_id="30eda0e34fc4",
             identity_name=None,
             identity_state="no_face",
         )
@@ -182,7 +182,7 @@ class SessionIdentityFlowTests(unittest.TestCase):
     def test_timeout_after_guest_is_noop(self) -> None:
         self.flow.start_session(
             session_id="s1",
-            device_id="nino-home",
+            device_id="30eda0e34fc4",
             identity_name=None,
             identity_state="unknown",
         )
@@ -194,7 +194,7 @@ class SessionIdentityFlowTests(unittest.TestCase):
     def test_goodbye_during_offer_not_guest(self) -> None:
         self.flow.start_session(
             session_id="s1",
-            device_id="nino-home",
+            device_id="30eda0e34fc4",
             identity_name=None,
             identity_state="unknown",
         )

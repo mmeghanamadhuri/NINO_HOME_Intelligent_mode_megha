@@ -35,11 +35,8 @@ def format_device_mac(raw: str | None) -> str:
 
 
 def canonical_device_id(raw: str | None) -> str:
-    """MAC hex when the client sent a MAC; otherwise the trimmed id as-is."""
-    mac = normalize_device_mac(raw)
-    if mac:
-        return mac
-    return str(raw or "").strip()
+    """Return 12 lowercase hex, or '' if raw is not a MAC."""
+    return normalize_device_mac(raw)
 
 
 def _path() -> Path:

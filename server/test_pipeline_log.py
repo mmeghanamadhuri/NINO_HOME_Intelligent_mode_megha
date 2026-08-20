@@ -20,12 +20,12 @@ from pipeline_log import (
 
 class PipelineLogTests(unittest.TestCase):
     def test_stage_and_total_are_on_the_same_line(self) -> None:
-        begin_pipeline(device_id="nino-home", turn=3, session="wake", t0=time.perf_counter())
+        begin_pipeline(device_id="30eda0e34fc4", turn=3, session="wake", t0=time.perf_counter())
         with self.assertLogs("nino.pipeline", level="INFO") as captured:
             pipeline_log("ASR", "DONE", text="what time is it", stage_s=0.412)
 
         line = captured.records[-1].getMessage()
-        self.assertIn("device=nino-home", line)
+        self.assertIn("device=30eda0e34fc4", line)
         self.assertIn("turn=3", line)
         self.assertIn("ASR DONE", line)
         self.assertIn("stage=0.412s", line)
@@ -74,7 +74,7 @@ class PipelineLogTests(unittest.TestCase):
 
     def test_plain_columns_stay_grepable(self) -> None:
         line = format_pipeline_line(
-            device="nino-home",
+            device="30eda0e34fc4",
             turn=3,
             kind="ASR",
             event="DONE",
@@ -84,7 +84,7 @@ class PipelineLogTests(unittest.TestCase):
             use_colors=False,
         )
         self.assertTrue(line.startswith("NINO | "))
-        self.assertIn("nino-home", line)
+        self.assertIn("30eda0e34fc4", line)
         self.assertIn("t3", line)
         self.assertIn("ASR", line)
         self.assertIn("DONE", line)
@@ -94,7 +94,7 @@ class PipelineLogTests(unittest.TestCase):
 
     def test_colors_mark_kind_event_and_http_status(self) -> None:
         line = format_pipeline_line(
-            device="nino-home",
+            device="30eda0e34fc4",
             turn=1,
             kind="ASR",
             event="DONE",
@@ -117,19 +117,19 @@ class PipelineLogTests(unittest.TestCase):
             logging.INFO,
             "",
             0,
-            "NINO | device=nino-home turn=3 | ASR DONE | text='hi' | stage=0.100s total=0.200s",
+            "NINO | device=30eda0e34fc4 turn=3 | ASR DONE | text='hi' | stage=0.100s total=0.200s",
             (),
             None,
         )
         record.nino_kind = "ASR"
         record.nino_event = "DONE"
-        record.nino_device = "nino-home"
+        record.nino_device = "30eda0e34fc4"
         record.nino_turn = 3
         record.nino_detail = "text='hi'"
         record.nino_stage = "0.100s"
         record.nino_total = "0.200s"
         formatted = PipelineFormatter(use_colors=False).format(record)
-        self.assertIn("nino-home", formatted)
+        self.assertIn("30eda0e34fc4", formatted)
         self.assertIn("ASR", formatted)
         self.assertIn("DONE", formatted)
         self.assertNotIn("\033[", formatted)

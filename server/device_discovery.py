@@ -327,12 +327,16 @@ class DeviceDiscovery:
                 continue
             if not isinstance(payload, dict):
                 continue
-            mac_id = normalize_device_mac(payload.get("mac"))
-            device_id = mac_id or normalize_device_mac(payload.get("device_id"))
-            if not device_id:
-                device_id = str(payload.get("device_id") or "").strip()
-            if not device_id:
-                logger.debug("NiNO status at %s did not include mac/device_id", base_url)
+            mac_id = normalize_device_mac(payload.get("mac")) or normalize_device_mac(
+                payload.get("device_id")
+            )
+            if not mac_id:
+                logger.debug(
+                    "NiNO status at %s had no MAC (id=%r mac=%r); skipped",
+                    base_url,
+                    payload.get("device_id"),
+                    payload.get("mac"),
+                )
                 continue
             # Firmware reports the currently assigned address too. Prefer it
             # for persisted URLs when valid; the request itself always goes to
@@ -344,32 +348,32 @@ class DeviceDiscovery:
                 else f"http://{reported_ip}:{port}"
             )
             display_name = str(
-                payload.get("device_name") or payload.get("name") or device_id
+                payload.get("device_name") or payload.get("name") or mac_id
             ).strip()
             record = DeviceRecord(
-                device_id=device_id,
+                device_id=mac_id,
                 display_name=display_name,
                 base_url=record_base_url,
                 camera_url=f"{record_base_url}/stream",
                 play_wav_url=f"{record_base_url}/play_wav",
             )
-            existing = records.get(device_id)
+            existing = records.get(mac_id)
             if existing and existing.effective_base_url() != record.effective_base_url():
                 duplicate_ids.setdefault(
-                    device_id,
+                    mac_id,
                     {existing.effective_base_url()},
                 ).add(record.effective_base_url())
                 continue
-            records[device_id] = record
+            records[mac_id] = record
 
         for device_id, endpoints in duplicate_ids.items():
-            # A device_id is the routing key for voice, camera, playback and
-            # alarms. Keep neither discovery result rather than letting the
-            # selected robot flip nondeterministically between two endpoints.
+            # A MAC is the routing key for voice, camera, playback and alarms.
+            # Keep neither discovery result rather than letting the selected
+            # robot flip nondeterministically between two endpoints.
             records.pop(device_id, None)
             logger.error(
-                "Duplicate NiNO device_id=%r reported by %s; assign each robot "
-                "a unique device_id before it can be routed safely",
+                "Duplicate NiNO MAC device_id=%r reported by %s; each robot "
+                "must have a unique Wi-Fi MAC before it can be routed safely",
                 device_id,
                 ", ".join(sorted(endpoints)),
             )

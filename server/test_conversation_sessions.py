@@ -23,16 +23,16 @@ class ConversationSessionStoreTests(unittest.TestCase):
 
     def test_begin_append_end(self) -> None:
         sid = "abc123session"
-        cs.begin_session(sid, device_id="nino-home", user_name="Hari")
+        cs.begin_session(sid, device_id="30eda0e34fc4", user_name="Hari")
         cs.append_session_turn(
             sid,
-            device_id="nino-home",
+            device_id="30eda0e34fc4",
             user_name="Hari",
             user_text="what time is it",
             assistant_text="It is three.",
             reply_path="local_time",
         )
-        ended = cs.end_session(sid, device_id="nino-home", user_name="Hari")
+        ended = cs.end_session(sid, device_id="30eda0e34fc4", user_name="Hari")
         self.assertIsNotNone(ended)
         assert ended is not None
         self.assertEqual(len(ended["turns"]), 1)
@@ -44,8 +44,8 @@ class ConversationSessionStoreTests(unittest.TestCase):
 
     def test_bind_moves_to_user_folder(self) -> None:
         sid = "bindsession01"
-        cs.begin_session(sid, device_id="nino-home")
-        bound = cs.bind_session_user(sid, device_id="nino-home", user_name="Hari")
+        cs.begin_session(sid, device_id="30eda0e34fc4")
+        bound = cs.bind_session_user(sid, device_id="30eda0e34fc4", user_name="Hari")
         self.assertIsNotNone(bound)
         assert bound is not None
         self.assertEqual(bound["user_name"], "Hari")

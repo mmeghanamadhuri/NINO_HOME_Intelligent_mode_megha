@@ -47,6 +47,7 @@ from device_discovery import (
     stop_discovery_loop,
 )
 from device_registry import get_device_registry, resolve_device_id
+from user_devices import normalize_device_mac
 from eye_expression import normalize_eye_expression
 from face_registration_service import capture_face_samples, configure_face_registration
 from session_identity import configure_session_identity, get_session_identity
@@ -1481,22 +1482,22 @@ def _voice_wants_stream(websocket: WebSocket) -> bool:
 
 
 def _device_id_from_websocket(websocket: WebSocket) -> str:
-    """Resolve device_id from query param or X-Nino-Device-Id header.
+    """Resolve the robot MAC from query param or X-Nino-Device-Id.
 
-    MACs are registered as 12 lowercase hex. Unknown ids are never remapped
-    onto another robot.
+    Voice traffic never remaps a missing or name-based id onto another robot.
     """
     raw = (websocket.query_params.get("device_id") or "").strip()
     if not raw:
         raw = (websocket.headers.get("x-nino-device-id") or "").strip()
-    if not raw:
+    mac = normalize_device_mac(raw)
+    if not mac:
         logger.warning(
-            "Voice WS missing device_id from %s — using default %s",
+            "Voice WS missing or non-MAC device_id from %s raw=%r",
             _ws_client_label(websocket),
-            registry.default_device_id(),
+            raw,
         )
-        return registry.default_device_id()
-    return resolve_device_id(raw)
+        return ""
+    return resolve_device_id(mac)
 
 
 async def _process_voice_query_audio(

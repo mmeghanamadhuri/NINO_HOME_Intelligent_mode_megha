@@ -119,7 +119,7 @@ class ContinueListenGateTests(unittest.TestCase):
             "conversation_sessions.end_session",
         ) as persist:
             wav, meta = synthesize_idle_goodbye_wav(
-                session_id="sid-idle", device_id="nino-home"
+                session_id="sid-idle", device_id="30eda0e34fc4"
             )
         self.assertEqual(wav, dummy)
         self.assertIsInstance(meta, VoiceReplyMeta)
