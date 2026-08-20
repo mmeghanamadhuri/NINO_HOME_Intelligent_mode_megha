@@ -10,6 +10,7 @@
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "sdkconfig.h"
 #include "usb/usb_helpers.h"
 #include "usb/usb_host.h"
 
@@ -87,6 +88,9 @@
 #define DXL_ATTACH_RETRY_MS                   750
 #define DXL_HUB_SETTLE_ATTEMPTS               80
 #define DXL_PING_FAIL_RECONNECT               8
+#define DXL_BOOT_HEALTH_SPEED                 180
+#define DXL_BOOT_MOVE_TIMEOUT_MS              3000
+#define DXL_BOOT_BUS_SETTLE_MS                200
 #define DXL_USB_ADDR_LIST_MAX                 16
 #define DXL_POSITION_TOLERANCE                15
 #define DXL_MOVE_SEGMENT_TIMEOUT_MS           60000
@@ -120,6 +124,7 @@ typedef enum {
     DEVICE_ACTION_NONE = 0,
     DEVICE_ACTION_OPEN = 1 << 0,
     DEVICE_ACTION_CLOSE = 1 << 1,
+    DEVICE_ACTION_SCAN = 1 << 2,
 } device_action_t;
 
 typedef struct {
@@ -176,6 +181,8 @@ static const uint8_t s_servo_ids[] = {
     DXL_SECONDARY_ID,
 };
 static ftdi_device_t s_ftdi = {0};
+static uint32_t s_usb_bus_sig = 0;
+static TickType_t s_usb_bus_log_tick = 0;
 static bool s_torque_enabled = false; /* joint-mode initialized / bus usable */
 static bool s_servo_torque_on[DXL_SERVO_COUNT] = {false, false};
 static volatile bool s_torque_update_pending[DXL_SERVO_COUNT] = {false, false};
@@ -189,6 +196,10 @@ static volatile int s_requested_position_speed = DXL_DEFAULT_POSITION_SPEED;
 static int s_active_position_speed = DXL_DEFAULT_POSITION_SPEED;
 static volatile bool s_position_speed_pending = false;
 static int s_ping_fail_streak = 0;
+static bool s_usb_bus_settle = false;
+static bool s_servo_online[DXL_SERVO_COUNT] = {false, false};
+static bool s_servo_move_ok[DXL_SERVO_COUNT] = {false, false};
+static volatile bool s_boot_nod_started = false;
 static bool s_servo_started = false;
 static SemaphoreHandle_t s_goal_mutex;
 static dxl_sync_request_t s_sync = {0};
@@ -237,7 +248,7 @@ static bool dynamixel_wait_servo_at(uint8_t id, int target, TickType_t timeout_m
 static bool track_hon_wait_target_or_stop(uint8_t id, int target, TickType_t timeout_ms);
 static void spin360_task(void *arg);
 static void track_hon_task(void *arg);
-static bool usb_is_obvious_non_u2d2(uint16_t vid, uint16_t pid);
+static bool usb_is_obvious_non_u2d2(uint16_t vid, uint16_t pid, uint8_t dev_class);
 static bool usb_is_u2d2_candidate(uint16_t vid, uint16_t pid);
 
 static uint8_t dynamixel_v1_checksum(const uint8_t *data, size_t len)
@@ -251,11 +262,16 @@ static uint8_t dynamixel_v1_checksum(const uint8_t *data, size_t len)
     return (uint8_t)(~sum & 0xFF);
 }
 
-static bool usb_is_obvious_non_u2d2(uint16_t vid, uint16_t pid)
+static bool usb_is_obvious_non_u2d2(uint16_t vid, uint16_t pid, uint8_t dev_class)
 {
     (void)pid;
+    /* Never claim the J18 hub itself — that hides camera + U2D2 downstream. */
+    if (dev_class == USB_CLASS_HUB) {
+        return true;
+    }
     /* USB hub bridge chips and UVC camera — not the Dynamixel serial adapter. */
-    if (vid == 0x046d || vid == 0x03eb || vid == 0x1a40 || vid == 0x05e3) {
+    if (vid == 0x046d || vid == 0x03eb || vid == 0x1a40 || vid == 0x05e3 ||
+        vid == 0x2109 || vid == 0x0424 || vid == 0x0bda) {
         return true;
     }
     return false;
@@ -302,6 +318,29 @@ static void dynamixel_queue_goal_all(int goal)
 bool nino_servo_dxl_is_ready(void)
 {
     return s_torque_enabled && s_ftdi.device_ready && !s_ftdi.device_gone;
+}
+
+bool nino_servo_dxl_id_is_online(uint8_t id)
+{
+    const int idx = servo_index_for_id(id);
+    if (idx < 0) {
+        return false;
+    }
+    return s_servo_online[idx];
+}
+
+bool nino_servo_dxl_id_moved_ok(uint8_t id)
+{
+    const int idx = servo_index_for_id(id);
+    if (idx < 0) {
+        return false;
+    }
+    return s_servo_move_ok[idx];
+}
+
+static const char *servo_axis_name(uint8_t id)
+{
+    return (id == DXL_PRIMARY_ID) ? "tilt" : "pan";
 }
 
 bool nino_servo_dxl_bus_open(void)
@@ -1049,9 +1088,9 @@ static esp_err_t ftdi_open_device(ftdi_device_t *dev)
     dev->pid = dev_desc->idProduct;
     dev->is_ftdi = (dev->vid == FTDI_VID);
 
-    if (usb_is_obvious_non_u2d2(dev->vid, dev->pid)) {
-        ESP_LOGD(TAG, "addr=%u vid=%04x pid=%04x — hub/camera, skip", dev->dev_addr, dev->vid,
-                 dev->pid);
+    if (usb_is_obvious_non_u2d2(dev->vid, dev->pid, dev_desc->bDeviceClass)) {
+        ESP_LOGI(TAG, "addr=%u vid=%04x pid=%04x class=%02x — hub/camera, skip", dev->dev_addr,
+                 dev->vid, dev->pid, dev_desc->bDeviceClass);
         usb_host_device_close(dev->client_hdl, dev->dev_hdl);
         dev->dev_hdl = NULL;
         dev->dev_addr = 0;
@@ -1059,8 +1098,8 @@ static esp_err_t ftdi_open_device(ftdi_device_t *dev)
     }
 
     if (!usb_is_u2d2_candidate(dev->vid, dev->pid)) {
-        ESP_LOGD(TAG, "addr=%u vid=%04x pid=%04x — not a known U2D2 VID", dev->dev_addr,
-                 dev->vid, dev->pid);
+        ESP_LOGI(TAG, "addr=%u vid=%04x pid=%04x class=%02x — not a known U2D2 VID", dev->dev_addr,
+                 dev->vid, dev->pid, dev_desc->bDeviceClass);
         usb_host_device_close(dev->client_hdl, dev->dev_hdl);
         dev->dev_hdl = NULL;
         dev->dev_addr = 0;
@@ -1526,7 +1565,8 @@ static void bulk_in_transfer_cb(usb_transfer_t *transfer)
     }
 }
 
-static esp_err_t servo_peek_usb_ids(ftdi_device_t *dev, uint8_t addr, uint16_t *vid, uint16_t *pid)
+static esp_err_t servo_peek_usb_ids(ftdi_device_t *dev, uint8_t addr, uint16_t *vid, uint16_t *pid,
+                                   uint8_t *dev_class, bool *behind_hub, uint8_t *parent_port)
 {
     usb_device_handle_t hdl = NULL;
     esp_err_t err = usb_host_device_open(dev->client_hdl, addr, &hdl);
@@ -1538,6 +1578,20 @@ static esp_err_t servo_peek_usb_ids(ftdi_device_t *dev, uint8_t addr, uint16_t *
     if (err == ESP_OK) {
         *vid = desc->idVendor;
         *pid = desc->idProduct;
+        if (dev_class != NULL) {
+            *dev_class = desc->bDeviceClass;
+        }
+    }
+    if (behind_hub != NULL || parent_port != NULL) {
+        usb_device_info_t info = {0};
+        if (usb_host_device_info(hdl, &info) == ESP_OK) {
+            if (behind_hub != NULL) {
+                *behind_hub = (info.parent.dev_hdl != NULL);
+            }
+            if (parent_port != NULL) {
+                *parent_port = info.parent.port_num;
+            }
+        }
     }
     usb_host_device_close(dev->client_hdl, hdl);
     return err;
@@ -1555,26 +1609,73 @@ static void servo_try_attach_ftdi(ftdi_device_t *dev)
     uint16_t try_vid[DXL_USB_ADDR_LIST_MAX];
     int num_dev = 0;
     int num_try = 0;
+    int hub_count = 0;
+    int behind_hub_count = 0;
     if (usb_host_device_addr_list_fill((int)sizeof(addr_list), addr_list, &num_dev) != ESP_OK ||
         num_dev <= 0) {
         return;
     }
 
-    ESP_LOGD(TAG, "J18 USB scan: %d device(s) on bus", num_dev);
+    uint32_t bus_sig = (uint32_t)num_dev;
+    const TickType_t now = xTaskGetTickCount();
+    const bool log_bus = (bus_sig != s_usb_bus_sig) ||
+                         (s_usb_bus_log_tick == 0) ||
+                         ((now - s_usb_bus_log_tick) >= pdMS_TO_TICKS(10000));
+
+    if (log_bus) {
+        ESP_LOGI(TAG, "J18 USB scan: %d device(s) on bus", num_dev);
+        s_usb_bus_sig = bus_sig;
+        s_usb_bus_log_tick = now;
+    }
 
     for (int i = 0; i < num_dev; i++) {
         uint16_t vid = 0;
         uint16_t pid = 0;
+        uint8_t dev_class = 0;
+        bool behind_hub = false;
+        uint8_t parent_port = 0;
         (void)usb_host_client_handle_events(dev->client_hdl, pdMS_TO_TICKS(20));
-        if (servo_peek_usb_ids(dev, addr_list[i], &vid, &pid) != ESP_OK) {
+        if (servo_peek_usb_ids(dev, addr_list[i], &vid, &pid, &dev_class, &behind_hub, &parent_port) != ESP_OK) {
+            if (log_bus) {
+                ESP_LOGW(TAG, "  addr=%u — descriptor peek failed (still enumerating?)", addr_list[i]);
+            }
             continue;
         }
-        if (usb_is_obvious_non_u2d2(vid, pid) || !usb_is_u2d2_candidate(vid, pid)) {
+        if (dev_class == USB_CLASS_HUB) {
+            hub_count++;
+        }
+        if (behind_hub) {
+            behind_hub_count++;
+        }
+        const bool skip = usb_is_obvious_non_u2d2(vid, pid, dev_class);
+        const bool candidate = !skip && usb_is_u2d2_candidate(vid, pid);
+        if (log_bus) {
+            ESP_LOGI(TAG,
+                     "  addr=%u %04x:%04x class=%02x loc=%s port=%u %s",
+                     addr_list[i], vid, pid, dev_class,
+                     behind_hub ? "behind-hub" : "root",
+                     (unsigned)parent_port,
+                     candidate ? "U2D2-candidate" : (skip ? "skip-hub/camera" : "skip"));
+        }
+        if (!candidate) {
             continue;
         }
         try_order[num_try] = addr_list[i];
         try_vid[num_try] = vid;
         num_try++;
+    }
+
+    if (log_bus && num_try == 0) {
+        if (num_dev == hub_count) {
+            ESP_LOGW(TAG,
+                     "Only hub(s) on the bus — U2D2 is still hidden downstream (wait for J18 ports, or check hub power / CONFIG_USB_HOST_HUBS_SUPPORTED)");
+        } else if (behind_hub_count == 0) {
+            ESP_LOGW(TAG,
+                     "No U2D2 candidate yet and no hub children — adapter may still be behind the hub");
+        } else {
+            ESP_LOGW(TAG,
+                     "Hub children visible but none are FTDI 0403 or ROBOTIS 16d0:06a7");
+        }
     }
 
     /* Prefer ROBOTIS U2D2 on the hub over any other serial adapter. */
@@ -1604,6 +1705,7 @@ static void servo_try_attach_ftdi(ftdi_device_t *dev)
 
 attached:
     s_ping_fail_streak = 0;
+    s_usb_bus_settle = true;
     s_torque_enabled = false;
     s_position_speed_pending = true;
     dynamixel_queue_goal_all(DXL_CENTER_POSITION);
@@ -1623,9 +1725,11 @@ static void client_event_cb(const usb_host_client_event_msg_t *event_msg, void *
         if (dev->device_ready) {
             break;
         }
-        dev->dev_addr = event_msg->new_dev.address;
-        dev->actions |= DEVICE_ACTION_OPEN;
-        ESP_LOGI(TAG, "USB device at address %u (will try U2D2 open)", dev->dev_addr);
+        /* Hub enumerates first; camera and U2D2 appear later as children.
+         * Do not open this address — it is usually the hub itself. */
+        ESP_LOGI(TAG, "USB device at address %u — scan bus for U2D2 behind hub",
+                 event_msg->new_dev.address);
+        dev->actions |= DEVICE_ACTION_SCAN;
         break;
     case USB_HOST_CLIENT_EVENT_DEV_GONE:
         /* IDF 5.5: dev_gone carries dev_hdl (only for devices this client opened). */
@@ -1654,7 +1758,11 @@ static void usb_client_task(void *arg)
     };
 
     ESP_ERROR_CHECK(usb_host_client_register(&client_config, &s_ftdi.client_hdl));
-    ESP_LOGI(TAG, "Servo USB client ready — J18 hub: camera (UVC) + U2D2 (FTDI or 16d0 CDC)");
+#if CONFIG_USB_HOST_HUBS_SUPPORTED
+    ESP_LOGI(TAG, "Servo USB client ready — hub support ON, will walk J18 children (camera + U2D2)");
+#else
+    ESP_LOGE(TAG, "CONFIG_USB_HOST_HUBS_SUPPORTED is off — U2D2 behind the J18 hub will never enumerate");
+#endif
 
     TickType_t last_poll_tick = 0;
     TickType_t last_attach_scan_tick = 0;
@@ -1671,12 +1779,21 @@ static void usb_client_task(void *arg)
     }
 
     while (1) {
+        if (s_ftdi.actions & DEVICE_ACTION_SCAN) {
+            s_ftdi.actions &= ~DEVICE_ACTION_SCAN;
+            if (!s_ftdi.device_ready) {
+                servo_try_attach_ftdi(&s_ftdi);
+                last_attach_scan_tick = xTaskGetTickCount();
+            }
+        }
+
         if (s_ftdi.actions & DEVICE_ACTION_OPEN) {
             s_ftdi.actions &= ~DEVICE_ACTION_OPEN;
             if (!s_ftdi.device_ready) {
                 esp_err_t err = ftdi_open_device(&s_ftdi);
                 if (err == ESP_OK) {
                     s_torque_enabled = false;
+                    s_usb_bus_settle = true;
                     for (size_t i = 0; i < DXL_SERVO_COUNT; i++) {
                         s_servo_torque_on[i] = false;
                     }
@@ -1704,10 +1821,13 @@ static void usb_client_task(void *arg)
                 for (size_t i = 0; i < DXL_SERVO_COUNT; i++) {
                     s_servo_torque_on[i] = false;
                     s_torque_update_pending[i] = false;
+                    s_servo_online[i] = false;
+                    s_servo_move_ok[i] = false;
                 }
                 s_ftdi.dev_addr = 0;
             }
             s_ping_fail_streak = 0;
+            s_boot_nod_started = false;
             last_attach_scan_tick = 0;
         }
 
@@ -1764,38 +1884,49 @@ static void usb_client_task(void *arg)
                                      s_sync.state != DXL_SYNC_READ_PENDING);
                         xSemaphoreGive(s_sync_mutex);
                     }
-                    if (!sync_busy) {
-                        err = dynamixel_ping_blocking(DXL_PRIMARY_ID, pdMS_TO_TICKS(400));
-                        if (err != ESP_OK) {
-                            ESP_LOGD(TAG, "PING ID%u failed (%s) — trying ID%u",
-                                     DXL_PRIMARY_ID, esp_err_to_name(err), DXL_SECONDARY_ID);
-                            vTaskDelay(pdMS_TO_TICKS(30));
-                            err = dynamixel_ping_blocking(DXL_SECONDARY_ID, pdMS_TO_TICKS(400));
-                        }
+                    if (!sync_busy && s_usb_bus_settle) {
+                        s_usb_bus_settle = false;
+                        vTaskDelay(pdMS_TO_TICKS(DXL_BOOT_BUS_SETTLE_MS));
                     }
-                    if (!sync_busy && err != ESP_OK) {
-                        s_ping_fail_streak++;
-                        if (s_ping_fail_streak == 1 || (s_ping_fail_streak % 4) == 0) {
-                            if (err == ESP_ERR_TIMEOUT) {
-                                ESP_LOGW(TAG,
-                                         "No Dynamixel reply to PING ID%u/%u (%d) — check servo "
-                                         "power, TTL wiring, IDs 1&2, 1 Mbps baud, U2D2 on J18",
-                                         DXL_PRIMARY_ID, DXL_SECONDARY_ID, s_ping_fail_streak);
+                    bool ping_ok[DXL_SERVO_COUNT] = {false, false};
+                    if (!sync_busy) {
+                        for (size_t i = 0; i < DXL_SERVO_COUNT; i++) {
+                            const uint8_t id = s_servo_ids[i];
+                            const esp_err_t ping_err =
+                                dynamixel_ping_blocking(id, pdMS_TO_TICKS(400));
+                            ping_ok[i] = (ping_err == ESP_OK);
+                            s_servo_online[i] = ping_ok[i];
+                            if (ping_ok[i]) {
+                                ESP_LOGI(TAG, "PING ID%u (%s) OK", id, servo_axis_name(id));
                             } else {
-                                ESP_LOGW(TAG, "PING failed (%d): %s", s_ping_fail_streak,
-                                         esp_err_to_name(err));
+                                ESP_LOGW(TAG, "PING ID%u (%s) failed: %s", id,
+                                         servo_axis_name(id), esp_err_to_name(ping_err));
+                            }
+                            if (i + 1 < DXL_SERVO_COUNT) {
+                                vTaskDelay(pdMS_TO_TICKS(30));
                             }
                         }
-                        if (err != ESP_ERR_TIMEOUT &&
-                            s_ping_fail_streak >= DXL_PING_FAIL_RECONNECT) {
-                            ESP_LOGW(TAG, "U2D2 USB write failed — reopening adapter");
-                            s_ping_fail_streak = 0;
-                            s_ftdi.actions |= DEVICE_ACTION_CLOSE;
+                    }
+                    const bool any_online = ping_ok[0] || ping_ok[1];
+                    if (!sync_busy && !any_online) {
+                        s_ping_fail_streak++;
+                        if (s_ping_fail_streak == 1 || (s_ping_fail_streak % 4) == 0) {
+                            ESP_LOGW(TAG,
+                                     "No Dynamixel reply to PING ID%u/%u (%d) — check servo "
+                                     "power, TTL wiring, IDs 1&2, 1 Mbps baud, U2D2 on J18",
+                                     DXL_PRIMARY_ID, DXL_SECONDARY_ID, s_ping_fail_streak);
                         }
-                    } else if (!sync_busy) {
+                    } else if (!sync_busy && any_online) {
                         s_ping_fail_streak = 0;
-                        ESP_LOGI(TAG, "Dynamixel servo responded to PING (IDs %u/%u)",
-                                 DXL_PRIMARY_ID, DXL_SECONDARY_ID);
+                        if (!ping_ok[0] || !ping_ok[1]) {
+                            ESP_LOGW(TAG,
+                                     "Bring-up: ID1 tilt %s, ID2 pan %s — continuing with "
+                                     "servos that answered",
+                                     ping_ok[0] ? "OK" : "MISSING",
+                                     ping_ok[1] ? "OK" : "MISSING");
+                        } else {
+                            ESP_LOGI(TAG, "Dynamixel ID1 (tilt) and ID2 (pan) both answered PING");
+                        }
                         err = dynamixel_set_joint_mode(&s_ftdi);
                         if (err == ESP_OK) {
                             s_position_speed_pending = true;
@@ -1874,25 +2005,68 @@ static void usb_client_task(void *arg)
     }
 }
 
-static volatile bool s_boot_nod_started;
+static bool boot_health_move_axis(uint8_t id, int target, const char *label)
+{
+    int before = 0;
+    if (nino_servo_dxl_get_present_position(id, &before) != ESP_OK) {
+        ESP_LOGW(TAG, "Boot health ID%u (%s) FAIL — no present-position reply", id, label);
+        return false;
+    }
+    ESP_LOGI(TAG, "Boot health ID%u (%s) present=%d — moving to %d", id, label, before, target);
+    nino_servo_dxl_set_servo_goal(id, target);
+    if (!dynamixel_wait_servo_at(id, target, pdMS_TO_TICKS(DXL_BOOT_MOVE_TIMEOUT_MS))) {
+        int now_pos = before;
+        (void)nino_servo_dxl_get_present_position(id, &now_pos);
+        ESP_LOGW(TAG, "Boot health ID%u (%s) FAIL — did not reach %d (now %d)", id, label, target,
+                 now_pos);
+        return false;
+    }
+    ESP_LOGI(TAG, "Boot health ID%u (%s) OK — reached %d", id, label, target);
+    return true;
+}
 
 static void boot_nod_task(void *arg)
 {
     (void)arg;
-    for (int i = 0; i < 50 && !nino_servo_dxl_is_ready(); i++) {
+    for (int i = 0; i < 80 && !nino_servo_dxl_is_ready(); i++) {
         vTaskDelay(pdMS_TO_TICKS(40));
     }
     if (!nino_servo_dxl_is_ready()) {
-        ESP_LOGW(TAG, "Boot nod skipped — no Dynamixel PING yet (U2D2/J18/IDs/baud?)");
+        ESP_LOGW(TAG, "Boot health skipped — joint mode never came up (U2D2/J18/IDs/baud?)");
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(TAG, "Boot nod: tilt up then down (IDs 1&2, 1 Mbps)");
-    nino_servo_dxl_set_pan_tilt(NINO_SERVO_AXIS_CENTER, NINO_SERVO_TILT_UP);
-    vTaskDelay(pdMS_TO_TICKS(450));
-    nino_servo_dxl_set_pan_tilt(NINO_SERVO_AXIS_CENTER, NINO_SERVO_TILT_DOWN);
-    vTaskDelay(pdMS_TO_TICKS(450));
+
+    ESP_LOGI(TAG, "Boot health: ID1 tilt online=%d, ID2 pan online=%d",
+             s_servo_online[0] ? 1 : 0, s_servo_online[1] ? 1 : 0);
+
+    nino_servo_dxl_set_position_speed(DXL_BOOT_HEALTH_SPEED);
+    vTaskDelay(pdMS_TO_TICKS(120));
+
+    if (s_servo_online[0]) {
+        const bool up = boot_health_move_axis(DXL_PRIMARY_ID, NINO_SERVO_TILT_UP, "tilt");
+        const bool down = boot_health_move_axis(DXL_PRIMARY_ID, NINO_SERVO_TILT_DOWN, "tilt");
+        s_servo_move_ok[0] = up && down;
+        (void)boot_health_move_axis(DXL_PRIMARY_ID, DXL_CENTER_POSITION, "tilt");
+    } else {
+        ESP_LOGW(TAG, "Boot health: skipping tilt (ID1 did not PING)");
+    }
+
+    if (s_servo_online[1]) {
+        const bool left = boot_health_move_axis(DXL_SECONDARY_ID, NINO_SERVO_PAN_LEFT, "pan");
+        const bool right = boot_health_move_axis(DXL_SECONDARY_ID, NINO_SERVO_PAN_RIGHT, "pan");
+        s_servo_move_ok[1] = left && right;
+        (void)boot_health_move_axis(DXL_SECONDARY_ID, DXL_CENTER_POSITION, "pan");
+    } else {
+        ESP_LOGW(TAG, "Boot health: skipping pan (ID2 did not PING)");
+    }
+
+    nino_servo_dxl_set_position_speed(DXL_DEFAULT_POSITION_SPEED);
     nino_servo_dxl_go_neutral();
+
+    ESP_LOGI(TAG, "Boot health summary: tilt=%s pan=%s",
+             s_servo_move_ok[0] ? "PASS" : (s_servo_online[0] ? "NO-MOVE" : "NO-PING"),
+             s_servo_move_ok[1] ? "PASS" : (s_servo_online[1] ? "NO-MOVE" : "NO-PING"));
     vTaskDelete(NULL);
 }
 
@@ -1902,9 +2076,9 @@ void nino_servo_dxl_boot_nod(void)
         return;
     }
     s_boot_nod_started = true;
-    if (xTaskCreate(boot_nod_task, "dxl_boot_nod", 3072, NULL, 4, NULL) != pdPASS) {
+    if (xTaskCreate(boot_nod_task, "dxl_boot_nod", 4096, NULL, 4, NULL) != pdPASS) {
         s_boot_nod_started = false;
-        ESP_LOGW(TAG, "Boot nod task not started");
+        ESP_LOGW(TAG, "Boot health task not started");
     }
 }
 

@@ -3471,6 +3471,12 @@ static int cmd_servo_status(int argc, char **argv) {
          nino_servo_dxl_bus_open() ? "open" : "not open (connect U2D2 on J18 hub)");
   printf("servo ready: %s\n",
          nino_servo_dxl_is_ready() ? "yes" : "no");
+  printf("servo ID1 tilt: ping=%s move=%s\n",
+         nino_servo_dxl_id_is_online(NINO_SERVO_TILT_ID) ? "ok" : "fail",
+         nino_servo_dxl_id_moved_ok(NINO_SERVO_TILT_ID) ? "ok" : "fail");
+  printf("servo ID2 pan: ping=%s move=%s\n",
+         nino_servo_dxl_id_is_online(NINO_SERVO_PAN_ID) ? "ok" : "fail",
+         nino_servo_dxl_id_moved_ok(NINO_SERVO_PAN_ID) ? "ok" : "fail");
   printf("spin360: %s\n",
          nino_servo_dxl_spin_is_active() ? "running" : "idle");
   printf("track hon: %s\n",

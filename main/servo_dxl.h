@@ -7,11 +7,17 @@
 /** Register USB host client for U2D2 (FTDI) and start the Dynamixel worker task. */
 esp_err_t nino_servo_dxl_start(void);
 
-/** One up/down nod after joint mode comes up (boot). Safe if bus not ready. */
+/** Boot health: PING both servos, move each axis, return to center. Safe if bus not ready. */
 void nino_servo_dxl_boot_nod(void);
 
 /** True after U2D2 is open, joint mode enabled, and servos are usable. */
 bool nino_servo_dxl_is_ready(void);
+
+/** True if that Dynamixel ID (1=tilt, 2=pan) answered PING on bring-up. */
+bool nino_servo_dxl_id_is_online(uint8_t id);
+
+/** True if boot health confirmed that ID actually moved. */
+bool nino_servo_dxl_id_moved_ok(uint8_t id);
 
 /** True when U2D2 USB serial is open (may still be enabling joint mode). */
 bool nino_servo_dxl_bus_open(void);
