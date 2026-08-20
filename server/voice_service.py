@@ -2104,6 +2104,23 @@ def process_voice_wav(
 
     ident = get_session_identity()
     ident_handled = False
+    if ident is not None and ident.should_skip_prompt_echo(user_text):
+        logger.info(
+            "Voice session GREET echo skipped | heard: %s",
+            user_text[:120],
+        )
+        return _silent_close(
+            meta,
+            reply_path="silent_skip",
+            heard=user_text,
+            audio_input_format=audio_input_format,
+            audio_in_seconds=audio_in_seconds,
+            wav_bytes=wav_bytes,
+            stt_engine=stt_engine,
+            t_start=t_start,
+            t_stt=t_stt,
+            extra={"session": session, "energy": peak_energy, "turn": voice_turn},
+        )
     if ident is not None and ident.in_registration():
         ident_result = ident.handle_voice(user_text)
         if ident_result.handled:

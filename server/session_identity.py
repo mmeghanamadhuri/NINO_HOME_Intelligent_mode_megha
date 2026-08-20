@@ -20,6 +20,7 @@ from face_registration_voice import (
     is_confirm_yes,
     is_face_reg_prompt_echo,
     is_incomplete_name_phrase,
+    is_opening_greeting_echo,
     is_registration_cancel,
     is_registration_offer_no,
     is_registration_offer_yes,
@@ -97,6 +98,7 @@ class SessionIdentityFlow:
         self._session_id = ""
         self._device_id = ""
         self._active = False
+        self._opening_echo_budget = 0
 
     def set_frame_getter(self, read_frame: Callable[[], Any]) -> None:
         self._read_frame = read_frame
@@ -132,6 +134,7 @@ class SessionIdentityFlow:
             self._device_id = device_id
             self._pending_name = ""
             self._is_guest = False
+            self._opening_echo_budget = 2
             name = (identity_name or "").strip()
             if identity_state == "recognized" and name and name.lower() not in {
                 "unknown",
@@ -169,6 +172,30 @@ class SessionIdentityFlow:
             self._state = "idle"
             self._pending_name = ""
             self._session_id = ""
+            self._opening_echo_budget = 0
+
+    def should_skip_prompt_echo(self, user_text: str) -> bool:
+        """Drop GREET / hello TTS that the Aux-in mics picked up after session open."""
+        text = str(user_text or "").strip()
+        if not text:
+            return False
+        with self._lock:
+            if not self._active:
+                return False
+            budget = self._opening_echo_budget
+        if is_face_reg_prompt_echo(text):
+            return True
+        if budget <= 0:
+            return False
+        if is_opening_greeting_echo(text):
+            with self._lock:
+                if self._opening_echo_budget > 0:
+                    self._opening_echo_budget -= 1
+            logger.info("Session identity: skip opening greet echo heard=%s", text[:80])
+            return True
+        with self._lock:
+            self._opening_echo_budget = 0
+        return False
 
     def handle_voice(self, user_text: str) -> FaceRegVoiceResult:
         text = str(user_text or "").strip()
@@ -177,11 +204,11 @@ class SessionIdentityFlow:
                 return FaceRegVoiceResult(handled=False)
             state = self._state
 
-        if state == "idle" or state == "identified" or state == "guest":
-            return FaceRegVoiceResult(handled=False)
-
         if is_face_reg_prompt_echo(text):
             return FaceRegVoiceResult(handled=True, reply="", relisten_after_reply=True)
+
+        if state == "idle" or state == "identified" or state == "guest":
+            return FaceRegVoiceResult(handled=False)
 
         # Goodbye / stop still end the session — do not convert to guest.
         if is_session_end_utterance(text):

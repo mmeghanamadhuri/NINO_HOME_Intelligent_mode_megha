@@ -53,7 +53,7 @@ static const char *TAG = "voice_ast";
 #define AUX_QUIET_MS 800
 #define AUX_QUIET_MAX_MS 4000
 #define AUX_REARM_DELAY_MS 1500
-#define AUX_POST_SPEAKER_IGNORE_MS 1500
+#define AUX_POST_SPEAKER_IGNORE_MS 2500
 #define AUX_STATUS_LOG_MS 1000
 #define AUX_REPLY_WAIT_MS 180000
 #define STREAM_LISTEN_CAP_MS 65000
@@ -968,6 +968,11 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
     nino_voice_ws_session_begin_turn(ws);
   }
 
+  /* Wake preroll is stale after hunt + GREET TTS; sending it is heard as
+   * another greeting. */
+  (void)preroll;
+  (void)preroll_samples;
+
   bool first_turn = true;
 
   while (!session_end && nino_voice_ws_session_is_open(ws)) {
@@ -978,26 +983,15 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
     (void)nino_rgb_led_show(NINO_RGB_SHOW_LISTEN);
     voice_log(ESP_LOG_INFO, turn, "STREAM", "sending Aux-in PCM until ASR EOS");
 
-    if (preroll != NULL && preroll_samples > 0) {
-      if (nino_voice_ws_session_send_pcm(ws, preroll,
-                                         preroll_samples * sizeof(int16_t)) != ESP_OK) {
-        if (nino_voice_ws_session_should_pause(ws)) {
-          voice_log(ESP_LOG_INFO, turn, "STREAM",
-                    "paused because EOS/skip during preroll");
-        } else {
-          voice_log(ESP_LOG_WARN, turn, "STREAM",
-                    "preroll write-0 — wait for server, camera stays on");
-        }
-      }
-      preroll = NULL;
-      preroll_samples = 0;
-    }
-
     int16_t frame[AUX_DETECT_SAMPLES];
     uint32_t streamed_ms = 0;
     bool tx_failed = false;
     while (!nino_voice_ws_session_should_pause(ws)) {
       if (nino_music_blocks_mic()) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        continue;
+      }
+      if (aux_ignore_energy_now()) {
         vTaskDelay(pdMS_TO_TICKS(20));
         continue;
       }

@@ -90,6 +90,16 @@ class ExtractRegistrationNameTests(unittest.TestCase):
             self.assertTrue(is_face_reg_prompt_echo(prompt), prompt)
             self.assertIsNone(extract_registration_name(prompt), prompt)
 
+    def test_session_greet_echo(self) -> None:
+        from face_registration_voice import is_opening_greeting_echo
+
+        self.assertTrue(is_opening_greeting_echo("Hey Hari, how can I help you"))
+        self.assertTrue(is_opening_greeting_echo("Hey Hari"))
+        self.assertTrue(is_opening_greeting_echo("how can I help you"))
+        self.assertTrue(is_opening_greeting_echo("Good morning Hari! How are you today?"))
+        self.assertFalse(is_opening_greeting_echo("What's the weather in London?"))
+        self.assertFalse(is_opening_greeting_echo("Hi tell me a joke"))
+
     def test_pick_registration_prompt_from_pool(self) -> None:
         picked = {pick_registration_prompt() for _ in range(40)}
         self.assertTrue(picked.issubset(set(REGISTRATION_PROMPTS)))

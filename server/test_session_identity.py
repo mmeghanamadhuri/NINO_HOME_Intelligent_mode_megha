@@ -83,6 +83,20 @@ class SessionIdentityFlowTests(unittest.TestCase):
         self.assertEqual(user, "Hari")
         self.assertFalse(guest)
 
+    def test_identified_greet_echo_is_skipped(self) -> None:
+        self.flow.start_session(
+            session_id="s1",
+            device_id="nino-home",
+            identity_name="Hari",
+            identity_state="recognized",
+        )
+        self.assertTrue(
+            self.flow.should_skip_prompt_echo("Hey Hari, how can I help you")
+        )
+        self.assertTrue(self.flow.should_skip_prompt_echo("Hey Hari"))
+        self.assertTrue(self.flow.should_skip_prompt_echo("Good morning Hari"))
+        self.assertFalse(self.flow.should_skip_prompt_echo("What's the weather?"))
+
     def test_unknown_offer_then_no_guest(self) -> None:
         open_result = self.flow.start_session(
             session_id="s1",
