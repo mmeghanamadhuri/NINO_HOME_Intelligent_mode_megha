@@ -1,6 +1,7 @@
 #include "mic_input.h"
 
 #include "audio_playback.h"
+#include "sd_record.h"
 
 #include "bsp/esp32_p4_function_ev_board.h"
 #include "driver/i2c_master.h"
@@ -175,6 +176,9 @@ esp_err_t nino_mic_read(int16_t *samples, int sample_count) {
     }
   }
   nino_audio_bus_unlock();
+  if (err == ESP_OK) {
+    nino_sd_record_feed(samples, sample_count);
+  }
   return err;
 }
 

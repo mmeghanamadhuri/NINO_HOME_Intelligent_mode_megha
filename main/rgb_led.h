@@ -12,6 +12,9 @@ typedef enum {
   NINO_RGB_SHOW_IDLE = 0,       /* no light */
   NINO_RGB_SHOW_LISTEN,         /* solid blue — STREAM / listen until TTS */
   NINO_RGB_SHOW_TTS,            /* solid green — voice reply playing */
+  NINO_RGB_SHOW_BATTERY,        /* red blink 400 ms — pack ≤ 10 V */
+  NINO_RGB_SHOW_MUTE,           /* solid red — speaker muted */
+  NINO_RGB_SHOW_OTA,            /* solid purple — firmware update */
   NINO_RGB_SHOW_ERROR,          /* solid red — WS/capture/query fail */
   NINO_RGB_SHOW_WIFI_WAIT,      /* blink white — boot / no Wi-Fi */
   NINO_RGB_SHOW_SERVER_WAIT,    /* blink green — Wi-Fi up, voice server not OK */

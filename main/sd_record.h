@@ -15,9 +15,11 @@ esp_err_t nino_sd_record_init(void);
 
 bool nino_sd_record_ready(void);
 
-/** Write a WAV blob to /sdcard/rec_NNNN.wav. @p out_path receives the path used. */
-esp_err_t nino_sd_record_save_wav(const uint8_t *wav, size_t len, char *out_path,
-                                  size_t out_path_len);
+/**
+ * Append Aux-in PCM (16 kHz mono 16-bit) while the mic is reading.
+ * Every 15 s a WAV is written under the SD mount point. Safe from the mic task.
+ */
+void nino_sd_record_feed(const int16_t *samples, int sample_count);
 
 #ifdef __cplusplus
 }

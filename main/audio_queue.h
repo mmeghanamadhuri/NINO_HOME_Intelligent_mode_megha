@@ -51,3 +51,30 @@ void nino_audio_queue_preempt_for_wake(void);
 
 /** True while a queued clip is pending, playing, or suspended. */
 bool nino_audio_queue_busy(void);
+
+/**
+ * Enqueue an app-streamed music clip. Same ownership as nino_audio_queue_wav().
+ * Keeps the speaker open between clips so playback is gapless when the next
+ * job is already queued (or arrives within a short hand-off window).
+ */
+esp_err_t nino_audio_queue_stream_wav(uint8_t *wav, size_t len,
+                                      nino_eye_state_t eye_state);
+
+/** Snapshot for GET /play_wav/status. */
+typedef struct {
+  bool playing;
+  bool paused;
+  bool suspended;
+  int queued;
+} nino_audio_queue_status_t;
+
+/** Cut speaker now; keep remaining PCM so resume continues from this point. */
+void nino_audio_queue_pause(void);
+
+/** Continue from the pause point, then any clips still in the queue. */
+void nino_audio_queue_resume(void);
+
+/** Drop queued/suspended clips and silence the speaker. */
+void nino_audio_queue_stop(void);
+
+void nino_audio_queue_get_status(nino_audio_queue_status_t *out);

@@ -9,7 +9,8 @@
  *
  * ESP32-P4-Function-EV-Board J1 header wiring (all free I/O on this board):
  *   CLK -> GPIO23 (J1 pin 7), DIN -> GPIO22 (pin 12), DC -> GPIO21 (pin 11),
- *   RST -> GPIO20 (pin 13), CS left -> GPIO32, CS right -> GPIO33.
+ *   RST -> GPIO6, CS left -> GPIO32, CS right -> GPIO33.
+ * Battery ADC is GPIO20; keep OLED RST on GPIO6. GPIO54 is C6 slave reset.
  *
  * CS was moved off GPIO 26/27 because those are the ESP32-P4 USB OTG FS PHY
  * D-/D+ pads. GPIO 32/33 are plain digital I/O with no USB overlap.
@@ -17,7 +18,7 @@
 #define OLED_PIN_SCLK   23   /* shared CLK -> both displays */
 #define OLED_PIN_MOSI   22   /* shared DIN -> both displays */
 #define OLED_PIN_DC     21   /* shared DC  -> both displays */
-#define OLED_PIN_RST    20   /* shared RST -> both displays */
+#define OLED_PIN_RST    6    /* shared RST -> both displays */
 #define OLED_PIN_CS0    32   /* CS for display 0 (left eye)  */
 #define OLED_PIN_CS1    33   /* CS for display 1 (right eye) */
 

@@ -45,6 +45,7 @@
 #include "audio_playback.h"
 #include "audio_capture.h"
 #include "audio_queue.h"
+#include "battery_adc.h"
 #include "camera_orientation.h"
 #include "camera_stream.h"
 #include "face_detect.hpp"
@@ -59,6 +60,7 @@
 #include "push_buttons.h"
 #include "voice_assist.h"
 #include "music_stream.h"
+#include "sd_record.h"
 #include "wifi_config.h"
 #include "wifi_prov_ble.h"
 #if CONFIG_ESP_HOSTED_ENABLED
@@ -575,6 +577,48 @@ static bool try_canonical_mac_id(char *dst, size_t dst_size, const char *src) {
   hex[12] = '\0';
   memcpy(dst, hex, 13);
   return true;
+}
+
+static bool mac_is_unset(const uint8_t mac[6]) {
+  if (mac == NULL) {
+    return true;
+  }
+  for (int i = 0; i < 6; i++) {
+    if (mac[i] != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** P4 Wi-Fi STA MAC lives on the C6 (ESP-Hosted). It is often 00:00:00:00:00:00
+ *  until wifi_init. Fall back to the P4 eFuse/base MAC (what esptool prints). */
+static bool read_robot_mac(uint8_t mac[6]) {
+  if (mac == NULL) {
+    return false;
+  }
+  memset(mac, 0, 6);
+  const esp_mac_type_t types[] = {
+      ESP_MAC_WIFI_STA,
+      ESP_MAC_WIFI_SOFTAP,
+      ESP_MAC_BASE,
+      ESP_MAC_EFUSE_FACTORY,
+  };
+  for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+    uint8_t tmp[6] = {0};
+    if (esp_read_mac(tmp, types[i]) == ESP_OK && !mac_is_unset(tmp)) {
+      memcpy(mac, tmp, 6);
+      return true;
+    }
+  }
+  if (esp_wifi_get_mac(WIFI_IF_STA, mac) == ESP_OK && !mac_is_unset(mac)) {
+    return true;
+  }
+  if (esp_wifi_get_mac(WIFI_IF_AP, mac) == ESP_OK && !mac_is_unset(mac)) {
+    return true;
+  }
+  memset(mac, 0, 6);
+  return false;
 }
 
 static void make_default_device_id_from_mac(char *dst, size_t dst_size) {
@@ -1365,6 +1409,7 @@ static void console_init(void) {
   servo_cli_register();
   track_cli_register();
   speaker_cli_register();
+  nino_battery_adc_cli_register();
   eye_cli_register();
   nino_rgb_led_cli_register();
   hstop_cli_register();
@@ -1865,7 +1910,10 @@ static void multicast_discovery_task(void *arg) {
           wifi_config_get_sta_ip(sta_ip, sizeof(sta_ip));
 
           uint8_t mac[6];
-          esp_wifi_get_mac(WIFI_IF_AP, mac);
+          if (!read_robot_mac(mac)) {
+            memset(mac, 0, 6);
+            (void)esp_wifi_get_mac(WIFI_IF_STA, mac);
+          }
           char mac_str[18];
           snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -2148,8 +2196,22 @@ static esp_err_t play_wav_handler(httpd_req_t *req) {
     }
   }
 
-  if (nino_audio_queue_wav(buf, total, false, NINO_AUDIO_SERVO_FULL, prompt_ack,
-                           eye_state) != ESP_OK) {
+  bool stream = false;
+  char stream_hdr[4] = {0};
+  if (httpd_req_get_hdr_value_str(req, "X-Nino-Stream", stream_hdr,
+                                  sizeof(stream_hdr)) == ESP_OK) {
+    stream = (stream_hdr[0] == '1');
+  }
+
+  esp_err_t qerr;
+  if (stream) {
+    ESP_LOGI(TAG, "HTTP /play_wav stream %u bytes", (unsigned)total);
+    qerr = nino_audio_queue_stream_wav(buf, total, eye_state);
+  } else {
+    qerr = nino_audio_queue_wav(buf, total, false, NINO_AUDIO_SERVO_FULL,
+                                prompt_ack, eye_state);
+  }
+  if (qerr != ESP_OK) {
     httpd_resp_set_status(req, "503 Service Unavailable");
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, "{\"ok\":false,\"error\":\"audio queue down\"}",
@@ -2250,6 +2312,76 @@ static esp_err_t music_status_handler(httpd_req_t *req) {
   char body[64];
   int n = snprintf(body, sizeof(body), "{\"ok\":true,\"playing\":%s}",
                    nino_music_is_playing() ? "true" : "false");
+  if (n <= 0 || n >= (int)sizeof(body)) {
+    return httpd_resp_send_500(req);
+  }
+  return httpd_resp_send(req, body, n);
+}
+
+static void httpd_discard_body(httpd_req_t *req) {
+  int remaining = req->content_len;
+  while (remaining > 0) {
+    char discard[64];
+    int chunk = remaining > (int)sizeof(discard) ? (int)sizeof(discard) : remaining;
+    int r = httpd_req_recv(req, discard, chunk);
+    if (r <= 0) {
+      break;
+    }
+    remaining -= r;
+  }
+}
+
+static esp_err_t play_wav_pause_handler(httpd_req_t *req) {
+  if (req->method != HTTP_POST) {
+    return music_json_error(req, "405 Method Not Allowed", "POST only");
+  }
+  httpd_discard_body(req);
+  nino_audio_queue_pause();
+  ESP_LOGI(TAG, "HTTP /play_wav/pause");
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, "{\"ok\":true,\"paused\":true}",
+                         HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t play_wav_resume_handler(httpd_req_t *req) {
+  if (req->method != HTTP_POST) {
+    return music_json_error(req, "405 Method Not Allowed", "POST only");
+  }
+  httpd_discard_body(req);
+  nino_audio_queue_resume();
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, "{\"ok\":true,\"paused\":false}",
+                         HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t play_wav_stop_handler(httpd_req_t *req) {
+  if (req->method != HTTP_POST) {
+    return music_json_error(req, "405 Method Not Allowed", "POST only");
+  }
+  httpd_discard_body(req);
+  nino_audio_queue_stop();
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, "{\"ok\":true,\"stopped\":true}",
+                         HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t play_wav_status_handler(httpd_req_t *req) {
+  if (req->method != HTTP_GET) {
+    return music_json_error(req, "405 Method Not Allowed", "GET only");
+  }
+  nino_audio_queue_status_t st = {};
+  nino_audio_queue_get_status(&st);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  char body[160];
+  int n = snprintf(body, sizeof(body),
+                   "{\"ok\":true,\"playing\":%s,\"paused\":%s,\"suspended\":%s,"
+                   "\"queued\":%d}",
+                   st.playing ? "true" : "false", st.paused ? "true" : "false",
+                   st.suspended ? "true" : "false", st.queued);
   if (n <= 0 || n >= (int)sizeof(body)) {
     return httpd_resp_send_500(req);
   }
@@ -3585,14 +3717,42 @@ static int cmd_speaker(int argc, char **argv) {
     return 0;
   }
 
+  if (argc >= 2 && strcmp(argv[1], "mute") == 0) {
+    bool muted = true;
+    if (argc >= 3) {
+      if (strcmp(argv[2], "off") == 0 || strcmp(argv[2], "0") == 0) {
+        muted = false;
+      } else if (strcmp(argv[2], "on") == 0 || strcmp(argv[2], "1") == 0) {
+        muted = true;
+      } else if (strcmp(argv[2], "toggle") == 0) {
+        muted = !nino_audio_is_muted();
+      } else {
+        printf("Usage: speaker mute [on|off|toggle]\n");
+        return 1;
+      }
+    }
+    nino_mute_set(muted);
+    printf("speaker %s\n", nino_audio_is_muted() ? "MUTED (solid red LED)" : "unmuted");
+    return 0;
+  }
+
+  if (argc >= 2 && (strcmp(argv[1], "unmute") == 0 || strcmp(argv[1], "on") == 0)) {
+    nino_mute_set(false);
+    printf("speaker unmuted\n");
+    return 0;
+  }
+
+  printf("speaker volume: %d%%  mute: %s\n", nino_audio_get_volume_percent(),
+         nino_audio_is_muted() ? "on" : "off");
   printf("Usage: speaker volume [0-100]\n");
+  printf("       speaker mute [on|off|toggle]\n");
   return 0;
 }
 
 static void speaker_cli_register(void) {
   const esp_console_cmd_t cmd = {
       .command = "speaker",
-      .help = "speaker volume [0-100]",
+      .help = "speaker volume [0-100] | speaker mute [on|off|toggle]",
       .hint = NULL,
       .func = &cmd_speaker,
       .argtable = NULL,
@@ -3653,6 +3813,30 @@ static void start_http_server(void) {
       .uri = "/play_wav",
       .method = HTTP_POST,
       .handler = play_wav_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t play_wav_pause_uri = {
+      .uri = "/play_wav/pause",
+      .method = HTTP_POST,
+      .handler = play_wav_pause_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t play_wav_resume_uri = {
+      .uri = "/play_wav/resume",
+      .method = HTTP_POST,
+      .handler = play_wav_resume_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t play_wav_stop_uri = {
+      .uri = "/play_wav/stop",
+      .method = HTTP_POST,
+      .handler = play_wav_stop_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t play_wav_status_uri = {
+      .uri = "/play_wav/status",
+      .method = HTTP_GET,
+      .handler = play_wav_status_handler,
       .user_ctx = NULL,
   };
   const httpd_uri_t music_play_uri = {
@@ -3794,6 +3978,10 @@ static void start_http_server(void) {
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &snapshot_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &aux_in_wav_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &play_wav_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &play_wav_pause_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &play_wav_resume_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &play_wav_stop_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &play_wav_status_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &music_play_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &music_stop_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &music_status_uri));
@@ -4180,7 +4368,6 @@ void app_main(void) {
   }
 
   ESP_ERROR_CHECK(nino_voice_assist_init_mutex());
-  load_device_id_from_nvs();
   load_voice_ws_from_nvs();
   nino_voice_assist_set_ws_uri(s_voice_ws_url);
   if (s_voice_ws_url[0] != '\0') {
@@ -4205,6 +4392,16 @@ void app_main(void) {
   if (wifi_init_all() != ESP_OK) {
     ESP_LOGW(TAG, "Running without Wi-Fi (ESP-Hosted SDIO to C6 not ready)");
   }
+  load_device_id_from_nvs();
+  if (is_legacy_placeholder_device_id(s_device_id)) {
+    make_default_device_id_from_mac(s_device_id, sizeof(s_device_id));
+    if (!is_legacy_placeholder_device_id(s_device_id)) {
+      (void)save_device_id_to_nvs();
+      ESP_LOGI(TAG, "Replaced nino-000000 with device_id from chip MAC");
+    }
+  }
+  ensure_voice_ws_url_has_device_id();
+  nino_voice_assist_set_ws_uri(s_voice_ws_url);
   s_boot_unprovisioned = !wifi_config_is_provisioned();
   BaseType_t ble_task_ok = xTaskCreatePinnedToCore(
       wifi_provisioning_task, "wifi_prov", 4096, NULL, 6, NULL, APP_CORE_NET);
@@ -4215,6 +4412,12 @@ void app_main(void) {
   if (nino_audio_init() != ESP_OK) {
     ESP_LOGW(TAG,
              "Speaker (BSP audio) init failed; POST /play_wav may not work");
+  }
+  if (nino_battery_adc_init() != ESP_OK) {
+    ESP_LOGW(TAG, "GPIO20 battery ADC init failed");
+  }
+  if (nino_sd_record_init() != ESP_OK) {
+    ESP_LOGW(TAG, "microSD not mounted — Aux-in will not be saved to card");
   }
   if (nino_music_init() != ESP_OK) {
     ESP_LOGW(TAG, "Music stream init failed; POST /music/play will not work");

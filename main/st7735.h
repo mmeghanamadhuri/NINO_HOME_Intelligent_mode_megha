@@ -7,8 +7,9 @@
  * 1.44" ST7735 SPI TFT (128×128 RGB565), dual-panel eye bus.
  *
  * ESP32-P4 wiring (shared SPI2, independent CS):
- *   SCK  GPIO 23    MOSI GPIO 22    DC GPIO 21    RST GPIO 20
+ *   SCK  GPIO 23    MOSI GPIO 22    DC GPIO 21    RST GPIO 6
  *   BL   GPIO 19    CS0  GPIO 32 (left)    CS1 GPIO 33 (right)
+ * Battery ADC is GPIO20; keep TFT RST on GPIO6. GPIO54 is C6 slave reset.
  *
  * Tie BL/LED to 3.3 V if GPIO 19 is unused — panel stays black without backlight.
  *
@@ -18,7 +19,7 @@
 #define TFT_PIN_SCLK    23
 #define TFT_PIN_MOSI    22
 #define TFT_PIN_DC      21
-#define TFT_PIN_RST     20
+#define TFT_PIN_RST     6
 #define TFT_PIN_BL      19
 #define TFT_PIN_CS0     32
 #define TFT_PIN_CS1     33

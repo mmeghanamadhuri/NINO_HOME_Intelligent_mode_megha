@@ -32,7 +32,17 @@ void nino_decoded_wav_free(nino_decoded_wav_t *decoded);
  * interrupted playback mid-clip.
  */
 esp_err_t nino_audio_play_decoded(const nino_decoded_wav_t *decoded, size_t *pcm_byte_offset,
-                                  volatile bool *stop_requested, bool *completed);
+                                  volatile bool *stop_requested, bool *completed,
+                                  bool leave_codec_open);
+
+/** Close the speaker after a gapless stream when no more clips are queued. */
+void nino_audio_close_speaker(void);
+
+/**
+ * Mute and close the speaker immediately (pause/stop). Safe to call from HTTP.
+ * Discards PCM already sitting in the I2S/codec pipeline.
+ */
+void nino_audio_cut_speaker(void);
 
 /** Play 16-bit mono PCM; waits for the DAC pipeline to finish before closing the codec. */
 esp_err_t nino_audio_play_pcm16_mono(const int16_t *samples, size_t sample_count,
@@ -68,6 +78,12 @@ esp_err_t nino_audio_set_volume_percent(int volume_percent);
 
 /** Current speaker output volume percent (0-100). */
 int nino_audio_get_volume_percent(void);
+
+/** User mute (GPIO47 / `speaker mute`). Low-battery prompts still play. */
+esp_err_t nino_audio_set_muted(bool muted);
+bool nino_audio_is_muted(void);
+/** Re-apply codec mute after battery-alert enter/exit. */
+void nino_audio_refresh_mute(void);
 
 /**
  * Load the speaker volume saved in NVS (set by the app/console) and apply it.

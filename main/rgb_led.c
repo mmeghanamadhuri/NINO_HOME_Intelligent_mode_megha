@@ -11,6 +11,9 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 
+#include "audio_playback.h"
+#include "battery_adc.h"
+
 static const char *TAG = "rgb_led";
 
 #define RGB_PIN_RED GPIO_NUM_2
@@ -79,6 +82,12 @@ const char *nino_rgb_led_show_name(nino_rgb_show_t show)
     return "listen";
   case NINO_RGB_SHOW_TTS:
     return "tts";
+  case NINO_RGB_SHOW_BATTERY:
+    return "battery";
+  case NINO_RGB_SHOW_MUTE:
+    return "mute";
+  case NINO_RGB_SHOW_OTA:
+    return "ota";
   case NINO_RGB_SHOW_ERROR:
     return "error";
   case NINO_RGB_SHOW_WIFI_WAIT:
@@ -185,6 +194,13 @@ nino_rgb_show_t nino_rgb_led_current(void) { return s_show; }
 
 esp_err_t nino_rgb_led_show(nino_rgb_show_t show)
 {
+  if (nino_battery_low_alert_active() && show != NINO_RGB_SHOW_BATTERY) {
+    return ESP_OK;
+  }
+  if (nino_audio_is_muted() && show != NINO_RGB_SHOW_MUTE &&
+      show != NINO_RGB_SHOW_BATTERY) {
+    return ESP_OK;
+  }
   if (s_blink_timer == NULL) {
     return ESP_ERR_INVALID_STATE;
   }
@@ -200,6 +216,19 @@ esp_err_t nino_rgb_led_show(nino_rgb_show_t show)
     break;
   case NINO_RGB_SHOW_TTS:
     (void)nino_rgb_led_set_named("green", RGB_LED_LEVEL_MAX);
+    break;
+  case NINO_RGB_SHOW_BATTERY:
+    /* Continuous red while pack is at or below 10 V (not mute solid). */
+    s_blink_r = 255;
+    s_blink_g = 0;
+    s_blink_b = 0;
+    ESP_RETURN_ON_ERROR(blink_timer_start(400 * 1000, -1), TAG, "battery blink failed");
+    break;
+  case NINO_RGB_SHOW_MUTE:
+    (void)nino_rgb_led_set_named("red", RGB_LED_LEVEL_MAX);
+    break;
+  case NINO_RGB_SHOW_OTA:
+    (void)nino_rgb_led_set_named("purple", RGB_LED_LEVEL_MAX);
     break;
   case NINO_RGB_SHOW_ERROR:
     (void)nino_rgb_led_set_named("red", RGB_LED_LEVEL_MAX);
@@ -382,6 +411,9 @@ static void print_help(void) {
   printf("      listen       solid blue      (STREAM / listen)\n");
   printf("      tts          solid green     (voice reply playing)\n");
   printf("      idle         off\n");
+  printf("      battery      blink red 400 ms (low battery)\n");
+  printf("      mute         solid red        (speaker muted)\n");
+  printf("      ota          solid purple     (firmware update)\n");
   printf("      error        solid red       (capture/WS/error)\n");
   printf("      wifi-wait    blink white     (boot / Wi-Fi connecting)\n");
   printf("      server-wait  blink green     (Wi-Fi up, voice server down)\n");
@@ -427,6 +459,12 @@ static int cmd_rgb(int argc, char **argv) {
       show = NINO_RGB_SHOW_TTS;
     } else if (strcmp(argv[2], "idle") == 0) {
       show = NINO_RGB_SHOW_IDLE;
+    } else if (strcmp(argv[2], "battery") == 0) {
+      show = NINO_RGB_SHOW_BATTERY;
+    } else if (strcmp(argv[2], "mute") == 0) {
+      show = NINO_RGB_SHOW_MUTE;
+    } else if (strcmp(argv[2], "ota") == 0) {
+      show = NINO_RGB_SHOW_OTA;
     } else if (strcmp(argv[2], "error") == 0) {
       show = NINO_RGB_SHOW_ERROR;
     } else if (strcmp(argv[2], "wifi-wait") == 0) {
@@ -585,7 +623,7 @@ void nino_rgb_led_cli_register(void) {
   const esp_console_cmd_t cmd = {
       .command = "rgb",
       .help =
-          "rgb show listen|tts|idle|error|wifi-wait|server-wait | "
+          "rgb show listen|tts|idle|battery|mute|ota|error|wifi-wait|server-wait | "
           "rgb off | rgb status",
       .hint = NULL,
       .func = &cmd_rgb,

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdbool.h>
+
 #include "esp_err.h"
 
 /**
@@ -7,6 +9,9 @@
  *  - double press: play DEMO_main.wav
  *  - triple press: erase Wi-Fi credentials, enable BLE provisioning,
  *    play NiNO-Home_Wifi.wav
+ *
+ * GPIO47 mute button (same wiring): single press toggles speaker mute.
+ * While muted the RGB LED is solid red (not the low-battery blink).
  *
  * Do not wire buttons to GPIO7 (I2C SDA) or GPIO53 (speaker PA).
  * Call once from app_main after audio queue start.
@@ -20,3 +25,6 @@ esp_err_t nino_push_buttons_start(void);
  * Ignored (still ESP_OK) if the demo is already playing.
  */
 esp_err_t nino_push_buttons_trigger_demo(void);
+
+/** Mute/unmute the speaker and set the solid-red mute LED. */
+void nino_mute_set(bool muted);
