@@ -553,7 +553,9 @@ def synthesize_session_open_wav(
 
     meta = VoiceReplyMeta(session_id=session_id, device_id=device_id)
     meta.end_session = False
-    meta.prompt_medical_ack = False
+    # Keep the stream session in continue-listen after GREET so the board
+    # treats this like a spoken reply, not a silent skip.
+    meta.prompt_medical_ack = True
     # Identified greet -> heart; hunt / register-offer -> no LCD emoji.
     inferred = infer_eye_expression_for_response(reply, reply_path=reply_path)
     if inferred == "heart" or (eye_expression or "").strip().lower() == "heart":
@@ -699,7 +701,8 @@ class VoiceSettings:
     openai_api_key: str = ""
     openai_api_base: str = "https://api.openai.com/v1"
     openai_whisper_model: str = "whisper-1"
-    max_request_bytes: int = 512_000
+    # 16 kHz 16-bit mono WAV: 2 bytes/sample + header. Cover 60s registration.
+    max_request_bytes: int = 2_100_000
     max_words_reply: int = 45
     recap_max_words: int = 55
     personalize_prob: float = DEFAULT_VOICE_PERSONALIZE_PROB
@@ -1956,7 +1959,24 @@ def process_voice_wav(
     if not wav_bytes:
         raise RuntimeError("Empty audio.")
     if len(wav_bytes) > SETTINGS.max_request_bytes:
-        raise RuntimeError("Audio exceeds size limit.")
+        t_start = time.perf_counter()
+        logger.warning(
+            "Audio exceeds size limit device=%s bytes=%s max=%s",
+            device_id,
+            len(wav_bytes),
+            SETTINGS.max_request_bytes,
+        )
+        return _silent_close(
+            meta,
+            reply_path="too_long",
+            heard="",
+            audio_input_format="wav",
+            audio_in_seconds=len(wav_bytes) / 32_000.0,
+            wav_bytes=wav_bytes,
+            stt_engine="skipped",
+            t_start=t_start,
+            t_stt=t_start,
+        )
 
     try:
         wav_bytes, audio_input_format = normalize_voice_input_bytes(wav_bytes)
@@ -2188,7 +2208,7 @@ def process_voice_wav(
 
     from session_identity import get_session_identity
 
-    ident = get_session_identity()
+    ident = get_session_identity(device_id)
     ident_handled = False
     if ident is not None and ident.should_skip_prompt_echo(user_text):
         logger.info(

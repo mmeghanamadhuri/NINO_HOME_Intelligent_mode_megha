@@ -27,6 +27,8 @@ class UserDeviceMacTests(unittest.TestCase):
         self.assertEqual(ud.normalize_device_mac("nino-a0e34fc4"), "")
         self.assertEqual(ud.normalize_device_mac("not-a-mac"), "")
         self.assertEqual(ud.normalize_device_mac(""), "")
+        self.assertEqual(ud.normalize_device_mac("000000000000"), "")
+        self.assertEqual(ud.normalize_device_mac("00:00:00:00:00:00"), "")
 
     def test_pretty_print(self) -> None:
         self.assertEqual(ud.format_device_mac("30eda0e34fc4"), "30:ED:A0:E3:4F:C4")
@@ -63,6 +65,34 @@ class UserDeviceMacTests(unittest.TestCase):
         ud.link_user_device("Hari", "nino-home")
         self.assertEqual(ud.devices_for_user("guest"), [])
         self.assertFalse(self.path.exists())
+
+
+class DeviceHostMapTests(unittest.TestCase):
+    def test_maps_client_ip_to_mac(self) -> None:
+        from device_registry import DeviceRegistry
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "devices.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "devices": [
+                            {
+                                "device_id": "588c81542a4c",
+                                "base_url": "http://192.168.0.83",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registry = DeviceRegistry(path)
+            self.assertEqual(
+                registry.find_device_id_by_host("192.168.0.83"),
+                "588c81542a4c",
+            )
+            self.assertEqual(registry.find_device_id_by_host("192.168.0.8"), "")
+            self.assertEqual(registry.find_device_id_by_host(""), "")
 
 
 if __name__ == "__main__":

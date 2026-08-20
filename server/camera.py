@@ -489,7 +489,22 @@ class CameraPool:
         from device_registry import get_device_registry
 
         record = get_device_registry().resolve_or_default(device_id)
-        source = record.effective_camera_url() or "auto"
+        source = record.effective_camera_url()
+        if not source:
+            # Empty URL means the robot is gone. Do not open the PC webcam
+            # and keep logging that MAC as if it were still on the LAN.
+            live = next(
+                (
+                    other
+                    for other in get_device_registry().list_devices()
+                    if other.effective_camera_url()
+                    and other.device_id != record.device_id
+                ),
+                None,
+            )
+            if live is not None:
+                return self.ensure(live.device_id)
+            source = "auto"
         with self._lock:
             stream = self._streams.get(record.device_id)
             if stream is None:
@@ -508,7 +523,13 @@ class CameraPool:
             return stream
 
     def read(self, device_id: str | None = None) -> np.ndarray | None:
-        return self.ensure(device_id).read()
+        from device_registry import get_device_registry
+
+        registry = get_device_registry()
+        record = registry.get(device_id) if device_id else registry.resolve_or_default(None)
+        if record is None or not record.effective_camera_url():
+            return None
+        return self.ensure(record.device_id).read()
 
     def restart(self, device_id: str | None, source: str) -> CameraStream:
         from device_registry import get_device_registry
@@ -549,6 +570,10 @@ class CameraPool:
 
 
 def get_device_registry_safe_id(device_id: str | None) -> str:
-    from device_registry import resolve_device_id
+    from device_registry import get_device_registry, resolve_device_id
+    from user_devices import normalize_device_mac
 
+    mac = normalize_device_mac(device_id)
+    if mac and get_device_registry().get(mac) is None:
+        return mac
     return resolve_device_id(device_id)

@@ -232,5 +232,23 @@ class NameInjectionTests(unittest.TestCase):
         self.assertTrue(is_guest_name(new_guest_name()))
 
 
+class PerDeviceIdentityTests(unittest.TestCase):
+    def test_robots_do_not_share_register_state(self) -> None:
+        from session_identity import configure_session_identity, get_session_identity
+
+        configure_session_identity(MagicMock(), lambda: None)
+        a = get_session_identity("588c81542a4c")
+        b = get_session_identity("b0a6048addd4")
+        self.assertIsNot(a, b)
+        a.start_session(
+            session_id="a",
+            device_id="588c81542a4c",
+            identity_name=None,
+            identity_state="no_face",
+        )
+        self.assertTrue(a.in_registration())
+        self.assertFalse(b.in_registration())
+
+
 if __name__ == "__main__":
     unittest.main()

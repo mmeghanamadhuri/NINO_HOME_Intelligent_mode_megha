@@ -24,7 +24,11 @@ def normalize_device_mac(raw: str | None) -> str:
     hexdigits = _MAC_HEX_RE.sub("", str(raw or ""))
     if len(hexdigits) != 12:
         return ""
-    return hexdigits.lower()
+    mac = hexdigits.lower()
+    # Firmware sometimes sends STA-unset 00:00:00:00:00:00 as device_id.
+    if mac == "000000000000":
+        return ""
+    return mac
 
 
 def format_device_mac(raw: str | None) -> str:

@@ -76,12 +76,8 @@ static esp_err_t spk_stream_open_locked(uint32_t sample_rate_hz, bool leave_open
   if (s_spk == NULL) {
     return ESP_FAIL;
   }
-  if (s_spk_stream_open && s_spk_stream_rate_hz == sample_rate_hz &&
-      !s_spk_force_reopen) {
-    return ESP_OK;
-  }
-  /* ES8311 AUX ADC + speaker share one duplex I2S. Drop the ADC before any
-   * rate change / reopen so capture does not keep a stale mic handle. */
+  /* Always reopen. TTS is 16 kHz, same as the warm chime / AUX path, so the
+   * old skip-reopen branch wrote into a dead I2S (silent speaker, i2s errors). */
   nino_mic_drop_es8311_locked();
   spk_stream_close_locked();
 

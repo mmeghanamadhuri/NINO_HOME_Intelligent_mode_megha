@@ -217,6 +217,9 @@ class DeviceDiscovery:
             device_id = record.device_id
             last_seen = self._last_seen.get(device_id)
             if last_seen is None:
+                if device_id not in found_ids and not record.effective_base_url():
+                    stale.append(device_id)
+                    continue
                 self._last_seen[device_id] = now
                 continue
             if device_id not in found_ids and (now - last_seen) >= self.stale_after_s:

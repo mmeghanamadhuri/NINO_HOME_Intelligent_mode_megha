@@ -409,16 +409,33 @@ class SessionIdentityFlow:
         )
 
 
-_flow: SessionIdentityFlow | None = None
+_faces: Any = None
+_default_read_frame: Callable[[], Any] | None = None
+_flows: dict[str, SessionIdentityFlow] = {}
 _flow_lock = threading.Lock()
 
 
 def configure_session_identity(faces: Any, read_frame: Callable[[], Any]) -> SessionIdentityFlow:
-    global _flow
+    global _faces, _default_read_frame
     with _flow_lock:
-        _flow = SessionIdentityFlow(faces, read_frame)
-        return _flow
+        _faces = faces
+        _default_read_frame = read_frame
+        _flows.clear()
+        default = SessionIdentityFlow(faces, read_frame)
+        _flows[""] = default
+        return default
 
 
-def get_session_identity() -> SessionIdentityFlow | None:
-    return _flow
+def get_session_identity(device_id: str | None = None) -> SessionIdentityFlow | None:
+    """Return the identity flow for this robot. Each MAC has its own greet/register state."""
+    if _faces is None:
+        return None
+    key = str(device_id or "").strip()
+    with _flow_lock:
+        found = _flows.get(key)
+        if found is not None:
+            return found
+        read_frame = _default_read_frame or (lambda: None)
+        found = SessionIdentityFlow(_faces, read_frame)
+        _flows[key] = found
+        return found

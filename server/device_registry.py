@@ -516,6 +516,19 @@ class DeviceRegistry:
         with self._lock:
             return list(self._devices.values())
 
+    def find_device_id_by_host(self, host: str) -> str:
+        """Map a voice-WS client IP to a discovered robot MAC."""
+        needle = (host or "").strip()
+        if not needle:
+            return ""
+        with self._lock:
+            devices = list(self._devices.values())
+        for record in devices:
+            parsed = urllib.parse.urlparse(record.effective_base_url())
+            if parsed.hostname == needle:
+                return record.device_id
+        return ""
+
     def _find_locked(self, device_id: str) -> DeviceRecord | None:
         """Exact match, then case-insensitive. Caller must hold ``self._lock``."""
         key = (device_id or "").strip()
@@ -672,7 +685,11 @@ def get_device_registry() -> DeviceRegistry:
 
 
 def resolve_device_id(raw: str | None) -> str:
-    """Normalize a client MAC. Names are rejected; new MACs are registered."""
+    """Normalize a client MAC. Names are rejected; unknown MACs are not persisted.
+
+    Discovery is the only path that adds robots. HTTP/camera callers that still
+    send a powered-off MAC must not resurrect it in devices.json.
+    """
     reg = get_device_registry()
     cleaned = (raw or "").strip()
     if not cleaned or cleaned.casefold() in {"default", "ui"}:
@@ -681,7 +698,11 @@ def resolve_device_id(raw: str | None) -> str:
     if not mac:
         logger.warning("Rejected non-MAC device_id=%r", cleaned)
         return ""
-    return reg.ensure_registered(mac).device_id
+    found = reg.get(mac)
+    if found is not None:
+        return found.device_id
+    logger.warning("Unknown device mac=%s — not remapped", mac)
+    return ""
 
 
 def _parse_coordinate(value: object, minimum: float, maximum: float) -> float | None:

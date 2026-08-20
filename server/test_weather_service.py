@@ -97,6 +97,25 @@ class WeatherServiceTests(unittest.TestCase):
                 warning.assert_called()
             self.assertEqual(registry.resolve_or_default(MAC_A).device_id, MAC_A)
 
+    def test_resolve_device_id_does_not_resurrect_offline_mac(self) -> None:
+        from device_registry import DeviceRegistry, resolve_device_id
+        import device_registry as dr
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "devices.json"
+            path.write_text(
+                json.dumps({"devices": [{"device_id": MAC_A, "base_url": "http://192.168.0.173"}]}),
+                encoding="utf-8",
+            )
+            registry = DeviceRegistry(path)
+            with patch.object(dr, "_REGISTRY", registry):
+                self.assertEqual(resolve_device_id(MAC_B), "")
+                self.assertIsNone(registry.get(MAC_B))
+                self.assertEqual(
+                    {d.device_id for d in registry.list_devices()},
+                    {MAC_A},
+                )
+
     def test_device_lookup_normalizes_mac_case_and_colons(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "devices.json"

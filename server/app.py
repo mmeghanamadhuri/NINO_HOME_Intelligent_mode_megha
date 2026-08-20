@@ -360,6 +360,8 @@ def startup() -> None:
         while True:
             try:
                 for record in registry.list_devices():
+                    if not record.effective_camera_url():
+                        continue
                     _vision_tick_device(
                         record.device_id,
                         update_tts=True,
@@ -641,7 +643,7 @@ def select_device(req: DeviceSelectRequest) -> dict:
     device_id = registry.set_ui_device_id(req.device_id)
     tts.set_playback_device_id(device_id)
     face_registration.set_frame_getter(cameras.frame_getter(device_id))
-    ident = get_session_identity()
+    ident = get_session_identity(device_id)
     if ident is not None:
         ident.set_frame_getter(cameras.frame_getter(device_id))
     return {"ok": True, "devices": registry.status()}
@@ -1188,7 +1190,6 @@ def _same_camera_device_ids(device_id: str | None) -> list[str]:
             keys.append(cleaned)
 
     _add(active)
-    _add(registry.ui_device_id())
     rec = registry.get(active)
     url = rec.effective_camera_url() if rec else ""
     if url:
@@ -1512,22 +1513,35 @@ def _voice_wants_stream(websocket: WebSocket) -> bool:
 
 
 def _device_id_from_websocket(websocket: WebSocket) -> str:
-    """Resolve the robot MAC from query param or X-Nino-Device-Id.
+    """Resolve the robot MAC from query param, header, or client IP.
 
-    Voice traffic never remaps a missing or name-based id onto another robot.
+    All-zero and name-based device_id values are not treated as MACs. In that
+    case the voice socket is mapped to a discovered robot by exact client IP.
     """
     raw = (websocket.query_params.get("device_id") or "").strip()
     if not raw:
         raw = (websocket.headers.get("x-nino-device-id") or "").strip()
     mac = normalize_device_mac(raw)
-    if not mac:
-        logger.warning(
-            "Voice WS missing or non-MAC device_id from %s raw=%r",
+    if mac:
+        return resolve_device_id(mac)
+    host = ""
+    if websocket.client is not None:
+        host = str(getattr(websocket.client, "host", "") or "")
+    mapped = get_device_registry().find_device_id_by_host(host)
+    if mapped:
+        logger.info(
+            "Voice WS mapped client %s raw=%r -> %s",
             _ws_client_label(websocket),
             raw,
+            mapped,
         )
-        return ""
-    return resolve_device_id(mac)
+        return mapped
+    logger.warning(
+        "Voice WS missing or non-MAC device_id from %s raw=%r",
+        _ws_client_label(websocket),
+        raw,
+    )
+    return ""
 
 
 async def _process_voice_query_audio(
@@ -1725,6 +1739,50 @@ async def _voice_ws_send_reply(
         )
         return False
 
+    # Vaseekaran (d4) queues the WS WAV (wait_idle matches clip length) but the
+    # ES8311 speaker stays silent. POST /play_wav after the board has reopened
+    # Aux so the HTTP job forces a DAC reopen. Skip tiny wake-reject clips.
+    # Do not do this on Gitam — that unit already plays the WS binary.
+    if (
+        wav_out
+        and len(wav_out) > 8000
+        and device_id == "b0a6048addd4"
+    ):
+        wav_copy = bytes(wav_out)
+        eye_copy = eye_tag
+        delay_s = max(0.5, (len(wav_copy) - 44) / 32000.0 + 0.45)
+        logger.info(
+            "HTTP play_wav fallback in %.2fs device=%s bytes=%s",
+            delay_s,
+            device_id,
+            len(wav_copy),
+        )
+
+        async def _http_play_fallback() -> None:
+            await asyncio.sleep(delay_s)
+            def _http_play() -> None:
+                try:
+                    from esp_playback import deliver_wav_to_device
+
+                    deliver_wav_to_device(
+                        device_id,
+                        wav_copy,
+                        timeout=20.0,
+                        prompt_ack=False,
+                        prompt_ack_chime=False,
+                        eye_expression=eye_copy,
+                    )
+                except Exception:
+                    logger.exception(
+                        "HTTP play_wav failed device=%s bytes=%s",
+                        device_id,
+                        len(wav_copy),
+                    )
+
+            await run_in_threadpool(_http_play)
+
+        asyncio.create_task(_http_play_fallback())
+
     if meta.registered_face_name:
         _remember_voice_viewer(meta.registered_face_name, device_id)
     viewer = str(meta.timings.get("voice_viewer") or "")
@@ -1774,7 +1832,7 @@ async def _voice_ws_stream_pipeline(
     hunt_greet_timeout_s = 8.0
 
     def apply_listen_timeout() -> None:
-        ident = get_session_identity()
+        ident = get_session_identity(device_id)
         registering = ident is not None and ident.in_registration()
         buf.set_listen_max_ms(stream_listen_max_ms(in_registration=registering))
 
@@ -1804,12 +1862,13 @@ async def _voice_ws_stream_pipeline(
         try:
             try:
                 registry.set_ui_device_id(device_id)
+                tts.set_playback_device_id(device_id)
             except Exception:
                 pass
             identity_name, identity_state = await run_in_threadpool(
                 _session_open_identity_snapshot, device_id
             )
-            ident = get_session_identity()
+            ident = get_session_identity(device_id)
             if ident is None:
                 greet_sent = True
                 accepting = True
@@ -1850,6 +1909,12 @@ async def _voice_ws_stream_pipeline(
                 greet_sent = True
                 apply_listen_timeout()
                 accepting = True
+                logger.info(
+                    "stream GREET sent device=%s session=%s wav_bytes=%s",
+                    device_id,
+                    session_id,
+                    len(wav_out or b""),
+                )
             return ok
         except Exception:
             logger.exception("stream session-open greeting failed device=%s", device_id)
@@ -1990,7 +2055,7 @@ async def _voice_ws_stream_pipeline(
     async def finish_utterance(reason: str) -> bool:
         """Send EOS (receive not in flight). Skip now or start STT off-websocket."""
         nonlocal accepting, first_turn, voice_turn, stt_task
-        ident = get_session_identity()
+        ident = get_session_identity(device_id)
         registering = ident is not None and ident.in_registration()
         pcm = bytes(buf.pcm)
         buf.reset()
@@ -2222,7 +2287,7 @@ async def _voice_ws_stream_pipeline(
             await websocket.close()
         except Exception:
             pass
-        ident = get_session_identity()
+        ident = get_session_identity(device_id)
         if ident is not None:
             ident.end_session()
 
