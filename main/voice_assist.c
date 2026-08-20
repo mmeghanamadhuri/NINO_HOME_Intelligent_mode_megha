@@ -60,8 +60,9 @@ static const char *TAG = "voice_ast";
 #define AUX_REPLY_WAIT_MS 180000
 #define STREAM_LISTEN_CAP_MS 65000
 #define CAMERA_STREAM_WAIT_MS 2500
-#define FACE_HUNT_MS 5000
-#define SESSION_GREET_WAIT_MS 15000
+#define FACE_HUNT_MS 13000
+#define SESSION_GREET_WAIT_MS 20000
+#define IDENTITY_SCAN_WAIT_MS 12000
 #define AUX_MUSIC_LISTEN_MS 200
 #define AUX_MUSIC_PLAY_SLICE_MS 800
 #define AUX_WAKE_GAP_MS 1000
@@ -947,6 +948,38 @@ static void play_ws_reply_wav(uint8_t *resp, size_t resp_len, const char *eye_ex
   nino_main_queue_audio_wav(resp, resp_len, false, false, eye_state);
 }
 
+static bool wait_and_play_ws_wav(nino_voice_ws_session_t *ws, uint32_t wait_ms,
+                                 const char *stage, bool session_open,
+                                 bool *session_end) {
+  uint8_t *resp = NULL;
+  size_t resp_len = 0;
+  bool skip = false;
+  bool end_session = false;
+  char eye_expr[16] = {0};
+  char motion[192] = {0};
+  esp_err_t err = nino_voice_ws_session_wait_reply(
+      ws, wait_ms, &resp, &resp_len, &skip, &end_session, eye_expr,
+      sizeof(eye_expr), motion, sizeof(motion), NULL);
+  if (err == ESP_OK && !skip && resp != NULL && resp_len > 0) {
+    play_ws_reply_wav(resp, resp_len, eye_expr, motion, session_open);
+    resp = NULL;
+    voice_log(ESP_LOG_INFO, s_voice_turn, stage,
+              "bytes=%u end_session=%d eye=%s", (unsigned)resp_len,
+              end_session ? 1 : 0, eye_expr[0] ? eye_expr : "idle");
+    nino_audio_queue_wait_idle(AUX_REPLY_WAIT_MS);
+    aux_ignore_energy_for_ms(AUX_POST_SPEAKER_IGNORE_MS);
+  } else if (err == ESP_ERR_TIMEOUT) {
+    voice_log(ESP_LOG_INFO, s_voice_turn, stage, "timeout — continue");
+  } else if (skip) {
+    voice_log(ESP_LOG_INFO, s_voice_turn, stage, "skip");
+  }
+  free(resp);
+  if (session_end != NULL && end_session) {
+    *session_end = true;
+  }
+  return err == ESP_OK || err == ESP_ERR_TIMEOUT;
+}
+
 static bool stream_aux_pcm(nino_voice_ws_session_t *ws, uint32_t turn,
                            const int16_t *preroll, size_t preroll_samples,
                            bool listen_led) {
@@ -1112,7 +1145,7 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
   (void)nino_rgb_led_show(NINO_RGB_SHOW_LISTEN);
   session_camera_on();
   camera_on = true;
-  (void)nino_face_hunt_for_person(FACE_HUNT_MS);
+  (void)nino_face_hunt_for_person(FACE_HUNT_MS, false);
 
   nino_voice_ws_session_clear_reply(ws);
   err = nino_voice_ws_session_send_text(ws, "{\"type\":\"ready\"}");
@@ -1123,35 +1156,26 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
     voice_log(ESP_LOG_INFO, s_voice_turn, "READY", "hunt done — waiting GREET");
   }
 
-  {
-    uint8_t *resp = NULL;
-    size_t resp_len = 0;
-    bool skip = false;
-    bool end_session = false;
-    char eye_expr[16] = {0};
-    char motion[192] = {0};
-    err = nino_voice_ws_session_wait_reply(ws, SESSION_GREET_WAIT_MS, &resp, &resp_len,
-                                           &skip, &end_session, eye_expr,
-                                           sizeof(eye_expr), motion, sizeof(motion),
-                                           NULL);
-    if (err == ESP_OK && !skip && resp != NULL && resp_len > 0) {
-      play_ws_reply_wav(resp, resp_len, eye_expr, motion, true);
-      resp = NULL; /* queue owns the WAV; do not free after playback */
-      voice_log(ESP_LOG_INFO, s_voice_turn, "GREET",
-                "bytes=%u end_session=%d eye=%s", (unsigned)resp_len,
-                end_session ? 1 : 0, eye_expr[0] ? eye_expr : "idle");
-      nino_audio_queue_wait_idle(AUX_REPLY_WAIT_MS);
-      aux_ignore_energy_for_ms(AUX_POST_SPEAKER_IGNORE_MS);
-      if (end_session) {
-        session_end = true;
-        goto session_done;
-      }
-    } else if (err == ESP_ERR_TIMEOUT) {
-      voice_log(ESP_LOG_INFO, s_voice_turn, "GREET", "no session-open TTS — listen");
-    }
-    free(resp);
-    nino_voice_ws_session_begin_turn(ws);
+  if (!wait_and_play_ws_wav(ws, SESSION_GREET_WAIT_MS, "GREET", true, &session_end)) {
+    /* keep going into listen even if GREET wait failed */
   }
+  if (session_end) {
+    goto session_done;
+  }
+
+  /* After GREET TTS, re-acquire the same person (or switch) before listen. */
+  (void)nino_face_hunt_for_person(FACE_HUNT_MS, true);
+  nino_voice_ws_session_clear_reply(ws);
+  if (nino_voice_ws_session_send_text(ws, "{\"type\":\"identity_scan\"}") == ESP_OK) {
+    voice_log(ESP_LOG_INFO, s_voice_turn, "SCAN", "post-GREET identity refresh");
+    if (!wait_and_play_ws_wav(ws, IDENTITY_SCAN_WAIT_MS, "SCAN", false, &session_end)) {
+      /* listen anyway */
+    }
+  }
+  if (session_end) {
+    goto session_done;
+  }
+  nino_voice_ws_session_begin_turn(ws);
 
   /* Wake preroll is stale after hunt + GREET TTS. */
   (void)preroll;
@@ -1199,7 +1223,24 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
       session_end = true;
       voice_log(ESP_LOG_INFO, turn, "SESSION", "ended after TTS id=%s", session_id);
     } else {
-      (void)nino_rgb_led_show(NINO_RGB_SHOW_LISTEN);
+      (void)nino_face_hunt_for_person(FACE_HUNT_MS, true);
+      nino_voice_ws_session_clear_reply(ws);
+      if (nino_voice_ws_session_send_text(ws, "{\"type\":\"identity_scan\"}") !=
+          ESP_OK) {
+        voice_log(ESP_LOG_WARN, turn, "SCAN", "send failed — listen");
+      } else {
+        voice_log(ESP_LOG_INFO, turn, "SCAN", "hunt done — identity refresh");
+        if (!wait_and_play_ws_wav(ws, IDENTITY_SCAN_WAIT_MS, "SCAN", false,
+                                  &session_end)) {
+          /* listen anyway */
+        }
+      }
+      if (session_end) {
+        voice_log(ESP_LOG_INFO, turn, "SESSION", "ended after identity scan id=%s",
+                  session_id);
+      } else {
+        (void)nino_rgb_led_show(NINO_RGB_SHOW_LISTEN);
+      }
     }
   }
 

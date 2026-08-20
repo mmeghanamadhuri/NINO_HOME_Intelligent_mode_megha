@@ -347,8 +347,24 @@ _CANCEL_IN_SENTENCE = re.compile(
     r"cancel(?:\s+(?:it|this|registration))?|"
     r"never\s*mind|forget\s+it|"
     r"don'?t\s+(?:want\s+to\s+)?register|"
-    r"stop\s+(?:it|this|registration)|"
+    r"stop\s+(?:it|this|registration|the\s+process)|"
+    r"cancel\s+(?:the\s+)?(?:process|registration)|"
     r"leave\s+me\s+alone"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# User says they are already known — re-run recognition instead of guest/register.
+_ALREADY_REGISTERED_CLAIM_RE = re.compile(
+    r"\b(?:"
+    r"i(?:'?m| am)\s+not\s+(?:a\s+)?new(?:\s+user)?"
+    r"|not\s+a\s+new\s+user"
+    r"|i(?:'?m| am)\s+already\s+registered"
+    r"|i\s+already\s+registered"
+    r"|you(?:'?ve| have)?\s+(?:already\s+)?(?:know|seen|recogni[sz]e)(?:d)?\s+me"
+    r"|you\s+know\s+(?:me|who\s+i\s+am)"
+    r"|i(?:'?m| am)\s+(?:already\s+)?(?:a\s+)?(?:registered|known)\s+user"
+    r"|you\s+already\s+know\s+me"
     r")\b",
     re.IGNORECASE,
 )
@@ -483,14 +499,47 @@ _SESSION_STOP_RE = re.compile(
 )
 
 
+def is_session_goodbye_utterance(user_text: str) -> bool:
+    """True farewell — end the whole session (not a registration cancel)."""
+    text = (user_text or "").strip()
+    if not text:
+        return False
+    return bool(_SESSION_END_RE.search(text))
+
+
 def is_session_end_utterance(user_text: str) -> bool:
-    """Goodbye / stop — end the session; do not convert register silence to guest."""
+    """Goodbye / stop — end the session outside of registration."""
     text = (user_text or "").strip()
     if not text:
         return False
     if _SESSION_STOP_RE.match(text):
         return True
-    return bool(_SESSION_END_RE.search(text))
+    return is_session_goodbye_utterance(text)
+
+
+def is_registration_stop_process(user_text: str) -> bool:
+    """Cancel or stop registration without treating a bare 'no' as abort.
+
+    Bare 'no' still means decline on the offer, or 'wrong name' on confirm.
+    """
+    if is_session_goodbye_utterance(user_text):
+        return False
+    text = _strip_trailing_punct(user_text or "")
+    if not text:
+        return False
+    if re.match(r"^\s*(?:no|nope|nah)\b", text, re.IGNORECASE) and not re.search(
+        r"\b(?:cancel|stop|quit|abort|never\s*mind|forget)\b", text, re.IGNORECASE
+    ):
+        return False
+    return is_registration_cancel(text)
+
+
+def is_already_registered_claim(user_text: str) -> bool:
+    """True when the user says they are not new / already known."""
+    text = _strip_trailing_punct(user_text or "")
+    if not text or len(text) > 100:
+        return False
+    return bool(_ALREADY_REGISTERED_CLAIM_RE.search(text))
 
 
 def is_registration_cancel(user_text: str) -> bool:

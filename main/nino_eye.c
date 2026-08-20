@@ -354,6 +354,18 @@ static uint16_t color_red(void)
     return ssd1351_color(255, 0, 0);
 }
 
+/* Identify heart must read as red on the ST7735. RGB (255,0,0) currently shows
+ * as blue on this panel (BGR wire order); put 255 on the blue channel so the
+ * glass shows a red heart. Other procedural colours stay unchanged. */
+static uint16_t color_heart(void)
+{
+#if CONFIG_NINO_EYE_DISPLAY_TFT
+    return ssd1351_color(0, 0, 255);
+#else
+    return ssd1351_color(255, 0, 0);
+#endif
+}
+
 static uint16_t color_capsule_body(void)
 {
     return ssd1351_color(210, 210, 210);
@@ -2254,7 +2266,7 @@ static void run_heart_profile_once(const nino_state_profile_t *profile, nino_eye
     erase_prev_eye();
     /* Heart's pointed bottom reaches lower than its lobes rise, so lift the
      * center well above mid-screen to keep the symbol visually centered. */
-    draw_heart(EYE_CX, EYE_CY - 4, profile->heart_max_scale, color_red());
+    draw_heart(EYE_CX, EYE_CY - 4, profile->heart_max_scale, color_heart());
     fb_batch_end();
     remember_heart(EYE_CX, EYE_CY - 4, profile->heart_max_scale);
     while (delay_ms_interruptible(profile->state_ms, expected)) {

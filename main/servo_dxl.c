@@ -88,8 +88,8 @@
 #define DXL_ATTACH_RETRY_MS                   750
 #define DXL_HUB_SETTLE_ATTEMPTS               80
 #define DXL_PING_FAIL_RECONNECT               8
-#define DXL_BOOT_HEALTH_SPEED                 180
-#define DXL_BOOT_MOVE_TIMEOUT_MS              3000
+#define DXL_BOOT_HEALTH_SPEED                 28
+#define DXL_BOOT_MOVE_TIMEOUT_MS              8000
 #define DXL_BOOT_BUS_SETTLE_MS                200
 #define DXL_USB_ADDR_LIST_MAX                 16
 #define DXL_POSITION_TOLERANCE                15
@@ -2022,6 +2022,7 @@ static bool boot_health_move_axis(uint8_t id, int target, const char *label)
         return false;
     }
     ESP_LOGI(TAG, "Boot health ID%u (%s) OK — reached %d", id, label, target);
+    vTaskDelay(pdMS_TO_TICKS(200));
     return true;
 }
 

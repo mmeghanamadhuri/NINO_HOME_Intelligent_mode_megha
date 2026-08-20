@@ -24,6 +24,10 @@ static const char *TAG = "face_tracker";
 #define FACE_TRACK_POSITION_SPEED 70
 /** Restore the regular head-motion speed when face tracking is disabled. */
 #define FACE_TRACK_NORMAL_POSITION_SPEED 22
+/** Hunt head motion: slower than tracking so the overlay can ID a known face. */
+#define FACE_HUNT_POSITION_SPEED 16
+#define FACE_HUNT_POSE_MS 1600
+#define FACE_HUNT_FACE_SETTLE_MS 400
 /** Tilt ID1 on this head: higher goal = physical up, lower goal = physical down. */
 #define FACE_TRACK_TILT_UP_LIMIT_DEG 15
 #define FACE_TRACK_TILT_DOWN_LIMIT_DEG 10
@@ -243,51 +247,77 @@ void nino_face_tracker_get_status(nino_face_tracker_status_t *out) {
 
 bool nino_face_tracker_face_seen(void) { return s_face_found; }
 
-bool nino_face_hunt_for_person(uint32_t timeout_ms) {
+bool nino_face_hunt_for_person(uint32_t timeout_ms, bool skip_if_visible) {
   const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
-  const int poses[] = {
-      NINO_SERVO_AXIS_CENTER,
-      NINO_SERVO_PAN_LEFT,
-      NINO_SERVO_AXIS_CENTER,
-      NINO_SERVO_PAN_RIGHT,
-      NINO_SERVO_AXIS_CENTER,
-      NINO_SERVO_PAN_LEFT,
-      NINO_SERVO_PAN_RIGHT,
-      NINO_SERVO_AXIS_CENTER,
+  const struct {
+    int pan;
+    int tilt;
+  } poses[] = {
+      {NINO_SERVO_AXIS_CENTER, NINO_SERVO_AXIS_CENTER},
+      {NINO_SERVO_PAN_LEFT, NINO_SERVO_AXIS_CENTER},
+      {NINO_SERVO_PAN_RIGHT, NINO_SERVO_AXIS_CENTER},
+      {NINO_SERVO_AXIS_CENTER, NINO_SERVO_AXIS_CENTER},
+      {NINO_SERVO_AXIS_CENTER, NINO_SERVO_TILT_UP},
+      {NINO_SERVO_AXIS_CENTER, NINO_SERVO_TILT_DOWN},
+      {NINO_SERVO_AXIS_CENTER, NINO_SERVO_AXIS_CENTER},
   };
   const size_t nposes = sizeof(poses) / sizeof(poses[0]);
   size_t pose_i = 0;
   TickType_t pose_until = xTaskGetTickCount();
+  bool saw_face = false;
+  int last_face_pan = NINO_SERVO_AXIS_CENTER;
+  int last_face_tilt = NINO_SERVO_AXIS_CENTER;
+  int cur_pan = NINO_SERVO_AXIS_CENTER;
+  int cur_tilt = NINO_SERVO_AXIS_CENTER;
 
-  s_face_found = false;
-  ESP_LOGI(TAG, "Face hunt start (timeout %u ms)", (unsigned)timeout_ms);
+  ESP_LOGI(TAG, "Face hunt start (timeout %u ms, slow pan/tilt)", (unsigned)timeout_ms);
+
+  /* After TTS, keep the current person if they are still in frame. */
+  vTaskDelay(pdMS_TO_TICKS(220));
+  if (skip_if_visible && s_face_found) {
+    ESP_LOGI(TAG, "Face hunt: person already in frame");
+    return true;
+  }
+  if (!skip_if_visible) {
+    s_face_found = false;
+  }
 
   if (nino_servo_dxl_is_ready() && !nino_servo_recplay_is_busy()) {
-    nino_servo_dxl_set_pan_tilt(poses[0], NINO_SERVO_AXIS_CENTER);
-    pose_until = xTaskGetTickCount() + pdMS_TO_TICKS(450);
+    nino_servo_dxl_set_position_speed(FACE_HUNT_POSITION_SPEED);
+    cur_pan = poses[0].pan;
+    cur_tilt = poses[0].tilt;
+    nino_servo_dxl_set_pan_tilt(cur_pan, cur_tilt);
+    pose_until = xTaskGetTickCount() + pdMS_TO_TICKS(FACE_HUNT_POSE_MS);
     pose_i = 1;
   }
 
   while (xTaskGetTickCount() < deadline) {
     if (s_face_found) {
-      ESP_LOGI(TAG, "Face hunt found a person");
-      if (nino_servo_dxl_is_ready() && !nino_servo_recplay_is_busy()) {
-        nino_servo_dxl_go_neutral();
-      }
-      return true;
+      saw_face = true;
+      last_face_pan = cur_pan;
+      last_face_tilt = cur_tilt;
     }
     if (nino_servo_dxl_is_ready() && !nino_servo_recplay_is_busy() &&
         xTaskGetTickCount() >= pose_until && pose_i < nposes) {
-      nino_servo_dxl_set_pan_tilt(poses[pose_i], NINO_SERVO_AXIS_CENTER);
+      cur_pan = poses[pose_i].pan;
+      cur_tilt = poses[pose_i].tilt;
+      nino_servo_dxl_set_pan_tilt(cur_pan, cur_tilt);
       pose_i++;
-      pose_until = xTaskGetTickCount() + pdMS_TO_TICKS(450);
+      pose_until = xTaskGetTickCount() + pdMS_TO_TICKS(FACE_HUNT_POSE_MS);
     }
     vTaskDelay(pdMS_TO_TICKS(40));
   }
 
-  ESP_LOGI(TAG, "Face hunt done (found=%d)", (int)s_face_found);
   if (nino_servo_dxl_is_ready() && !nino_servo_recplay_is_busy()) {
-    nino_servo_dxl_go_neutral();
+    if (saw_face) {
+      nino_servo_dxl_set_pan_tilt(last_face_pan, last_face_tilt);
+      vTaskDelay(pdMS_TO_TICKS(FACE_HUNT_FACE_SETTLE_MS));
+    } else {
+      nino_servo_dxl_go_neutral();
+    }
+    nino_servo_dxl_set_position_speed(FACE_TRACK_NORMAL_POSITION_SPEED);
   }
-  return s_face_found;
+
+  ESP_LOGI(TAG, "Face hunt done (found=%d)", (int)(saw_face || s_face_found));
+  return saw_face || s_face_found;
 }

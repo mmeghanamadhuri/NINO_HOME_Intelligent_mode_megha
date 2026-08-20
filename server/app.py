@@ -1171,6 +1171,16 @@ def _remember_voice_viewer(name: str | None, device_id: str | None = None) -> No
         _voice_viewer_by_device[key] = (cleaned, time.time())
 
 
+def _forget_voice_viewer(device_id: str | None = None) -> None:
+    from user_devices import normalize_device_mac
+
+    key = normalize_device_mac(device_id)
+    if not key:
+        return
+    with _voice_viewer_lock:
+        _voice_viewer_by_device.pop(key, None)
+
+
 def _recall_voice_viewer(device_id: str | None = None) -> str | None:
     from user_devices import normalize_device_mac
 
@@ -1223,6 +1233,29 @@ def _primary_recognized_viewer(
 ) -> str | None:
     """Largest primary face in frame with a confident identity."""
     return faces.primary_viewer(results, allow_pending=allow_pending)
+
+
+def _recognized_viewer_names(
+    results: list[dict], *, allow_pending: bool = False
+) -> list[str]:
+    """All confident identities currently in the overlay cache, largest first."""
+    ranked: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for result in results or []:
+        name = ""
+        if result.get("recognized") or result.get("stabilized"):
+            name = str(result.get("name", "")).strip()
+        elif allow_pending and result.get("pending"):
+            name = str(result.get("candidate_name") or result.get("name") or "").strip()
+        key = name.lower()
+        if not name or key in {"unknown", "face"} or key in seen:
+            continue
+        box = result.get("box") or {}
+        area = int(box.get("w", 0) or 0) * int(box.get("h", 0) or 0)
+        seen.add(key)
+        ranked.append((area, name))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [name for _area, name in ranked]
 
 
 def _viewer_for_voice_query(device_id: str | None = None) -> str | None:
@@ -1357,10 +1390,45 @@ def _session_open_identity_snapshot(
                 "session-open identity vote name=%s device=%s", cleaned, active
             )
             return cleaned, "recognized"
+    recalled = _recall_voice_viewer(active)
+    if recalled:
+        logger.info(
+            "session-open identity hunt-memory name=%s device=%s", recalled, active
+        )
+        return recalled, "recognized"
     logger.info("session-open identity state=%s device=%s", state or last_state, active)
     if state == "unknown" or last_state == "unknown":
         return None, "unknown"
     return None, "no_face"
+
+
+def _live_scene_identity(
+    device_id: str | None = None,
+    *,
+    wait_s: float = 0.8,
+) -> tuple[list[str], Literal["recognized", "unknown", "no_face"]]:
+    """Who is in frame right now after a hunt (for mid-session identity refresh)."""
+    active = resolve_device_id(device_id)
+    deadline = time.monotonic() + max(0.0, wait_s)
+    last_state: Literal["recognized", "unknown", "no_face"] = "no_face"
+    last_names: list[str] = []
+    while True:
+        cached = _cached_face_results(active)
+        if cached:
+            names = _recognized_viewer_names(cached, allow_pending=True)
+            if names:
+                _remember_voice_viewer(names[0], active)
+                return names, "recognized"
+            if any(r.get("detection_valid") or r.get("box") for r in cached):
+                last_state = "unknown"
+                last_names = []
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.15)
+    recalled = _recall_voice_viewer(active)
+    if last_state == "no_face" and recalled:
+        return [recalled], "recognized"
+    return last_names, last_state
 
 
 async def _delayed_esp_servo_360(
@@ -1831,6 +1899,7 @@ async def _voice_ws_stream_pipeline(
     aux_energy = _aux_energy_from_websocket(websocket)
     voice_turn = _voice_turn_from_websocket(websocket) or 0
     client_label = _ws_client_label(websocket)
+    _forget_voice_viewer(device_id)
 
     buf = UtteranceBuffer()
     accepting = True
@@ -1841,7 +1910,7 @@ async def _voice_ws_stream_pipeline(
     receive_task: asyncio.Task | None = None
     stt_task: asyncio.Task | None = None
     greet_timeout_task: asyncio.Task | None = None
-    hunt_greet_timeout_s = 8.0
+    hunt_greet_timeout_s = 20.0
 
     def apply_listen_timeout() -> None:
         ident = get_session_identity(device_id)
@@ -1932,6 +2001,73 @@ async def _voice_ws_stream_pipeline(
             greet_sent = True
             accepting = True
             return True
+
+    async def send_identity_refresh() -> bool:
+        """After a post-TTS hunt: switch user, offer register, or stay silent."""
+        try:
+            names, scene_state = await run_in_threadpool(
+                _live_scene_identity, device_id
+            )
+            ident = get_session_identity(device_id)
+            if ident is None:
+                return await send_skip("identity_scan")
+            result = ident.apply_visible_scene(
+                visible_names=names, scene_state=scene_state
+            )
+            if result is None:
+                logger.info(
+                    "stream identity_scan unchanged device=%s scene=%s names=%s",
+                    device_id,
+                    scene_state,
+                    names,
+                )
+                return await send_skip("identity_unchanged")
+            if result.user_name:
+                bind_session_user(
+                    session_id, device_id=device_id, user_name=result.user_name
+                )
+                if not result.is_guest:
+                    _remember_voice_viewer(result.user_name, device_id)
+            if not (result.reply or "").strip():
+                logger.info(
+                    "stream identity_scan silent user=%s guest=%s device=%s",
+                    result.user_name,
+                    result.is_guest,
+                    device_id,
+                )
+                return await send_skip("identity_switched")
+            from voice_service import synthesize_session_open_wav
+
+            wav_out, reply_meta = await run_in_threadpool(
+                lambda: synthesize_session_open_wav(
+                    result.reply,
+                    session_id=session_id,
+                    device_id=device_id,
+                    reply_path=result.reply_path,
+                    eye_expression=result.eye_expression,
+                    user_name=result.user_name,
+                )
+            )
+            ok = await _voice_ws_send_reply(
+                websocket,
+                device_id=device_id,
+                session_id=session_id,
+                wav_out=wav_out,
+                reply_meta=reply_meta,
+                client_label=client_label,
+            )
+            if ok:
+                apply_listen_timeout()
+                logger.info(
+                    "stream identity_scan TTS path=%s user=%s device=%s",
+                    result.reply_path,
+                    result.user_name,
+                    device_id,
+                )
+            return ok
+        except Exception:
+            logger.exception("stream identity_scan failed device=%s", device_id)
+            return await send_skip("identity_scan_error")
 
     async def send_wake_result(detected: bool) -> bool:
         return await _ws_send_json(
@@ -2201,6 +2337,13 @@ async def _voice_ws_stream_pipeline(
                 await cancel_task(greet_timeout_task)
                 greet_timeout_task = None
                 return await send_session_greet()
+            if str(payload.get("type") or "").strip().lower() == "identity_scan":
+                logger.info(
+                    "stream identity_scan device=%s session=%s",
+                    device_id,
+                    session_id,
+                )
+                return await send_identity_refresh()
             return True
         chunk = message.get("bytes")
         if not chunk:

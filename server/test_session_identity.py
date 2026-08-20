@@ -6,10 +6,12 @@ import unittest
 from unittest.mock import MagicMock
 
 from face_registration_voice import (
+    is_already_registered_claim,
     is_confirm_no,
     is_confirm_yes,
     is_registration_offer_no,
     is_registration_offer_yes,
+    is_registration_stop_process,
     is_session_end_utterance,
     parse_spelled_name,
     spell_name_aloud,
@@ -17,7 +19,9 @@ from face_registration_voice import (
 from session_identity import (
     ASK_NAME_PROMPT,
     GUEST_REPLY,
+    NO_FACE_GUEST_REPLY,
     OFFER_REGISTER_PROMPT,
+    STILL_UNKNOWN_REPLY,
     SessionIdentityFlow,
     greet_recognized_user,
     is_guest_name,
@@ -42,6 +46,24 @@ class RegistrationOfferTests(unittest.TestCase):
         self.assertFalse(is_session_end_utterance("yes"))
         self.assertFalse(is_session_end_utterance("Hari"))
 
+    def test_not_new_user_claim(self) -> None:
+        for text in (
+            "I'm not a new user",
+            "I am not new",
+            "I'm already registered",
+            "you already know me",
+            "you know who I am",
+        ):
+            self.assertTrue(is_already_registered_claim(text), text)
+        self.assertFalse(is_already_registered_claim("no"))
+        self.assertFalse(is_already_registered_claim("My name is Hari"))
+
+    def test_stop_process_is_registration_abort(self) -> None:
+        for text in ("cancel", "stop", "stop the process", "please cancel"):
+            self.assertTrue(is_registration_stop_process(text), text)
+        self.assertFalse(is_registration_stop_process("no"))
+        self.assertFalse(is_registration_stop_process("goodbye"))
+
     def test_confirm_yes_good(self) -> None:
         for text in ("yes", "yeah", "that's right", "good", "okay", "correct"):
             self.assertTrue(is_confirm_yes(text), text)
@@ -63,6 +85,7 @@ class SessionIdentityFlowTests(unittest.TestCase):
         self.faces.validate_registration_name.return_value = (True, None)
         self.faces.identify_registered_face.return_value = None
         self.faces.same_person.return_value = False
+        self.faces.recognize_identity.return_value = (None, "no_face")
         self.read_frame = MagicMock(return_value=object())
         self.flow = SessionIdentityFlow(self.faces, self.read_frame)
 
@@ -122,7 +145,7 @@ class SessionIdentityFlowTests(unittest.TestCase):
             session_id="s1",
             device_id="30eda0e34fc4",
             identity_name=None,
-            identity_state="no_face",
+            identity_state="unknown",
         )
         self.assertIn(ASK_NAME_PROMPT, self.flow.handle_voice("yes").reply)
         self.assertIn("spell", self.flow.handle_voice("Hari").reply.lower())
@@ -171,7 +194,7 @@ class SessionIdentityFlowTests(unittest.TestCase):
             session_id="s1",
             device_id="30eda0e34fc4",
             identity_name=None,
-            identity_state="no_face",
+            identity_state="unknown",
         )
         self.flow.handle_voice("yes")
         self.assertTrue(self.flow.in_registration())
@@ -202,6 +225,148 @@ class SessionIdentityFlowTests(unittest.TestCase):
         self.assertFalse(handled.handled)
         self.assertTrue(self.flow.in_registration())
         self.assertIsNone(self.flow.current_user()[0])
+
+    def test_no_face_after_hunt_is_guest(self) -> None:
+        open_result = self.flow.start_session(
+            session_id="s1",
+            device_id="30eda0e34fc4",
+            identity_name=None,
+            identity_state="no_face",
+        )
+        self.assertEqual(open_result.reply, NO_FACE_GUEST_REPLY)
+        self.assertTrue(open_result.is_guest)
+        self.assertFalse(self.flow.in_registration())
+        user, guest = self.flow.current_user()
+        self.assertTrue(guest)
+        self.assertTrue(is_guest_name(user))
+
+    def test_stop_during_offer_becomes_guest(self) -> None:
+        self.flow.start_session(
+            session_id="s1",
+            device_id="30eda0e34fc4",
+            identity_name=None,
+            identity_state="unknown",
+        )
+        handled = self.flow.handle_voice("stop")
+        self.assertTrue(handled.handled)
+        self.assertEqual(handled.reply, GUEST_REPLY)
+        self.assertFalse(self.flow.in_registration())
+        self.assertTrue(self.flow.current_user()[1])
+
+    def test_cancel_during_name_becomes_guest(self) -> None:
+        self.flow.start_session(
+            session_id="s1",
+            device_id="30eda0e34fc4",
+            identity_name=None,
+            identity_state="unknown",
+        )
+        self.flow.handle_voice("yes")
+        handled = self.flow.handle_voice("cancel the process")
+        self.assertTrue(handled.handled)
+        self.assertEqual(handled.reply, GUEST_REPLY)
+        self.assertTrue(self.flow.current_user()[1])
+
+    def test_not_new_user_identified_cancels_register(self) -> None:
+        self.faces.recognize_identity.return_value = ("Hari", "recognized")
+        self.flow.start_session(
+            session_id="s1",
+            device_id="30eda0e34fc4",
+            identity_name=None,
+            identity_state="unknown",
+        )
+        handled = self.flow.handle_voice("I'm not a new user")
+        self.assertTrue(handled.handled)
+        self.assertEqual(handled.reply, greet_recognized_user("Hari"))
+        self.assertEqual(handled.registered_name, "Hari")
+        self.assertFalse(self.flow.in_registration())
+        user, guest = self.flow.current_user()
+        self.assertEqual(user, "Hari")
+        self.assertFalse(guest)
+
+    def test_not_new_user_still_unknown_stays_in_register(self) -> None:
+        self.faces.recognize_identity.return_value = (None, "unknown")
+        self.flow.start_session(
+            session_id="s1",
+            device_id="30eda0e34fc4",
+            identity_name=None,
+            identity_state="unknown",
+        )
+        handled = self.flow.handle_voice("you already know me")
+        self.assertTrue(handled.handled)
+        self.assertEqual(handled.reply, STILL_UNKNOWN_REPLY)
+        self.assertTrue(self.flow.in_registration())
+
+    def test_confirm_no_still_retries_not_guest(self) -> None:
+        self.flow.start_session(
+            session_id="s1",
+            device_id="30eda0e34fc4",
+            identity_name=None,
+            identity_state="unknown",
+        )
+        self.flow.handle_voice("yes")
+        self.flow.handle_voice("Hari")
+        self.flow.handle_voice("H A R I")
+        retry = self.flow.handle_voice("no")
+        self.assertIn("try again", retry.reply.lower())
+        self.assertTrue(self.flow.in_registration())
+
+    def test_apply_visible_scene_switches_user(self) -> None:
+        self.flow.start_session(
+            session_id="s1",
+            device_id="30eda0e34fc4",
+            identity_name="Hari",
+            identity_state="recognized",
+        )
+        result = self.flow.apply_visible_scene(
+            visible_names=["Nora"], scene_state="recognized"
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result.user_name, "Nora")
+        self.assertEqual(result.reply, "")
+        self.assertTrue(result.identified)
+        self.assertEqual(self.flow.current_user()[0], "Nora")
+
+    def test_apply_visible_scene_unknown_starts_register(self) -> None:
+        self.flow.start_session(
+            session_id="s1",
+            device_id="30eda0e34fc4",
+            identity_name="Hari",
+            identity_state="recognized",
+        )
+        result = self.flow.apply_visible_scene(
+            visible_names=[], scene_state="unknown"
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result.reply, OFFER_REGISTER_PROMPT)
+        self.assertTrue(self.flow.in_registration())
+
+    def test_apply_visible_scene_no_face_becomes_guest(self) -> None:
+        self.flow.start_session(
+            session_id="s1",
+            device_id="30eda0e34fc4",
+            identity_name="Hari",
+            identity_state="recognized",
+        )
+        result = self.flow.apply_visible_scene(
+            visible_names=[], scene_state="no_face"
+        )
+        self.assertIsNotNone(result)
+        self.assertTrue(result.is_guest)
+        self.assertTrue(is_guest_name(result.user_name))
+        self.assertEqual(result.reply, "")
+
+    def test_apply_visible_scene_keeps_same_user(self) -> None:
+        self.flow.start_session(
+            session_id="s1",
+            device_id="30eda0e34fc4",
+            identity_name="Hari",
+            identity_state="recognized",
+        )
+        result = self.flow.apply_visible_scene(
+            visible_names=["Hari"], scene_state="recognized"
+        )
+        self.assertIsNone(result)
+        self.assertEqual(self.flow.current_user()[0], "Hari")
 
 
 class NameInjectionTests(unittest.TestCase):
@@ -244,7 +409,7 @@ class PerDeviceIdentityTests(unittest.TestCase):
             session_id="a",
             device_id="588c81542a4c",
             identity_name=None,
-            identity_state="no_face",
+            identity_state="unknown",
         )
         self.assertTrue(a.in_registration())
         self.assertFalse(b.in_registration())

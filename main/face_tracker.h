@@ -36,10 +36,11 @@ void nino_face_tracker_get_status(nino_face_tracker_status_t *out);
 bool nino_face_tracker_face_seen(void);
 
 /**
- * Pan left/right within servo_motion limits until a face is found or
- * @p timeout_ms elapses. Camera session must already be streaming.
+ * Slow pan/tilt search until timeout. Camera session must already be streaming.
+ * When @p skip_if_visible is true and a face is already in frame, do not sweep.
+ * Ends on the last pose where a face was seen so the server can identify them.
  */
-bool nino_face_hunt_for_person(uint32_t timeout_ms);
+bool nino_face_hunt_for_person(uint32_t timeout_ms, bool skip_if_visible);
 
 #ifdef __cplusplus
 }
