@@ -14,12 +14,16 @@ from dataclasses import dataclass, field
 DEFAULT_FRAME_MS = 20
 DEFAULT_START_ENERGY = 50
 DEFAULT_QUIET_ENERGY = 20
+# Once speech started, only frames at/above this reset the silence hangover.
+DEFAULT_CONTINUE_ENERGY = 50
 DEFAULT_SPEECH_MS = 160
 DEFAULT_SILENCE_MS = 450
 DEFAULT_MAX_MS = 30000
 # Registration yes/no/name/spell/confirm: 60s of no speech → guest, not goodbye.
 DEFAULT_REGISTER_MAX_MS = 60000
 DEFAULT_MIN_SPEECH_MS = 200
+# Quiet Aux can drop the start bar, but not into electrical-tick range.
+ADAPTIVE_START_MIN = 6
 SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2
 # P4 stream frames are 20 ms / 640 bytes. Allow a little jitter either side.
@@ -71,6 +75,7 @@ class StreamEndOfSpeech:
 
     start_energy: int = DEFAULT_START_ENERGY
     quiet_energy: int = DEFAULT_QUIET_ENERGY
+    continue_energy: int = DEFAULT_CONTINUE_ENERGY
     speech_ms: int = DEFAULT_SPEECH_MS
     silence_ms: int = DEFAULT_SILENCE_MS
     max_ms: int = DEFAULT_MAX_MS
@@ -82,6 +87,10 @@ class StreamEndOfSpeech:
     uttered_ms: int = 0
     speech_ms_total: int = 0
     ended: bool = False
+    last_energy: int = 0
+    peak_energy: int = 0
+    noise_sum: int = 0
+    noise_n: int = 0
 
     def reset(self) -> None:
         self.heard_speech = False
@@ -90,26 +99,47 @@ class StreamEndOfSpeech:
         self.uttered_ms = 0
         self.speech_ms_total = 0
         self.ended = False
+        self.last_energy = 0
+        self.peak_energy = 0
+        self.noise_sum = 0
+        self.noise_n = 0
+
+    def effective_start(self) -> int:
+        """Absolute start, or a lower bar when Aux idle is clearly quieter."""
+        if self.noise_n < 15:
+            return self.start_energy
+        noise_mean = self.noise_sum // self.noise_n
+        adaptive = noise_mean * 3 + 8
+        return max(ADAPTIVE_START_MIN, min(self.start_energy, adaptive))
 
     def feed(self, pcm: bytes) -> str:
         """Feed one PCM frame. Returns idle, speech, end_of_speech, or timeout."""
         if self.ended:
             return "end_of_speech"
         energy = pcm_frame_energy(pcm)
+        self.last_energy = energy
+        if energy > self.peak_energy:
+            self.peak_energy = energy
+        if energy < self.quiet_energy:
+            self.noise_sum += energy
+            self.noise_n += 1
+        start = self.effective_start()
+        continue_at = max(self.continue_energy, start + 1)
         self.uttered_ms += self.frame_ms
-        if energy >= self.start_energy:
-            self.speech_streak_ms += self.frame_ms
+        if not self.heard_speech:
+            if energy >= start:
+                self.speech_streak_ms += self.frame_ms
+                self.silence_ms_run = 0
+                self.speech_ms_total += self.frame_ms
+                if self.speech_streak_ms >= self.speech_ms:
+                    self.heard_speech = True
+            else:
+                self.speech_streak_ms = 0
+        elif energy >= continue_at:
             self.silence_ms_run = 0
             self.speech_ms_total += self.frame_ms
-            if self.speech_streak_ms >= self.speech_ms:
-                self.heard_speech = True
         else:
-            self.speech_streak_ms = 0
-            # Aux-in idle often sits between quiet_energy and start_energy
-            # (~20–50). Counting only < quiet_energy as silence reset the
-            # hangover on every mid-level noise frame and waited out max_ms.
-            if self.heard_speech:
-                self.silence_ms_run += self.frame_ms
+            self.silence_ms_run += self.frame_ms
 
         if (
             self.heard_speech
@@ -148,6 +178,9 @@ def stream_vad_from_environ() -> StreamEndOfSpeech:
     return StreamEndOfSpeech(
         start_energy=start,
         quiet_energy=quiet,
+        continue_energy=_env_int(
+            "ASR_EOS_CONTINUE_ENERGY", DEFAULT_CONTINUE_ENERGY
+        ),
         speech_ms=_env_int("ASR_EOS_SPEECH_MS", DEFAULT_SPEECH_MS),
         silence_ms=_env_int("ASR_EOS_SILENCE_MS", DEFAULT_SILENCE_MS),
         max_ms=_env_int("ASR_EOS_MAX_MS", DEFAULT_MAX_MS),

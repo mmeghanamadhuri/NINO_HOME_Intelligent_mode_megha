@@ -167,10 +167,24 @@ class FaceRegistrationService:
         self._voice_heard_since_listen: bool = False
         self._no_speech_retries: int = 0
         self._pending_relisten_prompt: str | None = NAME_RETRY_PROMPT
+        self._device_id: str = ""
         self.apply_settings_from_environ()
 
     def set_frame_getter(self, read_frame: Callable[[], np.ndarray | None]) -> None:
         self._read_frame = read_frame
+
+    def set_device_id(self, device_id: str | None) -> None:
+        self._device_id = str(device_id or "").strip()
+
+    def _playback_device_id(self) -> str:
+        from user_devices import normalize_device_mac
+
+        mac = normalize_device_mac(self._device_id)
+        if mac:
+            return mac
+        from device_registry import get_device_registry
+
+        return get_device_registry().ui_device_id()
 
     def apply_settings_from_environ(self) -> None:
         # Off by default: stream session_identity owns register/guest.
@@ -493,10 +507,10 @@ class FaceRegistrationService:
     def _try_prompt_registration(self) -> None:
         from session_identity import get_session_identity
 
-        ident = get_session_identity()
+        ident = get_session_identity(self._device_id or None)
         if ident is not None and ident.is_active():
             return
-        if device_base_url(None) is None:
+        if device_base_url(self._playback_device_id()) is None:
             logger.debug("Face registration prompt skipped: no ESP play URL")
             return
 
@@ -571,13 +585,11 @@ class FaceRegistrationService:
             return pcm_bytes / (rate_hz * 2)
 
     def _send_listen_prompt(self, text: str) -> bool:
-        if device_base_url(None) is None:
+        if device_base_url(self._playback_device_id()) is None:
             logger.debug("Face registration listen prompt skipped: no ESP play URL")
             return False
 
-        from device_registry import get_device_registry
-
-        device_id = get_device_registry().ui_device_id()
+        device_id = self._playback_device_id()
         wav = self._synthesize_prompt_wav(text)
         try:
             deliver_wav_to_device(device_id, wav, prompt_ack=True, prompt_ack_chime=True)
@@ -601,14 +613,13 @@ class FaceRegistrationService:
 
     def _send_silent_listen(self) -> bool:
         """Reopen the mic with beep only — used when STT heard our own prompt."""
-        if device_base_url(None) is None:
+        if device_base_url(self._playback_device_id()) is None:
             logger.debug("Face registration silent listen skipped: no ESP play URL")
             return False
 
-        from device_registry import get_device_registry
         from voice_service import minimal_voice_reply_wav
 
-        device_id = get_device_registry().ui_device_id()
+        device_id = self._playback_device_id()
         wav = minimal_voice_reply_wav()
         try:
             deliver_wav_to_device(device_id, wav, prompt_ack=True, prompt_ack_chime=True)

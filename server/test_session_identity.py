@@ -249,6 +249,24 @@ class PerDeviceIdentityTests(unittest.TestCase):
         self.assertTrue(a.in_registration())
         self.assertFalse(b.in_registration())
 
+    def test_new_mac_uses_that_robot_frame_getter(self) -> None:
+        from session_identity import configure_session_identity, get_session_identity
+
+        seen: list[str | None] = []
+
+        def factory(device_id: str | None):
+            def _read():
+                seen.append(device_id)
+                return None
+
+            return _read
+
+        configure_session_identity(MagicMock(), lambda: "ui-frame", factory)
+        flow = get_session_identity("588c81542a4c")
+        self.assertIsNotNone(flow)
+        flow._read_frame()
+        self.assertEqual(seen, ["588c81542a4c"])
+
 
 if __name__ == "__main__":
     unittest.main()

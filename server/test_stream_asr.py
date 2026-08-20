@@ -53,6 +53,7 @@ class StreamEndOfSpeechTests(unittest.TestCase):
         """Aux idle often sits in 20–49; that band must not reset hangover."""
         vad = StreamEndOfSpeech(
             start_energy=50,
+            continue_energy=55,
             quiet_energy=20,
             speech_ms=160,
             silence_ms=200,
@@ -67,6 +68,30 @@ class StreamEndOfSpeechTests(unittest.TestCase):
                 ended = True
                 break
         self.assertTrue(ended)
+
+    def test_ambient_12_25_closes_after_speech(self) -> None:
+        """Sensitive start (12) must not keep a turn open on 12–25 ambient noise."""
+        vad = StreamEndOfSpeech(
+            start_energy=12,
+            continue_energy=28,
+            quiet_energy=5,
+            speech_ms=60,
+            silence_ms=500,
+            min_speech_ms=60,
+            max_ms=30000,
+        )
+        for _ in range(8):
+            vad.feed(_frame(12))
+        self.assertTrue(vad.heard_speech)
+        for _ in range(30):
+            vad.feed(_frame(18))
+        ended = False
+        for _ in range(40):
+            if vad.feed(_frame(18)) == "end_of_speech":
+                ended = True
+                break
+        self.assertTrue(ended)
+        self.assertLess(vad.uttered_ms, 30000)
 
     def test_timeout_without_speech(self) -> None:
         vad = StreamEndOfSpeech(start_energy=50, max_ms=80, frame_ms=20)
@@ -120,6 +145,55 @@ class StreamEndOfSpeechTests(unittest.TestCase):
     def test_pcm_energy(self) -> None:
         self.assertGreater(pcm_frame_energy(_frame(120)), 50)
         self.assertLess(pcm_frame_energy(_frame(3)), 10)
+
+    def test_quiet_noise_floor_detects_soft_speech(self) -> None:
+        vad = StreamEndOfSpeech(
+            start_energy=50,
+            quiet_energy=20,
+            speech_ms=160,
+            max_ms=5000,
+        )
+        for _ in range(20):
+            self.assertEqual(vad.feed(_frame(3)), "idle")
+        self.assertLessEqual(vad.effective_start(), 18)
+        states = [vad.feed(_frame(40)) for _ in range(10)]
+        self.assertIn("speech", states)
+        self.assertTrue(vad.heard_speech)
+        self.assertGreaterEqual(vad.peak_energy, 40)
+
+    def test_feeble_speech_on_quiet_mic(self) -> None:
+        vad = StreamEndOfSpeech(
+            start_energy=12,
+            continue_energy=28,
+            quiet_energy=5,
+            speech_ms=60,
+        )
+        for _ in range(20):
+            self.assertEqual(vad.feed(_frame(2)), "idle")
+        self.assertLessEqual(vad.effective_start(), 12)
+        states = [vad.feed(_frame(12)) for _ in range(8)]
+        self.assertIn("speech", states)
+        self.assertTrue(vad.heard_speech)
+
+    def test_electrical_ticks_stay_idle(self) -> None:
+        vad = StreamEndOfSpeech(start_energy=12, quiet_energy=5, speech_ms=60)
+        for _ in range(30):
+            self.assertEqual(vad.feed(_frame(2)), "idle")
+        self.assertFalse(vad.heard_speech)
+
+    def test_high_noise_keeps_absolute_start(self) -> None:
+        vad = StreamEndOfSpeech(
+            start_energy=50,
+            quiet_energy=20,
+            speech_ms=160,
+            max_ms=5000,
+        )
+        for _ in range(20):
+            vad.feed(_frame(18))
+        self.assertEqual(vad.effective_start(), 50)
+        for _ in range(10):
+            self.assertEqual(vad.feed(_frame(25)), "idle")
+        self.assertFalse(vad.heard_speech)
 
 
 class StreamPcmFrameDetectTests(unittest.TestCase):

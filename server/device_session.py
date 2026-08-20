@@ -44,13 +44,20 @@ def _ttl_seconds() -> float:
 
 
 def _normalize_device_id(device_id: str | None) -> str:
-    cleaned = str(device_id or "").strip()
-    return cleaned or "__default__"
+    """Session key is the MAC when present. Empty ids are not shared."""
+    from user_devices import normalize_device_mac
+
+    mac = normalize_device_mac(device_id)
+    if mac:
+        return mac
+    return str(device_id or "").strip()
 
 
 def get_device_session_turns(device_id: str | None) -> list[tuple[str, str]]:
     """Return a copy of the active session turns for this device."""
     key = _normalize_device_id(device_id)
+    if not key:
+        return []
     ttl = _ttl_seconds()
     with _lock:
         session = _sessions.get(key)
@@ -73,6 +80,8 @@ def append_device_session_turn(
     if not user or not assistant:
         return
     key = _normalize_device_id(device_id)
+    if not key:
+        return
     with _lock:
         session = _sessions.setdefault(key, _DeviceSession())
         session.turns.append((user, assistant))
@@ -92,6 +101,8 @@ def append_device_session_turn(
 def clear_device_session(device_id: str | None) -> None:
     """End the device session (after goodbye)."""
     key = _normalize_device_id(device_id)
+    if not key:
+        return
     with _lock:
         if key in _sessions:
             del _sessions[key]

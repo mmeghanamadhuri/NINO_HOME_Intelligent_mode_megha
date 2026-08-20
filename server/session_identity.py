@@ -411,15 +411,21 @@ class SessionIdentityFlow:
 
 _faces: Any = None
 _default_read_frame: Callable[[], Any] | None = None
+_frame_getter_for_device: Callable[[str | None], Callable[[], Any]] | None = None
 _flows: dict[str, SessionIdentityFlow] = {}
 _flow_lock = threading.Lock()
 
 
-def configure_session_identity(faces: Any, read_frame: Callable[[], Any]) -> SessionIdentityFlow:
-    global _faces, _default_read_frame
+def configure_session_identity(
+    faces: Any,
+    read_frame: Callable[[], Any],
+    frame_getter_for_device: Callable[[str | None], Callable[[], Any]] | None = None,
+) -> SessionIdentityFlow:
+    global _faces, _default_read_frame, _frame_getter_for_device
     with _flow_lock:
         _faces = faces
         _default_read_frame = read_frame
+        _frame_getter_for_device = frame_getter_for_device
         _flows.clear()
         default = SessionIdentityFlow(faces, read_frame)
         _flows[""] = default
@@ -435,7 +441,10 @@ def get_session_identity(device_id: str | None = None) -> SessionIdentityFlow | 
         found = _flows.get(key)
         if found is not None:
             return found
-        read_frame = _default_read_frame or (lambda: None)
+        if key and _frame_getter_for_device is not None:
+            read_frame = _frame_getter_for_device(key)
+        else:
+            read_frame = _default_read_frame or (lambda: None)
         found = SessionIdentityFlow(_faces, read_frame)
         _flows[key] = found
         return found

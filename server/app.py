@@ -56,8 +56,10 @@ from memory_service import configure_from_environ as configure_memory_from_envir
 from memory_service import get_memory_service, normalize_database_url
 from esp_playback import (
     device_base_url,
+    device_busy_speaking,
     ensure_esp_play_wav_url_configured,
     esp_play_wav_url,
+    mark_device_busy_for,
 )
 from emotion_service import EmotionService
 from object_detection_service import ObjectDetectionService, summarize_detections
@@ -97,24 +99,32 @@ def _load_env_file() -> None:
 _load_env_file()
 
 _voice_query_lock = threading.Lock()
-_voice_query_depth = 0
+_voice_query_by_device: dict[str, int] = {}
 
 
-def begin_voice_query() -> None:
-    global _voice_query_depth
+def _voice_query_key(device_id: str | None) -> str:
+    from user_devices import normalize_device_mac
+
+    return normalize_device_mac(device_id) or str(device_id or "").strip() or "_"
+
+
+def begin_voice_query(device_id: str | None = None) -> None:
+    key = _voice_query_key(device_id)
     with _voice_query_lock:
-        _voice_query_depth += 1
+        _voice_query_by_device[key] = _voice_query_by_device.get(key, 0) + 1
 
 
-def end_voice_query() -> None:
-    global _voice_query_depth
+def end_voice_query(device_id: str | None = None) -> None:
+    key = _voice_query_key(device_id)
     with _voice_query_lock:
-        _voice_query_depth = max(0, _voice_query_depth - 1)
+        _voice_query_by_device[key] = max(0, _voice_query_by_device.get(key, 0) - 1)
 
 
-def voice_pipeline_active() -> bool:
+def voice_pipeline_active(device_id: str | None = None) -> bool:
     with _voice_query_lock:
-        return _voice_query_depth > 0
+        if device_id:
+            return _voice_query_by_device.get(_voice_query_key(device_id), 0) > 0
+        return any(count > 0 for count in _voice_query_by_device.values())
 
 
 class _GracefulShutdownFilter(logging.Filter):
@@ -212,8 +222,11 @@ faces = FaceService(BASE_DIR / "data")
 face_registration = configure_face_registration(
     faces, cameras.frame_getter(registry.ui_device_id())
 )
+face_registration.set_device_id(registry.ui_device_id())
 session_identity = configure_session_identity(
-    faces, cameras.frame_getter(registry.ui_device_id())
+    faces,
+    cameras.frame_getter(registry.ui_device_id()),
+    cameras.frame_getter,
 )
 emotion = EmotionService()
 objects = ObjectDetectionService()
@@ -298,6 +311,7 @@ def startup() -> None:
     # no robots or multicast-capable network are present.
     start_discovery_loop(on_registry_updated=cameras.configure_from_registry)
     tts.set_playback_device_id(registry.ui_device_id())
+    face_registration.set_device_id(registry.ui_device_id())
     face_registration.set_frame_getter(cameras.frame_getter(registry.ui_device_id()))
     ensure_esp_play_wav_url_configured()
 
@@ -441,12 +455,13 @@ def shutdown() -> None:
 @app.get("/")
 def index(request: Request):
     device_id = resolve_device_id(request.query_params.get("device_id"))
-    stream = cameras.ensure(device_id)
+    rec = registry.get(device_id)
+    camera_source = rec.effective_camera_url() if rec else ""
     response = templates.TemplateResponse(
         request,
         "index.html",
         {
-            "camera_source": stream.source,
+            "camera_source": camera_source,
             "device_id": device_id,
             "devices": registry.status().get("devices", []),
         },
@@ -642,6 +657,7 @@ def set_camera_orientation(req: CameraOrientationRequest) -> dict:
 def select_device(req: DeviceSelectRequest) -> dict:
     device_id = registry.set_ui_device_id(req.device_id)
     tts.set_playback_device_id(device_id)
+    face_registration.set_device_id(device_id)
     face_registration.set_frame_getter(cameras.frame_getter(device_id))
     ident = get_session_identity(device_id)
     if ident is not None:
@@ -702,13 +718,24 @@ def update_device_location(
 
 
 @app.post("/api/devices/{device_id}/network")
-def update_device_wifi_network(device_id: str, req: DeviceWifiNetworkRequest) -> dict:
+def update_device_wifi_network(
+    device_id: str,
+    req: DeviceWifiNetworkRequest,
+    request: Request,
+) -> dict:
     """Record Wi-Fi identity reported after a registered device connects."""
-    if registry.get(device_id) is None:
+    mac = normalize_device_mac(device_id)
+    host = str(getattr(request.client, "host", "") or "") if request.client else ""
+    created = False
+    if not mac:
+        mac, created = registry.ensure_from_client_host(host)
+    if not mac or registry.get(mac) is None:
         raise HTTPException(status_code=404, detail="Unknown device_id")
+    if created:
+        cameras.configure_from_registry()
     try:
         device = registry.set_wifi_network(
-            device_id,
+            mac,
             ssid=req.ssid,
             bssid=req.bssid,
             rssi=req.rssi,
@@ -889,7 +916,7 @@ def status(device_id: str | None = None) -> dict:
         "alarms": get_alarm_service().status(),
         "memory": get_memory_service().status(),
         "face_registration": face_registration.status(),
-        "latest_results": _latest_results_by_device.get(active, latest_results),
+        "latest_results": _cached_face_results(active) or latest_results,
     }
 
 
@@ -1032,7 +1059,7 @@ def snapshot(device_id: str | None = None) -> Response:
     if frame is None:
         raise HTTPException(status_code=503, detail="No camera frame available")
 
-    results = faces.recognize(frame)
+    results = faces.recognize(frame, device_id=active)
     try:
         emotion.attach_emotions(frame, results)
     except Exception:
@@ -1065,11 +1092,11 @@ def _mjpeg_generator(device_id: str):
             frame = cameras.read(device_id)
             if frame is None:
                 if is_ui_device:
-                    tts.update_face_state([])
+                    tts.update_face_state([], device_id=device_id)
                 time.sleep(0.02)
                 continue
 
-            results = faces.recognize(frame)
+            results = faces.recognize(frame, device_id=device_id)
             try:
                 emotion.attach_emotions(frame, results)
             except Exception:
@@ -1077,12 +1104,13 @@ def _mjpeg_generator(device_id: str):
             detections = _detect_objects(frame, device_id)
             annotated, results = faces.annotate(frame, results=results)
             objects.annotate(annotated, detections)
-            _latest_results_by_device[device_id] = results
+            key = _results_device_key(device_id)
+            if key:
+                _latest_results_by_device[key] = results
             if is_ui_device:
                 latest_results = results
             now = time.time()
             if now - last_tts_update_at >= TTS_UPDATE_INTERVAL_SECONDS:
-                tts.set_playback_device_id(device_id)
                 _update_tts_face_state(results, device_id=device_id)
                 last_tts_update_at = now
 
@@ -1109,33 +1137,23 @@ def _vision_tick_device(
     device_id: str, *, update_tts: bool = True
 ) -> None:
     """One recognition/emotion pass for a device (used by the background vision loop)."""
-    is_ui_device = device_id == registry.ui_device_id()
     frame = cameras.read(device_id)
     if frame is None:
-        if is_ui_device:
-            vision_eye.update([], device_id=device_id)
+        vision_eye.update([], device_id=device_id)
         return
-    results = faces.recognize(frame)
+    results = faces.recognize(frame, device_id=device_id)
     try:
         emotion.attach_emotions(frame, results)
     except Exception:
         logger.debug("Emotion tick failed for %s", device_id, exc_info=True)
     # Keeps the object cache warm for voice queries with no browser attached.
     _detect_objects(frame, device_id)
-    _latest_results_by_device[device_id] = results
-    if is_ui_device:
-        # The background loop is the normal source of emotion results. Without
-        # this call, eye expressions were sent only while a browser held an
-        # /video_feed stream open.
-        vision_eye.update(results, device_id=device_id)
+    key = _results_device_key(device_id)
+    if key:
+        _latest_results_by_device[key] = results
+    vision_eye.update(results, device_id=device_id)
     if update_tts:
-        prev = getattr(tts, "_playback_device_id", None)
-        tts.set_playback_device_id(device_id)
-        try:
-            _update_tts_face_state(results, device_id=device_id)
-        finally:
-            if prev:
-                tts.set_playback_device_id(prev)
+        _update_tts_face_state(results, device_id=device_id)
 
 
 def _remember_voice_viewer(name: str | None, device_id: str | None = None) -> None:
@@ -1144,13 +1162,21 @@ def _remember_voice_viewer(name: str | None, device_id: str | None = None) -> No
     cleaned = str(name).strip()
     if not cleaned or cleaned.lower() in {"unknown", "face"}:
         return
-    key = resolve_device_id(device_id)
+    from user_devices import normalize_device_mac
+
+    key = normalize_device_mac(device_id)
+    if not key:
+        return
     with _voice_viewer_lock:
         _voice_viewer_by_device[key] = (cleaned, time.time())
 
 
 def _recall_voice_viewer(device_id: str | None = None) -> str | None:
-    key = resolve_device_id(device_id)
+    from user_devices import normalize_device_mac
+
+    key = normalize_device_mac(device_id)
+    if not key:
+        return None
     with _voice_viewer_lock:
         entry = _voice_viewer_by_device.get(key)
         if not entry:
@@ -1159,6 +1185,12 @@ def _recall_voice_viewer(device_id: str | None = None) -> str | None:
         if time.time() - seen_at > VOICE_VIEWER_TTL_SECONDS:
             return None
         return name
+
+
+def _results_device_key(device_id: str | None) -> str:
+    from user_devices import normalize_device_mac
+
+    return normalize_device_mac(device_id) or str(device_id or "").strip()
 
 
 def _update_tts_face_state(
@@ -1174,39 +1206,16 @@ def _update_tts_face_state(
         if name and name.lower() not in {"unknown", "face"} and "[hold]" not in name:
             recognized_names.append(name)
     primary = _primary_recognized_viewer(results)
-    tts.update_face_state(recognized_names, primary_name=primary)
+    tts.update_face_state(recognized_names, primary_name=primary, device_id=device_id)
     if primary:
         _remember_voice_viewer(primary, device_id)
 
 
-def _same_camera_device_ids(device_id: str | None) -> list[str]:
-    """MAC plus any registry row that shares this robot's camera URL."""
-    active = resolve_device_id(device_id)
-    keys: list[str] = []
-
-    def _add(key: str | None) -> None:
-        cleaned = str(key or "").strip()
-        if cleaned and cleaned not in keys:
-            keys.append(cleaned)
-
-    _add(active)
-    rec = registry.get(active)
-    url = rec.effective_camera_url() if rec else ""
-    if url:
-        for other in registry.list_devices():
-            if other.effective_camera_url() == url:
-                _add(other.device_id)
-    return keys
-
-
 def _cached_face_results(device_id: str | None) -> list[dict]:
-    for key in _same_camera_device_ids(device_id):
-        cached = _latest_results_by_device.get(key)
-        if cached:
-            return cached
-    if latest_results and registry.ui_device_id() in _same_camera_device_ids(device_id):
-        return latest_results
-    return []
+    key = _results_device_key(device_id)
+    if not key:
+        return []
+    return list(_latest_results_by_device.get(key) or [])
 
 
 def _primary_recognized_viewer(
@@ -1229,14 +1238,8 @@ def _viewer_for_voice_query(device_id: str | None = None) -> str | None:
         frame = cameras.read(active)
         if frame is not None:
             name = _primary_recognized_viewer(
-                faces.recognize(frame), allow_pending=True
+                faces.recognize(frame, device_id=active), allow_pending=True
             )
-
-    if not name:
-        name = tts.current_viewer_name()
-
-    if not name:
-        name = tts.viewer_name_for_voice()
 
     if not name:
         name = _recall_voice_viewer(active)
@@ -1269,7 +1272,7 @@ def _camera_identity_snapshot(
     # Fresh frame fallback (keeps identity responsive even if latest_results lags).
     frame = cameras.read(active)
     if frame is not None:
-        results = faces.recognize(frame)
+        results = faces.recognize(frame, device_id=active)
         primary = _primary_recognized_viewer(results)
         if primary:
             _remember_voice_viewer(primary, active)
@@ -1281,6 +1284,7 @@ def _camera_identity_snapshot(
     name, state = faces.recognize_identity(
         cameras.frame_getter(active),
         allow_session_hint=not require_live_face,
+        device_id=active,
     )
     if state == "recognized" and name:
         _remember_voice_viewer(name, active)
@@ -1343,6 +1347,7 @@ def _session_open_identity_snapshot(
         cameras.frame_getter(active),
         allow_session_hint=False,
         allow_pending=True,
+        device_id=active,
     )
     if state == "recognized" and name:
         cleaned = str(name).strip()
@@ -1528,6 +1533,11 @@ def _device_id_from_websocket(websocket: WebSocket) -> str:
     if websocket.client is not None:
         host = str(getattr(websocket.client, "host", "") or "")
     mapped = get_device_registry().find_device_id_by_host(host)
+    created = False
+    if not mapped:
+        mapped, created = get_device_registry().ensure_from_client_host(host)
+        if created:
+            cameras.configure_from_registry()
     if mapped:
         logger.info(
             "Voice WS mapped client %s raw=%r -> %s",
@@ -1566,7 +1576,7 @@ async def _process_voice_query_audio(
     pipeline_error: str | None = None
     t_query_start = time.perf_counter()
     identity_seconds = 0.0
-    await run_in_threadpool(begin_voice_query)
+    await run_in_threadpool(begin_voice_query, device_id)
     try:
         try:
             t_ident = time.perf_counter()
@@ -1682,7 +1692,7 @@ async def _process_voice_query_audio(
         await run_in_threadpool(_append_latency_record, record)
         return wav_out, reply_meta, pipeline_error
     finally:
-        await run_in_threadpool(end_voice_query)
+        await run_in_threadpool(end_voice_query, device_id)
 
 
 async def _voice_ws_send_reply(
@@ -1751,6 +1761,8 @@ async def _voice_ws_send_reply(
         wav_copy = bytes(wav_out)
         eye_copy = eye_tag
         delay_s = max(0.5, (len(wav_copy) - 44) / 32000.0 + 0.45)
+        play_s = max(0.5, (len(wav_copy) - 44) / 32000.0)
+        mark_device_busy_for(delay_s + play_s + 0.8, device_id=device_id)
         logger.info(
             "HTTP play_wav fallback in %.2fs device=%s bytes=%s",
             delay_s,
@@ -1786,7 +1798,7 @@ async def _voice_ws_send_reply(
     if meta.registered_face_name:
         _remember_voice_viewer(meta.registered_face_name, device_id)
     viewer = str(meta.timings.get("voice_viewer") or "")
-    await run_in_threadpool(tts.notify_voice_interaction, viewer or None)
+    await run_in_threadpool(tts.notify_voice_interaction, viewer or None, device_id)
 
     from voice_service import SERVO_360_TRIGGER_DELAY_SECONDS
 
@@ -1861,7 +1873,6 @@ async def _voice_ws_stream_pipeline(
             return True
         try:
             try:
-                registry.set_ui_device_id(device_id)
                 tts.set_playback_device_id(device_id)
             except Exception:
                 pass
@@ -2057,6 +2068,7 @@ async def _voice_ws_stream_pipeline(
         nonlocal accepting, first_turn, voice_turn, stt_task
         ident = get_session_identity(device_id)
         registering = ident is not None and ident.in_registration()
+        peak_energy = buf.vad.peak_energy
         pcm = bytes(buf.pcm)
         buf.reset()
         accepting = False
@@ -2088,9 +2100,10 @@ async def _voice_ws_stream_pipeline(
             )
 
             logger.info(
-                "stream idle timeout — goodbye device=%s session=%s",
+                "stream idle timeout — goodbye device=%s session=%s peak=%s",
                 device_id,
                 session_id,
+                peak_energy,
             )
             try:
                 wav_out, reply_meta = await run_in_threadpool(
@@ -2139,20 +2152,28 @@ async def _voice_ws_stream_pipeline(
         if not accepting:
             # Same-task drain: drop PCM so uvicorn max_queue cannot stall TCP.
             return True
+        if device_busy_speaking(device_id):
+            buf.reset()
+            return True
         pcm_frames += 1
-        if pcm_frames == 1 or pcm_frames % 50 == 0:
-            logger.info(
-                "stream PCM device=%s session=%s frames=%d bytes=%d",
-                device_id,
-                session_id,
-                pcm_frames,
-                len(chunk),
-            )
         if is_wav_bytes(chunk) and len(chunk) > 4096:
             buf.reset()
             buf.pcm.extend(chunk)
             return await finish_utterance("wav")
         state = buf.feed(chunk)
+        if pcm_frames == 1 or pcm_frames % 50 == 0:
+            logger.info(
+                "stream PCM device=%s session=%s frames=%d bytes=%d energy=%d peak=%d heard=%d start=%d continue=%d",
+                device_id,
+                session_id,
+                pcm_frames,
+                len(chunk),
+                buf.vad.last_energy,
+                buf.vad.peak_energy,
+                int(buf.vad.heard_speech),
+                buf.vad.effective_start(),
+                max(buf.vad.continue_energy, buf.vad.effective_start() + 1),
+            )
         if state in {"end_of_speech", "timeout"}:
             return await finish_utterance(state)
         return True
@@ -2423,7 +2444,7 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                 client=client_label,
                 energy=aux_energy,
             )
-            await run_in_threadpool(begin_voice_query)
+            await run_in_threadpool(begin_voice_query, device_id)
             try:
                 try:
                     t_ident = time.perf_counter()
@@ -2570,7 +2591,9 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                         reply_meta.registered_face_name, device_id
                     )
 
-                await run_in_threadpool(tts.notify_voice_interaction, active_viewer)
+                await run_in_threadpool(
+                    tts.notify_voice_interaction, active_viewer, device_id
+                )
 
                 ws_meta: dict[str, object] = {
                     "prompt_medical_ack": reply_meta.prompt_medical_ack,
@@ -2621,7 +2644,7 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                 )
                 break
             finally:
-                await run_in_threadpool(end_voice_query)
+                await run_in_threadpool(end_voice_query, device_id)
     finally:
         if session_queries == 0:
             await run_in_threadpool(
@@ -2866,6 +2889,7 @@ def main() -> None:
     except Exception as exc:
         logger.warning("Could not apply CLI camera source: %s", exc)
     tts.set_playback_device_id(registry.ui_device_id())
+    face_registration.set_device_id(registry.ui_device_id())
     face_registration.set_frame_getter(cameras.frame_getter(registry.ui_device_id()))
 
     if args.alarm_wav.strip():

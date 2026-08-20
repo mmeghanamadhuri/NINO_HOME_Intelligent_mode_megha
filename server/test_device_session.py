@@ -38,6 +38,16 @@ class DeviceSessionTests(unittest.TestCase):
         clear_device_session("test-device")
         self.assertEqual(get_device_session_turns("test-device"), [])
 
+    def test_empty_device_id_does_not_share_session(self) -> None:
+        append_device_session_turn("", "hi", "hello")
+        append_device_session_turn(None, "hi", "hello")
+        append_device_session_turn("588c81542a4c", "from gitam", "ok")
+        self.assertEqual(get_device_session_turns(""), [])
+        self.assertEqual(get_device_session_turns(None), [])
+        self.assertEqual(get_device_session_turns("588c81542a4c"), [("from gitam", "ok")])
+        self.assertEqual(get_device_session_turns("b0a6048addd4"), [])
+        clear_device_session("588c81542a4c")
+
     def test_session_prompt_mentions_continue(self) -> None:
         append_device_session_turn(
             "test-device",

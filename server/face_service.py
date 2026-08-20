@@ -11,6 +11,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -24,6 +25,17 @@ SFACE_FILENAME = "face_recognition_sface_2021dec.onnx"
 OPENCV_ZOO_BASE = "https://github.com/opencv/opencv_zoo/raw/main/models"
 YUNET_MODEL_URL = f"{OPENCV_ZOO_BASE}/face_detection_yunet/{YUNET_FILENAME}"
 SFACE_MODEL_URL = f"{OPENCV_ZOO_BASE}/face_recognition_sface/{SFACE_FILENAME}"
+
+
+@dataclass
+class _PrimaryTrack:
+    candidate_name: str | None = None
+    candidate_streak: int = 0
+    stable_name: str | None = None
+    stable_until: float = 0.0
+    session_primary_name: str | None = None
+    session_primary_at: float = 0.0
+    session_unknown_streak: int = 0
 
 
 class FaceService:
@@ -47,13 +59,7 @@ class FaceService:
         self._model_lock = threading.RLock()
         # person_id -> (display_name, embeddings ndarray [n_samples, 128])
         self._embeddings: dict[str, tuple[str, np.ndarray]] = {}
-        self._session_primary_name: str | None = None
-        self._session_primary_at: float = 0.0
-        self._primary_candidate_name: str | None = None
-        self._primary_candidate_streak = 0
-        self._primary_stable_name: str | None = None
-        self._primary_stable_until: float = 0.0
-        self._session_unknown_streak = 0
+        self._tracks: dict[str, _PrimaryTrack] = {}
 
         if recognition_threshold is not None and recognition_threshold <= 1.0:
             os.environ["FACE_MATCH_THRESHOLD"] = str(recognition_threshold)
@@ -549,16 +555,48 @@ class FaceService:
                 best_idx = idx
         return best_idx
 
-    def _stabilize_primary_face(self, results: list[dict[str, Any]]) -> None:
+    def _track(self, device_id: str | None = None) -> _PrimaryTrack:
+        key = str(device_id or "").strip()
+        if not hasattr(self, "_tracks") or self._tracks is None:
+            self._tracks = {}
+        if not hasattr(self, "_state_lock") or self._state_lock is None:
+            self._state_lock = threading.Lock()
+        with self._state_lock:
+            found = self._tracks.get(key)
+            if found is None:
+                found = _PrimaryTrack()
+                self._tracks[key] = found
+            return found
+
+    @property
+    def _session_primary_name(self) -> str | None:
+        return self._track("").session_primary_name
+
+    @_session_primary_name.setter
+    def _session_primary_name(self, value: str | None) -> None:
+        self._track("").session_primary_name = value
+
+    @property
+    def _session_primary_at(self) -> float:
+        return self._track("").session_primary_at
+
+    @_session_primary_at.setter
+    def _session_primary_at(self, value: float) -> None:
+        self._track("").session_primary_at = value
+
+    def _stabilize_primary_face(
+        self, results: list[dict[str, Any]], *, device_id: str | None = None
+    ) -> None:
         """Require consistent primary recognition before treating it as known."""
         primary_idx = self._largest_primary_index(results)
         now = time.time()
+        track = self._track(device_id)
         if primary_idx is None:
             with self._state_lock:
-                self._primary_candidate_name = None
-                self._primary_candidate_streak = 0
-                if now > self._primary_stable_until:
-                    self._primary_stable_name = None
+                track.candidate_name = None
+                track.candidate_streak = 0
+                if now > track.stable_until:
+                    track.stable_name = None
             return
 
         primary = results[primary_idx]
@@ -570,46 +608,45 @@ class FaceService:
         with self._state_lock:
             required_confirm = self.confirm_frames
             if (
-                self._primary_stable_name
+                track.stable_name
                 and candidate_name
-                and candidate_name != self._primary_stable_name
+                and candidate_name != track.stable_name
             ):
                 required_confirm = self.confirm_frames_switch
 
             if raw_ok and self._is_known_name(candidate_name):
-                if candidate_name == self._primary_candidate_name:
-                    self._primary_candidate_streak += 1
+                if candidate_name == track.candidate_name:
+                    track.candidate_streak += 1
                 else:
-                    self._primary_candidate_name = candidate_name
-                    self._primary_candidate_streak = 1
+                    track.candidate_name = candidate_name
+                    track.candidate_streak = 1
             else:
-                self._primary_candidate_name = None
-                self._primary_candidate_streak = 0
+                track.candidate_name = None
+                track.candidate_streak = 0
 
             stabilized = False
             if (
-                self._primary_candidate_name is not None
-                and self._primary_candidate_streak >= required_confirm
+                track.candidate_name is not None
+                and track.candidate_streak >= required_confirm
                 and candidate_score >= self.match_threshold
                 and margin_score >= self.margin_min
             ):
-                self._primary_stable_name = self._primary_candidate_name
-                self._primary_stable_until = now + self.stable_hold_seconds
+                track.stable_name = track.candidate_name
+                track.stable_until = now + self.stable_hold_seconds
                 stabilized = True
             elif (
-                self._primary_stable_name
-                and candidate_name == self._primary_stable_name
+                track.stable_name
+                and candidate_name == track.stable_name
                 and candidate_score >= self.match_soft_threshold
                 and margin_score >= self.margin_min
             ):
-                # Hysteresis only while the same person stays clearly ahead.
-                self._primary_stable_until = now + self.stable_hold_seconds
+                track.stable_until = now + self.stable_hold_seconds
                 stabilized = True
-            elif now > self._primary_stable_until:
-                self._primary_stable_name = None
+            elif now > track.stable_until:
+                track.stable_name = None
 
-            if stabilized and self._primary_stable_name:
-                primary["name"] = self._primary_stable_name
+            if stabilized and track.stable_name:
+                primary["name"] = track.stable_name
                 primary["recognized"] = True
                 primary["stabilized"] = True
                 primary["pending"] = False
@@ -743,7 +780,9 @@ class FaceService:
 
     # ------------------------------------------------------------- recognition
 
-    def recognize(self, frame: np.ndarray) -> list[dict[str, Any]]:
+    def recognize(
+        self, frame: np.ndarray, *, device_id: str | None = None
+    ) -> list[dict[str, Any]]:
         detections = self._detect_faces(frame)
         results: list[dict[str, Any]] = []
 
@@ -808,7 +847,7 @@ class FaceService:
                 }
             )
 
-        self._stabilize_primary_face(results)
+        self._stabilize_primary_face(results, device_id=device_id)
         for result in results:
             if not result.get("stabilized", False):
                 result["recognized"] = False
@@ -821,22 +860,23 @@ class FaceService:
             )
 
         primary_name = self.primary_viewer(results)
+        track = self._track(device_id)
         if primary_name:
-            self._update_session_primary(primary_name)
+            self._update_session_primary(primary_name, device_id=device_id)
             with self._state_lock:
-                self._session_unknown_streak = 0
+                track.session_unknown_streak = 0
         else:
             with self._state_lock:
                 if results and any(r.get("detection_valid") for r in results):
-                    self._session_unknown_streak += 1
-                    if self._session_unknown_streak >= self.session_clear_unknown_frames:
-                        self._session_primary_name = None
-                        self._session_primary_at = 0.0
-                        self._primary_stable_name = None
-                        self._primary_candidate_name = None
-                        self._primary_candidate_streak = 0
+                    track.session_unknown_streak += 1
+                    if track.session_unknown_streak >= self.session_clear_unknown_frames:
+                        track.session_primary_name = None
+                        track.session_primary_at = 0.0
+                        track.stable_name = None
+                        track.candidate_name = None
+                        track.candidate_streak = 0
                 else:
-                    self._session_unknown_streak = 0
+                    track.session_unknown_streak = 0
 
         return results
 
@@ -947,18 +987,22 @@ class FaceService:
             return False
         return str(name).strip().lower() not in {"unknown", "face", ""}
 
-    def _session_primary_hint(self) -> str | None:
-        if not self._session_primary_name:
+    def _session_primary_hint(self, device_id: str | None = None) -> str | None:
+        track = self._track(device_id)
+        if not track.session_primary_name:
             return None
-        if (time.time() - self._session_primary_at) > self.session_primary_hold_seconds:
+        if (time.time() - track.session_primary_at) > self.session_primary_hold_seconds:
             return None
-        return self._session_primary_name
+        return track.session_primary_name
 
-    def _update_session_primary(self, name: str | None) -> None:
+    def _update_session_primary(
+        self, name: str | None, *, device_id: str | None = None
+    ) -> None:
         if not self._is_known_name(name):
             return
-        self._session_primary_name = str(name).strip()
-        self._session_primary_at = time.time()
+        track = self._track(device_id)
+        track.session_primary_name = str(name).strip()
+        track.session_primary_at = time.time()
 
     def primary_viewer(
         self, results: list[dict[str, Any]], *, allow_pending: bool = False
@@ -995,6 +1039,7 @@ class FaceService:
         samples: int | None = None,
         allow_session_hint: bool = True,
         allow_pending: bool = False,
+        device_id: str | None = None,
     ) -> tuple[str | None, str]:
         """Multi-frame vote for voice identity ('who am I?'). Returns (name, state)."""
         sample_count = samples if samples is not None else self.identity_sample_frames
@@ -1007,7 +1052,7 @@ class FaceService:
                 time.sleep(self.identity_sample_gap_s)
                 continue
 
-            results = self.recognize(frame)
+            results = self.recognize(frame, device_id=device_id)
             if not results:
                 time.sleep(self.identity_sample_gap_s)
                 continue
@@ -1020,7 +1065,7 @@ class FaceService:
 
         if not saw_face:
             if allow_session_hint:
-                hint = self._session_primary_hint()
+                hint = self._session_primary_hint(device_id)
                 if hint:
                     return hint, "recognized"
             return None, "no_face"
@@ -1031,7 +1076,7 @@ class FaceService:
                 return winner, "recognized"
 
         if allow_session_hint:
-            hint = self._session_primary_hint()
+            hint = self._session_primary_hint(device_id)
             if hint:
                 return hint, "recognized"
 

@@ -529,6 +529,29 @@ class DeviceRegistry:
                 return record.device_id
         return ""
 
+    def ensure_from_client_host(self, host: str, *, display_name: str = "") -> tuple[str, bool]:
+        """Resolve or register a robot by LAN IP. Returns (mac, created)."""
+        needle = (host or "").strip()
+        if not needle:
+            return "", False
+        mapped = self.find_device_id_by_host(needle)
+        if mapped:
+            return mapped, False
+        from device_discovery import lookup_lan_mac
+
+        mac = lookup_lan_mac(needle)
+        if not mac:
+            return "", False
+        found = self.get(mac)
+        if found is not None:
+            return found.device_id, False
+        record = self.ensure_registered(
+            mac,
+            display_name=display_name,
+            base_url=f"http://{needle}",
+        )
+        return record.device_id, True
+
     def _find_locked(self, device_id: str) -> DeviceRecord | None:
         """Exact match, then case-insensitive. Caller must hold ``self._lock``."""
         key = (device_id or "").strip()

@@ -42,6 +42,7 @@ from llm_service import (
 from memory_filters import (
     is_likely_tts_echo,
     is_unintelligible_stt,
+    is_whisper_silence_hallucination,
     query_needs_recent_context,
 )
 from eye_expression import infer_eye_expression_for_response
@@ -585,6 +586,7 @@ def synthesize_idle_goodbye_wav(
     device_id: str = "",
 ) -> tuple[bytes, VoiceReplyMeta]:
     """Farewell TTS after 30s of no speech on an open stream session."""
+    begin_pipeline(device_id=device_id, session="stream")
     reply = conversation_goodbye_reply()
     meta = VoiceReplyMeta(
         end_session=True,
@@ -753,6 +755,36 @@ def wav_peak_frame_energy(wav_bytes: bytes, frame_ms: int = 20) -> int:
     if peak == 0 and len(pcm) > 0:
         peak = int(np.mean(np.abs(pcm)))
     return peak
+
+
+def wav_mean_frame_energy(wav_bytes: bytes, frame_ms: int = 20) -> int:
+    """Mean 20 ms frame energy — catches long ambient/noise clips Whisper hallucinates on."""
+    if not wav_bytes or len(wav_bytes) <= 44:
+        return 0
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            nch = wf.getnchannels()
+            sw = wf.getsampwidth()
+            sr = wf.getframerate()
+            raw = wf.readframes(wf.getnframes())
+    except Exception:
+        return 0
+    if sw != 2 or nch < 1 or sr <= 0 or not raw:
+        return 0
+    pcm = np.frombuffer(raw, dtype=np.int16)
+    if nch > 1:
+        pcm = pcm.reshape(-1, nch).mean(axis=1).astype(np.int32)
+    else:
+        pcm = pcm.astype(np.int32)
+    frame = max(1, int(sr * frame_ms / 1000))
+    if len(pcm) < frame:
+        return int(np.mean(np.abs(pcm))) if len(pcm) else 0
+    total = 0
+    count = 0
+    for i in range(0, len(pcm) - frame + 1, frame):
+        total += int(np.mean(np.abs(pcm[i : i + frame])))
+        count += 1
+    return total // count if count else 0
 
 
 def clip_peak_energy(wav_bytes: bytes, reported: int | None = None) -> int:
@@ -1992,6 +2024,7 @@ def process_voice_wav(
     )
     audio_in_seconds = _wav_seconds(wav_bytes)
     peak_energy = clip_peak_energy(wav_bytes, aux_energy)
+    mean_energy = wav_mean_frame_energy(wav_bytes)
     energy_gate = min_speech_energy()
     meta.timings["turn"] = voice_turn
     log_nino_voice(
@@ -2003,6 +2036,7 @@ def process_voice_wav(
         bytes=len(wav_bytes),
         format=audio_input_format,
         energy=peak_energy,
+        mean_energy=mean_energy,
         energy_th=energy_gate,
     )
 
@@ -2021,6 +2055,59 @@ def process_voice_wav(
                 "session": session,
                 "wake_ok": False,
                 "energy": peak_energy,
+                "mean_energy": mean_energy,
+                "energy_th": energy_gate,
+                "turn": voice_turn,
+            },
+        )
+    if audio_in_seconds >= 6.0 and mean_energy < 22:
+        logger.info(
+            "Voice clip rejected (long low-mean noise) | mean=%s peak=%s audio_s=%.2f",
+            mean_energy,
+            peak_energy,
+            audio_in_seconds,
+        )
+        return _silent_close(
+            meta,
+            reply_path="stt_silent",
+            heard="",
+            audio_input_format=audio_input_format,
+            audio_in_seconds=audio_in_seconds,
+            wav_bytes=wav_bytes,
+            stt_engine="skipped",
+            t_start=t_start,
+            t_stt=t_start,
+            extra={
+                "session": session,
+                "wake_ok": False,
+                "energy": peak_energy,
+                "mean_energy": mean_energy,
+                "energy_th": energy_gate,
+                "turn": voice_turn,
+            },
+        )
+    if audio_in_seconds >= 3.0 and mean_energy < 12:
+        logger.info(
+            "Voice clip rejected (quiet clip) | mean=%s peak=%s audio_s=%.2f",
+            mean_energy,
+            peak_energy,
+            audio_in_seconds,
+        )
+        return _silent_close(
+            meta,
+            reply_path="stt_silent",
+            heard="",
+            audio_input_format=audio_input_format,
+            audio_in_seconds=audio_in_seconds,
+            wav_bytes=wav_bytes,
+            stt_engine="skipped",
+            t_start=t_start,
+            t_stt=t_start,
+            extra={
+                "session": session,
+                "wake_ok": False,
+                "energy": peak_energy,
+                "mean_energy": mean_energy,
                 "energy_th": energy_gate,
                 "turn": voice_turn,
             },
@@ -2264,7 +2351,14 @@ def process_voice_wav(
                 return b"", meta
 
     if not ident_handled and (
-        is_likely_tts_echo(user_text) or is_unintelligible_stt(user_text)
+        is_likely_tts_echo(user_text)
+        or is_unintelligible_stt(user_text)
+        or is_whisper_silence_hallucination(
+            user_text,
+            mean_energy=mean_energy,
+            peak_energy=peak_energy,
+            audio_seconds=audio_in_seconds,
+        )
     ):
         logger.info("Voice STT rejected (echo/garbled) | heard: %s", user_text[:120])
         return _silent_close(
@@ -2376,23 +2470,33 @@ def process_voice_wav(
         )
 
         reply_path = "weather"
-        device = get_device_registry().resolve_or_default(device_id or None)
-        try:
-            reply = weather_voice_reply(
-                device, get_weather_service().current_for_device(device)
-            )
-            logger.info(
-                "Voice weather query | device=%s heard: %s",
-                device.device_id,
-                user_text[:120],
-            )
-        except DeviceLocationUnavailableError:
+        from user_devices import normalize_device_mac
+
+        registry = get_device_registry()
+        mac = normalize_device_mac(device_id)
+        device = registry.get(mac) if mac else registry.resolve_or_default(device_id or None)
+        if device is None:
             reply = (
-                f"I do not have a location configured for {device.display_name or device.device_id}. "
+                "I do not have a location configured for that device. "
                 "Please set its location first."
             )
-        except WeatherUnavailableError:
-            reply = "I cannot retrieve the current weather right now. Please try again soon."
+        else:
+            try:
+                reply = weather_voice_reply(
+                    device, get_weather_service().current_for_device(device)
+                )
+                logger.info(
+                    "Voice weather query | device=%s heard: %s",
+                    device.device_id,
+                    user_text[:120],
+                )
+            except DeviceLocationUnavailableError:
+                reply = (
+                    f"I do not have a location configured for {device.display_name or device.device_id}. "
+                    "Please set its location first."
+                )
+            except WeatherUnavailableError:
+                reply = "I cannot retrieve the current weather right now. Please try again soon."
 
     top_scorer_year = fifa_world_cup_top_scorer_year(user_text)
     if reply_path == "llm" and top_scorer_year is not None:

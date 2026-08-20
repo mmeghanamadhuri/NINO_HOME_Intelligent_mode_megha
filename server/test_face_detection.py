@@ -76,6 +76,8 @@ class RegistrationEligibilityTests(unittest.TestCase):
         self.svc._session_primary_at = 0.0
         self.svc.session_primary_hold_seconds = 90.0
         self.svc._lock = __import__("threading").Lock()
+        self.svc._state_lock = __import__("threading").Lock()
+        self.svc._tracks = {}
         self.svc._embeddings = {}
 
     def test_session_primary_does_not_block_unknown(self) -> None:

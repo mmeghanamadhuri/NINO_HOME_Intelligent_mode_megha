@@ -911,6 +911,8 @@ class _SpeechJob:
     is_startup_greeting: bool = False
     #: True → weave yesterday summary; False → warm greeting only (never both).
     include_db_context: bool = False
+    #: Robot MAC that should play this greeting. Empty = legacy/UI playback hint.
+    device_id: str = ""
 
 
 class TTSService:
@@ -939,6 +941,8 @@ class TTSService:
         self._present_known_names: set[str] = set()
         self._vision_queued: set[str] = set()
         self._pending_jobs: list[_SpeechJob] = []
+        self._playback_device_id = ""
+        self._speaking_device_ids: set[str] = set()
         self._suppress_vision_until: float = 0.0
         self._voice_cooldown_seconds: float = float(
             os.environ.get("VISION_GREETING_AFTER_VOICE_SECONDS", "90")
@@ -1001,12 +1005,22 @@ class TTSService:
             self._last_spoken_at.clear()
             self._vision_queued.clear()
             self._pending_jobs.clear()
+            self._speaking_device_ids.clear()
             self._suppress_vision_until = 0.0
 
-    def is_speaking(self) -> bool:
-        """True while any vision TTS job is running or queued."""
+    def is_speaking(self, device_id: str | None = None) -> bool:
+        """True while vision TTS is running or queued (optionally for one MAC)."""
         with self._lock:
-            return self._is_speaking or bool(self._pending_jobs)
+            if device_id:
+                key = str(device_id).strip()
+                if key and key in self._speaking_device_ids:
+                    return True
+                return any((job.device_id or "") == key for job in self._pending_jobs)
+            return (
+                self._is_speaking
+                or bool(self._pending_jobs)
+                or bool(self._speaking_device_ids)
+            )
 
     def needs_startup_summary_greeting(self, person_name: str) -> bool:
         """True until this person receives their first summary greeting this session."""
@@ -1016,18 +1030,32 @@ class TTSService:
         with self._lock:
             return name not in self._startup_greeted
 
-    def speak_to_esp(self, text: str, *, eye_expression: str | None = None) -> None:
+    def speak_to_esp(
+        self,
+        text: str,
+        *,
+        eye_expression: str | None = None,
+        device_id: str | None = None,
+    ) -> None:
         """Synthesize and POST WAV to ESP (vision empathy / greetings)."""
-        self._output_speech(text, eye_expression=eye_expression)
+        self._output_speech(text, eye_expression=eye_expression, device_id=device_id)
 
-    def notify_voice_interaction(self, viewer_name: str | None) -> None:
+    def notify_voice_interaction(
+        self, viewer_name: str | None, device_id: str | None = None
+    ) -> None:
         """After a voice reply: drop stale vision greetings and pause auto-welcome."""
         with self._lock:
             now = time.time()
             self._suppress_vision_until = now + self._voice_cooldown_seconds
-            # Drop queued vision greets (e.g. wrong person detected in background).
-            self._pending_jobs.clear()
-            self._vision_queued.clear()
+            key = str(device_id or "").strip()
+            if key:
+                self._pending_jobs = [
+                    job for job in self._pending_jobs if (job.device_id or "") != key
+                ]
+                self._vision_queued = {job.llm_name for job in self._pending_jobs}
+            else:
+                self._pending_jobs.clear()
+                self._vision_queued.clear()
             if viewer_name:
                 cleaned = str(viewer_name).strip()
                 if cleaned and cleaned.lower() not in {"unknown", "face"}:
@@ -1040,7 +1068,11 @@ class TTSService:
                     self._last_face_seen_at = now
 
     def update_face_state(
-        self, recognized_names: list[str], *, primary_name: str | None = None
+        self,
+        recognized_names: list[str],
+        *,
+        primary_name: str | None = None,
+        device_id: str | None = None,
     ) -> None:
         """Drive vision TTS for the **primary** face in frame only (largest / closest).
 
@@ -1087,16 +1119,18 @@ class TTSService:
                 # Legacy path: "Yesterday we discussed…" / welcome-back over HTTP play_wav.
                 # Disabled by default so identified users only get session GREET.
                 if primary not in self._startup_greeted:
-                    self._enqueue_startup_greeting_locked(primary, now)
+                    self._enqueue_startup_greeting_locked(
+                        primary, now, device_id=device_id
+                    )
                 else:
                     seen_before = primary in self._known_seen_once
                     if not seen_before:
                         self._enqueue_known_greeting_locked(
-                            primary, now, welcome_back=False
+                            primary, now, welcome_back=False, device_id=device_id
                         )
                     elif primary_re_entered:
                         self._enqueue_known_greeting_locked(
-                            primary, now, welcome_back=True
+                            primary, now, welcome_back=True, device_id=device_id
                         )
 
             self._active_mode = "known"
@@ -1155,6 +1189,7 @@ class TTSService:
                     llm_return_visitor=False,
                     track_vision_session=False,
                     include_db_context=include_db,
+                    device_id="",
                 )
             )
         return True
@@ -1203,9 +1238,12 @@ class TTSService:
                 continue
 
             spoke_ok = False
+            play_id = (job.device_id or "").strip()
             if job.is_startup_greeting:
                 with self._lock:
                     self._is_speaking = True
+                    if play_id:
+                        self._speaking_device_ids.add(play_id)
 
             try:
                 text = ""
@@ -1326,14 +1364,20 @@ class TTSService:
                 try:
                     with self._lock:
                         self._is_speaking = True
+                        if play_id:
+                            self._speaking_device_ids.add(play_id)
                     continue_listen = _greeting_continue_listen_enabled()
                     if job.is_startup_greeting and startup_parts is not None:
                         spoken_text = self._output_startup_greeting(
-                            startup_parts, prompt_ack=continue_listen
+                            startup_parts,
+                            prompt_ack=continue_listen,
+                            device_id=play_id or None,
                         )
                     else:
                         spoken_text = self._output_speech(
-                            text, prompt_ack=continue_listen
+                            text,
+                            prompt_ack=continue_listen,
+                            device_id=play_id or None,
                         )
                     spoke_ok = True
                     self._last_error = ""
@@ -1374,11 +1418,15 @@ class TTSService:
                 finally:
                     with self._lock:
                         self._is_speaking = False
+                        if play_id:
+                            self._speaking_device_ids.discard(play_id)
             finally:
                 with self._lock:
                     self._vision_queued.discard(job.llm_name)
                     if job.is_startup_greeting:
                         self._is_speaking = False
+                        if play_id:
+                            self._speaking_device_ids.discard(play_id)
                         if spoke_ok:
                             self._startup_greeted.add(job.llm_name)
                             self._known_seen_once.add(job.llm_name)
@@ -1444,10 +1492,10 @@ class TTSService:
         except Exception as exc:
             self._last_error = str(exc)
 
-    def _esp_play_wav_url(self) -> str | None:
+    def _esp_play_wav_url(self, device_id: str | None = None) -> str | None:
         from esp_playback import device_base_url
 
-        base = device_base_url(getattr(self, "_playback_device_id", None))
+        base = device_base_url(device_id or getattr(self, "_playback_device_id", None))
         return f"{base}/play_wav" if base else None
 
     def set_playback_device_id(self, device_id: str | None) -> None:
@@ -1479,6 +1527,7 @@ class TTSService:
         eye_expression: str | None = None,
         prompt_ack: bool = False,
         prompt_ack_chime: bool = True,
+        device_id: str | None = None,
     ) -> str:
         """Queue WAV clips on ESP at normal TTS rate (back-to-back playback)."""
         from esp_playback import ESP_MAX_PLAY_WAV_BYTES, deliver_wav_to_device
@@ -1486,11 +1535,7 @@ class TTSService:
         spoken: list[str] = []
         valid = [c.strip() for c in chunks if c.strip()]
         total = len(valid)
-        device_id = getattr(self, "_playback_device_id", None)
-        if not device_id:
-            from device_registry import get_device_registry
-
-            device_id = get_device_registry().ui_device_id()
+        play_id = (device_id or "").strip() or getattr(self, "_playback_device_id", "") or ""
         for i, chunk in enumerate(valid):
             wav = self._synthesize_esp_wav(chunk, rate=self.rate)
             if len(wav) > ESP_MAX_PLAY_WAV_BYTES:
@@ -1503,14 +1548,14 @@ class TTSService:
                 "ESP play_wav %d/%d device=%s (%d bytes, rate=%d%s): %s",
                 i + 1,
                 total,
-                device_id,
+                play_id or "-",
                 len(wav),
                 self.rate,
                 ", prompt_ack" if prompt_ack and is_last else "",
                 chunk,
             )
             deliver_wav_to_device(
-                device_id,
+                play_id or None,
                 wav,
                 prompt_ack=prompt_ack and is_last,
                 prompt_ack_chime=prompt_ack_chime,
@@ -1526,6 +1571,7 @@ class TTSService:
         eye_expression: str | None = None,
         prompt_ack: bool = False,
         prompt_ack_chime: bool = True,
+        device_id: str | None = None,
     ) -> str:
         """Play arbitrary text on ESP — auto-chunked by measured WAV size."""
         text = _normalize_tts_text(text)
@@ -1550,14 +1596,15 @@ class TTSService:
             eye_expression=eye_expression,
             prompt_ack=prompt_ack,
             prompt_ack_chime=prompt_ack_chime,
+            device_id=device_id,
         )
 
     def _output_startup_greeting(
-        self, parts: Any, *, prompt_ack: bool = False
+        self, parts: Any, *, prompt_ack: bool = False, device_id: str | None = None
     ) -> str:
         text = parts.spoken()
-        if self._esp_play_wav_url():
-            return self._play_esp_text(text, prompt_ack=prompt_ack)
+        if self._esp_play_wav_url(device_id):
+            return self._play_esp_text(text, prompt_ack=prompt_ack, device_id=device_id)
         self._speak_with_windows_sapi(text)
         return text
 
@@ -1567,10 +1614,14 @@ class TTSService:
         *,
         eye_expression: str | None = None,
         prompt_ack: bool = False,
+        device_id: str | None = None,
     ) -> str:
-        if self._esp_play_wav_url():
+        if self._esp_play_wav_url(device_id):
             return self._play_esp_text(
-                text, eye_expression=eye_expression, prompt_ack=prompt_ack
+                text,
+                eye_expression=eye_expression,
+                prompt_ack=prompt_ack,
+                device_id=device_id,
             )
         self._speak_with_windows_sapi(text)
         return text
@@ -1581,13 +1632,15 @@ class TTSService:
             self._voice_name = voice_name
         return wav
 
-    def _enqueue_startup_greeting_locked(self, name: str, now: float) -> None:
+    def _enqueue_startup_greeting_locked(
+        self, name: str, now: float, *, device_id: str | None = None
+    ) -> None:
         """First sight after server boot — template greeting from Phase C summary."""
         if now < self._suppress_vision_until:
             return
         if name in self._vision_queued or name in self._startup_greeted:
             return
-        if not self._esp_play_wav_url() and not self._ollama_configured():
+        if not self._esp_play_wav_url(device_id) and not self._ollama_configured():
             self._last_error = "Neither ESP playback nor Ollama is configured."
             self._startup_greeted.add(name)
             return
@@ -1606,11 +1659,17 @@ class TTSService:
                 track_vision_session=True,
                 is_startup_greeting=True,
                 include_db_context=include_db,
+                device_id=str(device_id or "").strip(),
             )
         )
 
     def _enqueue_known_greeting_locked(
-        self, name: str, now: float, *, welcome_back: bool
+        self,
+        name: str,
+        now: float,
+        *,
+        welcome_back: bool,
+        device_id: str | None = None,
     ) -> None:
         if now < self._suppress_vision_until:
             return
@@ -1644,6 +1703,7 @@ class TTSService:
                 llm_return_visitor=welcome_back,
                 track_vision_session=True,
                 include_db_context=include_db,
+                device_id=str(device_id or "").strip(),
             )
         )
 

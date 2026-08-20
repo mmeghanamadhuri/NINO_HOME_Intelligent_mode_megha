@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from esp_playback import device_busy_speaking, post_eye_expression_to_esp
@@ -40,6 +41,15 @@ EMOTION_TO_EYE: dict[str, str] = {
 }
 
 _ACTIVE_EMOTIONS = frozenset({"happy", "sad", "surprised"})
+
+
+@dataclass
+class _EyeLatch:
+    candidate: str | None = None
+    candidate_since: float = 0.0
+    display_until: float = 0.0
+    last_pushed: str | None = None
+    last_high_priority_at: float = 0.0
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -79,13 +89,7 @@ class VisionEyeDriver:
         self._voice_active_fn = voice_active_fn
         self._speaking_fn = speaking_fn
         self._push_fn = push_fn
-        self._device_id: str | None = None
-
-        self._candidate: str | None = None
-        self._candidate_since = 0.0
-        self._display_until = 0.0
-        self._last_pushed: str | None = None
-        self._last_high_priority_at = 0.0
+        self._latches: dict[str, _EyeLatch] = {}
 
         if self._enabled:
             logger.info(
@@ -111,62 +115,78 @@ class VisionEyeDriver:
         """Feed one frame's face results. Safe to call every frame."""
         if not self._enabled:
             return
-        self._device_id = device_id
+        latch = self._latch(device_id)
         now = time.time() if now is None else now
 
         # P0/P1: a voice query, alarm/medical reminder, or greeting owns the eyes.
-        if self._high_priority_active():
-            self._abandon_latch()
+        if self._high_priority_active(device_id):
+            self._abandon_latch(latch)
             # Speech ends on idle (firmware reverts after /play_wav), so track that.
-            self._last_pushed = "idle"
-            self._last_high_priority_at = now
+            latch.last_pushed = "idle"
+            latch.last_high_priority_at = now
             return
 
         # Short cooldown after speech so the eyes don't snap to emotion mid-tail.
-        if now - self._last_high_priority_at < self._suppress_after_voice_s:
+        if now - latch.last_high_priority_at < self._suppress_after_voice_s:
             return
 
         # During the display latch, ignore emotion entirely — hold what we committed.
-        if now < self._display_until:
+        if now < latch.display_until:
             return
 
         # A latched expression must explicitly return to idle when its display
         # window ends. Reset the candidate timer too, so a continuing face must
         # be stable again before it can claim the eyes for another window.
-        if self._display_until > 0.0:
-            self._display_until = 0.0
-            self._candidate = None
-            self._candidate_since = now
-            if self._last_pushed in _ACTIVE_EMOTIONS:
-                self._last_pushed = "idle" if self._push("idle") else None
+        if latch.display_until > 0.0:
+            latch.display_until = 0.0
+            latch.candidate = None
+            latch.candidate_since = now
+            if latch.last_pushed in _ACTIVE_EMOTIONS:
+                latch.last_pushed = "idle" if self._push("idle", device_id) else None
 
         target = self._target_from_results(results)
-        if target != self._candidate:
-            self._candidate = target
-            self._candidate_since = now
-        held = now - self._candidate_since
+        if target != latch.candidate:
+            latch.candidate = target
+            latch.candidate_since = now
+        held = now - latch.candidate_since
 
         if target in _ACTIVE_EMOTIONS:
-            if held >= self._stable_s and self._last_pushed != target:
-                if self._push(target):
-                    self._last_pushed = target
-                    self._display_until = now + self._display_s
+            if held >= self._stable_s and latch.last_pushed != target:
+                if self._push(target, device_id):
+                    latch.last_pushed = target
+                    latch.display_until = now + self._display_s
         else:  # idle (neutral / no face / unclear)
-            if held >= self._idle_debounce_s and self._last_pushed != "idle":
-                if self._push("idle"):
-                    self._last_pushed = "idle"
+            if held >= self._idle_debounce_s and latch.last_pushed != "idle":
+                if self._push("idle", device_id):
+                    latch.last_pushed = "idle"
 
-    def _abandon_latch(self) -> None:
-        self._candidate = None
-        self._candidate_since = 0.0
-        self._display_until = 0.0
+    def _latch(self, device_id: str | None) -> _EyeLatch:
+        key = str(device_id or "").strip()
+        found = self._latches.get(key)
+        if found is None:
+            found = _EyeLatch()
+            self._latches[key] = found
+        return found
 
-    def _high_priority_active(self) -> bool:
-        if self._voice_active_fn is not None and self._voice_active_fn():
+    def _abandon_latch(self, latch: _EyeLatch) -> None:
+        latch.candidate = None
+        latch.candidate_since = 0.0
+        latch.display_until = 0.0
+
+    def _call_flag(self, fn: Callable[..., bool] | None, device_id: str | None) -> bool:
+        if fn is None:
+            return False
+        try:
+            return bool(fn(device_id) if device_id else fn())
+        except TypeError:
+            return bool(fn())
+
+    def _high_priority_active(self, device_id: str | None = None) -> bool:
+        if self._call_flag(self._voice_active_fn, device_id):
             return True
-        if self._speaking_fn is not None and self._speaking_fn():
+        if self._call_flag(self._speaking_fn, device_id):
             return True
-        return device_busy_speaking()
+        return device_busy_speaking(device_id)
 
     def _target_from_results(self, results: list[dict[str, Any]] | None) -> str:
         label = self._primary_emotion(results)
@@ -193,13 +213,13 @@ class VisionEyeDriver:
                 best_label = emotion
         return best_label
 
-    def _push(self, name: str) -> bool:
+    def _push(self, name: str, device_id: str | None = None) -> bool:
         if self._push_fn is not None:
             ok = self._push_fn(name)
         else:
-            ok = post_eye_expression_to_esp(name, device_id=self._device_id)
+            ok = post_eye_expression_to_esp(name, device_id=device_id)
         if ok:
-            logger.info("Vision emotion -> eye %s (device=%s)", name, self._device_id)
+            logger.info("Vision emotion -> eye %s (device=%s)", name, device_id)
         else:
-            logger.warning("Vision eye push failed (%s, device=%s)", name, self._device_id)
+            logger.warning("Vision eye push failed (%s, device=%s)", name, device_id)
         return ok

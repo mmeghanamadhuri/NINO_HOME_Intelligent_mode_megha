@@ -44,6 +44,35 @@ def _ipv4(value: object) -> str | None:
     return str(address) if address.version == 4 else None
 
 
+def lookup_lan_mac(ip: str, arp_path: str = "/proc/net/arp") -> str:
+    """Return the neighbor-table MAC for this IPv4 (STA address on the LAN).
+
+    Firmware often reports ``device_id=000000000000`` or a name. After we HTTP
+    GET ``/status``, the kernel ARP/neighbor entry is the robot's real Wi-Fi MAC.
+    """
+    needle = _ipv4(ip)
+    if not needle:
+        return ""
+    try:
+        with open(arp_path, encoding="utf-8") as handle:
+            next(handle, None)
+            for line in handle:
+                parts = line.split()
+                if len(parts) < 4 or parts[0] != needle:
+                    continue
+                try:
+                    flags = int(parts[2], 16)
+                except ValueError:
+                    continue
+                if flags & 0x2:
+                    mac = normalize_device_mac(parts[3])
+                    if mac:
+                        return mac
+    except OSError:
+        logger.debug("Could not read ARP table %s", arp_path, exc_info=True)
+    return ""
+
+
 class _MdnsListener:
     def __init__(self) -> None:
         self.names: set[str] = set()
@@ -334,7 +363,16 @@ class DeviceDiscovery:
                 payload.get("device_id")
             )
             if not mac_id:
-                logger.debug(
+                mac_id = lookup_lan_mac(ip)
+                if mac_id:
+                    logger.debug(
+                        "NiNO status at %s missing MAC (id=%r); using LAN MAC %s",
+                        base_url,
+                        payload.get("device_id"),
+                        mac_id,
+                    )
+            if not mac_id:
+                logger.warning(
                     "NiNO status at %s had no MAC (id=%r mac=%r); skipped",
                     base_url,
                     payload.get("device_id"),

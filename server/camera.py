@@ -442,26 +442,16 @@ class CameraPool:
             for device_id in list(self._streams.keys()):
                 if device_id not in wanted:
                     stream = self._streams.pop(device_id)
-                    if stream not in self._streams.values():
-                        stream.stop()
-            source_owners: dict[str, CameraStream] = {}
-            for stream in self._streams.values():
-                source_owners.setdefault(stream.source, stream)
+                    stream.stop()
             for device_id, source in wanted.items():
                 existing = self._streams.get(device_id)
+                record = registry.get(device_id)
                 if existing is not None:
-                    record = registry.get(device_id)
                     if record:
                         existing.set_rotation(record.camera_rotation)
                     if existing.source != source:
                         existing.restart(source)
-                    source_owners[source] = existing
                     continue
-                shared = source_owners.get(source)
-                if shared is not None:
-                    self._streams[device_id] = shared
-                    continue
-                record = registry.get(device_id)
                 stream = CameraStream(
                     source,
                     record.camera_rotation if record else "none",
@@ -469,76 +459,69 @@ class CameraPool:
                 )
                 stream.start()
                 self._streams[device_id] = stream
-                source_owners[source] = stream
 
     def start_all(self) -> None:
         self.configure_from_registry()
 
     def stop_all(self) -> None:
         with self._lock:
-            stopped: set[int] = set()
             for stream in self._streams.values():
-                marker = id(stream)
-                if marker in stopped:
-                    continue
-                stopped.add(marker)
                 stream.stop()
             self._streams.clear()
 
-    def ensure(self, device_id: str | None) -> CameraStream:
-        from device_registry import get_device_registry
+    def _record_for(self, device_id: str | None):
+        from device_registry import DeviceRecord, get_device_registry
+        from user_devices import normalize_device_mac
 
-        record = get_device_registry().resolve_or_default(device_id)
+        registry = get_device_registry()
+        mac = normalize_device_mac(device_id)
+        if mac:
+            return registry.get(mac) or DeviceRecord(device_id=mac)
+        return registry.resolve_or_default(device_id)
+
+    def ensure(self, device_id: str | None) -> CameraStream:
+        record = self._record_for(device_id)
         source = record.effective_camera_url()
         if not source:
-            # Empty URL means the robot is gone. Do not open the PC webcam
-            # and keep logging that MAC as if it were still on the LAN.
-            live = next(
-                (
-                    other
-                    for other in get_device_registry().list_devices()
-                    if other.effective_camera_url()
-                    and other.device_id != record.device_id
-                ),
-                None,
+            raise RuntimeError(
+                f"No camera URL for device {record.device_id or device_id!r}"
             )
-            if live is not None:
-                return self.ensure(live.device_id)
-            source = "auto"
         with self._lock:
             stream = self._streams.get(record.device_id)
             if stream is None:
-                for other in self._streams.values():
-                    if other.source == source:
-                        stream = other
-                        break
-            if stream is None:
-                stream = CameraStream(source, record.camera_rotation, device_id=record.device_id)
+                stream = CameraStream(
+                    source, record.camera_rotation, device_id=record.device_id
+                )
                 stream.start()
+                self._streams[record.device_id] = stream
             else:
                 stream.set_rotation(record.camera_rotation)
-                if stream.source != source and source:
+                if stream.source != source:
                     stream.restart(source)
-            self._streams[record.device_id] = stream
             return stream
 
     def read(self, device_id: str | None = None) -> np.ndarray | None:
         from device_registry import get_device_registry
+        from user_devices import normalize_device_mac
 
         registry = get_device_registry()
-        record = registry.get(device_id) if device_id else registry.resolve_or_default(None)
+        mac = normalize_device_mac(device_id)
+        record = registry.get(mac) if mac else registry.resolve_or_default(device_id)
         if record is None or not record.effective_camera_url():
             return None
-        return self.ensure(record.device_id).read()
+        try:
+            return self.ensure(record.device_id).read()
+        except RuntimeError:
+            return None
 
     def restart(self, device_id: str | None, source: str) -> CameraStream:
-        from device_registry import get_device_registry
-
-        record = get_device_registry().resolve_or_default(device_id)
+        record = self._record_for(device_id)
         with self._lock:
             stream = self._streams.get(record.device_id)
             if stream is None:
-                stream = CameraStream(source, record.camera_rotation, device_id=record.device_id)
+                stream = CameraStream(
+                    source, record.camera_rotation, device_id=record.device_id
+                )
                 stream.start()
                 self._streams[record.device_id] = stream
             else:
@@ -552,14 +535,21 @@ class CameraPool:
 
     def status(self, device_id: str | None = None) -> dict[str, Any]:
         if device_id is not None:
-            stream = self.ensure(device_id)
+            try:
+                stream = self.ensure(device_id)
+            except RuntimeError:
+                return {
+                    "device_id": get_device_registry_safe_id(device_id),
+                    "source": "",
+                    "ok": False,
+                }
             payload = stream.status()
             payload["device_id"] = get_device_registry_safe_id(device_id)
             return payload
         with self._lock:
             return {
-                device_id: stream.status()
-                for device_id, stream in self._streams.items()
+                dev_id: stream.status()
+                for dev_id, stream in self._streams.items()
             }
 
     def frame_getter(self, device_id: str | None):

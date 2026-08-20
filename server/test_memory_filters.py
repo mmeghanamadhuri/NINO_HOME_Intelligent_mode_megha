@@ -550,6 +550,32 @@ class MemoryFilterTests(unittest.TestCase):
         self.assertTrue(is_unintelligible_stt("नमस्ते क्या हाल है"))
         self.assertFalse(is_unintelligible_stt("What's the weather today?"))
         self.assertFalse(is_unintelligible_stt("café"))
+        from memory_filters import is_whisper_silence_hallucination
+
+        self.assertTrue(
+            is_whisper_silence_hallucination(
+                "Thank you.",
+                mean_energy=15,
+                peak_energy=90,
+                audio_seconds=30.0,
+            )
+        )
+        self.assertFalse(
+            is_whisper_silence_hallucination(
+                "Thank you.",
+                mean_energy=40,
+                peak_energy=200,
+                audio_seconds=2.0,
+            )
+        )
+        self.assertFalse(
+            is_whisper_silence_hallucination(
+                "What's the weather today?",
+                mean_energy=10,
+                peak_energy=50,
+                audio_seconds=30.0,
+            )
+        )
         self.assertTrue(is_preference_update_statement("My birthday is June 25th."))
 
     def test_llm_memory_enrichment_for_terse_extractions(self) -> None:

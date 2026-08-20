@@ -374,6 +374,39 @@ def _is_latin_letter(ch: str) -> bool:
     )
 
 
+_WHISPER_SILENCE_HALLUCINATIONS = (
+    re.compile(r"^\s*\.+\s*$"),
+    re.compile(r"^\s*thank you\.?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*thanks\.?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*thank you for watching\.?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*thanks for watching\.?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*you\.?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*okay\.?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*ok\.?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*bye\.?\s*$", re.IGNORECASE),
+)
+
+
+def is_whisper_silence_hallucination(
+    user_text: str,
+    *,
+    mean_energy: int,
+    peak_energy: int,
+    audio_seconds: float,
+) -> bool:
+    """Groq/Whisper often emits polite filler on noise-only clips."""
+    text = str(user_text or "").strip()
+    if not text:
+        return True
+    if not any(p.match(text) for p in _WHISPER_SILENCE_HALLUCINATIONS):
+        return False
+    if mean_energy >= 35 and peak_energy >= 80:
+        return False
+    if audio_seconds >= 4.0 and mean_energy < 30:
+        return True
+    return mean_energy < 18
+
+
 def is_unintelligible_stt(user_text: str) -> bool:
     """Garbled or empty STT — do not send to the LLM."""
     text = user_text.strip()

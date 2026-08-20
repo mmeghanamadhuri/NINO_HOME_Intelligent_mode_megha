@@ -27,7 +27,18 @@ _EYE_BUSY_TAIL_SECONDS = float(os.environ.get("EYE_BUSY_TAIL_SECONDS", "1.5"))
 # Shared "device is speaking" window. post_wav_to_esp() extends it so lower-priority
 # eye updates (camera emotion) can yield to voice replies, alarms, and greetings.
 _busy_lock = threading.Lock()
-_device_busy_until = 0.0
+_device_busy_until: dict[str, float] = {}
+_GLOBAL_BUSY_KEY = "__global__"
+
+
+def _busy_key(device_id: str | None) -> str:
+    from user_devices import normalize_device_mac
+
+    mac = normalize_device_mac(device_id)
+    if mac:
+        return mac
+    cleaned = str(device_id or "").strip()
+    return cleaned or _GLOBAL_BUSY_KEY
 
 
 def _wav_duration_seconds(wav: bytes) -> float:
@@ -43,17 +54,21 @@ def _wav_duration_seconds(wav: bytes) -> float:
         return 0.0
 
 
-def mark_device_busy_for(seconds: float) -> None:
+def mark_device_busy_for(seconds: float, device_id: str | None = None) -> None:
     """Extend the 'device is speaking' window to at least now + seconds."""
-    global _device_busy_until
+    key = _busy_key(device_id)
+    until = time.time() + max(0.0, seconds)
     with _busy_lock:
-        _device_busy_until = max(_device_busy_until, time.time() + max(0.0, seconds))
+        _device_busy_until[key] = max(_device_busy_until.get(key, 0.0), until)
 
 
-def device_busy_speaking() -> bool:
-    """True while the ESP is (estimated to be) playing audio, plus a short tail."""
+def device_busy_speaking(device_id: str | None = None) -> bool:
+    """True while this ESP is (estimated to be) playing audio, plus a short tail."""
+    now = time.time()
     with _busy_lock:
-        return time.time() < _device_busy_until
+        if device_id:
+            return now < _device_busy_until.get(_busy_key(device_id), 0.0)
+        return any(now < until for until in _device_busy_until.values())
 
 
 def esp_eye_expression_url(device_id: str | None = None) -> str | None:
@@ -193,7 +208,10 @@ def _post_wav_to_url(
 
     # Reserve the "speaking" window up front so the emotion eye driver yields
     # immediately, even while this (blocking) POST is still in flight.
-    mark_device_busy_for(_wav_duration_seconds(wav) + _EYE_BUSY_TAIL_SECONDS)
+    mark_device_busy_for(
+        _wav_duration_seconds(wav) + _EYE_BUSY_TAIL_SECONDS,
+        device_id=device_id,
+    )
 
     req = urllib.request.Request(
         url,
@@ -276,17 +294,30 @@ def deliver_wav_to_device(
     prompt_ack_chime: bool = True,
     eye_expression: str | None = None,
 ) -> None:
-    """POST WAV to the play_wav URL for device_id (falls back to legacy env URL)."""
+    """POST WAV to the play_wav URL for this MAC. Named MACs never steal another robot."""
     from device_registry import get_device_registry
+    from user_devices import normalize_device_mac
 
-    record = get_device_registry().resolve_or_default(device_id)
-    url = record.effective_play_wav_url() or esp_play_wav_url()
-    if not url:
-        raise RuntimeError(
-            f"No play_wav URL for device_id={record.device_id!r} "
-            "(set devices.json or ESP_PLAY_WAV_URL / CAMERA_SOURCE)"
-        )
-    logger.debug("deliver_wav_to_device device_id=%s url=%s", record.device_id, url)
+    mac = normalize_device_mac(device_id)
+    if mac:
+        record = get_device_registry().get(mac)
+        url = record.effective_play_wav_url() if record else None
+        if not url:
+            raise RuntimeError(
+                f"No play_wav URL for device_id={mac!r} "
+                "(set devices.json camera/play URLs for this MAC)"
+            )
+        play_id = record.device_id
+    else:
+        record = get_device_registry().resolve_or_default(device_id)
+        url = record.effective_play_wav_url() or esp_play_wav_url()
+        if not url:
+            raise RuntimeError(
+                f"No play_wav URL for device_id={record.device_id!r} "
+                "(set devices.json or ESP_PLAY_WAV_URL / CAMERA_SOURCE)"
+            )
+        play_id = record.device_id
+    logger.debug("deliver_wav_to_device device_id=%s url=%s", play_id, url)
     _post_wav_to_url(
         url,
         wav,
@@ -294,13 +325,19 @@ def deliver_wav_to_device(
         prompt_ack=prompt_ack,
         prompt_ack_chime=prompt_ack_chime,
         eye_expression=eye_expression,
-        device_id=record.device_id,
+        device_id=play_id,
     )
 
 
 def device_base_url(device_id: str | None) -> str | None:
     """HTTP base for volume/servo on a device."""
     from device_registry import get_device_registry
+    from user_devices import normalize_device_mac
+
+    mac = normalize_device_mac(device_id)
+    if mac:
+        record = get_device_registry().get(mac)
+        return record.effective_base_url() if record else None
 
     base = get_device_registry().resolve_or_default(device_id).effective_base_url()
     if base:
