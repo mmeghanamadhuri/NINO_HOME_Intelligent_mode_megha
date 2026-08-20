@@ -960,16 +960,25 @@ class FaceService:
         self._session_primary_name = str(name).strip()
         self._session_primary_at = time.time()
 
-    def primary_viewer(self, results: list[dict[str, Any]]) -> str | None:
-        """Largest face in frame with a confident identity (closest viewer)."""
+    def primary_viewer(
+        self, results: list[dict[str, Any]], *, allow_pending: bool = False
+    ) -> str | None:
+        """Largest face in frame with a confident identity (closest viewer).
+
+        ``allow_pending`` also accepts the overlay candidate (Hari [hold]) so a
+        session greet can match what the browser already shows before the
+        5-frame stabilizer commits.
+        """
         best_name: str | None = None
         best_area = 0
         for result in results:
-            if not result.get("recognized") and not result.get("stabilized"):
-                continue
             if not result.get("primary", True):
                 continue
-            name = str(result.get("name", "")).strip()
+            name = ""
+            if result.get("recognized") or result.get("stabilized"):
+                name = str(result.get("name", "")).strip()
+            elif allow_pending and result.get("pending"):
+                name = str(result.get("candidate_name") or result.get("name") or "").strip()
             if not self._is_known_name(name):
                 continue
             box = result.get("box") or {}
@@ -985,6 +994,7 @@ class FaceService:
         *,
         samples: int | None = None,
         allow_session_hint: bool = True,
+        allow_pending: bool = False,
     ) -> tuple[str | None, str]:
         """Multi-frame vote for voice identity ('who am I?'). Returns (name, state)."""
         sample_count = samples if samples is not None else self.identity_sample_frames
@@ -1003,7 +1013,7 @@ class FaceService:
                 continue
 
             saw_face = True
-            primary = self.primary_viewer(results)
+            primary = self.primary_viewer(results, allow_pending=allow_pending)
             if primary:
                 votes[primary] = votes.get(primary, 0) + 1
             time.sleep(self.identity_sample_gap_s)

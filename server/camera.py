@@ -441,32 +441,47 @@ class CameraPool:
         with self._lock:
             for device_id in list(self._streams.keys()):
                 if device_id not in wanted:
-                    self._streams[device_id].stop()
-                    del self._streams[device_id]
+                    stream = self._streams.pop(device_id)
+                    if stream not in self._streams.values():
+                        stream.stop()
+            source_owners: dict[str, CameraStream] = {}
+            for stream in self._streams.values():
+                source_owners.setdefault(stream.source, stream)
             for device_id, source in wanted.items():
                 existing = self._streams.get(device_id)
-                if existing is None:
-                    record = registry.get(device_id)
-                    stream = CameraStream(
-                        source,
-                        record.camera_rotation if record else "none",
-                        device_id=device_id,
-                    )
-                    stream.start()
-                    self._streams[device_id] = stream
-                else:
+                if existing is not None:
                     record = registry.get(device_id)
                     if record:
                         existing.set_rotation(record.camera_rotation)
                     if existing.source != source:
                         existing.restart(source)
+                    source_owners[source] = existing
+                    continue
+                shared = source_owners.get(source)
+                if shared is not None:
+                    self._streams[device_id] = shared
+                    continue
+                record = registry.get(device_id)
+                stream = CameraStream(
+                    source,
+                    record.camera_rotation if record else "none",
+                    device_id=device_id,
+                )
+                stream.start()
+                self._streams[device_id] = stream
+                source_owners[source] = stream
 
     def start_all(self) -> None:
         self.configure_from_registry()
 
     def stop_all(self) -> None:
         with self._lock:
+            stopped: set[int] = set()
             for stream in self._streams.values():
+                marker = id(stream)
+                if marker in stopped:
+                    continue
+                stopped.add(marker)
                 stream.stop()
             self._streams.clear()
 
@@ -478,13 +493,18 @@ class CameraPool:
         with self._lock:
             stream = self._streams.get(record.device_id)
             if stream is None:
+                for other in self._streams.values():
+                    if other.source == source:
+                        stream = other
+                        break
+            if stream is None:
                 stream = CameraStream(source, record.camera_rotation, device_id=record.device_id)
                 stream.start()
-                self._streams[record.device_id] = stream
             else:
                 stream.set_rotation(record.camera_rotation)
                 if stream.source != source and source:
                     stream.restart(source)
+            self._streams[record.device_id] = stream
             return stream
 
     def read(self, device_id: str | None = None) -> np.ndarray | None:

@@ -135,6 +135,24 @@ class RegistrationEligibilityTests(unittest.TestCase):
         )
         self.assertTrue(eligible)
 
+    def test_primary_viewer_can_use_pending_overlay_name(self) -> None:
+        pending = [
+            {
+                "primary": True,
+                "recognized": False,
+                "stabilized": False,
+                "pending": True,
+                "name": "Hari",
+                "candidate_name": "Hari",
+                "box": {"x": 0, "y": 0, "w": 80, "h": 80},
+            }
+        ]
+        self.assertIsNone(self.svc.primary_viewer(pending))
+        self.assertEqual(
+            self.svc.primary_viewer(pending, allow_pending=True),
+            "Hari",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

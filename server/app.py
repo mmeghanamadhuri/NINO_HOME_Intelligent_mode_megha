@@ -1177,25 +1177,59 @@ def _update_tts_face_state(
         _remember_voice_viewer(primary, device_id)
 
 
-def _primary_recognized_viewer(results: list[dict]) -> str | None:
+def _same_camera_device_ids(device_id: str | None) -> list[str]:
+    """MAC plus any registry row that shares this robot's camera URL."""
+    active = resolve_device_id(device_id)
+    keys: list[str] = []
+
+    def _add(key: str | None) -> None:
+        cleaned = str(key or "").strip()
+        if cleaned and cleaned not in keys:
+            keys.append(cleaned)
+
+    _add(active)
+    _add(registry.ui_device_id())
+    rec = registry.get(active)
+    url = rec.effective_camera_url() if rec else ""
+    if url:
+        for other in registry.list_devices():
+            if other.effective_camera_url() == url:
+                _add(other.device_id)
+    return keys
+
+
+def _cached_face_results(device_id: str | None) -> list[dict]:
+    for key in _same_camera_device_ids(device_id):
+        cached = _latest_results_by_device.get(key)
+        if cached:
+            return cached
+    if latest_results and registry.ui_device_id() in _same_camera_device_ids(device_id):
+        return latest_results
+    return []
+
+
+def _primary_recognized_viewer(
+    results: list[dict], *, allow_pending: bool = False
+) -> str | None:
     """Largest primary face in frame with a confident identity."""
-    return faces.primary_viewer(results)
+    return faces.primary_viewer(results, allow_pending=allow_pending)
 
 
 def _viewer_for_voice_query(device_id: str | None = None) -> str | None:
-    """Who is speaking — live frame, recent stream results, then session memory."""
+    """Who is speaking — overlay cache first, then live frame, then session memory."""
     active = resolve_device_id(device_id)
     name: str | None = None
 
-    frame = cameras.read(active)
-    if frame is not None:
-        name = _primary_recognized_viewer(faces.recognize(frame))
+    cached = _cached_face_results(active)
+    if cached:
+        name = _primary_recognized_viewer(cached, allow_pending=True)
 
-    cached = _latest_results_by_device.get(active) or (
-        latest_results if active == registry.ui_device_id() else []
-    )
-    if not name and cached:
-        name = _primary_recognized_viewer(cached)
+    if not name:
+        frame = cameras.read(active)
+        if frame is not None:
+            name = _primary_recognized_viewer(
+                faces.recognize(frame), allow_pending=True
+            )
 
     if not name:
         name = tts.current_viewer_name()
@@ -1218,13 +1252,11 @@ def _camera_identity_snapshot(
 ) -> tuple[str | None, Literal["recognized", "unknown", "no_face"]]:
     """Live camera identity for voice queries and 'who am I?' prompts."""
     active = resolve_device_id(device_id)
-    cached = _latest_results_by_device.get(active) or (
-        latest_results if active == registry.ui_device_id() else []
-    )
+    cached = _cached_face_results(active)
     # Prefer the same live detection stream shown in UI so voice identity follows
-    # what the user sees in the camera overlay (when this is the UI device).
+    # what the user sees in the camera overlay.
     if cached:
-        primary = _primary_recognized_viewer(cached)
+        primary = _primary_recognized_viewer(cached, allow_pending=True)
         if primary:
             _remember_voice_viewer(primary, active)
             return primary, "recognized"
@@ -1281,37 +1313,35 @@ def _session_open_identity_snapshot(
 ) -> tuple[str | None, Literal["recognized", "unknown", "no_face"]]:
     """Live identity for stream GREET after face hunt.
 
-    Do not treat a cached unstabilized face as unknown (that skipped the
-    multi-frame vote and sent known people down register-offer). Do not
-    recall the previous session's viewer — greet only who is in frame now.
+    Use the same recognition cache the browser overlay writes. Do not greet from
+    a previous session, and do not call recognize() first — a dark/empty frame
+    right after the robot camera powers on would wipe the stabilizer.
     """
     active = resolve_device_id(device_id)
-    cached = _latest_results_by_device.get(active) or (
-        latest_results if active == registry.ui_device_id() else []
-    )
-    if cached:
-        primary = _primary_recognized_viewer(cached)
-        if primary:
-            _remember_voice_viewer(primary, active)
-            logger.info(
-                "session-open identity cache name=%s device=%s", primary, active
-            )
-            return primary, "recognized"
-
-    frame = cameras.read(active)
-    if frame is not None:
-        results = faces.recognize(frame)
-        primary = _primary_recognized_viewer(results)
-        if primary:
-            _remember_voice_viewer(primary, active)
-            logger.info(
-                "session-open identity frame name=%s device=%s", primary, active
-            )
-            return primary, "recognized"
+    deadline = time.monotonic() + 2.5
+    last_state: Literal["recognized", "unknown", "no_face"] = "no_face"
+    while True:
+        cached = _cached_face_results(active)
+        if cached:
+            primary = _primary_recognized_viewer(cached, allow_pending=True)
+            if primary:
+                _remember_voice_viewer(primary, active)
+                logger.info(
+                    "session-open identity cache name=%s device=%s",
+                    primary,
+                    active,
+                )
+                return primary, "recognized"
+            if any(r.get("detection_valid") or r.get("box") for r in cached):
+                last_state = "unknown"
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.2)
 
     name, state = faces.recognize_identity(
         cameras.frame_getter(active),
         allow_session_hint=False,
+        allow_pending=True,
     )
     if state == "recognized" and name:
         cleaned = str(name).strip()
@@ -1321,8 +1351,8 @@ def _session_open_identity_snapshot(
                 "session-open identity vote name=%s device=%s", cleaned, active
             )
             return cleaned, "recognized"
-    logger.info("session-open identity state=%s device=%s", state, active)
-    if state == "unknown":
+    logger.info("session-open identity state=%s device=%s", state or last_state, active)
+    if state == "unknown" or last_state == "unknown":
         return None, "unknown"
     return None, "no_face"
 
@@ -1772,6 +1802,10 @@ async def _voice_ws_stream_pipeline(
         if greet_sent:
             return True
         try:
+            try:
+                registry.set_ui_device_id(device_id)
+            except Exception:
+                pass
             identity_name, identity_state = await run_in_threadpool(
                 _session_open_identity_snapshot, device_id
             )
