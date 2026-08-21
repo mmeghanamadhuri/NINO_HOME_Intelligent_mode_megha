@@ -6,6 +6,7 @@
 #include "audio_queue.h"
 #include "audio_playback.h"
 #include "battery_adc.h"
+#include "battery_endurance.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -18,8 +19,8 @@ static const char *TAG = "push_btn";
 
 /*
  * Wiring (ESP32-P4-Function-EV-Board J1, active-low to GND):
- *  - GPIO48 (J1 pin 33): double press = DEMO_main.wav;
- *    triple press = erase Wi-Fi + BLE setup
+ *  - GPIO48 (J1 pin 33): single press = hardware test on/off;
+ *    double press = DEMO_main.wav; triple press = erase Wi-Fi + BLE setup
  *  - GPIO47 (J1 pin 37): single press = speaker mute on/off (solid red LED)
  *
  * Do NOT use:
@@ -36,6 +37,7 @@ static const char *TAG = "push_btn";
 #define BTN_DEBOUNCE_MS 40
 /* Max quiet time after the last release before a click sequence is evaluated. */
 #define BTN_MULTI_GAP_MS 350
+#define BTN_CLICKS_SOAK 1
 #define BTN_CLICKS_DEMO 2
 #define BTN_CLICKS_SETUP 3
 #define BTN_TASK_STACK 3072
@@ -45,7 +47,8 @@ static const char *TAG = "push_btn";
 typedef enum {
   BTN_EVT_DEMO = 1,
   BTN_EVT_SETUP = 2,
-  BTN_EVT_MUTE = 3,
+  BTN_EVT_SOAK = 3,
+  BTN_EVT_MUTE = 4,
 } btn_evt_t;
 
 extern const uint8_t demo_wav_start[] asm("_binary_DEMO_main_wav_start");
@@ -166,11 +169,17 @@ static void btn_worker_task(void *arg) {
     } else if (evt == BTN_EVT_SETUP) {
       ESP_LOGI(TAG, "Action: erase Wi-Fi + enter setup mode + BLE");
       s_demo_busy = false;
+      if (nino_battery_endurance_is_active()) {
+        nino_battery_endurance_stop();
+      }
       esp_err_t err = wifi_config_enter_setup_mode();
       if (err != ESP_OK) {
         ESP_LOGW(TAG, "Enter setup mode failed: %s", esp_err_to_name(err));
       }
       (void)play_setup_clip();
+    } else if (evt == BTN_EVT_SOAK) {
+      ESP_LOGI(TAG, "Action: toggle hardware test");
+      nino_battery_endurance_toggle();
     } else if (evt == BTN_EVT_MUTE) {
       toggle_user_mute();
     }
@@ -215,7 +224,13 @@ static void btn_update(btn_state_t *btn) {
       const uint8_t clicks = btn->click_count;
       btn->click_count = 0;
       btn->gap_ms = 0;
-      if (clicks >= BTN_CLICKS_SETUP) {
+      /* While the test is running, any click on this button is STOP — so a
+       * hurried second press cannot fire demo or wipe Wi-Fi. */
+      if (nino_battery_endurance_is_active()) {
+        ESP_LOGI(TAG, "GPIO%d (%s) %u press during test → STOP",
+                 (int)btn->gpio, btn->name, (unsigned)clicks);
+        post_evt(BTN_EVT_SOAK);
+      } else if (clicks >= BTN_CLICKS_SETUP) {
         ESP_LOGI(TAG, "GPIO%d (%s) triple press → setup + BLE", (int)btn->gpio,
                  btn->name);
         post_evt(BTN_EVT_SETUP);
@@ -223,8 +238,12 @@ static void btn_update(btn_state_t *btn) {
         ESP_LOGI(TAG, "GPIO%d (%s) double press → demo audio", (int)btn->gpio,
                  btn->name);
         post_evt(BTN_EVT_DEMO);
+      } else if (clicks == BTN_CLICKS_SOAK) {
+        ESP_LOGI(TAG, "GPIO%d (%s) single press → hardware test START",
+                 (int)btn->gpio, btn->name);
+        post_evt(BTN_EVT_SOAK);
       } else {
-        ESP_LOGI(TAG, "GPIO%d (%s) %u press ignored (need 2=demo, 3=setup)",
+        ESP_LOGI(TAG, "GPIO%d (%s) %u press ignored (need 1=hwtest, 2=demo, 3=setup)",
                  (int)btn->gpio, btn->name, (unsigned)clicks);
       }
     }
@@ -236,7 +255,7 @@ static void push_buttons_task(void *arg) {
 
   btn_state_t demo = {
       .gpio = BTN_DEMO_GPIO,
-      .name = "demo/setup",
+      .name = "hwtest/demo/setup",
       .stable_pressed = false,
       .armed = true,
       .debounce_ms = 0,
@@ -263,7 +282,7 @@ static void push_buttons_task(void *arg) {
   }
 
   ESP_LOGI(TAG,
-           "Buttons ready: GPIO%d double=Demo triple=erase Wi-Fi + BLE; "
+           "Buttons ready: GPIO%d single=hwtest double=Demo triple=Wi-Fi setup; "
            "GPIO%d mute (level48=%d level47=%d, 0=pressed)",
            (int)BTN_DEMO_GPIO, (int)BTN_MUTE_GPIO, gpio_get_level(BTN_DEMO_GPIO),
            gpio_get_level(BTN_MUTE_GPIO));

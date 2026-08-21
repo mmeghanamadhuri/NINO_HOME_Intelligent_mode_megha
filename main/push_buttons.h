@@ -6,6 +6,7 @@
 
 /**
  * GPIO48 push button (active-low, internal pull-up, press to GND):
+ *  - single press: start/stop hardware test (motors + camera + RGB + TFT)
  *  - double press: play DEMO_main.wav
  *  - triple press: erase Wi-Fi credentials, enable BLE provisioning,
  *    play NiNO-Home_Wifi.wav

@@ -46,6 +46,7 @@
 #include "audio_capture.h"
 #include "audio_queue.h"
 #include "battery_adc.h"
+#include "battery_endurance.h"
 #include "camera_orientation.h"
 #include "camera_stream.h"
 #include "face_detect.hpp"
@@ -120,7 +121,8 @@ static bool s_mdns_started = false;
 #define UVC_URB_SIZE (12 * 1024)
 #define UVC_FRAME_SIZE_BYTES (92 * 1024)
 #define UVC_FRAME_TIMEOUT_LOG_INTERVAL_MS 15000
-#define UVC_OPEN_TIMEOUT_MS 5000
+#define UVC_OPEN_TIMEOUT_MS 15000
+#define UVC_WAIT_U2D2_BEFORE_OPEN_MS 8000
 #define FACE_TRACK_TASK_STACK_SIZE (12 * 1024)
 #define FACE_TRACK_TASK_PRIORITY 5
 #define FACE_TRACK_NOTIFY_WAIT_MS 40
@@ -1417,6 +1419,7 @@ static void console_init(void) {
   nino_battery_adc_cli_register();
   eye_cli_register();
   nino_rgb_led_cli_register();
+  nino_battery_endurance_cli_register();
   hstop_cli_register();
   dinner_cli_register();
   bday_cli_register();
@@ -4098,6 +4101,10 @@ bool nino_camera_wait_streaming(uint32_t timeout_ms) {
   return s_uvc_streaming;
 }
 
+bool nino_uvc_camera_connected(void) { return s_device_connected; }
+
+uint32_t nino_uvc_frame_sequence(void) { return s_latest_frame.sequence; }
+
 static bool frame_callback(const uvc_host_frame_t *frame, void *user_ctx) {
   /* Gate: grab/log/HTTP-stream frames only during a voice session. USB host
    * and the opened UVC device stay up so the next session can start again. */
@@ -4167,6 +4174,26 @@ static bool select_stream_format(const uvc_host_frame_info_t *frame_list,
   return true;
 }
 
+/* Claim U2D2 bulk endpoints before UVC takes host channels for isoc. Camera
+ * still opens if the adapter is missing, so a cam-only boot keeps working. */
+static void wait_for_u2d2_before_uvc_open(void) {
+  if (nino_servo_dxl_bus_open()) {
+    return;
+  }
+  ESP_LOGI(TAG, "Waiting up to %d ms for U2D2 on the hub before claiming camera isoc",
+           UVC_WAIT_U2D2_BEFORE_OPEN_MS);
+  const TickType_t deadline =
+      xTaskGetTickCount() + pdMS_TO_TICKS(UVC_WAIT_U2D2_BEFORE_OPEN_MS);
+  while (!nino_servo_dxl_bus_open() && xTaskGetTickCount() < deadline) {
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+  if (nino_servo_dxl_bus_open()) {
+    ESP_LOGI(TAG, "U2D2 claimed — opening UVC camera");
+  } else {
+    ESP_LOGW(TAG, "U2D2 not on hub yet — opening camera anyway");
+  }
+}
+
 static void uvc_stream_task(void *arg) {
   (void)arg;
 
@@ -4199,6 +4226,8 @@ static void uvc_stream_task(void *arg) {
                 .user_frame_buffers = NULL,
             },
     };
+
+    wait_for_u2d2_before_uvc_open();
 
     ESP_LOGI(TAG,
              "Opening camera addr=%u stream=%u format=%s %ux%u @ %.1f fps, "
@@ -4448,6 +4477,9 @@ void app_main(void) {
   if (nino_push_buttons_start() != ESP_OK) {
     ESP_LOGW(TAG, "GPIO push button task not started");
   }
+  if (nino_battery_endurance_init() != ESP_OK) {
+    ESP_LOGW(TAG, "Hardware test (GPIO48) not started");
+  }
   xTaskCreatePinnedToCore(multicast_discovery_task, "discovery", 4096, NULL, 5,
                           NULL, APP_CORE_NET);
   xTaskCreatePinnedToCore(tcp_message_server_task, "tcp_server", 4096, NULL, 5,
@@ -4477,8 +4509,11 @@ void app_main(void) {
   vTaskDelay(pdMS_TO_TICKS(300));
 
   if (nino_servo_dxl_start() != ESP_OK) {
-    ESP_LOGW(TAG, "Dynamixel servo task not started (connect U2D2 on J18 USB hub)");
+    ESP_LOGW(TAG, "Dynamixel servo task not started (connect U2D2 on the HOST hub)");
   }
+
+  /* Hub port power-on + downstream reset before UVC claims isoc channels. */
+  vTaskDelay(pdMS_TO_TICKS(400));
 
   BaseType_t track_ok = xTaskCreatePinnedToCore(
       face_track_task, "face_track", FACE_TRACK_TASK_STACK_SIZE, NULL,
@@ -4499,7 +4534,7 @@ void app_main(void) {
   };
   ESP_ERROR_CHECK(uvc_host_install(&uvc_driver_config));
 
-  ESP_LOGI(TAG, "J18: powered USB hub -> UVC camera + FTDI U2D2 (Dynamixel)");
+  ESP_LOGI(TAG, "USB HOST: powered hub -> UVC camera + FTDI U2D2 (both stay enumerated)");
   ESP_LOGI(TAG, "Audio: ES8311 Aux-in (Sirena) → energy VAD capture; speaker is playback only");
   ESP_LOGI(
       TAG,

@@ -22,7 +22,7 @@ set(main_srcs
     servo_recplay.c mic_input.c wifi_prov_ble.c servo_dxl.c servo_motion.c
     face_tracker.c face_detect.cpp main.c audio_playback.c audio_capture.c audio_queue.c
     voice_ws_client.c voice_assist.c nino_eye.c push_buttons.c rgb_led.c
-    music_stream.c sd_record.c battery_adc.c)
+    music_stream.c sd_record.c battery_adc.c battery_endurance.c)
 
 if(CONFIG_NINO_EYE_DISPLAY_TFT)
     list(APPEND main_srcs st7735.c tft_neutral.c)

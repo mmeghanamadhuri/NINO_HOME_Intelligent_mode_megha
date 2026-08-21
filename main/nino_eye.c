@@ -12,6 +12,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
+#include "battery_endurance.h"
 #include "nino_display.h"
 #if CONFIG_NINO_EYE_DISPLAY_TFT
 #include "tft_neutral.h"
@@ -2365,6 +2366,9 @@ static void run_emoji_bmp_profile_once(const nino_state_profile_t *profile, nino
 void nino_eye_set_state(nino_eye_state_t state)
 {
     if (state >= NINO_EYE_STATE_COUNT) {
+        return;
+    }
+    if (nino_battery_endurance_owns_actuators() && !nino_battery_endurance_is_self()) {
         return;
     }
     const bool same = (s_state == state);

@@ -14,6 +14,7 @@
 #include "usb/usb_helpers.h"
 #include "usb/usb_host.h"
 
+#include "battery_endurance.h"
 #include "servo_dxl.h"
 #include "servo_motion.h"
 #include "servo_recplay.h"
@@ -46,6 +47,9 @@
 #define FTDI_SIO_SET_DATA_8N1               0x0008
 
 #define USB_CLASS_CDC_COMM                  0x02
+#ifndef USB_CLASS_VIDEO
+#define USB_CLASS_VIDEO                     0x0E
+#endif
 #define CDC_ACM_SET_LINE_CODING             0x20
 #define CDC_ACM_SET_CONTROL_LINE_STATE      0x22
 #define CDC_ACM_CONTROL_LINE_DTR            0x0001
@@ -249,7 +253,11 @@ static bool track_hon_wait_target_or_stop(uint8_t id, int target, TickType_t tim
 static void spin360_task(void *arg);
 static void track_hon_task(void *arg);
 static bool usb_is_obvious_non_u2d2(uint16_t vid, uint16_t pid, uint8_t dev_class);
+static bool usb_is_robotis_u2d2(uint16_t vid, uint16_t pid);
 static bool usb_is_u2d2_candidate(uint16_t vid, uint16_t pid);
+static bool usb_iface_is_cdc_acm(const ftdi_device_t *dev);
+static bool usb_device_uses_ftdi_sio(const ftdi_device_t *dev);
+static const char *usb_speed_str(usb_speed_t speed);
 
 static uint8_t dynamixel_v1_checksum(const uint8_t *data, size_t len)
 {
@@ -262,19 +270,40 @@ static uint8_t dynamixel_v1_checksum(const uint8_t *data, size_t len)
     return (uint8_t)(~sum & 0xFF);
 }
 
+static const char *usb_speed_str(usb_speed_t speed)
+{
+    switch (speed) {
+    case USB_SPEED_HIGH:
+        return "HS";
+    case USB_SPEED_FULL:
+        return "FS";
+    case USB_SPEED_LOW:
+        return "LS";
+    default:
+        return "?";
+    }
+}
+
 static bool usb_is_obvious_non_u2d2(uint16_t vid, uint16_t pid, uint8_t dev_class)
 {
     (void)pid;
-    /* Never claim the J18 hub itself — that hides camera + U2D2 downstream. */
-    if (dev_class == USB_CLASS_HUB) {
+    /* Never claim the hub or UVC camera — that hides the other downstream device. */
+    if (dev_class == USB_CLASS_HUB || dev_class == USB_CLASS_VIDEO) {
         return true;
     }
-    /* USB hub bridge chips and UVC camera — not the Dynamixel serial adapter. */
+    /* USB hub bridge chips and common UVC camera vendors — not the Dynamixel adapter. */
     if (vid == 0x046d || vid == 0x03eb || vid == 0x1a40 || vid == 0x05e3 ||
-        vid == 0x2109 || vid == 0x0424 || vid == 0x0bda) {
+        vid == 0x2109 || vid == 0x0bda || vid == 0x1a86 || vid == 0x0424 ||
+        vid == 0x174c || vid == 0x2357 || vid == 0x214b || vid == 0x14cd ||
+        vid == 0x05ac || vid == 0x0a12 || vid == 0x1d6b || vid == 0x8087) {
         return true;
     }
     return false;
+}
+
+static bool usb_is_robotis_u2d2(uint16_t vid, uint16_t pid)
+{
+    return vid == ROBOTIS_VID && pid == ROBOTIS_U2D2_PID;
 }
 
 static bool usb_is_u2d2_candidate(uint16_t vid, uint16_t pid)
@@ -282,9 +311,25 @@ static bool usb_is_u2d2_candidate(uint16_t vid, uint16_t pid)
     if (vid == FTDI_VID) {
         return true;
     }
-    /* ROBOTIS U2D2 on the hub is USB CDC (16d0:06a7), not FTDI 0403:6014. */
-    if (vid == ROBOTIS_VID) {
-        return pid == ROBOTIS_U2D2_PID;
+    /* USB-C and Micro-B U2D2: FT232HL with ROBOTIS EEPROM 16d0:06a7. */
+    return usb_is_robotis_u2d2(vid, pid);
+}
+
+static bool usb_iface_is_cdc_acm(const ftdi_device_t *dev)
+{
+    return dev->interface_class == USB_CLASS_CDC_DATA &&
+           dev->control_interface_number != 0xFF;
+}
+
+/** True when the chip speaks FTDI SIO (not native CDC ACM). */
+static bool usb_device_uses_ftdi_sio(const ftdi_device_t *dev)
+{
+    if (dev->vid == FTDI_VID) {
+        return true;
+    }
+    /* New U2D2 keeps FTDI protocol; only the VID/PID in EEPROM changed. */
+    if (usb_is_robotis_u2d2(dev->vid, dev->pid) && !usb_iface_is_cdc_acm(dev)) {
+        return true;
     }
     return false;
 }
@@ -362,9 +407,9 @@ void nino_servo_dxl_go_neutral(void)
 {
     /* Audio-playback cleanup and head-motion stop call this; while a 360 spin
      * is running it must not yank ID2 back to center mid-rotation (the spin
-     * ends at neutral anyway). */
+     * ends at neutral anyway). Same for the GPIO48 hardware test sweep. */
     if (nino_servo_dxl_spin_is_active() || nino_servo_dxl_track_hon_is_active() ||
-        nino_servo_recplay_is_busy()) {
+        nino_servo_recplay_is_busy() || nino_battery_endurance_owns_actuators()) {
         return;
     }
     dynamixel_queue_goal_all(DXL_CENTER_POSITION);
@@ -1080,17 +1125,28 @@ static esp_err_t ftdi_open_device(ftdi_device_t *dev)
 {
     const usb_device_desc_t *dev_desc = NULL;
     const usb_config_desc_t *config_desc = NULL;
+    bool claimed_ctrl = false;
+    bool claimed_data = false;
+    esp_err_t err;
 
-    ESP_RETURN_ON_ERROR(usb_host_device_open(dev->client_hdl, dev->dev_addr, &dev->dev_hdl), TAG, "device open failed");
-    ESP_RETURN_ON_ERROR(usb_host_get_device_descriptor(dev->dev_hdl, &dev_desc), TAG, "descriptor read failed");
+    err = usb_host_device_open(dev->client_hdl, dev->dev_addr, &dev->dev_hdl);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "device open failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    err = usb_host_get_device_descriptor(dev->dev_hdl, &dev_desc);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "descriptor read failed: %s", esp_err_to_name(err));
+        goto open_fail;
+    }
 
     dev->vid = dev_desc->idVendor;
     dev->pid = dev_desc->idProduct;
-    dev->is_ftdi = (dev->vid == FTDI_VID);
+    dev->is_ftdi = false;
 
     if (usb_is_obvious_non_u2d2(dev->vid, dev->pid, dev_desc->bDeviceClass)) {
-        ESP_LOGI(TAG, "addr=%u vid=%04x pid=%04x class=%02x — hub/camera, skip", dev->dev_addr,
-                 dev->vid, dev->pid, dev_desc->bDeviceClass);
+        ESP_LOGD(TAG, "addr=%u vid=%04x pid=%04x class=0x%02x — hub/camera, skip",
+                 dev->dev_addr, dev->vid, dev->pid, dev_desc->bDeviceClass);
         usb_host_device_close(dev->client_hdl, dev->dev_hdl);
         dev->dev_hdl = NULL;
         dev->dev_addr = 0;
@@ -1098,31 +1154,75 @@ static esp_err_t ftdi_open_device(ftdi_device_t *dev)
     }
 
     if (!usb_is_u2d2_candidate(dev->vid, dev->pid)) {
-        ESP_LOGI(TAG, "addr=%u vid=%04x pid=%04x class=%02x — not a known U2D2 VID", dev->dev_addr,
-                 dev->vid, dev->pid, dev_desc->bDeviceClass);
+        ESP_LOGD(TAG, "addr=%u vid=%04x pid=%04x class=0x%02x — not a known U2D2 VID",
+                 dev->dev_addr, dev->vid, dev->pid, dev_desc->bDeviceClass);
         usb_host_device_close(dev->client_hdl, dev->dev_hdl);
         dev->dev_hdl = NULL;
         dev->dev_addr = 0;
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    ESP_RETURN_ON_ERROR(usb_host_get_active_config_descriptor(dev->dev_hdl, &config_desc), TAG, "config descriptor read failed");
+    err = usb_host_get_active_config_descriptor(dev->dev_hdl, &config_desc);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "config descriptor read failed: %s", esp_err_to_name(err));
+        goto open_fail;
+    }
     if (!ftdi_find_bulk_interface(dev, config_desc)) {
         ESP_LOGW(TAG, "Device %04x:%04x has no bulk IN/OUT pair we can use", dev->vid, dev->pid);
-        usb_host_device_close(dev->client_hdl, dev->dev_hdl);
-        dev->dev_hdl = NULL;
-        dev->dev_addr = 0;
-        return ESP_ERR_NOT_FOUND;
+        err = ESP_ERR_NOT_FOUND;
+        goto open_fail;
     }
 
-    if (dev->interface_class == USB_CLASS_CDC_DATA && dev->control_interface_number != 0xFF) {
-        ESP_RETURN_ON_ERROR(usb_host_interface_claim(dev->client_hdl, dev->dev_hdl, dev->control_interface_number, 0), TAG, "CDC control interface claim failed");
+    /* USB-C U2D2 is FT232HL with ROBOTIS 16d0:06a7 — same FTDI SIO as 0403:6014. */
+    dev->is_ftdi = usb_device_uses_ftdi_sio(dev);
+
+    usb_device_info_t info = {0};
+    const bool have_info = (usb_host_device_info(dev->dev_hdl, &info) == ESP_OK);
+    const bool on_hub = have_info && (info.parent.dev_hdl != NULL);
+    ESP_LOGI(TAG,
+             "U2D2 candidate %04x:%04x class=0x%02x proto=%s speed=%s parent=%s mps_in=%u mps_out=%u",
+             dev->vid, dev->pid, dev->interface_class,
+             dev->is_ftdi ? "FTDI-SIO" : "CDC",
+             have_info ? usb_speed_str(info.speed) : "?",
+             on_hub ? "hub" : "root",
+             (unsigned)dev->ep_mps_in, (unsigned)dev->ep_mps_out);
+    if (on_hub && have_info && info.speed != USB_SPEED_HIGH) {
+        ESP_LOGE(TAG,
+                 "U2D2 is %s behind a High-Speed hub — ESP-IDF has no Transaction Translator. "
+                 "Use a USB 2.0 HS hub that keeps FT232H at High Speed.",
+                 usb_speed_str(info.speed));
     }
-    ESP_RETURN_ON_ERROR(usb_host_interface_claim(dev->client_hdl, dev->dev_hdl, dev->interface_number, dev->interface_alt), TAG, "interface claim failed");
-    ESP_RETURN_ON_ERROR(usb_host_transfer_alloc(USB_SETUP_PACKET_SIZE, 0, &dev->ctrl_xfer), TAG, "control alloc failed");
-    ESP_RETURN_ON_ERROR(usb_host_transfer_alloc(dev->ep_mps_in, 0, &dev->bulk_in_xfer), TAG, "bulk IN alloc failed");
-    ESP_RETURN_ON_ERROR(usb_host_transfer_alloc(dev->ep_mps_out + FTDI_TX_HEADER_SIZE, 0, &dev->bulk_out_xfer),
-                        TAG, "bulk OUT alloc failed");
+
+    if (!dev->is_ftdi && usb_iface_is_cdc_acm(dev)) {
+        err = usb_host_interface_claim(dev->client_hdl, dev->dev_hdl, dev->control_interface_number, 0);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "CDC control claim failed: %s", esp_err_to_name(err));
+            goto open_fail;
+        }
+        claimed_ctrl = true;
+    }
+    err = usb_host_interface_claim(dev->client_hdl, dev->dev_hdl, dev->interface_number, dev->interface_alt);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "interface claim failed: %s (mps_in=%u mps_out=%u)",
+                 esp_err_to_name(err), (unsigned)dev->ep_mps_in, (unsigned)dev->ep_mps_out);
+        goto open_fail;
+    }
+    claimed_data = true;
+    err = usb_host_transfer_alloc(USB_SETUP_PACKET_SIZE, 0, &dev->ctrl_xfer);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "control alloc failed: %s", esp_err_to_name(err));
+        goto open_fail;
+    }
+    err = usb_host_transfer_alloc(dev->ep_mps_in, 0, &dev->bulk_in_xfer);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "bulk IN alloc failed: %s", esp_err_to_name(err));
+        goto open_fail;
+    }
+    err = usb_host_transfer_alloc(dev->ep_mps_out + FTDI_TX_HEADER_SIZE, 0, &dev->bulk_out_xfer);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "bulk OUT alloc failed: %s", esp_err_to_name(err));
+        goto open_fail;
+    }
 
     dev->bulk_in_xfer->device_handle = dev->dev_hdl;
     dev->bulk_in_xfer->bEndpointAddress = dev->ep_in;
@@ -1133,17 +1233,22 @@ static esp_err_t ftdi_open_device(ftdi_device_t *dev)
     dev->bulk_out_xfer->bEndpointAddress = dev->ep_out;
 
     if (dev->is_ftdi) {
-        ESP_RETURN_ON_ERROR(ftdi_configure_device(dev, DXL_DEFAULT_BAUDRATE), TAG, "FTDI configure failed");
-    } else if (dev->interface_class == USB_CLASS_CDC_DATA && dev->control_interface_number != 0xFF) {
-        ESP_RETURN_ON_ERROR(cdc_acm_configure_device(dev, DXL_DEFAULT_BAUDRATE), TAG, "CDC configure failed");
-    } else if (dev->vid == ROBOTIS_VID && dev->control_interface_number != 0xFF) {
-        ESP_RETURN_ON_ERROR(cdc_acm_configure_device(dev, DXL_DEFAULT_BAUDRATE), TAG, "ROBOTIS CDC configure failed");
+        err = ftdi_configure_device(dev, DXL_DEFAULT_BAUDRATE);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "FTDI configure failed: %s", esp_err_to_name(err));
+            goto open_fail;
+        }
+    } else if (usb_iface_is_cdc_acm(dev)) {
+        err = cdc_acm_configure_device(dev, DXL_DEFAULT_BAUDRATE);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "CDC configure failed: %s", esp_err_to_name(err));
+            goto open_fail;
+        }
     } else {
-        ESP_LOGW(TAG, "U2D2 candidate %04x:%04x has no usable CDC/FTDI serial path", dev->vid, dev->pid);
-        usb_host_device_close(dev->client_hdl, dev->dev_hdl);
-        dev->dev_hdl = NULL;
-        dev->dev_addr = 0;
-        return ESP_ERR_NOT_SUPPORTED;
+        ESP_LOGW(TAG, "U2D2 candidate %04x:%04x class=0x%02x has no usable CDC/FTDI serial path",
+                 dev->vid, dev->pid, dev->interface_class);
+        err = ESP_ERR_NOT_SUPPORTED;
+        goto open_fail;
     }
 
     dev->device_ready = true;
@@ -1151,10 +1256,11 @@ static esp_err_t ftdi_open_device(ftdi_device_t *dev)
     dev->rx_accum_len = 0;
 
     ESP_LOGI(TAG,
-             "USB serial candidate ready: addr=%u vid=%04x pid=%04x intf=%u class=0x%02x subclass=0x%02x protocol=0x%02x ep_in=0x%02x ep_out=0x%02x",
+             "USB serial candidate ready: addr=%u vid=%04x pid=%04x proto=%s intf=%u class=0x%02x subclass=0x%02x protocol=0x%02x ep_in=0x%02x ep_out=0x%02x",
              dev->dev_addr,
              dev->vid,
              dev->pid,
+             dev->is_ftdi ? "FTDI-SIO" : "CDC-ACM",
              dev->interface_number,
              dev->interface_class,
              dev->interface_subclass,
@@ -1162,6 +1268,32 @@ static esp_err_t ftdi_open_device(ftdi_device_t *dev)
              dev->ep_in,
              dev->ep_out);
     return ESP_OK;
+
+open_fail:
+    if (dev->bulk_in_xfer != NULL) {
+        usb_host_transfer_free(dev->bulk_in_xfer);
+        dev->bulk_in_xfer = NULL;
+    }
+    if (dev->bulk_out_xfer != NULL) {
+        usb_host_transfer_free(dev->bulk_out_xfer);
+        dev->bulk_out_xfer = NULL;
+    }
+    if (dev->ctrl_xfer != NULL) {
+        usb_host_transfer_free(dev->ctrl_xfer);
+        dev->ctrl_xfer = NULL;
+    }
+    if (dev->dev_hdl != NULL) {
+        if (claimed_ctrl) {
+            usb_host_interface_release(dev->client_hdl, dev->dev_hdl, dev->control_interface_number);
+        }
+        if (claimed_data) {
+            usb_host_interface_release(dev->client_hdl, dev->dev_hdl, dev->interface_number);
+        }
+        usb_host_device_close(dev->client_hdl, dev->dev_hdl);
+        dev->dev_hdl = NULL;
+    }
+    dev->dev_addr = 0;
+    return err;
 }
 
 static void ftdi_close_device(ftdi_device_t *dev)
@@ -1565,10 +1697,56 @@ static void bulk_in_transfer_cb(usb_transfer_t *transfer)
     }
 }
 
-static esp_err_t servo_peek_usb_ids(ftdi_device_t *dev, uint8_t addr, uint16_t *vid, uint16_t *pid,
-                                   uint8_t *dev_class, bool *behind_hub, uint8_t *parent_port)
+typedef struct {
+    uint16_t vid;
+    uint16_t pid;
+    uint8_t dev_class;
+    usb_speed_t speed;
+    bool on_hub;
+    uint8_t parent_port;
+} servo_usb_peek_t;
+
+static uint8_t s_usb_skip_addr[DXL_USB_ADDR_LIST_MAX];
+static uint8_t s_usb_skip_n;
+
+static bool servo_usb_addr_skipped(uint8_t addr)
+{
+    for (uint8_t i = 0; i < s_usb_skip_n; i++) {
+        if (s_usb_skip_addr[i] == addr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void servo_usb_skip_add(uint8_t addr)
+{
+    if (addr == 0 || servo_usb_addr_skipped(addr) || s_usb_skip_n >= DXL_USB_ADDR_LIST_MAX) {
+        return;
+    }
+    s_usb_skip_addr[s_usb_skip_n++] = addr;
+}
+
+static void servo_usb_skip_retain(const uint8_t *alive, int n_alive)
+{
+    uint8_t kept[DXL_USB_ADDR_LIST_MAX];
+    uint8_t n_kept = 0;
+    for (uint8_t i = 0; i < s_usb_skip_n; i++) {
+        for (int j = 0; j < n_alive; j++) {
+            if (alive[j] == s_usb_skip_addr[i]) {
+                kept[n_kept++] = s_usb_skip_addr[i];
+                break;
+            }
+        }
+    }
+    memcpy(s_usb_skip_addr, kept, n_kept);
+    s_usb_skip_n = n_kept;
+}
+
+static esp_err_t servo_peek_usb_dev(ftdi_device_t *dev, uint8_t addr, servo_usb_peek_t *out)
 {
     usb_device_handle_t hdl = NULL;
+    memset(out, 0, sizeof(*out));
     esp_err_t err = usb_host_device_open(dev->client_hdl, addr, &hdl);
     if (err != ESP_OK) {
         return err;
@@ -1576,28 +1754,24 @@ static esp_err_t servo_peek_usb_ids(ftdi_device_t *dev, uint8_t addr, uint16_t *
     const usb_device_desc_t *desc = NULL;
     err = usb_host_get_device_descriptor(hdl, &desc);
     if (err == ESP_OK) {
-        *vid = desc->idVendor;
-        *pid = desc->idProduct;
-        if (dev_class != NULL) {
-            *dev_class = desc->bDeviceClass;
-        }
-    }
-    if (behind_hub != NULL || parent_port != NULL) {
+        out->vid = desc->idVendor;
+        out->pid = desc->idProduct;
+        out->dev_class = desc->bDeviceClass;
         usb_device_info_t info = {0};
         if (usb_host_device_info(hdl, &info) == ESP_OK) {
-            if (behind_hub != NULL) {
-                *behind_hub = (info.parent.dev_hdl != NULL);
-            }
-            if (parent_port != NULL) {
-                *parent_port = info.parent.port_num;
-            }
+            out->speed = info.speed;
+            out->on_hub = (info.parent.dev_hdl != NULL);
+            out->parent_port = info.parent.port_num;
+        } else {
+            out->speed = USB_SPEED_FULL;
+            out->on_hub = false;
         }
     }
     usb_host_device_close(dev->client_hdl, hdl);
     return err;
 }
 
-/** Scan J18 hub tree and open U2D2 (FTDI 0403 or ROBOTIS CDC 16d0:06a7). */
+/** Scan the USB tree and open U2D2 (FTDI 0403:* or ROBOTIS 16d0:06a7 FT232H). */
 static void servo_try_attach_ftdi(ftdi_device_t *dev)
 {
     if (dev->client_hdl == NULL || dev->device_ready) {
@@ -1616,6 +1790,8 @@ static void servo_try_attach_ftdi(ftdi_device_t *dev)
         return;
     }
 
+    servo_usb_skip_retain(addr_list, num_dev);
+
     uint32_t bus_sig = (uint32_t)num_dev;
     const TickType_t now = xTaskGetTickCount();
     const bool log_bus = (bus_sig != s_usb_bus_sig) ||
@@ -1623,52 +1799,63 @@ static void servo_try_attach_ftdi(ftdi_device_t *dev)
                          ((now - s_usb_bus_log_tick) >= pdMS_TO_TICKS(10000));
 
     if (log_bus) {
-        ESP_LOGI(TAG, "J18 USB scan: %d device(s) on bus", num_dev);
+        ESP_LOGI(TAG, "USB bus scan: %d device(s)", num_dev);
         s_usb_bus_sig = bus_sig;
         s_usb_bus_log_tick = now;
     }
 
     for (int i = 0; i < num_dev; i++) {
-        uint16_t vid = 0;
-        uint16_t pid = 0;
-        uint8_t dev_class = 0;
-        bool behind_hub = false;
-        uint8_t parent_port = 0;
+        if (servo_usb_addr_skipped(addr_list[i])) {
+            continue;
+        }
+        servo_usb_peek_t peek = {0};
         (void)usb_host_client_handle_events(dev->client_hdl, pdMS_TO_TICKS(20));
-        if (servo_peek_usb_ids(dev, addr_list[i], &vid, &pid, &dev_class, &behind_hub, &parent_port) != ESP_OK) {
-            if (log_bus) {
-                ESP_LOGW(TAG, "  addr=%u — descriptor peek failed (still enumerating?)", addr_list[i]);
+        esp_err_t peek_err = servo_peek_usb_dev(dev, addr_list[i], &peek);
+        if (peek_err != ESP_OK) {
+            /* Camera/hub already opened by another client — never reopen it. */
+            if (peek_err == ESP_ERR_INVALID_STATE) {
+                servo_usb_skip_add(addr_list[i]);
+            } else if (log_bus) {
+                ESP_LOGW(TAG, "  addr=%u — descriptor peek failed (%s)",
+                         addr_list[i], esp_err_to_name(peek_err));
             }
             continue;
         }
-        if (dev_class == USB_CLASS_HUB) {
+        if (peek.dev_class == USB_CLASS_HUB) {
             hub_count++;
         }
-        if (behind_hub) {
+        if (peek.on_hub) {
             behind_hub_count++;
         }
-        const bool skip = usb_is_obvious_non_u2d2(vid, pid, dev_class);
-        const bool candidate = !skip && usb_is_u2d2_candidate(vid, pid);
+        const bool skip = usb_is_obvious_non_u2d2(peek.vid, peek.pid, peek.dev_class);
+        const bool candidate = !skip && usb_is_u2d2_candidate(peek.vid, peek.pid);
         if (log_bus) {
             ESP_LOGI(TAG,
-                     "  addr=%u %04x:%04x class=%02x loc=%s port=%u %s",
-                     addr_list[i], vid, pid, dev_class,
-                     behind_hub ? "behind-hub" : "root",
-                     (unsigned)parent_port,
+                     "  addr=%u %04x:%04x class=%02x speed=%s loc=%s port=%u %s",
+                     addr_list[i], peek.vid, peek.pid, peek.dev_class,
+                     usb_speed_str(peek.speed),
+                     peek.on_hub ? "behind-hub" : "root",
+                     (unsigned)peek.parent_port,
                      candidate ? "U2D2-candidate" : (skip ? "skip-hub/camera" : "skip"));
         }
         if (!candidate) {
+            servo_usb_skip_add(addr_list[i]);
             continue;
         }
+        if (peek.on_hub && peek.speed != USB_SPEED_HIGH) {
+            ESP_LOGW(TAG,
+                     "U2D2 at addr %u is %s on a hub — ESP-IDF cannot talk FS/LS through an HS hub (no TT)",
+                     addr_list[i], usb_speed_str(peek.speed));
+        }
         try_order[num_try] = addr_list[i];
-        try_vid[num_try] = vid;
+        try_vid[num_try] = peek.vid;
         num_try++;
     }
 
     if (log_bus && num_try == 0) {
         if (num_dev == hub_count) {
             ESP_LOGW(TAG,
-                     "Only hub(s) on the bus — U2D2 is still hidden downstream (wait for J18 ports, or check hub power / CONFIG_USB_HOST_HUBS_SUPPORTED)");
+                     "Only hub(s) on the bus — U2D2 is still hidden downstream (wait for hub ports)");
         } else if (behind_hub_count == 0) {
             ESP_LOGW(TAG,
                      "No U2D2 candidate yet and no hub children — adapter may still be behind the hub");
@@ -1696,6 +1883,9 @@ static void servo_try_attach_ftdi(ftdi_device_t *dev)
             esp_err_t err = ftdi_open_device(dev);
             if (err == ESP_OK) {
                 goto attached;
+            }
+            if (err == ESP_ERR_NOT_SUPPORTED || err == ESP_ERR_INVALID_STATE) {
+                servo_usb_skip_add(try_order[i]);
             }
             dev->dev_addr = 0;
             vTaskDelay(pdMS_TO_TICKS(40));
@@ -1759,9 +1949,9 @@ static void usb_client_task(void *arg)
 
     ESP_ERROR_CHECK(usb_host_client_register(&client_config, &s_ftdi.client_hdl));
 #if CONFIG_USB_HOST_HUBS_SUPPORTED
-    ESP_LOGI(TAG, "Servo USB client ready — hub support ON, will walk J18 children (camera + U2D2)");
+    ESP_LOGI(TAG, "Servo USB client ready — hub support ON, will walk hub children (camera + U2D2)");
 #else
-    ESP_LOGE(TAG, "CONFIG_USB_HOST_HUBS_SUPPORTED is off — U2D2 behind the J18 hub will never enumerate");
+    ESP_LOGE(TAG, "CONFIG_USB_HOST_HUBS_SUPPORTED is off — U2D2 behind an external hub will never enumerate");
 #endif
 
     TickType_t last_poll_tick = 0;
@@ -1775,7 +1965,7 @@ static void usb_client_task(void *arg)
     }
     last_attach_scan_tick = xTaskGetTickCount();
     if (!s_ftdi.device_ready) {
-        ESP_LOGW(TAG, "U2D2 not found yet — keep scanning (hub+camera on J18?)");
+        ESP_LOGW(TAG, "U2D2 not found yet — keep scanning (hub+camera on HOST?)");
     }
 
     while (1) {
@@ -1789,27 +1979,10 @@ static void usb_client_task(void *arg)
 
         if (s_ftdi.actions & DEVICE_ACTION_OPEN) {
             s_ftdi.actions &= ~DEVICE_ACTION_OPEN;
+            /* Never open the NEW_DEV address blindly — it is usually the hub or camera. */
             if (!s_ftdi.device_ready) {
-                esp_err_t err = ftdi_open_device(&s_ftdi);
-                if (err == ESP_OK) {
-                    s_torque_enabled = false;
-                    s_usb_bus_settle = true;
-                    for (size_t i = 0; i < DXL_SERVO_COUNT; i++) {
-                        s_servo_torque_on[i] = false;
-                    }
-                    s_position_speed_pending = true;
-                    dynamixel_queue_goal_all(DXL_CENTER_POSITION);
-                    if (ftdi_start_rx(&s_ftdi) != ESP_OK) {
-                        ESP_LOGW(TAG, "bulk IN start failed");
-                    }
-                    last_poll_tick = xTaskGetTickCount();
-                    ESP_LOGI(TAG, "U2D2 ready — homing servos to %d", DXL_CENTER_POSITION);
-                } else if (err == ESP_ERR_NOT_SUPPORTED) {
-                    s_ftdi.dev_addr = 0;
-                } else {
-                    ESP_LOGD(TAG, "open addr %u: %s", s_ftdi.dev_addr, esp_err_to_name(err));
-                    s_ftdi.dev_addr = 0;
-                }
+                servo_try_attach_ftdi(&s_ftdi);
+                last_attach_scan_tick = xTaskGetTickCount();
             }
         }
 

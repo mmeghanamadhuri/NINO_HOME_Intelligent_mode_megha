@@ -22,6 +22,12 @@ bool nino_camera_is_streaming(void);
 /** Wait until UVC is streaming, or @p timeout_ms elapses. */
 bool nino_camera_wait_streaming(uint32_t timeout_ms);
 
+/** True after a UVC device has enumerated on the USB host. */
+bool nino_uvc_camera_connected(void);
+
+/** Monotonic grabbed-frame counter (0 until the first stored frame). */
+uint32_t nino_uvc_frame_sequence(void);
+
 #ifdef __cplusplus
 }
 #endif

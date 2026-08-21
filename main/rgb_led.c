@@ -13,6 +13,7 @@
 
 #include "audio_playback.h"
 #include "battery_adc.h"
+#include "battery_endurance.h"
 
 static const char *TAG = "rgb_led";
 
@@ -194,6 +195,9 @@ nino_rgb_show_t nino_rgb_led_current(void) { return s_show; }
 
 esp_err_t nino_rgb_led_show(nino_rgb_show_t show)
 {
+  if (nino_battery_endurance_owns_actuators() && !nino_battery_endurance_is_self()) {
+    return ESP_OK;
+  }
   if (nino_battery_low_alert_active() && show != NINO_RGB_SHOW_BATTERY) {
     return ESP_OK;
   }

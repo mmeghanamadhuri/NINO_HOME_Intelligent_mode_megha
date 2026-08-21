@@ -15,6 +15,8 @@
 typedef enum {
   NINO_SERVO_MOTION_FULL = 0,
   NINO_SERVO_MOTION_NOD_LR = 1,
+  /** Wide pan+tilt CW/CCW sweep for the GPIO48 hardware load test. */
+  NINO_SERVO_MOTION_SWEEP = 2,
 } nino_servo_motion_mode_t;
 
 /** Start cyclic head motion (runs until nino_servo_motion_stop). */
