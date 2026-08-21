@@ -145,15 +145,16 @@ def piper_prosody_enabled() -> bool:
 def piper_pitch_offset() -> float:
     """Standing pitch shift on top of mood, in semitones.
 
-    Default is +4 semitones on Amy. Override with ``PIPER_PITCH_SEMITONES``.
+    Default is 0 (natural pitch). The old +4 lift made 16 kHz Piper thin and
+    harsh on the P4 speaker. Override with ``PIPER_PITCH_SEMITONES``.
     """
-    raw = os.environ.get("PIPER_PITCH_SEMITONES", "4.0").strip()
+    raw = os.environ.get("PIPER_PITCH_SEMITONES", "0").strip()
     if not raw:
-        return 4.0
+        return 0.0
     try:
         return max(-12.0, min(12.0, float(raw)))
     except ValueError:
-        return 4.0
+        return 0.0
 
 
 def piper_robotic_amount() -> float:

@@ -74,6 +74,14 @@ def _resample_mono_float(samples: np.ndarray, src_rate: int, dst_rate: int) -> n
     return np.interp(x_new, x_old, samples).astype(np.float32)
 
 
+def _soften_for_small_speaker(samples: np.ndarray) -> np.ndarray:
+    """Trim raspy treble and leave PA headroom for the P4 demo speaker."""
+    if samples.size < 3:
+        return samples
+    kernel = np.array([0.18, 0.64, 0.18], dtype=np.float32)
+    return np.convolve(samples, kernel, mode="same") * np.float32(0.88)
+
+
 def resample_wav_bytes_to_mono_16bit(wav_bytes: bytes, target_sr: int) -> bytes:
     """16-bit PCM WAV in → mono 16-bit PCM WAV at target_sr (linear resample)."""
     with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
@@ -93,6 +101,7 @@ def resample_wav_bytes_to_mono_16bit(wav_bytes: bytes, target_sr: int) -> bytes:
     # WAVE_FORMAT_EXTENSIBLE (0xFFFE); ESP parse_wav_pcm only accepts format 1.
     if sr != target_sr:
         pcm = _resample_mono_float(pcm, sr, target_sr)
+    pcm = _soften_for_small_speaker(pcm)
     out_i16 = (np.clip(pcm, -1.0, 1.0) * 32767.0).astype(np.int16)
     bio = io.BytesIO()
     with wave.open(bio, "wb") as wo:

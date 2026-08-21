@@ -98,11 +98,11 @@ class SpeechStyleTests(unittest.TestCase):
             self.assertEqual(wf.getframerate(), src_rate)
             self.assertGreater(wf.getnframes(), 0)
 
-    def test_pitch_offset_defaults_to_a_robotic_lift(self) -> None:
+    def test_pitch_offset_defaults_to_natural(self) -> None:
         previous = os.environ.get("PIPER_PITCH_SEMITONES")
         try:
             os.environ.pop("PIPER_PITCH_SEMITONES", None)
-            self.assertAlmostEqual(piper_pitch_offset(), 4.0)
+            self.assertAlmostEqual(piper_pitch_offset(), 0.0)
             os.environ["PIPER_PITCH_SEMITONES"] = "-1.5"
             self.assertAlmostEqual(piper_pitch_offset(), -1.5)
         finally:

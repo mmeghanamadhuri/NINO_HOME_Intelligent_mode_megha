@@ -25,6 +25,26 @@ static const char *TAG = "nino_audio";
 #define NINO_AUDIO_NVS_KEY_VOL "vol"
 #define NINO_AUDIO_DEFAULT_VOLUME 80
 
+/** Mild treble cut + headroom so 16 kHz TTS is less harsh on the EV speaker. */
+static void soften_playback_pcm(int16_t *pcm, size_t samples) {
+  if (pcm == NULL || samples == 0) {
+    return;
+  }
+  int32_t prev = (int32_t)pcm[0];
+  for (size_t i = 0; i < samples; i++) {
+    const int32_t x = (int32_t)pcm[i];
+    const int32_t lp = (x * 5 + prev * 3) / 8;
+    prev = lp;
+    int32_t y = (lp * 88) / 100;
+    if (y > 32767) {
+      y = 32767;
+    } else if (y < -32768) {
+      y = -32768;
+    }
+    pcm[i] = (int16_t)y;
+  }
+}
+
 static SemaphoreHandle_t s_mutex;
 static esp_codec_dev_handle_t s_spk;
 static bool s_ready;
@@ -64,6 +84,48 @@ static void wait_pcm_pipeline_done(uint32_t sample_rate_hz, size_t pcm_bytes,
     wait_ms = (audio_ms - elapsed_ms) + pipeline_margin_ms;
   }
   vTaskDelay(pdMS_TO_TICKS(wait_ms));
+}
+
+static esp_err_t spk_stream_open_clocks_locked(void) {
+  if (s_spk == NULL) {
+    return ESP_FAIL;
+  }
+  if (s_spk_stream_open && !s_spk_force_reopen && s_spk_stream_rate_hz == 16000) {
+    (void)esp_codec_dev_set_out_mute(s_spk, true);
+    return ESP_OK;
+  }
+
+  if (s_spk != NULL && s_spk_stream_open) {
+    (void)esp_codec_dev_set_out_mute(s_spk, true);
+    (void)esp_codec_dev_close(s_spk);
+    s_spk_stream_open = false;
+    s_spk_stream_rate_hz = 0;
+  }
+
+  esp_codec_dev_sample_info_t fs = {
+      .bits_per_sample = 16,
+      .channel = 1,
+      .channel_mask = 0,
+      .sample_rate = 16000,
+      .mclk_multiple = 0,
+  };
+  const int cr = esp_codec_dev_open(s_spk, &fs);
+  if (cr != ESP_CODEC_DEV_OK) {
+    ESP_LOGE(TAG, "esp_codec_dev_open (clocks) failed: %d", cr);
+    s_spk_force_reopen = true;
+    return ESP_FAIL;
+  }
+  s_spk_stream_open = true;
+  s_spk_stream_rate_hz = 16000;
+  s_spk_force_reopen = false;
+  (void)esp_codec_dev_set_out_vol(s_spk, s_volume_percent);
+  (void)esp_codec_dev_set_out_mute(s_spk, true);
+  {
+    int16_t zeros[160] = {0};
+    (void)esp_codec_dev_write(s_spk, zeros, sizeof(zeros));
+  }
+  ESP_LOGI(TAG, "Duplex I2S clocks held @ 16000 Hz (DAC muted for Aux-in)");
+  return ESP_OK;
 }
 
 static void spk_stream_close_locked(void) {
@@ -490,6 +552,8 @@ esp_err_t nino_audio_decode_wav(const uint8_t *wav_bytes, size_t wav_len,
     samples = pcm_owned;
   }
 
+  soften_playback_pcm(pcm_owned, num_bytes / sizeof(int16_t));
+
   out->samples = samples;
   out->num_bytes = num_bytes;
   out->sample_rate_hz = wav.sample_rate;
@@ -763,4 +827,8 @@ void nino_audio_drop_speaker_stream_locked(void) {
   }
   spk_stream_close_locked();
   s_spk_force_reopen = true;
+}
+
+esp_err_t nino_audio_ensure_duplex_clocks_locked(void) {
+  return spk_stream_open_clocks_locked();
 }

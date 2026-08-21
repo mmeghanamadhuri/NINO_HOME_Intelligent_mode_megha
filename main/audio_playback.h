@@ -73,6 +73,12 @@ void nino_audio_bus_unlock(void);
  */
 void nino_audio_drop_speaker_stream_locked(void);
 
+/**
+ * Keep 16 kHz TX+RX clocks running with the DAC muted. Caller holds
+ * nino_audio_bus_lock(). Does not close Aux-in.
+ */
+esp_err_t nino_audio_ensure_duplex_clocks_locked(void);
+
 /** Set speaker output volume percent (0-100). Persisted to NVS. */
 esp_err_t nino_audio_set_volume_percent(int volume_percent);
 

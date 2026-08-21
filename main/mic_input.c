@@ -76,6 +76,30 @@ static esp_err_t es8311_write_reg(uint8_t reg, uint8_t val) {
 
 /** Point the ES8311 ADC at analog LIN (board AUX IN), not onboard MIC1. */
 static void es8311_select_aux_in(void) {
+  if (s_es8311_mic != NULL) {
+    int reg14 = 0;
+    if (esp_codec_dev_read_reg(s_es8311_mic, ES8311_REG_ADC_ANALOG, &reg14) ==
+        ESP_CODEC_DEV_OK) {
+      const int next = (reg14 & (int)~ES8311_LINSEL_MASK) | ES8311_LINSEL_LIN;
+      if (next != reg14) {
+        if (esp_codec_dev_write_reg(s_es8311_mic, ES8311_REG_ADC_ANALOG, next) ==
+            ESP_CODEC_DEV_OK) {
+          ESP_LOGI(TAG, "ES8311 ADC input LIN/AUX IN (REG14 0x%02X -> 0x%02X)",
+                   (unsigned)reg14, (unsigned)next);
+          s_aux_selected = true;
+          return;
+        }
+      } else {
+        if (!s_aux_selected) {
+          ESP_LOGI(TAG, "ES8311 ADC already on LIN/AUX (REG14=0x%02X)",
+                   (unsigned)reg14);
+        }
+        s_aux_selected = true;
+        return;
+      }
+    }
+  }
+
   if (es8311_ensure_i2c() != ESP_OK) {
     return;
   }
@@ -99,10 +123,12 @@ static void es8311_select_aux_in(void) {
 }
 
 static esp_err_t open_es8311_aux_locked(void) {
-  /* Speaker TX and AUX ADC share one ES8311 duplex. Boot leaves the 16 kHz
-   * speaker stream warm; TTS is also 16 kHz, so playback would skip reopen
-   * and write into a dead I2S path (silent reply, i2s_channel_disable errors). */
-  nino_audio_drop_speaker_stream_locked();
+  /* Do not drop the speaker stream. Closing it disables I2S TX; the ES8311 ADC
+   * is a slave and Aux-in goes silent. */
+  if (nino_audio_ensure_duplex_clocks_locked() != ESP_OK) {
+    ESP_LOGE(TAG, "Duplex I2S clocks not ready for AUX ADC");
+    return ESP_FAIL;
+  }
 
   if (s_es8311_mic != NULL) {
     es8311_select_aux_in();
@@ -138,6 +164,13 @@ static esp_err_t open_es8311_aux_locked(void) {
   }
 
   es8311_select_aux_in();
+  /* WORK_MODE_BOTH unmutes the DAC. Mute it digitally; do not power down REG12. */
+  {
+    int reg31 = 0;
+    if (esp_codec_dev_read_reg(s_es8311_mic, 0x31, &reg31) == ESP_CODEC_DEV_OK) {
+      (void)esp_codec_dev_write_reg(s_es8311_mic, 0x31, (reg31 & 0x9F) | 0x60);
+    }
+  }
   ESP_LOGI(TAG, "Using ES8311 AUX IN at %d Hz (gain %.0f dB)",
            NINO_MIC_SAMPLE_RATE_HZ, (double)NINO_ES8311_AUX_GAIN_DB);
   return ESP_OK;
