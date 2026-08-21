@@ -23,9 +23,14 @@
  *
  * A 12 V pack should measure ~2.77 V from GPIO20 to GND. Never put pack
  * voltage straight on GPIO20.
+ *
+ * Low-battery protection only runs when a real pack is on the divider.
+ * 5V USB / direct supply, an open divider (~0 V), ADC rail, or a floating
+ * GPIO20 (implausible / unstable) skip the WAV, RGB blink, and unmute.
  */
 typedef struct {
   int16_t raw;
+  int16_t raw_span;
   int32_t adc_mv;
   int32_t battery_mv;
   uint8_t percent;

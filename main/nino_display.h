@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include "sdkconfig.h"
 
 #if CONFIG_NINO_EYE_DISPLAY_TFT
 #include "st7735.h"

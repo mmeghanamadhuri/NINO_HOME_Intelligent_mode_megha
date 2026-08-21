@@ -164,6 +164,10 @@ void tft_neutral_run(tft_neutral_should_run_fn should_run)
     }
 
     st7735_fill_screen(NEU_WHITE);
+    /* Paint the open oval before the hold loop. Re-applying idle used to
+     * abort should_run() immediately and leave a blank white (or prior
+     * all-black init) fill with no eye. */
+    neu_oval_full(NEU_CX, NEU_CY, NEU_RX, NEU_RY, NEU_BLACK);
 
     while (should_run()) {
         neu_blink_once(should_run);

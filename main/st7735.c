@@ -308,7 +308,9 @@ esp_err_t st7735_init(void)
     backlight_on();
 
     s_target = ST7735_TARGET_ALL;
-    st7735_fill_screen(0x0000);
+    /* Idle background is white. An all-black fill here looks like a dead
+     * panel if the eye task is slow to start or idle is interrupted. */
+    st7735_fill_screen(st7735_color(255, 255, 255));
 
 #if CONFIG_NINO_ST7735_BL_HARDCODED_3V3
     ESP_LOGI(TAG, "ST7735 ready: %d panel(s) %dx%d (BL hardwired 3.3 V, GPIO%d free for SDIO)",

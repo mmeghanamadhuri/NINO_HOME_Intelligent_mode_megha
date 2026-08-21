@@ -11,8 +11,8 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "nino_display.h"
 #include "sdkconfig.h"
+#include "nino_display.h"
 #if CONFIG_NINO_EYE_DISPLAY_TFT
 #include "tft_neutral.h"
 #endif
@@ -133,9 +133,18 @@ static volatile bool s_demo_idle_pace = false;
 
 static const nino_state_profile_t s_profiles[NINO_EYE_STATE_COUNT] = {
 #if CONFIG_NINO_EYE_DISPLAY_TFT
-    /* Idle on TFT: tft_neutral.c (standalone oval blink, no OLED engine). */
+    /* Idle on TFT: tft_neutral.c. rx/ry match the oval so a fallback blink
+     * still paints if the standalone path is skipped. */
     [NINO_EYE_IDLE] = {
         .mode = NINO_RENDER_BLINK,
+        .rx = 28,
+        .ry = 32,
+        .hold_ms = 4000,
+        .closed_hold_ms = 180,
+        .blink_step = 2,
+        .blink_ms = NINO_EYE_FRAME_MS,
+        .gaze_offsets = {0},
+        .gaze_count = 1,
         .eye_r = 0, .eye_g = 0, .eye_b = 0,
     },
 #else
@@ -2360,8 +2369,11 @@ void nino_eye_set_state(nino_eye_state_t state)
     }
     const bool same = (s_state == state);
     s_state = state;
-    if (same) {
-      /* Re-applying the same emotion must force a redraw (e.g. smile again). */
+    if (same && state != NINO_EYE_IDLE) {
+      /* Re-applying the same emotion must force a redraw (e.g. smile again).
+       * Re-applying idle must not abort tft_neutral mid-frame — that left the
+       * ST7735 on a white/black fill with no oval. Use nino_eye_restart_current
+       * when idle must be rebuilt. */
       s_restart_requested = true;
     }
     ESP_LOGI(TAG, "state set -> %d%s", (int)state, same ? " (restart)" : "");
@@ -2640,6 +2652,7 @@ static void run_current_state_once(void)
         break;
     case NINO_EYE_IDLE:
 #if CONFIG_NINO_EYE_DISPLAY_TFT
+        s_prev_kind = PREV_NONE;
         tft_neutral_run(tft_idle_should_run);
 #else
         if (profile->mode == NINO_RENDER_NEUTRAL) {
@@ -2719,7 +2732,10 @@ void nino_eye_begin(void)
     }
     s_engine_started = true;
     ESP_LOGI(TAG, "Nino eye starting (engine only)");
-    xTaskCreate(eye_engine_task, "nino_eye", 8192, NULL, 5, NULL);
+    if (xTaskCreate(eye_engine_task, "nino_eye", 8192, NULL, 5, NULL) != pdPASS) {
+        s_engine_started = false;
+        ESP_LOGE(TAG, "eye engine task not started — LCDs stay on last init fill");
+    }
 }
 
 void nino_eye_restart_current(void)
