@@ -368,6 +368,64 @@ class SessionIdentityFlowTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(self.flow.current_user()[0], "Hari")
 
+    def test_apply_visible_scene_allow_register_false_skips_offer(self) -> None:
+        self.flow.start_session(
+            session_id="s1",
+            device_id="30eda0e34fc4",
+            identity_name="Hari",
+            identity_state="recognized",
+        )
+        result = self.flow.apply_visible_scene(
+            visible_names=[], scene_state="unknown", allow_register=False
+        )
+        self.assertIsNone(result)
+        self.assertFalse(self.flow.in_registration())
+        self.assertEqual(self.flow.current_user()[0], "Hari")
+
+    def test_apply_visible_scene_allow_register_false_still_switches_user(self) -> None:
+        self.flow.start_session(
+            session_id="s1",
+            device_id="30eda0e34fc4",
+            identity_name="Hari",
+            identity_state="recognized",
+        )
+        result = self.flow.apply_visible_scene(
+            visible_names=["Nora"], scene_state="recognized", allow_register=False
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result.user_name, "Nora")
+        self.assertEqual(result.reply, "")
+        self.assertEqual(self.flow.current_user()[0], "Nora")
+
+    def test_apply_visible_scene_allow_register_false_becomes_guest(self) -> None:
+        self.flow.start_session(
+            session_id="s1",
+            device_id="30eda0e34fc4",
+            identity_name="Hari",
+            identity_state="recognized",
+        )
+        result = self.flow.apply_visible_scene(
+            visible_names=[], scene_state="no_face", allow_register=False
+        )
+        self.assertIsNotNone(result)
+        self.assertTrue(result.is_guest)
+        self.assertEqual(result.reply, "")
+        self.assertTrue(is_guest_name(result.user_name))
+
+    def test_apply_visible_scene_allow_register_true_still_offers(self) -> None:
+        self.flow.start_session(
+            session_id="s1",
+            device_id="30eda0e34fc4",
+            identity_name="Hari",
+            identity_state="recognized",
+        )
+        result = self.flow.apply_visible_scene(
+            visible_names=[], scene_state="unknown", allow_register=True
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result.reply, OFFER_REGISTER_PROMPT)
+        self.assertTrue(self.flow.in_registration())
+
 
 class NameInjectionTests(unittest.TestCase):
     def test_guest_skips_name(self) -> None:

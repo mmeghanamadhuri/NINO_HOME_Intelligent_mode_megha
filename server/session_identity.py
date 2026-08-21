@@ -334,11 +334,16 @@ class SessionIdentityFlow:
         *,
         visible_names: list[str],
         scene_state: str,
+        allow_register: bool = True,
     ) -> SessionOpenResult | None:
         """After a hunt: keep / switch user, offer register, or become guest.
 
         Returns a spoken prompt when one is needed; None means keep listening.
         Does not interrupt an in-progress registration voice flow.
+
+        When @p allow_register is False (next spoken turn after TTS): switch
+        identified users or become guest only — do not steal the question with
+        a register offer.
         """
         names = [
             n.strip()
@@ -388,6 +393,12 @@ class SessionIdentityFlow:
             )
 
         if scene == "unknown":
+            if not allow_register:
+                logger.info(
+                    "Session identity: unknown face — skip register offer "
+                    "(allow_register=False)"
+                )
+                return None
             if state == "guest" and declined:
                 return None
             with self._lock:

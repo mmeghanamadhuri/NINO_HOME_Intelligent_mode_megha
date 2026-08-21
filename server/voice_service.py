@@ -16,7 +16,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import numpy as np
 import requests
@@ -239,6 +239,46 @@ _SERVO_360_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     )
 )
 
+_FACE_TRACK_OFF_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bstop tracking(?:\s+my\s+face)?\b",
+        r"\b(?:don'?t|do not|dont)\s+track(?:\s+my\s+face)?\b",
+        r"\bstop following my face\b",
+        r"\bturn off (?:the\s+)?(?:face\s+)?tracking\b",
+        r"\bdisable (?:face\s+)?tracking\b",
+    )
+)
+
+_FACE_TRACK_ON_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\btrack my face\b",
+        r"\bstart tracking(?:\s+my\s+face)?\b",
+        r"\bsee me while i(?:'?m| am) talking\b",
+        r"\blook at me while i(?:'?m| am) talking\b",
+        r"\bkeep looking at (?:me|my face)\b",
+        r"\bfollow my face\b",
+        r"\bwatch my face\b",
+        r"\benable (?:face\s+)?tracking\b",
+        r"\bturn on (?:the\s+)?(?:face\s+)?tracking\b",
+    )
+)
+
+_WHAT_DO_YOU_SEE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bwhat do you see\b",
+        r"\bwhat can you see\b",
+        r"\bwhat are you seeing\b",
+        r"\btell me what you see\b",
+        r"\bwhat(?:'s| is) in front of you\b",
+        r"\bwhat do you see (?:now|right now|in front of you)\b",
+        r"\bdescribe what you see\b",
+        r"\bwhat(?:'s| is) around you\b",
+    )
+)
+
 _VOLUME_SET_PATTERN = re.compile(
     r"\b(?:set|change|make|keep|increase|decrease|raise|lower|turn)\b.*\bvolume\b"
     r".*?\b(?:to|at)\s+([a-z0-9\s-]+)(?:\s*percent)?\b",
@@ -281,6 +321,8 @@ class VoiceReplyMeta:
     registered_face_name: str | None = None
     face_reg_relisten: bool = False
     device_id: str = ""
+    # After this WAV, firmware pans left/right and asks for pose reports.
+    look_scan: bool = False
     # Per-stage latency info for this query (stt/reply/tts seconds, heard text,
     # reply path, audio sizes). Filled by process_voice_wav; logged by app.py.
     timings: dict[str, Any] = field(default_factory=dict)
@@ -332,6 +374,9 @@ CONTINUE_LISTEN_REPLY_PATHS = frozenset(
         "session_greet",
         "session_register_offer",
         "face_registration",
+        "face_track",
+        "look_scan",
+        "volume",
     }
 )
 
@@ -1557,6 +1602,128 @@ def apply_volume_command(
     return True, f"Okay, speaker volume set to {applied} percent."
 
 
+def is_face_track_command(user_text: str) -> bool:
+    return parse_face_track_command(user_text) is not None
+
+
+def parse_face_track_command(user_text: str) -> bool | None:
+    """True = enable tracking, False = disable, None = not a track command."""
+    text = (user_text or "").strip()
+    if not text:
+        return None
+    if any(p.search(text) for p in _FACE_TRACK_OFF_PATTERNS):
+        return False
+    if any(p.search(text) for p in _FACE_TRACK_ON_PATTERNS):
+        return True
+    return None
+
+
+def esp_face_track_url(device_id: str | None = None) -> str | None:
+    from esp_playback import device_base_url
+
+    base = device_base_url(device_id)
+    if not base:
+        return None
+    return f"{base.rstrip('/')}/face/track"
+
+
+def set_esp_face_track(
+    enabled: bool, device_id: str | None = None
+) -> tuple[bool, str | None]:
+    """POST /face/track on the ESP. Returns (ok, error_code)."""
+    url = esp_face_track_url(device_id)
+    if not url:
+        return False, "no_esp_url"
+    try:
+        resp = requests.post(url, json={"enabled": bool(enabled)}, timeout=8)
+        if resp.status_code == 200:
+            return True, None
+        try:
+            payload = resp.json()
+            err = str(payload.get("error", "request_failed"))
+        except Exception:
+            err = f"http_{resp.status_code}"
+        logger.warning("ESP face track failed: %s %s", resp.status_code, err)
+        return False, err
+    except requests.RequestException as exc:
+        logger.warning("ESP face track request failed: %s", exc)
+        return False, "request_failed"
+
+
+def apply_face_track_command(
+    user_text: str, *, device_id: str | None = None
+) -> tuple[bool, str]:
+    parsed = parse_face_track_command(user_text)
+    if parsed is None:
+        return False, ""
+    ok, err = set_esp_face_track(parsed, device_id=device_id)
+    if err == "no_esp_url":
+        return True, "I cannot reach the robot right now."
+    if err == "detector_not_ready":
+        return True, "Face tracking isn't ready yet."
+    if not ok:
+        return True, "I could not change face tracking on the robot."
+    if parsed:
+        return True, "I'll keep looking at you."
+    return True, "I'll stop tracking your face."
+
+
+def is_what_do_you_see_command(user_text: str) -> bool:
+    text = (user_text or "").strip()
+    if not text:
+        return False
+    return any(p.search(text) for p in _WHAT_DO_YOU_SEE_PATTERNS)
+
+
+_visible_scene_snapshot: Callable[[str | None], tuple[list[str], list[dict]]] | None = (
+    None
+)
+
+
+def configure_visible_scene_snapshot(
+    fn: Callable[[str | None], tuple[list[str], list[dict]]] | None,
+) -> None:
+    """Live overlay names + YOLO detections for 'what do you see' / look-scan."""
+    global _visible_scene_snapshot
+    _visible_scene_snapshot = fn
+
+
+def snapshot_visible_scene(
+    device_id: str | None = None,
+) -> tuple[list[str], list[dict]]:
+    if _visible_scene_snapshot is None:
+        return [], []
+    try:
+        names, detections = _visible_scene_snapshot(device_id)
+        return list(names or []), list(detections or [])
+    except Exception:
+        logger.exception("visible scene snapshot failed device=%s", device_id)
+        return [], []
+
+
+def synthesize_look_scan_wav(
+    reply: str,
+    *,
+    session_id: str = "",
+    device_id: str = "",
+) -> tuple[bytes, VoiceReplyMeta]:
+    """Side-pose TTS during a look-scan. Does not retrigger look_scan."""
+    meta = VoiceReplyMeta(session_id=session_id, device_id=device_id)
+    meta.end_session = False
+    meta.prompt_medical_ack = True
+    meta.look_scan = False
+    wav, _voice = synthesize_sapi_wav_bytes(reply)
+    wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
+    meta.timings = {
+        "heard": "",
+        "reply_text": reply[:200],
+        "reply_path": "look_scan",
+        "audio_out_seconds": round(_wav_seconds(wav_out), 2),
+        "audio_out_bytes": len(wav_out),
+    }
+    return wav_out, meta
+
+
 def _ensure_whisper() -> Any:
     global _WHISPER_MODEL
     if _WHISPER_MODEL is not None:
@@ -1966,6 +2133,64 @@ def _wake_gate_result(
     return wav_out, meta
 
 
+def _short_handled_wav(
+    meta: VoiceReplyMeta,
+    *,
+    reply: str,
+    reply_path: str,
+    user_text: str,
+    audio_input_format: str,
+    audio_in_seconds: float,
+    wav_bytes: bytes,
+    stt_engine: str,
+    t_start: float,
+    t_stt: float,
+    look_scan: bool = False,
+) -> tuple[bytes, VoiceReplyMeta]:
+    t_reply = time.perf_counter()
+    wav, _voice = synthesize_sapi_wav_bytes(reply)
+    tts_info = last_tts_synthesis_info()
+    wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
+    t_tts = time.perf_counter()
+    audio_out_seconds = _wav_seconds(wav_out)
+    if look_scan:
+        meta.look_scan = True
+        meta.motion = None
+    _mark_continue_listen(meta, reply_path, user_text)
+    meta.timings = {
+        "heard": user_text[:200],
+        "reply_text": reply[:200],
+        "reply_path": reply_path,
+        "audio_input_format": audio_input_format,
+        "audio_in_seconds": round(audio_in_seconds, 2),
+        "audio_in_bytes": len(wav_bytes),
+        "audio_out_seconds": round(audio_out_seconds, 2),
+        "audio_out_bytes": len(wav_out),
+        "stt_engine": stt_engine,
+        "tts_provider": tts_info["provider"],
+        "tts_voice": tts_info["voice"],
+        "tts_style": tts_info.get("style", ""),
+        "stt_seconds": round(t_stt - t_start, 3),
+        "reply_seconds": round(t_reply - t_stt, 3),
+        "tts_seconds": round(t_tts - t_reply, 3),
+        "process_total_seconds": round(t_tts - t_start, 3),
+        "continue_listen": bool(meta.prompt_medical_ack),
+        "look_scan": bool(meta.look_scan),
+    }
+    logger.info(
+        "Latency | stt(%s)=%.2fs reply(%s)=%.2fs tts=%.2fs total=%.2fs | in=%.1fs out=%.1fs audio",
+        stt_engine,
+        meta.timings["stt_seconds"],
+        reply_path,
+        meta.timings["reply_seconds"],
+        meta.timings["tts_seconds"],
+        meta.timings["process_total_seconds"],
+        audio_in_seconds,
+        audio_out_seconds,
+    )
+    return wav_out, meta
+
+
 def process_voice_wav(
     wav_bytes: bytes,
     viewer_name: str | None = None,
@@ -1973,6 +2198,7 @@ def process_voice_wav(
     camera_identity_name: str | None = None,
     camera_identity_state: CameraIdentityState = "no_face",
     camera_scene: str | None = None,
+    visible_names: list[str] | None = None,
     device_id: str = "",
     session_kind: str = "wake",
     session_id: str = "",
@@ -2246,6 +2472,34 @@ def process_voice_wav(
         )
     log_nino_voice("CMD", turn=voice_turn, session=session, text=user_text[:200])
 
+    from session_identity import get_session_identity
+
+    ident = get_session_identity(device_id)
+    if ident is not None and ident.is_active() and not ident.in_registration():
+        names = [n for n in (visible_names or []) if str(n).strip()]
+        if not names and camera_identity_state == "recognized" and camera_identity_name:
+            names = [str(camera_identity_name).strip()]
+        switched = ident.apply_visible_scene(
+            visible_names=names,
+            scene_state=camera_identity_state or "no_face",
+            allow_register=False,
+        )
+        if switched is not None and switched.user_name:
+            from conversation_sessions import bind_session_user
+
+            if meta.session_id:
+                bind_session_user(
+                    meta.session_id,
+                    device_id=device_id,
+                    user_name=switched.user_name,
+                )
+            logger.info(
+                "Voice identity refresh (no register) user=%s guest=%s heard: %s",
+                switched.user_name,
+                switched.is_guest,
+                user_text[:80],
+            )
+
     handled_volume, volume_reply = apply_volume_command(
         user_text, device_id=device_id or None
     )
@@ -2293,9 +2547,51 @@ def process_voice_wav(
         )
         return wav_out, meta
 
-    from session_identity import get_session_identity
+    handled_track, track_reply = apply_face_track_command(
+        user_text, device_id=device_id or None
+    )
+    if handled_track:
+        logger.info("Voice face-track command | heard: %s", user_text[:120])
+        return _short_handled_wav(
+            meta,
+            reply=track_reply,
+            reply_path="face_track",
+            user_text=user_text,
+            audio_input_format=audio_input_format,
+            audio_in_seconds=audio_in_seconds,
+            wav_bytes=wav_bytes,
+            stt_engine=stt_engine,
+            t_start=t_start,
+            t_stt=t_stt,
+        )
 
-    ident = get_session_identity(device_id)
+    if is_what_do_you_see_command(user_text):
+        from object_detection_service import spoken_scene_report
+
+        names, detections = snapshot_visible_scene(device_id or None)
+        if not names and visible_names:
+            names = list(visible_names)
+        reply = spoken_scene_report(names, detections, pose="center")
+        logger.info(
+            "Voice what-do-you-see | names=%s objects=%s heard: %s",
+            names,
+            [d.get("label") for d in detections[:8]],
+            user_text[:120],
+        )
+        return _short_handled_wav(
+            meta,
+            reply=reply,
+            reply_path="look_scan",
+            user_text=user_text,
+            audio_input_format=audio_input_format,
+            audio_in_seconds=audio_in_seconds,
+            wav_bytes=wav_bytes,
+            stt_engine=stt_engine,
+            t_start=t_start,
+            t_stt=t_stt,
+            look_scan=True,
+        )
+
     ident_handled = False
     if ident is not None and ident.should_skip_prompt_echo(user_text):
         logger.info(

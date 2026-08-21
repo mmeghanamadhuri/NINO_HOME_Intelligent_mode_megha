@@ -431,6 +431,7 @@ struct nino_voice_ws_session {
   bool wake_ok;
   char eye_expr[EYE_EXPR_MAX];
   char motion_json[MOTION_JSON_MAX];
+  bool look_scan;
 };
 
 static bool json_has_key_true(const char *text, size_t len, const char *key) {
@@ -581,6 +582,9 @@ static void stream_on_event(void *handler_args, esp_event_base_t base, int32_t e
         }
       }
       parse_motion_into(s->motion_json, sizeof(s->motion_json), text, tlen);
+      if (json_has_key_true(text, tlen, "\"look_scan\"")) {
+        s->look_scan = true;
+      }
       if (json_type_is(text, tlen, "motion") && s->motion_json[0] != '\0') {
         /* Side-channel motion frame — still played with the next WAV. */
       }
@@ -803,6 +807,7 @@ void nino_voice_ws_session_clear_reply(nino_voice_ws_session_t *session) {
   session->len = 0;
   session->eye_expr[0] = '\0';
   session->motion_json[0] = '\0';
+  session->look_scan = false;
   while (session->evt != NULL && xSemaphoreTake(session->evt, 0) == pdTRUE) {
   }
 }
@@ -902,6 +907,10 @@ esp_err_t nino_voice_ws_session_wait_reply(nino_voice_ws_session_t *session,
   *wav_out = copy;
   *wav_out_len = session->len;
   return ESP_OK;
+}
+
+bool nino_voice_ws_session_look_scan(nino_voice_ws_session_t *session) {
+  return session != NULL && session->look_scan;
 }
 
 void nino_voice_ws_session_close(nino_voice_ws_session_t *session) {

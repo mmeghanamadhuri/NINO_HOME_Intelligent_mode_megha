@@ -151,6 +151,77 @@ def summarize_detections(detections: list[dict[str, Any]]) -> str:
     return f"{', '.join(phrases[:-1])} and {phrases[-1]}"
 
 
+_PERSON_LABELS = {"person", "people"}
+EMPTY_SCENE_NOTE = "I don't see anyone or anything distinctive"
+
+
+def join_visible_names(names: list[str] | None) -> str:
+    """'Hari', 'Hari and Nora', or 'Hari, Nora and Sam'."""
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in names or []:
+        name = str(raw or "").strip()
+        key = name.lower()
+        if not name or key in {"unknown", "face"} or key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(name)
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+    if len(cleaned) == 2:
+        return f"{cleaned[0]} and {cleaned[1]}"
+    return f"{', '.join(cleaned[:-1])} and {cleaned[-1]}"
+
+
+def phrase_visible_scene(
+    names: list[str] | None,
+    detections: list[dict[str, Any]] | None,
+) -> str:
+    """People + objects together, e.g. 'Hari and a laptop'.
+
+    Registered names suppress YOLO 'person' counts so we do not say
+    'Hari and a person'.
+    """
+    people = join_visible_names(names)
+    dets = list(detections or [])
+    if people:
+        dets = [
+            det
+            for det in dets
+            if str(det.get("label", "")).strip().lower() not in _PERSON_LABELS
+        ]
+    objects = summarize_detections(dets)
+    if people and objects:
+        return f"{people} and {objects}"
+    return people or objects or ""
+
+
+def spoken_scene_report(
+    names: list[str] | None,
+    detections: list[dict[str, Any]] | None,
+    *,
+    pose: str = "center",
+) -> str:
+    """Full spoken line for a look-scan pose."""
+    content = phrase_visible_scene(names, detections)
+    side = (pose or "center").strip().lower()
+    if side == "left":
+        if not content:
+            return f"On my left {EMPTY_SCENE_NOTE}."
+        return f"On my left I see {content}."
+    if side == "right":
+        if not content:
+            return f"On my right {EMPTY_SCENE_NOTE}."
+        return f"On my right I see {content}."
+    if not content:
+        return f"{EMPTY_SCENE_NOTE}."
+    if side == "front":
+        return f"Right in front of me I see {content}."
+    return f"Right now I see {content}."
+
+
 class ObjectDetectionService:
     """Detect COCO objects in camera frames with Ultralytics YOLO26n.
 
@@ -232,17 +303,22 @@ class ObjectDetectionService:
             logger.warning("YOLO26 warmup failed: %s", exc)
 
     def detect(
-        self, frame_bgr: np.ndarray, *, device_id: str = "default"
+        self,
+        frame_bgr: np.ndarray,
+        *,
+        device_id: str = "default",
+        force: bool = False,
     ) -> list[dict[str, Any]]:
         """Detections for a frame, reusing the cached pass inside the interval."""
         if not self._enabled or frame_bgr is None:
             return []
 
         now = time.time()
-        with self._cache_lock:
-            cached = self._cache.get(device_id)
-            if cached is not None and (now - cached[0]) < self._interval_s:
-                return list(cached[1])
+        if not force:
+            with self._cache_lock:
+                cached = self._cache.get(device_id)
+                if cached is not None and (now - cached[0]) < self._interval_s:
+                    return list(cached[1])
 
         detections = self._infer(frame_bgr)
         with self._cache_lock:

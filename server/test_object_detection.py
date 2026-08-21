@@ -9,7 +9,13 @@ from unittest.mock import patch
 
 import numpy as np
 
-from object_detection_service import ObjectDetectionService, summarize_detections
+from object_detection_service import (
+    EMPTY_SCENE_NOTE,
+    ObjectDetectionService,
+    phrase_visible_scene,
+    spoken_scene_report,
+    summarize_detections,
+)
 
 
 class _FakeTensor:
@@ -91,6 +97,56 @@ class SummarizeDetectionsTests(unittest.TestCase):
         self.assertEqual(summarize_detections(detections), "2 people, a cup and a laptop")
 
 
+class PhraseVisibleSceneTests(unittest.TestCase):
+    def test_empty_scene(self) -> None:
+        self.assertEqual(phrase_visible_scene([], []), "")
+        self.assertEqual(
+            spoken_scene_report([], []), f"{EMPTY_SCENE_NOTE}."
+        )
+
+    def test_names_only(self) -> None:
+        self.assertEqual(phrase_visible_scene(["Hari"], []), "Hari")
+        self.assertEqual(
+            phrase_visible_scene(["Hari", "Nora"], []), "Hari and Nora"
+        )
+
+    def test_objects_only(self) -> None:
+        self.assertEqual(
+            phrase_visible_scene([], [{"label": "laptop"}]), "a laptop"
+        )
+
+    def test_names_and_objects(self) -> None:
+        self.assertEqual(
+            phrase_visible_scene(["Hari"], [{"label": "laptop"}]),
+            "Hari and a laptop",
+        )
+
+    def test_person_class_suppressed_when_names_exist(self) -> None:
+        detections = [{"label": "person"}, {"label": "laptop"}]
+        self.assertEqual(
+            phrase_visible_scene(["Hari"], detections), "Hari and a laptop"
+        )
+        self.assertIn("person", phrase_visible_scene([], detections))
+
+    def test_spoken_left_right_center(self) -> None:
+        self.assertEqual(
+            spoken_scene_report(["Hari"], [{"label": "cup"}], pose="center"),
+            "Right now I see Hari and a cup.",
+        )
+        self.assertEqual(
+            spoken_scene_report(["Hari"], [], pose="left"),
+            "On my left I see Hari.",
+        )
+        self.assertEqual(
+            spoken_scene_report([], [{"label": "chair"}], pose="right"),
+            "On my right I see a chair.",
+        )
+        self.assertEqual(
+            spoken_scene_report([], [], pose="left"),
+            f"On my left {EMPTY_SCENE_NOTE}.",
+        )
+
+
 class DetectTests(unittest.TestCase):
     def test_disabled_service_never_runs_inference(self) -> None:
         model = _FakeModel()
@@ -145,6 +201,16 @@ class DetectTests(unittest.TestCase):
 
         self.assertEqual(model.calls, 1)
         self.assertEqual(first, second)
+
+    def test_force_bypasses_cached_detections(self) -> None:
+        boxes = _FakeBoxes(xyxy=[[0, 0, 10, 10]], conf=[0.9], cls=[0])
+        model = _FakeModel(boxes)
+        service = _service(model)
+
+        service.detect(_frame())
+        service.detect(_frame(), force=True)
+
+        self.assertEqual(model.calls, 2)
 
     def test_cache_is_kept_per_device(self) -> None:
         boxes = _FakeBoxes(xyxy=[[0, 0, 10, 10]], conf=[0.9], cls=[0])

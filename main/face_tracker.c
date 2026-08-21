@@ -28,6 +28,11 @@ static const char *TAG = "face_tracker";
 #define FACE_HUNT_POSITION_SPEED 16
 #define FACE_HUNT_POSE_MS 1600
 #define FACE_HUNT_FACE_SETTLE_MS 400
+#define FACE_HUNT_TASK_STACK 8192
+#define FACE_HUNT_TASK_PRIO 4
+#define FACE_HUNT_DEFAULT_MS 13000
+/** Travel time before the look-scan 5s hold so overlay/YOLO see the pose. */
+#define FACE_LOOK_MOVE_MS 800
 /** Tilt ID1 on this head: higher goal = physical up, lower goal = physical down. */
 #define FACE_TRACK_TILT_UP_LIMIT_DEG 15
 #define FACE_TRACK_TILT_DOWN_LIMIT_DEG 10
@@ -50,7 +55,11 @@ static bool s_detector_ready;
 static bool s_paused_for_motion;
 static bool s_paused_for_spin;
 static bool s_paused_for_servo;
+static int s_paused_for_script;
 static bool s_face_found;
+static volatile bool s_hunt_running;
+static volatile bool s_hunt_cancel;
+static uint32_t s_hunt_timeout_ms = FACE_HUNT_DEFAULT_MS;
 static uint32_t s_last_frame_sequence;
 static int s_pan_goal = FACE_TRACK_AXIS_CENTER;
 static int s_tilt_goal = FACE_TRACK_AXIS_CENTER;
@@ -97,8 +106,13 @@ static void reset_track_state(void) {
   s_face_misses = 0;
 }
 
+static bool tracker_motion_blocked(void) {
+  return s_paused_for_motion || s_paused_for_spin || s_paused_for_servo ||
+         s_paused_for_script > 0;
+}
+
 static void go_neutral_if_allowed(void) {
-  if (!s_paused_for_motion && !s_paused_for_spin && !s_paused_for_servo) {
+  if (!tracker_motion_blocked()) {
     s_pan_goal = FACE_TRACK_AXIS_CENTER;
     s_tilt_goal = FACE_TRACK_AXIS_CENTER;
     nino_servo_dxl_set_pan_tilt(s_pan_goal, s_tilt_goal);
@@ -116,6 +130,10 @@ static void update_pause_flags(void) {
 void nino_face_tracker_init(void) {
   s_enabled = false;
   s_detector_ready = false;
+  s_paused_for_script = 0;
+  s_hunt_running = false;
+  s_hunt_cancel = false;
+  s_hunt_timeout_ms = FACE_HUNT_DEFAULT_MS;
   s_pan_goal = FACE_TRACK_AXIS_CENTER;
   s_tilt_goal = FACE_TRACK_AXIS_CENTER;
   s_last_frame_sequence = 0;
@@ -169,7 +187,7 @@ void nino_face_tracker_update(bool face_found, int face_cx, int face_cy,
   }
 
   update_pause_flags();
-  if (s_paused_for_motion || s_paused_for_spin || s_paused_for_servo) {
+  if (tracker_motion_blocked()) {
     return;
   }
 
@@ -247,6 +265,14 @@ void nino_face_tracker_get_status(nino_face_tracker_status_t *out) {
 
 bool nino_face_tracker_face_seen(void) { return s_face_found; }
 
+void nino_face_tracker_pause_scripted(bool pause) {
+  if (pause) {
+    s_paused_for_script++;
+  } else if (s_paused_for_script > 0) {
+    s_paused_for_script--;
+  }
+}
+
 bool nino_face_hunt_for_person(uint32_t timeout_ms, bool skip_if_visible) {
   const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
   const struct {
@@ -270,12 +296,24 @@ bool nino_face_hunt_for_person(uint32_t timeout_ms, bool skip_if_visible) {
   int cur_pan = NINO_SERVO_AXIS_CENTER;
   int cur_tilt = NINO_SERVO_AXIS_CENTER;
 
+  nino_face_tracker_pause_scripted(true);
+  /* Blocking INITIAL hunt is not cancellable. Background hunt may already have
+   * a cancel queued between xTaskCreate and this point — do not clear it. */
+  if (!s_hunt_running) {
+    s_hunt_cancel = false;
+  }
   ESP_LOGI(TAG, "Face hunt start (timeout %u ms, slow pan/tilt)", (unsigned)timeout_ms);
 
   /* After TTS, keep the current person if they are still in frame. */
   vTaskDelay(pdMS_TO_TICKS(220));
+  if (s_hunt_cancel) {
+    ESP_LOGI(TAG, "Face hunt cancelled before sweep");
+    nino_face_tracker_pause_scripted(false);
+    return s_face_found;
+  }
   if (skip_if_visible && s_face_found) {
     ESP_LOGI(TAG, "Face hunt: person already in frame");
+    nino_face_tracker_pause_scripted(false);
     return true;
   }
   if (!skip_if_visible) {
@@ -292,6 +330,10 @@ bool nino_face_hunt_for_person(uint32_t timeout_ms, bool skip_if_visible) {
   }
 
   while (xTaskGetTickCount() < deadline) {
+    if (s_hunt_cancel) {
+      ESP_LOGI(TAG, "Face hunt cancelled");
+      break;
+    }
     if (s_face_found) {
       saw_face = true;
       last_face_pan = cur_pan;
@@ -315,9 +357,86 @@ bool nino_face_hunt_for_person(uint32_t timeout_ms, bool skip_if_visible) {
     } else {
       nino_servo_dxl_go_neutral();
     }
-    nino_servo_dxl_set_position_speed(FACE_TRACK_NORMAL_POSITION_SPEED);
+    nino_servo_dxl_set_position_speed(s_enabled ? FACE_TRACK_POSITION_SPEED
+                                                : FACE_TRACK_NORMAL_POSITION_SPEED);
   }
 
   ESP_LOGI(TAG, "Face hunt done (found=%d)", (int)(saw_face || s_face_found));
+  nino_face_tracker_pause_scripted(false);
   return saw_face || s_face_found;
+}
+
+static void face_hunt_task(void *arg) {
+  (void)arg;
+  const uint32_t timeout_ms = s_hunt_timeout_ms;
+  (void)nino_face_hunt_for_person(timeout_ms, true);
+  s_hunt_running = false;
+  s_hunt_cancel = false;
+  vTaskDelete(NULL);
+}
+
+bool nino_face_hunt_start_if_needed(uint32_t timeout_ms) {
+  /* Tracker owns the head — do not start a competing sweep. */
+  if (nino_face_tracker_is_enabled()) {
+    ESP_LOGI(TAG, "Face hunt skip: tracker owns the head");
+    return false;
+  }
+  if (nino_face_tracker_face_seen()) {
+    ESP_LOGI(TAG, "Face hunt skip: person already in frame");
+    return false;
+  }
+  if (s_hunt_running) {
+    ESP_LOGI(TAG, "Face hunt skip: already running");
+    return false;
+  }
+
+  s_hunt_timeout_ms = timeout_ms > 0 ? timeout_ms : FACE_HUNT_DEFAULT_MS;
+  s_hunt_cancel = false;
+  s_hunt_running = true;
+  BaseType_t ok =
+      xTaskCreate(face_hunt_task, "face_hunt", FACE_HUNT_TASK_STACK, NULL,
+                  FACE_HUNT_TASK_PRIO, NULL);
+  if (ok != pdPASS) {
+    s_hunt_running = false;
+    ESP_LOGW(TAG, "Face hunt task create failed");
+    return false;
+  }
+  ESP_LOGI(TAG, "Face hunt started in background (timeout %u ms)",
+           (unsigned)s_hunt_timeout_ms);
+  return true;
+}
+
+bool nino_face_hunt_after_tts(uint32_t timeout_ms) {
+  return nino_face_hunt_start_if_needed(timeout_ms);
+}
+
+bool nino_face_hunt_is_running(void) { return s_hunt_running; }
+
+void nino_face_hunt_cancel(void) {
+  if (!s_hunt_running) {
+    return;
+  }
+  s_hunt_cancel = true;
+}
+
+void nino_face_hunt_wait_idle(uint32_t timeout_ms) {
+  const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+  while (s_hunt_running && xTaskGetTickCount() < deadline) {
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+void nino_face_look_hold_pan(int pan_goal, uint32_t hold_ms) {
+  if (nino_servo_dxl_is_ready() && !nino_servo_recplay_is_busy()) {
+    nino_servo_dxl_set_position_speed(FACE_TRACK_POSITION_SPEED);
+    nino_servo_dxl_set_pan_tilt(pan_goal, NINO_SERVO_AXIS_CENTER);
+  }
+  vTaskDelay(pdMS_TO_TICKS(FACE_LOOK_MOVE_MS));
+  if (hold_ms > 0) {
+    vTaskDelay(pdMS_TO_TICKS(hold_ms));
+  }
+  if (nino_servo_dxl_is_ready() && !nino_servo_recplay_is_busy()) {
+    nino_servo_dxl_set_position_speed(s_enabled ? FACE_TRACK_POSITION_SPEED
+                                                : FACE_TRACK_NORMAL_POSITION_SPEED);
+  }
 }

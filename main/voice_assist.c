@@ -22,6 +22,8 @@
 #include "rgb_led.h"
 #include "camera_stream.h"
 #include "face_tracker.h"
+#include "servo_dxl.h"
+#include "servo_motion.h"
 #include "servo_recplay.h"
 #include "voice_ws_client.h"
 #include "wifi_config.h"
@@ -62,7 +64,8 @@ static const char *TAG = "voice_ast";
 #define CAMERA_STREAM_WAIT_MS 2500
 #define FACE_HUNT_MS 13000
 #define SESSION_GREET_WAIT_MS 20000
-#define IDENTITY_SCAN_WAIT_MS 12000
+#define LOOK_SCAN_HOLD_MS 5000
+#define LOOK_SCAN_TTS_WAIT_MS 12000
 #define AUX_MUSIC_LISTEN_MS 200
 #define AUX_MUSIC_PLAY_SLICE_MS 800
 #define AUX_WAKE_GAP_MS 1000
@@ -980,6 +983,43 @@ static bool wait_and_play_ws_wav(nino_voice_ws_session_t *ws, uint32_t wait_ms,
   return err == ESP_OK || err == ESP_ERR_TIMEOUT;
 }
 
+/* Scripted left/right look for "what do you see". Completes before listen.
+ * Hunt is not started for this turn — this motion IS the answer. */
+static void run_post_tts_look_scan(nino_voice_ws_session_t *ws, bool *session_end) {
+  voice_log(ESP_LOG_INFO, s_voice_turn, "LOOK", "scan left then right");
+  /* Do not wait out a 13s hunt — take the head now. */
+  nino_face_hunt_cancel();
+  nino_face_hunt_wait_idle(2500);
+  nino_face_tracker_pause_scripted(true);
+
+  nino_face_look_hold_pan(NINO_SERVO_PAN_LEFT, LOOK_SCAN_HOLD_MS);
+  nino_voice_ws_session_clear_reply(ws);
+  if (nino_voice_ws_session_send_text(ws, "{\"type\":\"look_scan\",\"side\":\"left\"}") ==
+      ESP_OK) {
+    if (!wait_and_play_ws_wav(ws, LOOK_SCAN_TTS_WAIT_MS, "LOOK", false, session_end)) {
+      /* continue to the right even if left TTS timed out */
+    }
+  }
+  if (session_end != NULL && *session_end) {
+    nino_servo_dxl_go_neutral();
+    nino_face_tracker_pause_scripted(false);
+    return;
+  }
+
+  nino_face_look_hold_pan(NINO_SERVO_PAN_RIGHT, LOOK_SCAN_HOLD_MS);
+  nino_voice_ws_session_clear_reply(ws);
+  if (nino_voice_ws_session_send_text(ws, "{\"type\":\"look_scan\",\"side\":\"right\"}") ==
+      ESP_OK) {
+    if (!wait_and_play_ws_wav(ws, LOOK_SCAN_TTS_WAIT_MS, "LOOK", false, session_end)) {
+      /* return to center anyway */
+    }
+  }
+
+  nino_servo_dxl_go_neutral();
+  vTaskDelay(pdMS_TO_TICKS(400));
+  nino_face_tracker_pause_scripted(false);
+}
+
 static bool stream_aux_pcm(nino_voice_ws_session_t *ws, uint32_t turn,
                            const int16_t *preroll, size_t preroll_samples,
                            bool listen_led) {
@@ -1163,18 +1203,10 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
     goto session_done;
   }
 
-  /* After GREET TTS, re-acquire the same person (or switch) before listen. */
-  (void)nino_face_hunt_for_person(FACE_HUNT_MS, true);
-  nino_voice_ws_session_clear_reply(ws);
-  if (nino_voice_ws_session_send_text(ws, "{\"type\":\"identity_scan\"}") == ESP_OK) {
-    voice_log(ESP_LOG_INFO, s_voice_turn, "SCAN", "post-GREET identity refresh");
-    if (!wait_and_play_ws_wav(ws, IDENTITY_SCAN_WAIT_MS, "SCAN", false, &session_end)) {
-      /* listen anyway */
-    }
-  }
-  if (session_end) {
-    goto session_done;
-  }
+  /* Listen immediately after GREET. Hunt only if the user is not in frame and
+   * face tracking is off (tracker owns the head); that sweep is background so
+   * it does not block Aux listen. Identity can apply on the next spoken turn. */
+  nino_face_hunt_after_tts(FACE_HUNT_MS);
   nino_voice_ws_session_begin_turn(ws);
 
   /* Wake preroll is stale after hunt + GREET TTS. */
@@ -1188,6 +1220,11 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
     first_turn = false;
     nino_voice_ws_session_begin_turn(ws);
     (void)stream_aux_pcm(ws, turn, NULL, 0, true);
+    /* Settle the head before STT snapshots identity / "what do you see". */
+    if (nino_face_hunt_is_running()) {
+      nino_face_hunt_cancel();
+      nino_face_hunt_wait_idle(2500);
+    }
 
     uint8_t *resp = NULL;
     size_t resp_len = 0;
@@ -1209,6 +1246,7 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
     if (skip || resp == NULL || resp_len == 0) {
       voice_log(ESP_LOG_INFO, turn, "SKIP", "ASR skip — keep listening");
       free(resp);
+      nino_face_hunt_after_tts(FACE_HUNT_MS);
       continue;
     }
 
@@ -1222,25 +1260,21 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
     if (end_session) {
       session_end = true;
       voice_log(ESP_LOG_INFO, turn, "SESSION", "ended after TTS id=%s", session_id);
-    } else {
-      (void)nino_face_hunt_for_person(FACE_HUNT_MS, true);
-      nino_voice_ws_session_clear_reply(ws);
-      if (nino_voice_ws_session_send_text(ws, "{\"type\":\"identity_scan\"}") !=
-          ESP_OK) {
-        voice_log(ESP_LOG_WARN, turn, "SCAN", "send failed — listen");
-      } else {
-        voice_log(ESP_LOG_INFO, turn, "SCAN", "hunt done — identity refresh");
-        if (!wait_and_play_ws_wav(ws, IDENTITY_SCAN_WAIT_MS, "SCAN", false,
-                                  &session_end)) {
-          /* listen anyway */
-        }
-      }
+    } else if (nino_voice_ws_session_look_scan(ws)) {
+      /* look_scan is the answer: left/right reports complete before listen.
+       * Do not start a background hunt — this motion IS the head movement. */
+      run_post_tts_look_scan(ws, &session_end);
       if (session_end) {
-        voice_log(ESP_LOG_INFO, turn, "SESSION", "ended after identity scan id=%s",
+        voice_log(ESP_LOG_INFO, turn, "SESSION", "ended during look-scan id=%s",
                   session_id);
       } else {
         (void)nino_rgb_led_show(NINO_RGB_SHOW_LISTEN);
       }
+    } else {
+      /* Hunt only if not visible / tracking off; never block listen on hunt or
+       * identity_scan WAV. Overlay still updates while the camera is on. */
+      nino_face_hunt_after_tts(FACE_HUNT_MS);
+      (void)nino_rgb_led_show(NINO_RGB_SHOW_LISTEN);
     }
   }
 

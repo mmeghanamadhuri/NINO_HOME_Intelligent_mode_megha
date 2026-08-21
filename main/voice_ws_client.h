@@ -54,6 +54,8 @@ esp_err_t nino_voice_ws_session_wait_reply(nino_voice_ws_session_t *session,
                                            size_t eye_expr_cap, char *motion_out,
                                            size_t motion_cap, bool *wake_ok);
 void nino_voice_ws_session_close(nino_voice_ws_session_t *session);
+/** True when the last reply JSON included `"look_scan": true`. Cleared on clear_reply. */
+bool nino_voice_ws_session_look_scan(nino_voice_ws_session_t *session);
 
 #ifdef __cplusplus
 }

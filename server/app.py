@@ -1043,10 +1043,10 @@ def retrain() -> dict:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-def _detect_objects(frame, device_id: str) -> list[dict]:
+def _detect_objects(frame, device_id: str, *, force: bool = False) -> list[dict]:
     """YOLO26 detections for a frame; never let object detection break the feed."""
     try:
-        return objects.detect(frame, device_id=device_id)
+        return objects.detect(frame, device_id=device_id, force=force)
     except Exception:
         logger.debug("Object detection failed for %s", device_id, exc_info=True)
         return []
@@ -1344,6 +1344,41 @@ def _camera_scene_snapshot(device_id: str | None = None) -> str:
         if frame is not None:
             detections = _detect_objects(frame, active)
     return summarize_detections(detections)
+
+
+def _live_visible_scene(
+    device_id: str | None = None,
+    *,
+    force_objects: bool = False,
+) -> tuple[list[str], list[dict]]:
+    """People (overlay, then live frame) + objects. No stale session-hint names."""
+    active = resolve_device_id(device_id)
+    names: list[str] = []
+    cached = _cached_face_results(active)
+    if cached:
+        names = _recognized_viewer_names(cached, allow_pending=True)
+    frame = cameras.read(active)
+    if not names and frame is not None:
+        try:
+            names = _recognized_viewer_names(
+                faces.recognize(frame, device_id=active), allow_pending=True
+            )
+        except Exception:
+            logger.debug("live scene face recognize failed", exc_info=True)
+    detections: list[dict] = []
+    if objects.enabled:
+        if frame is not None:
+            detections = _detect_objects(frame, active, force=force_objects)
+        else:
+            detections = objects.latest(active)
+    return names, detections
+
+
+from voice_service import configure_visible_scene_snapshot
+
+configure_visible_scene_snapshot(
+    lambda device_id: _live_visible_scene(device_id, force_objects=True)
+)
 
 
 def _session_open_identity_snapshot(
@@ -1667,6 +1702,9 @@ async def _process_voice_query_audio(
             camera_scene = await run_in_threadpool(
                 _camera_scene_snapshot, device_id
             )
+            visible_names = _recognized_viewer_names(
+                _cached_face_results(device_id), allow_pending=True
+            )
 
             def _run_voice() -> tuple[bytes, VoiceReplyMeta]:
                 return process_voice_wav(
@@ -1675,6 +1713,7 @@ async def _process_voice_query_audio(
                     camera_identity_name=identity_name,
                     camera_identity_state=identity_state,
                     camera_scene=camera_scene,
+                    visible_names=visible_names,
                     device_id=device_id,
                     session_kind=session_kind,
                     session_id=session_id,
@@ -1802,6 +1841,8 @@ async def _voice_ws_send_reply(
     if motion:
         ws_meta["motion"] = list(motion)
         ws_meta["type"] = "reply"
+    if getattr(meta, "look_scan", False):
+        ws_meta["look_scan"] = True
     if not await _ws_send_json(websocket, ws_meta):
         logger.info(
             "WS reply skipped, socket closed device=%s client=%s",
@@ -2068,6 +2109,41 @@ async def _voice_ws_stream_pipeline(
         except Exception:
             logger.exception("stream identity_scan failed device=%s", device_id)
             return await send_skip("identity_scan_error")
+
+    async def send_look_scan(side: str) -> bool:
+        """Snapshot people+objects at the current pose and speak a report."""
+        pose = "left" if str(side or "").strip().lower() == "left" else "right"
+        try:
+            from object_detection_service import spoken_scene_report
+            from voice_service import synthesize_look_scan_wav
+
+            names, detections = await run_in_threadpool(
+                lambda: _live_visible_scene(device_id, force_objects=True)
+            )
+            reply = spoken_scene_report(names, detections, pose=pose)
+            wav_out, reply_meta = await run_in_threadpool(
+                lambda: synthesize_look_scan_wav(
+                    reply, session_id=session_id, device_id=device_id
+                )
+            )
+            logger.info(
+                "stream look_scan side=%s names=%s objects=%s device=%s",
+                pose,
+                names,
+                [d.get("label") for d in (detections or [])[:8]],
+                device_id,
+            )
+            return await _voice_ws_send_reply(
+                websocket,
+                device_id=device_id,
+                session_id=session_id,
+                wav_out=wav_out,
+                reply_meta=reply_meta,
+                client_label=client_label,
+            )
+        except Exception:
+            logger.exception("stream look_scan failed device=%s side=%s", device_id, pose)
+            return await send_skip("look_scan_error")
 
     async def send_wake_result(detected: bool) -> bool:
         return await _ws_send_json(
@@ -2344,6 +2420,15 @@ async def _voice_ws_stream_pipeline(
                     session_id,
                 )
                 return await send_identity_refresh()
+            if str(payload.get("type") or "").strip().lower() == "look_scan":
+                side = str(payload.get("side") or "").strip().lower()
+                logger.info(
+                    "stream look_scan side=%s device=%s session=%s",
+                    side or "right",
+                    device_id,
+                    session_id,
+                )
+                return await send_look_scan(side)
             return True
         chunk = message.get("bytes")
         if not chunk:
@@ -2623,6 +2708,9 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                     camera_scene = await run_in_threadpool(
                         _camera_scene_snapshot, device_id
                     )
+                    visible_names = _recognized_viewer_names(
+                        _cached_face_results(device_id), allow_pending=True
+                    )
 
                     def _run_voice() -> tuple[bytes, VoiceReplyMeta]:
                         return process_voice_wav(
@@ -2631,6 +2719,7 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                             camera_identity_name=identity_name,
                             camera_identity_state=identity_state,
                             camera_scene=camera_scene,
+                            visible_names=visible_names,
                             device_id=device_id,
                             session_kind=session_kind,
                             session_id=_session_id_from_websocket(websocket),
@@ -2753,6 +2842,8 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                         device_id,
                         client_label,
                     )
+                if getattr(reply_meta, "look_scan", False):
+                    ws_meta["look_scan"] = True
                 await websocket.send_json(ws_meta)
                 if wav_out:
                     t_send = time.perf_counter()

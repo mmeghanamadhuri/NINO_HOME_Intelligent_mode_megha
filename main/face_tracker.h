@@ -36,11 +36,41 @@ void nino_face_tracker_get_status(nino_face_tracker_status_t *out);
 bool nino_face_tracker_face_seen(void);
 
 /**
+ * Pause pan/tilt tracking for scripted motion (hunt / look-scan) without
+ * changing the user's enabled preference. Nested: each true needs a false.
+ */
+void nino_face_tracker_pause_scripted(bool pause);
+
+/**
  * Slow pan/tilt search until timeout. Camera session must already be streaming.
  * When @p skip_if_visible is true and a face is already in frame, do not sweep.
  * Ends on the last pose where a face was seen so the server can identify them.
  */
 bool nino_face_hunt_for_person(uint32_t timeout_ms, bool skip_if_visible);
+
+/**
+ * After TTS: start a background hunt only if the user is not in frame,
+ * tracking is off (tracker owns the head), and a hunt is not already running.
+ * Does not block the caller — listen can start immediately.
+ */
+bool nino_face_hunt_start_if_needed(uint32_t timeout_ms);
+
+/** Same as nino_face_hunt_start_if_needed (post-TTS entry point). */
+bool nino_face_hunt_after_tts(uint32_t timeout_ms);
+
+bool nino_face_hunt_is_running(void);
+
+/** Stop a background hunt so look-scan / STT can take the head. No-op if idle. */
+void nino_face_hunt_cancel(void);
+
+/** Wait until a background hunt finishes or @p timeout_ms elapses. */
+void nino_face_hunt_wait_idle(uint32_t timeout_ms);
+
+/**
+ * Pan to @p pan_goal, wait for travel, then hold so overlay/YOLO can settle.
+ * Tilt stays center. Caller should pause scripted tracking around this.
+ */
+void nino_face_look_hold_pan(int pan_goal, uint32_t hold_ms);
 
 #ifdef __cplusplus
 }
