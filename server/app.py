@@ -65,6 +65,7 @@ from emotion_service import EmotionService
 from object_detection_service import ObjectDetectionService, summarize_detections
 from tts_service import (
     TTSService,
+    preload_kokoro_voice,
     preload_piper_voice,
     synthesize_sapi_wav_bytes,
 )
@@ -296,6 +297,7 @@ def startup() -> None:
     face_registration.apply_settings_from_environ()
     configure_memory_from_environ()
     preload_piper_voice()
+    preload_kokoro_voice()
     from voice_service import preload_whisper_model
 
     preload_whisper_model()
@@ -1909,6 +1911,32 @@ async def _voice_ws_send_reply(
     viewer = str(meta.timings.get("voice_viewer") or "")
     await run_in_threadpool(tts.notify_voice_interaction, viewer or None, device_id)
 
+    from voice_listen_state import (
+        mark_session_closed,
+        mark_session_open,
+        mark_tts_playback,
+        post_tts_grace_seconds,
+    )
+
+    if meta.end_session:
+        mark_session_closed(session_id, device_id)
+    elif bool(meta.prompt_medical_ack):
+        mark_session_open(session_id, device_id)
+
+    if wav_out and len(wav_out) > 44:
+        play_s = float(meta.timings.get("audio_out_seconds") or 0.0)
+        if play_s <= 0.0:
+            from esp_playback import _wav_duration_seconds
+
+            play_s = _wav_duration_seconds(wav_out)
+        mark_tts_playback(
+            session_id,
+            device_id,
+            tts_seconds=float(meta.timings.get("tts_seconds") or 0.0),
+            audio_out_seconds=play_s,
+        )
+        mark_device_busy_for(play_s + post_tts_grace_seconds(), device_id=device_id)
+
     from voice_service import SERVO_360_TRIGGER_DELAY_SECONDS
 
     if meta.trigger_servo_360:
@@ -2158,7 +2186,7 @@ async def _voice_ws_stream_pipeline(
             },
         )
 
-    async def send_skip(reason: str) -> bool:
+    async def send_skip(reason: str, *, continue_listen: bool = False) -> bool:
         return await _ws_send_json(
             websocket,
             {
@@ -2167,6 +2195,8 @@ async def _voice_ws_stream_pipeline(
                 "reason": reason,
                 "session_id": session_id,
                 "end_session": False,
+                "continue_listen": bool(continue_listen),
+                "prompt_medical_ack": bool(continue_listen),
             },
         )
 
@@ -2231,7 +2261,7 @@ async def _voice_ws_stream_pipeline(
         if path in {"stt_silent", "stt_empty", "silent_skip", "stt_rejected"} and not getattr(
             reply_meta, "end_session", False
         ):
-            return ("skip", path)
+            return ("skip", path, reply_meta)
         return ("reply", wav_out, reply_meta)
 
     async def apply_stt_result(result: tuple) -> bool:
@@ -2240,6 +2270,9 @@ async def _voice_ws_stream_pipeline(
         session_queries += 1
         kind = result[0]
         if kind == "wake_ok":
+            from voice_listen_state import mark_session_open
+
+            mark_session_open(session_id, device_id)
             if not await send_wake_result(True):
                 return False
             accepting = False
@@ -2257,7 +2290,9 @@ async def _voice_ws_stream_pipeline(
             return False
         if kind == "skip":
             apply_listen_timeout()
-            await send_skip(str(result[1] or "skip"))
+            reply_meta = result[2] if len(result) > 2 else None
+            keep_listen = bool(getattr(reply_meta, "prompt_medical_ack", False))
+            await send_skip(str(result[1] or "skip"), continue_listen=keep_listen)
             accepting = True
             return True
         wav_out, reply_meta = result[1], result[2]

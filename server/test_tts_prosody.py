@@ -98,6 +98,24 @@ class SpeechStyleTests(unittest.TestCase):
             self.assertEqual(wf.getframerate(), src_rate)
             self.assertGreater(wf.getnframes(), 0)
 
+    def test_ffmpeg_pitch_shift_keeps_duration(self) -> None:
+        import shutil
+
+        from tts_prosody import pitch_shift_wav_bytes_ffmpeg
+
+        if not shutil.which("ffmpeg"):
+            self.skipTest("ffmpeg not installed")
+        wav = _sine_wav()
+        with wave.open(io.BytesIO(wav), "rb") as wf:
+            src_frames = wf.getnframes()
+            src_rate = wf.getframerate()
+        shifted = pitch_shift_wav_bytes_ffmpeg(wav, 4.0)
+        with wave.open(io.BytesIO(shifted), "rb") as wf:
+            self.assertEqual(wf.getframerate(), src_rate)
+            self.assertAlmostEqual(wf.getnframes() / float(src_rate), src_frames / float(src_rate), delta=0.03)
+            pcm = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+            self.assertGreater(int(np.max(np.abs(pcm))), 0)
+
     def test_pitch_offset_defaults_to_natural(self) -> None:
         previous = os.environ.get("PIPER_PITCH_SEMITONES")
         try:
@@ -142,6 +160,27 @@ class SpeechStyleTests(unittest.TestCase):
                 os.environ.pop("PIPER_PROSODY", None)
             else:
                 os.environ["PIPER_PROSODY"] = previous
+
+    def test_kokoro_prosody_maps_greeting_faster_and_brighter(self) -> None:
+        from tts_service import kokoro_synthesis_kwargs
+
+        previous = os.environ.get("PIPER_PROSODY")
+        os.environ["PIPER_PROSODY"] = "1"
+        os.environ["PIPER_PITCH_SEMITONES"] = "6"
+        os.environ["KOKORO_SPEED"] = "1.0"
+        try:
+            greeting = kokoro_synthesis_kwargs("Hello Chakri, good to see you!")
+            sad = kokoro_synthesis_kwargs("I'm sorry you're having a rough day.")
+            self.assertEqual(greeting["style"], "greeting")
+            self.assertEqual(sad["style"], "sad")
+            self.assertGreater(float(greeting["speed"]), float(sad["speed"]))
+            self.assertGreater(float(greeting["pitch"]), float(sad["pitch"]))
+        finally:
+            if previous is None:
+                os.environ.pop("PIPER_PROSODY", None)
+            else:
+                os.environ["PIPER_PROSODY"] = previous
+            os.environ.pop("KOKORO_SPEED", None)
 
 
 class UnifiedAmyTtsTests(unittest.TestCase):
