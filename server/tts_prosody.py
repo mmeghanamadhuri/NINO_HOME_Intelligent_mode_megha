@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import io
+import logging
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import wave
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 SPEECH_STYLES: tuple[str, ...] = (
     "greeting",
@@ -202,6 +209,80 @@ def infer_speech_prosody(text: str) -> SpeechProsody:
     if not piper_prosody_enabled():
         return _STYLE_PRESETS["neutral"]
     return prosody_for_style(infer_speech_style(text))
+
+
+def piper_pitch_backend() -> str:
+    """Pitch post-process backend for Piper: ``ffmpeg`` (default) or ``numpy``."""
+    raw = os.environ.get("PIPER_PITCH_BACKEND", "ffmpeg").strip().lower()
+    return raw if raw in {"ffmpeg", "numpy"} else "ffmpeg"
+
+
+def pitch_shift_wav_bytes_ffmpeg(wav_bytes: bytes, semitones: float) -> bytes:
+    """Shift pitch via ffmpeg ``asetrate`` + ``atempo`` while preserving duration."""
+    if not wav_bytes or abs(semitones) < 0.05:
+        return wav_bytes
+    binary = shutil.which(os.environ.get("FFMPEG_BINARY", "ffmpeg"))
+    if not binary:
+        raise RuntimeError("ffmpeg is not installed")
+
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        sample_rate = wf.getframerate()
+        if wf.getsampwidth() != 2 or wf.getnchannels() < 1:
+            raise RuntimeError("ffmpeg pitch shift requires 16-bit PCM WAV")
+
+    factor = 2.0 ** (semitones / 12.0)
+    new_rate = max(1, int(round(sample_rate * factor)))
+    tempo = 1.0 / factor
+    audio_filter = (
+        f"asetrate={new_rate},atempo={tempo:.6f},aresample={sample_rate}"
+    )
+    in_path = out_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as inp:
+            inp.write(wav_bytes)
+            in_path = inp.name
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as out:
+            out_path = out.name
+        completed = subprocess.run(
+            [
+                binary,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                in_path,
+                "-af",
+                audio_filter,
+                out_path,
+            ],
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+        if completed.returncode != 0:
+            err = (completed.stderr or b"").decode("utf-8", errors="replace").strip()
+            raise RuntimeError(err or "ffmpeg pitch shift failed")
+        return Path(out_path).read_bytes()
+    finally:
+        for path in (in_path, out_path):
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+
+def pitch_shift_wav_bytes_preserve_tempo(wav_bytes: bytes, semitones: float) -> bytes:
+    """Preserve duration when shifting pitch; prefer ffmpeg for Piper Amy."""
+    if piper_pitch_backend() == "ffmpeg":
+        try:
+            return pitch_shift_wav_bytes_ffmpeg(wav_bytes, semitones)
+        except Exception as exc:
+            logger.warning(
+                "ffmpeg pitch shift failed (%s); falling back to numpy.", exc
+            )
+    return pitch_shift_wav_bytes(wav_bytes, semitones)
 
 
 def pitch_shift_wav_bytes(wav_bytes: bytes, semitones: float) -> bytes:

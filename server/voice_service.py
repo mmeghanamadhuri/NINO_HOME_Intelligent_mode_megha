@@ -608,6 +608,9 @@ def synthesize_session_open_wav(
     # Keep the stream session in continue-listen after GREET so the board
     # treats this like a spoken reply, not a silent skip.
     meta.prompt_medical_ack = True
+    from voice_listen_state import mark_session_open
+
+    mark_session_open(session_id, device_id)
     # Identified greet -> heart; hunt / register-offer -> no LCD emoji.
     inferred = infer_eye_expression_for_response(reply, reply_path=reply_path)
     if inferred == "heart" or (eye_expression or "").strip().lower() == "heart":
@@ -697,10 +700,13 @@ def should_continue_listen_after_reply(reply_path: str, user_text: str) -> bool:
 
 
 def _mark_continue_listen(meta: VoiceReplyMeta, reply_path: str, user_text: str) -> None:
+    from voice_listen_state import mark_session_closed, mark_session_open
+
     turn = meta.timings.get("turn")
     meta.end_session = utterance_ends_session(reply_path, user_text)
     if meta.end_session:
         meta.prompt_medical_ack = False
+        mark_session_closed(meta.session_id, meta.device_id)
         log_nino_voice(
             "SESSION",
             turn=turn,
@@ -712,6 +718,7 @@ def _mark_continue_listen(meta: VoiceReplyMeta, reply_path: str, user_text: str)
         return
     if should_continue_listen_after_reply(reply_path, user_text):
         meta.prompt_medical_ack = True
+        mark_session_open(meta.session_id, meta.device_id)
         log_nino_voice(
             "SESSION",
             turn=turn,
@@ -721,6 +728,7 @@ def _mark_continue_listen(meta: VoiceReplyMeta, reply_path: str, user_text: str)
             next="mic stays open until goodbye",
         )
     else:
+        mark_session_closed(meta.session_id, meta.device_id)
         log_nino_voice(
             "SESSION",
             turn=turn,
@@ -776,6 +784,53 @@ def min_speech_energy() -> int:
         return max(1, int(raw))
     except ValueError:
         return DEFAULT_MIN_SPEECH_ENERGY
+
+
+def long_clip_min_mean_energy() -> int:
+    raw = os.environ.get("VOICE_LONG_CLIP_MIN_MEAN_ENERGY", "18").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 18
+
+
+def long_clip_min_seconds() -> float:
+    raw = os.environ.get("VOICE_LONG_CLIP_MIN_SECONDS", "6.0").strip()
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return 6.0
+
+
+def quiet_clip_min_mean_energy() -> int:
+    raw = os.environ.get("VOICE_QUIET_CLIP_MIN_MEAN_ENERGY", "12").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 12
+
+
+def quiet_clip_min_seconds() -> float:
+    raw = os.environ.get("VOICE_QUIET_CLIP_MIN_SECONDS", "3.0").strip()
+    try:
+        return max(0.5, float(raw))
+    except ValueError:
+        return 3.0
+
+
+def _preserve_continue_on_skip(
+    *,
+    session: str,
+    session_id: str,
+    device_id: str,
+) -> bool:
+    from voice_listen_state import should_preserve_continue_listen
+
+    return should_preserve_continue_listen(
+        session_id,
+        device_id,
+        session_kind=session,
+    )
 
 
 def wav_peak_frame_energy(wav_bytes: bytes, frame_ms: int = 20) -> int:
@@ -2050,9 +2105,11 @@ def _silent_close(
     t_start: float,
     t_stt: float,
     extra: dict[str, Any] | None = None,
+    preserve_continue_listen: bool = False,
 ) -> tuple[bytes, VoiceReplyMeta]:
     """Close the mic with no spoken reply — stops the sorry / listen loop."""
-    meta.prompt_medical_ack = False
+    keep_open = bool(preserve_continue_listen)
+    meta.prompt_medical_ack = keep_open
     t_done = time.perf_counter()
     wav_out = minimal_voice_reply_wav()
     meta.timings = {
@@ -2071,7 +2128,7 @@ def _silent_close(
         "reply_seconds": 0.0,
         "tts_seconds": 0.0,
         "process_total_seconds": round(t_done - t_start, 3),
-        "continue_listen": False,
+        "continue_listen": keep_open,
         "wake_ok": False,
     }
     if extra:
@@ -2081,8 +2138,8 @@ def _silent_close(
         turn=meta.timings.get("turn"),
         path=reply_path,
         heard=str(heard or "")[:120] or "(empty)",
-        continue_listen=0,
-        next="waiting for a new Ok Nino",
+        continue_listen=int(keep_open),
+        next="mic stays open until goodbye" if keep_open else "waiting for a new Ok Nino",
     )
     return wav_out, meta
 
@@ -2266,6 +2323,14 @@ def process_voice_wav(
     peak_energy = clip_peak_energy(wav_bytes, aux_energy)
     mean_energy = wav_mean_frame_energy(wav_bytes)
     energy_gate = min_speech_energy()
+    preserve_continue = _preserve_continue_on_skip(
+        session=session,
+        session_id=meta.session_id,
+        device_id=device_id,
+    )
+    from voice_listen_state import in_post_tts_grace
+
+    post_tts_grace = in_post_tts_grace(meta.session_id, device_id)
     meta.timings["turn"] = voice_turn
     log_nino_voice(
         "RECV",
@@ -2291,6 +2356,7 @@ def process_voice_wav(
             stt_engine="skipped",
             t_start=t_start,
             t_stt=t_start,
+            preserve_continue_listen=preserve_continue and post_tts_grace,
             extra={
                 "session": session,
                 "wake_ok": False,
@@ -2298,14 +2364,22 @@ def process_voice_wav(
                 "mean_energy": mean_energy,
                 "energy_th": energy_gate,
                 "turn": voice_turn,
+                "post_tts_grace": post_tts_grace,
             },
         )
-    if audio_in_seconds >= 6.0 and mean_energy < 22:
+    long_clip_s = long_clip_min_seconds()
+    long_mean_th = long_clip_min_mean_energy()
+    if (
+        audio_in_seconds >= long_clip_s
+        and mean_energy < long_mean_th
+        and not post_tts_grace
+    ):
         logger.info(
-            "Voice clip rejected (long low-mean noise) | mean=%s peak=%s audio_s=%.2f",
+            "Voice clip rejected (long low-mean noise) | mean=%s peak=%s audio_s=%.2f th=%s",
             mean_energy,
             peak_energy,
             audio_in_seconds,
+            long_mean_th,
         )
         return _silent_close(
             meta,
@@ -2317,6 +2391,7 @@ def process_voice_wav(
             stt_engine="skipped",
             t_start=t_start,
             t_stt=t_start,
+            preserve_continue_listen=preserve_continue,
             extra={
                 "session": session,
                 "wake_ok": False,
@@ -2324,9 +2399,12 @@ def process_voice_wav(
                 "mean_energy": mean_energy,
                 "energy_th": energy_gate,
                 "turn": voice_turn,
+                "post_tts_grace": post_tts_grace,
             },
         )
-    if audio_in_seconds >= 3.0 and mean_energy < 12:
+    quiet_clip_s = quiet_clip_min_seconds()
+    quiet_mean_th = quiet_clip_min_mean_energy()
+    if audio_in_seconds >= quiet_clip_s and mean_energy < quiet_mean_th:
         logger.info(
             "Voice clip rejected (quiet clip) | mean=%s peak=%s audio_s=%.2f",
             mean_energy,
@@ -2343,6 +2421,7 @@ def process_voice_wav(
             stt_engine="skipped",
             t_start=t_start,
             t_stt=t_start,
+            preserve_continue_listen=preserve_continue and post_tts_grace,
             extra={
                 "session": session,
                 "wake_ok": False,
@@ -2350,6 +2429,7 @@ def process_voice_wav(
                 "mean_energy": mean_energy,
                 "energy_th": energy_gate,
                 "turn": voice_turn,
+                "post_tts_grace": post_tts_grace,
             },
         )
 
@@ -2501,6 +2581,7 @@ def process_voice_wav(
             stt_engine=stt_engine,
             t_start=t_start,
             t_stt=t_stt,
+            preserve_continue_listen=preserve_continue,
             extra={"session": session, "energy": peak_energy, "turn": voice_turn},
         )
     log_nino_voice("CMD", turn=voice_turn, session=session, text=user_text[:200])
@@ -2736,6 +2817,7 @@ def process_voice_wav(
             stt_engine=stt_engine,
             t_start=t_start,
             t_stt=t_stt,
+            preserve_continue_listen=preserve_continue,
             extra={"session": session, "energy": peak_energy, "turn": voice_turn},
         )
 

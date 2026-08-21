@@ -37,8 +37,9 @@ faster-whisper>=1.1.0
 # wrapper against it (see server/.venv/opt/ctranslate2).
 
 # --- TTS ---
-# Neural local fallback: Piper. Linux: also install system espeak-ng as last fallback.
+# Neural local fallback: Piper. Kokoro ONNX alternative (~82M params, 54 voices).
 piper-tts>=1.3.0
+kokoro-onnx>=0.6.1
 # Windows: pyttsx3 (SAPI).
 pyttsx3>=2.90
 

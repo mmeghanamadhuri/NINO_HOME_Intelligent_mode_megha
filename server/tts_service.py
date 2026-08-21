@@ -23,10 +23,12 @@ import requests
 from esp_wav_chunking import chunk_text_for_esp_limit
 from pipeline_log import log_http, pipeline_log
 from tts_prosody import (
+    infer_speech_prosody,
     piper_pitch_offset,
     piper_prosody_enabled,
     piper_robotic_amount,
     pitch_shift_wav_bytes,
+    pitch_shift_wav_bytes_preserve_tempo,
     robotic_color_wav_bytes,
 )
 from wav_resample import ESP_PCM_SAMPLE_RATE_HZ, resample_wav_bytes_to_mono_16bit
@@ -119,7 +121,13 @@ DEFAULT_ELEVENLABS_TTS_SAMPLE_RATE_HZ = 16000
 DEFAULT_PIPER_MODEL_PATH = (
     Path(__file__).resolve().parent
     / "models"
-    / "en_US-amy-medium.onnx"
+    / "en_US-amy-low.onnx"
+)
+DEFAULT_KOKORO_MODEL_PATH = (
+    Path(__file__).resolve().parent / "models" / "kokoro-v1.0.onnx"
+)
+DEFAULT_KOKORO_VOICES_PATH = (
+    Path(__file__).resolve().parent / "models" / "voices-v1.0.bin"
 )
 
 _ESPEAK_LOCK = threading.Lock()
@@ -128,6 +136,10 @@ _ESPEAK_SAMPLE_RATE_HZ = 22050
 _PIPER_LOCK = threading.RLock()
 _PIPER_VOICE: Any | None = None
 _PIPER_VOICE_MODEL_PATH: Path | None = None
+_KOKORO_LOCK = threading.RLock()
+_KOKORO_ENGINE: Any | None = None
+_KOKORO_MODEL_PATH: Path | None = None
+_KOKORO_VOICES_PATH: Path | None = None
 _SYNTHESIS_INFO = threading.local()
 _ELEVENLABS_FALLBACK_LOCK = threading.Lock()
 _ELEVENLABS_FALLBACK_UNTIL = 0.0
@@ -222,10 +234,12 @@ def _mark_elevenlabs_unavailable() -> None:
 
 def _tts_provider() -> str:
     provider = os.environ.get("TTS_PROVIDER", "").strip().lower()
-    if provider in {"elevenlabs", "piper", "sapi", "local"}:
+    if provider in {"elevenlabs", "piper", "kokoro", "sapi", "local"}:
         return provider
     if _elevenlabs_api_key():
         return "elevenlabs"
+    if _kokoro_available():
+        return "kokoro"
     if _piper_available():
         return "piper"
     if _use_windows_sapi():
@@ -245,6 +259,33 @@ def _piper_length_scale() -> float:
     except ValueError:
         logger.warning("Invalid PIPER_LENGTH_SCALE %r; using 1.0.", raw)
         return 1.0
+
+
+def _piper_noise_scale() -> float:
+    raw = os.environ.get("PIPER_NOISE_SCALE", "0.667").strip()
+    try:
+        return max(0.10, min(1.4, float(raw)))
+    except ValueError:
+        logger.warning("Invalid PIPER_NOISE_SCALE %r; using 0.667.", raw)
+        return 0.667
+
+
+def _piper_noise_w_scale() -> float:
+    raw = os.environ.get("PIPER_NOISE_W_SCALE", "0.8").strip()
+    try:
+        return max(0.10, min(1.4, float(raw)))
+    except ValueError:
+        logger.warning("Invalid PIPER_NOISE_W_SCALE %r; using 0.8.", raw)
+        return 0.8
+
+
+def _piper_sentence_silence() -> float:
+    raw = os.environ.get("PIPER_SENTENCE_SILENCE", "0.5").strip()
+    try:
+        return max(0.0, min(2.0, float(raw)))
+    except ValueError:
+        logger.warning("Invalid PIPER_SENTENCE_SILENCE %r; using 0.5.", raw)
+        return 0.5
 
 
 def _piper_available() -> bool:
@@ -300,6 +341,188 @@ def preload_piper_voice() -> bool:
         return False
 
 
+def _kokoro_model_path() -> Path:
+    configured = os.environ.get("KOKORO_MODEL_PATH", "").strip()
+    return Path(configured).expanduser() if configured else DEFAULT_KOKORO_MODEL_PATH
+
+
+def _kokoro_voices_path() -> Path:
+    configured = os.environ.get("KOKORO_VOICES_PATH", "").strip()
+    return Path(configured).expanduser() if configured else DEFAULT_KOKORO_VOICES_PATH
+
+
+def _kokoro_voice_name() -> str:
+    return os.environ.get("KOKORO_VOICE", "bf_emma").strip() or "bf_emma"
+
+
+def _kokoro_lang() -> str:
+    return os.environ.get("KOKORO_LANG", "en-gb").strip() or "en-gb"
+
+
+def _kokoro_speed() -> float:
+    raw = os.environ.get("KOKORO_SPEED", "1.0").strip()
+    try:
+        return max(0.5, min(2.0, float(raw)))
+    except ValueError:
+        logger.warning("Invalid KOKORO_SPEED %r; using 1.0.", raw)
+        return 1.0
+
+
+def _kokoro_available() -> bool:
+    model_path = _kokoro_model_path()
+    voices_path = _kokoro_voices_path()
+    if not model_path.is_file() or not voices_path.is_file():
+        return False
+    try:
+        from kokoro_onnx import Kokoro  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _load_kokoro_engine() -> Any:
+    """Return the cached Kokoro model, loading it once per configured paths."""
+    global _KOKORO_ENGINE, _KOKORO_MODEL_PATH, _KOKORO_VOICES_PATH
+
+    model_path = _kokoro_model_path().resolve()
+    voices_path = _kokoro_voices_path().resolve()
+    if not model_path.is_file() or not voices_path.is_file():
+        raise RuntimeError(
+            f"Kokoro model or voices file is missing: {model_path} and {voices_path} required."
+        )
+
+    with _KOKORO_LOCK:
+        if (
+            _KOKORO_ENGINE is not None
+            and _KOKORO_MODEL_PATH == model_path
+            and _KOKORO_VOICES_PATH == voices_path
+        ):
+            return _KOKORO_ENGINE
+        try:
+            from kokoro_onnx import Kokoro
+        except ImportError as exc:
+            raise RuntimeError("kokoro-onnx Python package is not installed.") from exc
+        logger.info("Loading Kokoro model: %s", model_path)
+        _KOKORO_ENGINE = Kokoro(str(model_path), str(voices_path))
+        _KOKORO_MODEL_PATH = model_path
+        _KOKORO_VOICES_PATH = voices_path
+        return _KOKORO_ENGINE
+
+
+def preload_kokoro_voice() -> bool:
+    """Warm the Kokoro model when configured as the active or fallback provider."""
+    enabled = os.environ.get("KOKORO_PRELOAD", "1").strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
+        logger.info("Kokoro preload disabled by KOKORO_PRELOAD.")
+        return False
+    if not _kokoro_available():
+        logger.warning("Kokoro TTS is unavailable; skipping preload.")
+        return False
+    try:
+        _load_kokoro_engine()
+        logger.info(
+            "Kokoro preloaded: voice=%s lang=%s",
+            _kokoro_voice_name(),
+            _kokoro_lang(),
+        )
+        return True
+    except Exception as exc:
+        logger.warning("Kokoro preload failed: %s", exc)
+        return False
+
+
+def _float_samples_to_wav_bytes(samples: Any, sample_rate: int, volume: float) -> bytes:
+    import numpy as np
+
+    arr = np.asarray(samples, dtype=np.float32).ravel()
+    if arr.size == 0:
+        raise RuntimeError("Kokoro produced no audio.")
+    peak = float(np.max(np.abs(arr)))
+    if peak > 1.0:
+        arr = arr / peak
+    vol = max(0.0, min(1.0, float(volume)))
+    pcm = (arr * 32767.0 * vol).astype(np.int16)
+    bio = io.BytesIO()
+    with wave.open(bio, "wb") as wo:
+        wo.setnchannels(1)
+        wo.setsampwidth(2)
+        wo.setframerate(sample_rate)
+        wo.writeframes(pcm.tobytes())
+    return bio.getvalue()
+
+
+def kokoro_synthesis_kwargs(
+    text: str = "", *, volume: float = 0.75
+) -> dict[str, float | str]:
+    """Map spoken text mood to Kokoro speed/pitch/volume knobs."""
+    base_speed = _kokoro_speed()
+    base_pitch = piper_pitch_offset()
+    spoken_volume = max(0.0, min(1.0, volume))
+    style = "neutral"
+    if piper_prosody_enabled() and text.strip():
+        prosody = infer_speech_prosody(text)
+        style = prosody.style
+        speed = max(0.5, min(2.0, base_speed / prosody.length_mul))
+        pitch = max(-12.0, min(12.0, base_pitch + prosody.pitch_semitones))
+        spoken_volume = max(0.0, min(1.0, spoken_volume * prosody.volume_mul))
+    else:
+        speed = base_speed
+        pitch = base_pitch
+    return {
+        "speed": speed,
+        "pitch": pitch,
+        "volume": spoken_volume,
+        "style": style,
+    }
+
+
+def _synthesize_kokoro_wav_bytes(
+    text: str, rate: int = 135, volume: float = 0.75
+) -> tuple[bytes, str]:
+    """Kokoro local neural TTS → WAV bytes using the cached ONNX model."""
+    del rate
+    clean = _normalize_tts_text(text).strip()
+    if not clean:
+        raise RuntimeError("TTS text is empty.")
+
+    voice_name = _kokoro_voice_name()
+    lang = _kokoro_lang()
+    cfg = kokoro_synthesis_kwargs(clean, volume=volume)
+    speed = float(cfg["speed"])
+    pitch = float(cfg["pitch"])
+    spoken_volume = float(cfg["volume"])
+    style = str(cfg["style"])
+    robotic = piper_robotic_amount()
+    engine = _load_kokoro_engine()
+    with _KOKORO_LOCK:
+        samples, sample_rate = engine.create(
+            clean,
+            voice=voice_name,
+            speed=speed,
+            lang=lang,
+        )
+    wav = _float_samples_to_wav_bytes(samples, sample_rate, volume=spoken_volume)
+    if abs(pitch) >= 0.05:
+        wav = pitch_shift_wav_bytes(wav, pitch)
+    if robotic >= 0.05:
+        wav = robotic_color_wav_bytes(wav, robotic)
+    logger.info(
+        "Kokoro %s style=%s speed=%.2f lang=%s volume=%.2f pitch=%+.1f robotic=%.2f",
+        voice_name,
+        style,
+        speed,
+        lang,
+        spoken_volume,
+        pitch,
+        robotic,
+    )
+    _set_tts_synthesis_info("kokoro", voice_name, style=style)
+    info = getattr(_SYNTHESIS_INFO, "value", None)
+    if isinstance(info, dict):
+        info.update({"speed": speed, "pitch": pitch, "volume": spoken_volume})
+    return wav, voice_name
+
+
 def _set_tts_synthesis_info(
     provider: str, voice: str, *, style: str = ""
 ) -> None:
@@ -327,26 +550,14 @@ def _keep_tts_style() -> str:
 def piper_synthesis_config_kwargs(
     text: str = "", *, volume: float = 0.75
 ) -> dict[str, float]:
-    """Amy SynthesisConfig knobs used for every spoken line (greet/register/replies).
-
-    Mood styles do not change length_scale — registration prompts must not
-    render slower than a normal reply.
-    """
+    """Amy SynthesisConfig knobs used for every spoken line (greet/register/replies)."""
     del text
-    length_scale = max(0.5, min(2.0, _piper_length_scale()))
-    robotic = piper_robotic_amount()
-    # Warm-neutral Amy body (same as the default preset), not mood length_mul.
-    if robotic >= 0.05:
-        noise_scale = max(0.10, min(1.4, 0.667 * 0.48))
-        noise_w_scale = max(0.10, min(1.4, 0.80 * 0.38))
-    else:
-        noise_scale = max(0.10, min(1.4, 0.667 * 1.08))
-        noise_w_scale = max(0.10, min(1.4, 0.80 * 1.06))
     spoken_volume = max(0.0, min(1.0, volume))
     return {
-        "length_scale": length_scale,
-        "noise_scale": noise_scale,
-        "noise_w_scale": noise_w_scale,
+        "length_scale": _piper_length_scale(),
+        "noise_scale": _piper_noise_scale(),
+        "noise_w_scale": _piper_noise_w_scale(),
+        "sentence_silence": _piper_sentence_silence(),
         "volume": spoken_volume,
     }
 
@@ -355,7 +566,7 @@ def last_piper_synthesis_kwargs() -> dict[str, float]:
     """SynthesisConfig fields from this thread's latest Piper call."""
     info = getattr(_SYNTHESIS_INFO, "value", {}) or {}
     out: dict[str, float] = {}
-    for key in ("length_scale", "noise_scale", "noise_w_scale", "volume"):
+    for key in ("length_scale", "noise_scale", "noise_w_scale", "sentence_silence", "volume"):
         raw = info.get(key)
         if raw is None:
             continue
@@ -385,30 +596,42 @@ def _synthesize_piper_wav_bytes(
     pitch = piper_pitch_offset()
     robotic = piper_robotic_amount()
     voice = _load_piper_voice()
+    syn = SynthesisConfig(
+        length_scale=cfg["length_scale"],
+        noise_scale=cfg["noise_scale"],
+        noise_w_scale=cfg["noise_w_scale"],
+        volume=cfg["volume"],
+    )
+    sentence_silence = float(cfg["sentence_silence"])
+    silence_bytes = bytes(
+        int(voice.config.sample_rate * sentence_silence * 2)
+    )
     output = io.BytesIO()
     with _PIPER_LOCK:
         with wave.open(output, "wb") as wav_file:
-            voice.synthesize_wav(
-                clean,
-                wav_file,
-                SynthesisConfig(
-                    length_scale=cfg["length_scale"],
-                    noise_scale=cfg["noise_scale"],
-                    noise_w_scale=cfg["noise_w_scale"],
-                    volume=cfg["volume"],
-                ),
-            )
+            first_chunk = True
+            for audio_chunk in voice.synthesize(clean, syn_config=syn):
+                if first_chunk:
+                    wav_file.setframerate(audio_chunk.sample_rate)
+                    wav_file.setsampwidth(audio_chunk.sample_width)
+                    wav_file.setnchannels(audio_chunk.sample_channels)
+                    first_chunk = False
+                elif sentence_silence > 0:
+                    wav_file.writeframes(silence_bytes)
+                wav_file.writeframes(audio_chunk.audio_int16_bytes)
     wav = output.getvalue()
     if not wav:
         raise RuntimeError("Piper produced no audio.")
     if abs(pitch) >= 0.05:
-        wav = pitch_shift_wav_bytes(wav, pitch)
+        wav = pitch_shift_wav_bytes_preserve_tempo(wav, pitch)
     if robotic >= 0.05:
         wav = robotic_color_wav_bytes(wav, robotic)
     logger.info(
-        "Piper Amy length=%.2f noise=%.2f volume=%.2f pitch=%+.1f robotic=%.2f",
+        "Piper Amy length=%.2f noise=%.3f noise_w=%.3f silence=%.2f volume=%.2f pitch=%+.1f robotic=%.2f",
         cfg["length_scale"],
         cfg["noise_scale"],
+        cfg["noise_w_scale"],
+        cfg["sentence_silence"],
         cfg["volume"],
         pitch,
         robotic,
@@ -803,6 +1026,20 @@ def _synthesize_sapi_wav_bytes_inner(
             wav, voice = _synthesize_espeak_wav_bytes(text, rate=rate, volume=volume)
             _set_tts_synthesis_info("local", voice)
             return wav, voice
+    if provider == "kokoro":
+        try:
+            wav, voice = _synthesize_kokoro_wav_bytes(
+                text, rate=rate, volume=volume
+            )
+            _set_tts_synthesis_info("kokoro", voice, style=_keep_tts_style())
+            return wav, voice
+        except Exception as exc:
+            logger.warning("Kokoro TTS failed (%s); falling back to Piper/local TTS.", exc)
+            wav, voice, used_provider = _synthesize_local_fallback_wav_bytes(
+                text, rate, volume
+            )
+            _set_tts_synthesis_info(used_provider, voice, style=_keep_tts_style())
+            return wav, voice
     if provider == "sapi":
         wav, voice = _synthesize_windows_sapi_wav_bytes(
             text, rate=rate, volume=volume
@@ -817,9 +1054,14 @@ def _synthesize_sapi_wav_bytes_inner(
 def tts_status() -> dict[str, Any]:
     provider = _tts_provider()
     model_path = _piper_model_path().resolve()
+    kokoro_model_path = _kokoro_model_path().resolve()
     with _PIPER_LOCK:
         piper_preloaded = (
             _PIPER_VOICE is not None and _PIPER_VOICE_MODEL_PATH == model_path
+        )
+    with _KOKORO_LOCK:
+        kokoro_preloaded = (
+            _KOKORO_ENGINE is not None and _KOKORO_MODEL_PATH == kokoro_model_path
         )
     out: dict[str, Any] = {
         "provider": provider,
@@ -830,9 +1072,19 @@ def tts_status() -> dict[str, Any]:
         "piper_model_path": str(model_path),
         "piper_preloaded": piper_preloaded,
         "piper_length_scale": _piper_length_scale(),
+        "piper_noise_scale": _piper_noise_scale(),
+        "piper_noise_w_scale": _piper_noise_w_scale(),
+        "piper_sentence_silence": _piper_sentence_silence(),
         "piper_pitch_semitones": piper_pitch_offset(),
         "piper_robotic": piper_robotic_amount(),
         "piper_prosody": piper_prosody_enabled(),
+        "kokoro_available": _kokoro_available(),
+        "kokoro_model_path": str(kokoro_model_path),
+        "kokoro_voices_path": str(_kokoro_voices_path().resolve()),
+        "kokoro_preloaded": kokoro_preloaded,
+        "kokoro_voice": _kokoro_voice_name(),
+        "kokoro_lang": _kokoro_lang(),
+        "kokoro_speed": _kokoro_speed(),
     }
     if provider == "elevenlabs":
         out.update(
@@ -852,6 +1104,8 @@ def tts_status() -> dict[str, Any]:
         )
     elif provider == "piper":
         out["piper_voice"] = _piper_model_path().stem
+    elif provider == "kokoro":
+        out["kokoro_voice"] = _kokoro_voice_name()
     else:
         out.update(
             {
