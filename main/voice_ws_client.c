@@ -8,6 +8,7 @@
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
 #include "nino_eye.h"
+#include "face_tracker.h"
 #include "audio_playback.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -461,6 +462,33 @@ static bool json_has_key_true(const char *text, size_t len, const char *key) {
   return false;
 }
 
+static bool json_has_key_false(const char *text, size_t len, const char *key) {
+  const size_t key_len = strlen(key);
+  if (text == NULL || key_len == 0 || len < key_len) {
+    return false;
+  }
+  for (size_t i = 0; i + key_len < len; ++i) {
+    if (memcmp(text + i, key, key_len) != 0) {
+      continue;
+    }
+    size_t j = i + key_len;
+    while (j < len && (text[j] == ' ' || text[j] == '\t' || text[j] == '\n' ||
+                       text[j] == '\r')) {
+      ++j;
+    }
+    if (j >= len || text[j] != ':') {
+      continue;
+    }
+    ++j;
+    while (j < len && (text[j] == ' ' || text[j] == '\t' || text[j] == '\n' ||
+                       text[j] == '\r')) {
+      ++j;
+    }
+    return j + 5 <= len && memcmp(text + j, "false", 5) == 0;
+  }
+  return false;
+}
+
 static bool json_type_is(const char *text, size_t len, const char *want) {
   static const char key[] = "\"type\"";
   const size_t key_len = sizeof(key) - 1;
@@ -584,6 +612,11 @@ static void stream_on_event(void *handler_args, esp_event_base_t base, int32_t e
       parse_motion_into(s->motion_json, sizeof(s->motion_json), text, tlen);
       if (json_has_key_true(text, tlen, "\"look_scan\"")) {
         s->look_scan = true;
+      }
+      if (json_has_key_true(text, tlen, "\"face_track\"")) {
+        nino_face_tracker_set_enabled(true);
+      } else if (json_has_key_false(text, tlen, "\"face_track\"")) {
+        nino_face_tracker_set_enabled(false);
       }
       if (json_type_is(text, tlen, "motion") && s->motion_json[0] != '\0') {
         /* Side-channel motion frame — still played with the next WAV. */

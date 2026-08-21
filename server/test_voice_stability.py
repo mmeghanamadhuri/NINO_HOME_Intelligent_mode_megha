@@ -181,6 +181,39 @@ def test_wake_with_hello_is_accepted() -> None:
     assert out == b""
 
 
+def test_continue_hello_is_time_of_day_greeting() -> None:
+    os.environ["VOICE_MIN_ENERGY"] = "5"
+    tone = (8000 * np.sin(2 * np.pi * 220 * np.arange(16000) / 16000)).astype(np.int16)
+    wav = _mono_wav(tone)
+    dummy_wav = _mono_wav(np.zeros(1600, dtype=np.int16))
+
+    from unittest.mock import patch
+
+    with (
+        patch("voice_service.transcribe_wav", return_value=("hello", "mock")),
+        patch("voice_service.synthesize_sapi_wav_bytes", return_value=(dummy_wav, "mock")),
+        patch("voice_service.resample_wav_bytes_to_mono_16bit", return_value=dummy_wav),
+        patch(
+            "voice_service.last_tts_synthesis_info",
+            return_value={"provider": "mock", "voice": "mock"},
+        ),
+        patch("llm_service.answer_voice_query") as llm,
+        patch("session_identity.get_session_identity", return_value=None),
+    ):
+        out, meta = process_voice_wav(
+            wav,
+            session_kind="continue",
+            aux_energy=99,
+            device_id="test",
+            voice_turn=2,
+        )
+
+    assert meta.timings["reply_path"] == "greeting"
+    assert meta.end_session is False
+    assert out
+    llm.assert_not_called()
+
+
 def test_low_energy_skips_stt_and_does_not_reopen() -> None:
     os.environ["VOICE_MIN_ENERGY"] = "5"
     wav = _mono_wav(np.zeros(8000, dtype=np.int16))

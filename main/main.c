@@ -2982,9 +2982,7 @@ static esp_err_t face_track_handler(httpd_req_t *req) {
   }
 
   if (want_enable && !nino_face_detect_is_ready()) {
-    httpd_resp_set_status(req, "503 Service Unavailable");
-    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"detector_not_ready\"}",
-                           HTTPD_RESP_USE_STRLEN);
+    ESP_LOGW(TAG, "Face track ON while detector not ready yet — will follow when it is");
   }
 
   nino_face_tracker_set_enabled(want_enable);

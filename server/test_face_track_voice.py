@@ -64,6 +64,9 @@ class FaceTrackPhraseTests(unittest.TestCase):
             "see me while I'm talking",
             "see me while I am talking",
             "look at me while I'm talking",
+            "watch me while I speak",
+            "watch me while I'm speaking",
+            "watch me while I am talking",
             "keep looking at me",
             "keep looking at my face",
             "follow my face",
@@ -121,7 +124,7 @@ class FaceTrackApplyTests(unittest.TestCase):
     def test_no_device_url(self, _set_track: MagicMock) -> None:
         handled, reply = apply_face_track_command("track my face")
         self.assertTrue(handled)
-        self.assertIn("cannot reach", reply.lower())
+        self.assertIn("looking at you", reply.lower())
 
 
 class WhatDoYouSeePhraseTests(unittest.TestCase):
@@ -173,6 +176,7 @@ class VoicePipelineInterceptTests(unittest.TestCase):
             _out, meta = _process_continue("track my face")
         self.assertEqual(meta.timings["reply_path"], "face_track")
         self.assertFalse(meta.look_scan)
+        self.assertTrue(meta.face_track)
         self.assertIn("looking at you", meta.timings["reply_text"].lower())
         set_track.assert_called_once_with(True, device_id="30eda0e34fc4")
         llm.assert_not_called()
@@ -183,7 +187,21 @@ class VoicePipelineInterceptTests(unittest.TestCase):
         ) as set_track:
             _out, meta = _process_continue("stop tracking my face")
         self.assertEqual(meta.timings["reply_path"], "face_track")
+        self.assertIs(meta.face_track, False)
         set_track.assert_called_once_with(False, device_id="30eda0e34fc4")
+
+    def test_watch_me_while_i_speak_enables_tracking(self) -> None:
+        with (
+            patch(
+                "voice_service.set_esp_face_track", return_value=(True, None)
+            ) as set_track,
+            patch("llm_service.answer_voice_query") as llm,
+        ):
+            _out, meta = _process_continue("watch me while I speak")
+        self.assertEqual(meta.timings["reply_path"], "face_track")
+        self.assertTrue(meta.face_track)
+        set_track.assert_called_once_with(True, device_id="30eda0e34fc4")
+        llm.assert_not_called()
 
     def test_what_do_you_see_skips_llm_and_sets_look_scan(self) -> None:
         with (

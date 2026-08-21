@@ -145,6 +145,9 @@ void nino_face_tracker_init(void) {
 }
 
 void nino_face_tracker_set_enabled(bool enabled) {
+  if (enabled) {
+    nino_face_hunt_cancel();
+  }
   if (s_enabled == enabled) {
     return;
   }
@@ -155,7 +158,7 @@ void nino_face_tracker_set_enabled(bool enabled) {
 
   if (enabled) {
     nino_servo_dxl_set_position_speed(FACE_TRACK_POSITION_SPEED);
-    go_neutral_if_allowed();
+    /* Keep the current pan/tilt so tracking can start from where the face is. */
     ESP_LOGI(TAG, "Pan/tilt tracking enabled (speed %d)",
              FACE_TRACK_POSITION_SPEED);
   } else {

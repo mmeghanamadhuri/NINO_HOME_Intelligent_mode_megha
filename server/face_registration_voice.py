@@ -82,15 +82,14 @@ _FACE_REG_ECHO_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     )
 )
 
-# Short hello / "Hey <name>" / "good morning" — session GREET echo, not a new query.
-_OPENING_HELLO_RE = re.compile(
-    r"^\s*(?:hey|hi|hello)"
-    r"(?:\s*,?\s*(?:there|everyone|all|folks|guys|team|[A-Za-z]{2,20}))?"
-    r"[.!?…]*\s*$"
-    r"|^\s*(?:good\s+)?(?:morning|afternoon|evening|night)"
-    r"(?:\s*,?\s*(?:everyone|all|there|folks|guys|team|[A-Za-z]{2,20}))?"
-    r"[.!?…]*\s*$",
+# GREET leftover is "Hey <name>" (or the full "how can I help you" prompt).
+# Bare hello / hi / good morning is the user's greeting — do not skip it.
+_OPENING_NAMED_HELLO_RE = re.compile(
+    r"^\s*(?:hey|hi|hello)\s*,?\s*(?P<name>[A-Za-z]{2,20})[.!?…]*\s*$",
     re.IGNORECASE,
+)
+_OPENING_HELLO_FILLER = frozenset(
+    {"there", "everyone", "all", "folks", "guys", "team"}
 )
 
 # Always reject — never a usable display name (framed or bare).
@@ -470,7 +469,7 @@ def is_face_reg_prompt_echo(user_text: str) -> bool:
 
 
 def is_opening_greeting_echo(user_text: str) -> bool:
-    """True when STT looks like session GREET / hello TTS, not a new user turn."""
+    """True when STT looks like session GREET TTS, not a new user hello."""
     text = (user_text or "").strip()
     if not text:
         return False
@@ -478,7 +477,11 @@ def is_opening_greeting_echo(user_text: str) -> bool:
         return True
     if "?" in text or len(text) > 48:
         return False
-    return bool(_OPENING_HELLO_RE.match(text))
+    match = _OPENING_NAMED_HELLO_RE.match(text)
+    if match is None:
+        return False
+    name = (match.group("name") or "").strip().lower()
+    return bool(name) and name not in _OPENING_HELLO_FILLER
 
 
 _SESSION_END_RE = re.compile(

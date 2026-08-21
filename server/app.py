@@ -1843,6 +1843,8 @@ async def _voice_ws_send_reply(
         ws_meta["type"] = "reply"
     if getattr(meta, "look_scan", False):
         ws_meta["look_scan"] = True
+    if getattr(meta, "face_track", None) is not None:
+        ws_meta["face_track"] = bool(meta.face_track)
     if not await _ws_send_json(websocket, ws_meta):
         logger.info(
             "WS reply skipped, socket closed device=%s client=%s",
@@ -2844,6 +2846,8 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                     )
                 if getattr(reply_meta, "look_scan", False):
                     ws_meta["look_scan"] = True
+                if getattr(reply_meta, "face_track", None) is not None:
+                    ws_meta["face_track"] = bool(reply_meta.face_track)
                 await websocket.send_json(ws_meta)
                 if wav_out:
                     t_send = time.perf_counter()

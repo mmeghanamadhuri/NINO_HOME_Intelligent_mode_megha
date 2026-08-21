@@ -97,6 +97,8 @@ class ExtractRegistrationNameTests(unittest.TestCase):
         self.assertTrue(is_opening_greeting_echo("Hey Hari"))
         self.assertTrue(is_opening_greeting_echo("how can I help you"))
         self.assertTrue(is_opening_greeting_echo("Good morning Hari! How are you today?"))
+        self.assertFalse(is_opening_greeting_echo("Hello"))
+        self.assertFalse(is_opening_greeting_echo("Hi"))
         self.assertFalse(is_opening_greeting_echo("What's the weather in London?"))
         self.assertFalse(is_opening_greeting_echo("Hi tell me a joke"))
 

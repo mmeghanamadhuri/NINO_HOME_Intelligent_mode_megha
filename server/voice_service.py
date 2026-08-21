@@ -256,8 +256,10 @@ _FACE_TRACK_ON_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     for p in (
         r"\btrack my face\b",
         r"\bstart tracking(?:\s+my\s+face)?\b",
-        r"\bsee me while i(?:'?m| am) talking\b",
-        r"\blook at me while i(?:'?m| am) talking\b",
+        r"\bsee me while i(?:'?m| am) (?:talking|speaking)\b",
+        r"\blook at me while i(?:'?m| am) (?:talking|speaking)\b",
+        r"\bwatch me while i(?:'?m| am) (?:talking|speaking)\b",
+        r"\bwatch me while i speak\b",
         r"\bkeep looking at (?:me|my face)\b",
         r"\bfollow my face\b",
         r"\bwatch my face\b",
@@ -324,6 +326,9 @@ class VoiceReplyMeta:
     device_id: str = ""
     # After this WAV, firmware pans left/right and asks for pose reports.
     look_scan: bool = False
+    # None = unchanged. True/False is sent on the WS reply so the P4 enables
+    # pan/tilt tracking locally (HTTP POST to /face/track is best-effort).
+    face_track: bool | None = None
     # Per-stage latency info for this query (stt/reply/tts seconds, heard text,
     # reply path, audio sizes). Filled by process_voice_wav; logged by app.py.
     timings: dict[str, Any] = field(default_factory=dict)
@@ -1658,12 +1663,13 @@ def apply_face_track_command(
     if parsed is None:
         return False, ""
     ok, err = set_esp_face_track(parsed, device_id=device_id)
-    if err == "no_esp_url":
-        return True, "I cannot reach the robot right now."
-    if err == "detector_not_ready":
-        return True, "Face tracking isn't ready yet."
     if not ok:
-        return True, "I could not change face tracking on the robot."
+        # Stream sessions still apply face_track on the WS reply JSON.
+        logger.warning(
+            "HTTP face track %s — WS reply will still %s tracking",
+            err or "failed",
+            "enable" if parsed else "disable",
+        )
     if parsed:
         return True, "I'll keep looking at you."
     return True, "I'll stop tracking your face."
@@ -2148,6 +2154,7 @@ def _short_handled_wav(
     t_stt: float,
     look_scan: bool = False,
     motion: list[str] | None = None,
+    face_track: bool | None = None,
 ) -> tuple[bytes, VoiceReplyMeta]:
     t_reply = time.perf_counter()
     wav, _voice = synthesize_sapi_wav_bytes(reply)
@@ -2160,6 +2167,8 @@ def _short_handled_wav(
         meta.motion = None
     elif motion:
         meta.motion = list(motion)
+    if face_track is not None:
+        meta.face_track = bool(face_track)
     _mark_continue_listen(meta, reply_path, user_text)
     meta.timings = {
         "heard": user_text[:200],
@@ -2437,7 +2446,9 @@ def process_voice_wav(
             t_stt=t_stt,
             extra=extra,
         )
-    if wake_found:
+    # In-session: strip a leading "Ok Nino" so the command remains. A bare
+    # "Hello" is the user's greeting — keep it (do not treat as empty STT).
+    if wake_found and command_text.strip():
         user_text = command_text
         log_nino_voice(
             "CONV",
@@ -2454,7 +2465,7 @@ def process_voice_wav(
             turn=voice_turn,
             ok=1,
             device=device_id or "-",
-            phrase="(none)",
+            phrase=wake_phrase if wake_found else "(none)",
             command=user_text[:200],
             session=session,
         )
@@ -2585,6 +2596,7 @@ def process_voice_wav(
             stt_engine=stt_engine,
             t_start=t_start,
             t_stt=t_stt,
+            face_track=parse_face_track_command(user_text),
         )
 
     from servo_tts_motion import parse_repeat_yes_no_command
