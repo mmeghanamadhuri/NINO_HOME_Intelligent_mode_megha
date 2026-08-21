@@ -26,6 +26,14 @@ _SAY_YES3_RE = re.compile(
 )
 
 
+# Short nods/shakes finish in ~2 s. Longer TTS must keep L/R/U/D looping.
+_LONG_REPLY_WORDS = 24
+
+
+def _word_count(text: str) -> int:
+    return len(re.findall(r"[A-Za-z0-9']+", text or ""))
+
+
 def parse_repeat_yes_no_command(user_text: str) -> str | None:
     """'say no no no' / 'yes, yes, yes' → 'no' or 'yes'; else None."""
     text = str(user_text or "").strip()
@@ -48,8 +56,6 @@ def motion_actions_for_reply(
     text = str(reply_text or "").strip()
     if path in {"goodbye"} or _BYE_RE.search(text):
         return ["nod"]
-    if path in {"session_greet", "greeting"} or _GREET_RE.search(text):
-        return ["greet"]
     if path in {
         "session_register_offer",
         "session_ask_name",
@@ -62,6 +68,11 @@ def motion_actions_for_reply(
         return ["shake3"]
     if path == "say_yes3" or _TRIPLE_YES_RE.search(text):
         return ["nod3"]
+    # Incidental "yes" / "?" / "hello" in a story must not replace talk-for-duration.
+    if _word_count(text) >= _LONG_REPLY_WORDS:
+        return ["talk"]
+    if path in {"session_greet", "greeting"} or _GREET_RE.search(text):
+        return ["greet"]
     if _QUESTION_RE.search(text):
         return ["look_left", "look_right", "nod"]
     if _NEG_RE.search(text) and not _YES_RE.search(text):

@@ -35,6 +35,15 @@ class ServoTtsMotionTests(unittest.TestCase):
             ["talk"],
         )
 
+    def test_long_story_keeps_talk_despite_question_or_yes(self) -> None:
+        story = (
+            "Once upon a time a curious robot walked across the moon and told "
+            "every crater a story. Yes, it took all night, and would you like "
+            "to hear what happened next when the sun came up?"
+        )
+        self.assertGreaterEqual(len(story.split()), 24)
+        self.assertEqual(motion_actions_for_reply(story, reply_path="llm"), ["talk"])
+
     def test_triple_no_yes_motion(self) -> None:
         self.assertEqual(
             motion_actions_for_reply("No, no, no.", reply_path="say_no3"),

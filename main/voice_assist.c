@@ -67,6 +67,8 @@ static const char *TAG = "voice_ast";
 #define SESSION_GREET_WAIT_MS 20000
 #define LOOK_SCAN_HOLD_MS 5000
 #define LOOK_SCAN_TTS_WAIT_MS 12000
+/* Scripted nod/shake finishes in ~2 s. Longer clips keep L/R/U/D until WAV ends. */
+#define TALK_MOTION_MIN_WAV_MS 4000
 #define AUX_MUSIC_LISTEN_MS 200
 #define AUX_MUSIC_PLAY_SLICE_MS 800
 #define AUX_WAKE_GAP_MS 1000
@@ -918,7 +920,19 @@ static void session_camera_off(void) {
   nino_camera_set_session_active(false);
 }
 
-/* Takes ownership of @p resp (queue frees it after playback, or on queue fail). */
+static uint32_t wav_pcm_duration_ms(const uint8_t *wav, size_t len) {
+  if (wav == NULL || len < 44) {
+    return 0;
+  }
+  const uint32_t byte_rate =
+      (uint32_t)wav[28] | ((uint32_t)wav[29] << 8) | ((uint32_t)wav[30] << 16) |
+      ((uint32_t)wav[31] << 24);
+  if (byte_rate == 0) {
+    return 0;
+  }
+  return (uint32_t)(((uint64_t)(len - 44U) * 1000ULL) / (uint64_t)byte_rate);
+}
+
 static bool motion_json_is_duration_talk(const char *json) {
   if (json == NULL || json[0] == '\0') {
     return false;
@@ -939,6 +953,25 @@ static bool motion_json_is_duration_talk(const char *json) {
   return true;
 }
 
+static bool use_duration_talk_motion(const char *motion_json, const uint8_t *wav,
+                                     size_t wav_len) {
+  if (motion_json == NULL || motion_json[0] == '\0' ||
+      motion_json_is_duration_talk(motion_json)) {
+    return true;
+  }
+  if (strstr(motion_json, "shake3") != NULL || strstr(motion_json, "nod3") != NULL) {
+    return false;
+  }
+  const uint32_t wav_ms = wav_pcm_duration_ms(wav, wav_len);
+  if (wav_ms >= TALK_MOTION_MIN_WAV_MS) {
+    voice_log(ESP_LOG_INFO, s_voice_turn, "MOTION",
+              "long reply %u ms — L/R/U/D for whole clip", (unsigned)wav_ms);
+    return true;
+  }
+  return false;
+}
+
+/* Takes ownership of @p resp (queue frees it after playback, or on queue fail). */
 static void play_ws_reply_wav(uint8_t *resp, size_t resp_len, const char *eye_expr,
                               const char *motion_json, bool session_open) {
   nino_eye_state_t eye_state = nino_eye_state_from_name(eye_expr);
@@ -948,7 +981,7 @@ static void play_ws_reply_wav(uint8_t *resp, size_t resp_len, const char *eye_ex
   }
   bool scripted = false;
   if (motion_json != NULL && motion_json[0] != '\0' &&
-      !motion_json_is_duration_talk(motion_json)) {
+      !use_duration_talk_motion(motion_json, resp, resp_len)) {
     const bool skip_curious_greet =
         session_open && strstr(motion_json, "curious") != NULL;
     if (!skip_curious_greet) {
