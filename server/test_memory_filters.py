@@ -550,8 +550,11 @@ class MemoryFilterTests(unittest.TestCase):
         self.assertTrue(is_unintelligible_stt("नमस्ते क्या हाल है"))
         self.assertFalse(is_unintelligible_stt("What's the weather today?"))
         self.assertFalse(is_unintelligible_stt("café"))
-        from memory_filters import is_whisper_silence_hallucination
+        from memory_filters import is_whisper_silence_hallucination, is_bare_thank_you_stt
 
+        self.assertTrue(is_bare_thank_you_stt("Thank you."))
+        self.assertTrue(is_bare_thank_you_stt("thanks!"))
+        self.assertFalse(is_bare_thank_you_stt("thank you for the story"))
         self.assertTrue(
             is_whisper_silence_hallucination(
                 "Thank you.",
@@ -560,7 +563,7 @@ class MemoryFilterTests(unittest.TestCase):
                 audio_seconds=30.0,
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             is_whisper_silence_hallucination(
                 "Thank you.",
                 mean_energy=40,

@@ -22,6 +22,9 @@ esp_err_t nino_mic_read(int16_t *samples, int sample_count);
 /** Discard a short settle window after the ADC opens. */
 void nino_mic_flush(void);
 
+/** Open Aux ADC and dump @p ms of samples (leftover speaker / I2S settle). */
+void nino_mic_warmup(uint32_t ms);
+
 nino_mic_source_t nino_mic_preferred_source(void);
 const char *nino_mic_source_name(nino_mic_source_t source);
 

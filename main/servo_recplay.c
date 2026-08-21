@@ -520,6 +520,26 @@ static size_t append_named_action(nino_servo_play_frame_t *frames, size_t count,
     append_pose(frames, &count, max, true, NINO_SERVO_PAN_LEFT, true, c, hold);
     append_pose(frames, &count, max, true, NINO_SERVO_PAN_RIGHT, true, c, hold);
     append_pose(frames, &count, max, true, c, true, c, hold);
+  } else if (action_token_is(name, name_len, "shake3")) {
+    /* Three quick L/R beats aligned with "no, no, no". */
+    const uint32_t beat = 240;
+    append_pose(frames, &count, max, true, NINO_SERVO_PAN_LEFT, true, c, beat);
+    append_pose(frames, &count, max, true, NINO_SERVO_PAN_RIGHT, true, c, beat);
+    append_pose(frames, &count, max, true, NINO_SERVO_PAN_LEFT, true, c, beat);
+    append_pose(frames, &count, max, true, NINO_SERVO_PAN_RIGHT, true, c, beat);
+    append_pose(frames, &count, max, true, NINO_SERVO_PAN_LEFT, true, c, beat);
+    append_pose(frames, &count, max, true, NINO_SERVO_PAN_RIGHT, true, c, beat);
+    append_pose(frames, &count, max, true, c, true, c, beat);
+  } else if (action_token_is(name, name_len, "nod3")) {
+    /* Three quick U/D beats aligned with "yes, yes, yes". */
+    const uint32_t beat = 240;
+    append_pose(frames, &count, max, true, c, true, NINO_SERVO_TILT_UP, beat);
+    append_pose(frames, &count, max, true, c, true, NINO_SERVO_TILT_DOWN, beat);
+    append_pose(frames, &count, max, true, c, true, NINO_SERVO_TILT_UP, beat);
+    append_pose(frames, &count, max, true, c, true, NINO_SERVO_TILT_DOWN, beat);
+    append_pose(frames, &count, max, true, c, true, NINO_SERVO_TILT_UP, beat);
+    append_pose(frames, &count, max, true, c, true, NINO_SERVO_TILT_DOWN, beat);
+    append_pose(frames, &count, max, true, c, true, c, beat);
   } else if (action_token_is(name, name_len, "look_left")) {
     append_pose(frames, &count, max, true, NINO_SERVO_PAN_LEFT, true, c, hold);
     append_pose(frames, &count, max, true, c, true, c, hold);
@@ -620,6 +640,11 @@ esp_err_t nino_servo_recplay_play_motion_json(const char *json) {
   }
   int speed = RECPLAY_DEFAULT_SPEED;
   (void)json_get_int_after(json, NULL, "speed", &speed);
+  if (strstr(json, "shake3") != NULL || strstr(json, "nod3") != NULL) {
+    if (speed == RECPLAY_DEFAULT_SPEED) {
+      speed = 50;
+    }
+  }
   ESP_LOGI(TAG, "Motion JSON play (%u frames)", (unsigned)count);
   return nino_servo_recplay_play(frames, count, speed);
 }

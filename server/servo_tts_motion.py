@@ -14,6 +14,28 @@ _GREET_RE = re.compile(
     r"\b(?:hey|hello|hi|good morning|good afternoon|good evening|welcome)\b", re.I
 )
 _BYE_RE = re.compile(r"\b(?:goodbye|good bye|bye|see you|take care)\b", re.I)
+_TRIPLE_NO_RE = re.compile(r"(?:no[\s,]+){2,}no\b", re.I)
+_TRIPLE_YES_RE = re.compile(r"(?:yes[\s,]+){2,}yes\b", re.I)
+_SAY_NO3_RE = re.compile(
+    r"(?:(?:please|can you|could you|would you)\s+)?(?:say\s+)?(?:no[\s,]+){2,}no\b",
+    re.I,
+)
+_SAY_YES3_RE = re.compile(
+    r"(?:(?:please|can you|could you|would you)\s+)?(?:say\s+)?(?:yes[\s,]+){2,}yes\b",
+    re.I,
+)
+
+
+def parse_repeat_yes_no_command(user_text: str) -> str | None:
+    """'say no no no' / 'yes, yes, yes' → 'no' or 'yes'; else None."""
+    text = str(user_text or "").strip()
+    if not text:
+        return None
+    if _SAY_YES3_RE.search(text):
+        return "yes"
+    if _SAY_NO3_RE.search(text):
+        return "no"
+    return None
 
 
 def motion_actions_for_reply(
@@ -36,6 +58,10 @@ def motion_actions_for_reply(
         "face_registration",
     }:
         return []
+    if path == "say_no3" or _TRIPLE_NO_RE.search(text):
+        return ["shake3"]
+    if path == "say_yes3" or _TRIPLE_YES_RE.search(text):
+        return ["nod3"]
     if _QUESTION_RE.search(text):
         return ["look_left", "look_right", "nod"]
     if _NEG_RE.search(text) and not _YES_RE.search(text):

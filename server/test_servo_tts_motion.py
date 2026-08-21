@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from servo_tts_motion import motion_actions_for_reply
+from servo_tts_motion import motion_actions_for_reply, parse_repeat_yes_no_command
 
 
 class ServoTtsMotionTests(unittest.TestCase):
@@ -25,6 +25,33 @@ class ServoTtsMotionTests(unittest.TestCase):
 
     def test_no_shakes(self) -> None:
         self.assertEqual(motion_actions_for_reply("No, I cannot do that.", reply_path="llm"), ["shake"])
+
+    def test_story_uses_talk(self) -> None:
+        self.assertEqual(
+            motion_actions_for_reply(
+                "Once upon a time a robot told a very long story about the moon.",
+                reply_path="llm",
+            ),
+            ["talk"],
+        )
+
+    def test_triple_no_yes_motion(self) -> None:
+        self.assertEqual(
+            motion_actions_for_reply("No, no, no.", reply_path="say_no3"),
+            ["shake3"],
+        )
+        self.assertEqual(
+            motion_actions_for_reply("Yes, yes, yes.", reply_path="say_yes3"),
+            ["nod3"],
+        )
+
+    def test_parse_repeat_yes_no_command(self) -> None:
+        self.assertEqual(parse_repeat_yes_no_command("say no no no"), "no")
+        self.assertEqual(parse_repeat_yes_no_command("no, no, no"), "no")
+        self.assertEqual(parse_repeat_yes_no_command("say yes, yes, yes"), "yes")
+        self.assertEqual(parse_repeat_yes_no_command("yes yes yes"), "yes")
+        self.assertIsNone(parse_repeat_yes_no_command("No I cannot do that"))
+        self.assertIsNone(parse_repeat_yes_no_command("tell a story"))
 
     def test_register_offer_has_no_curious_motion(self) -> None:
         self.assertEqual(

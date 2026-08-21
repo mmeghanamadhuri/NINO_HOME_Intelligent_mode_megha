@@ -386,6 +386,18 @@ _WHISPER_SILENCE_HALLUCINATIONS = (
     re.compile(r"^\s*bye\.?\s*$", re.IGNORECASE),
 )
 
+# Aux electrical artefacts and leftover TTS often transcribe as a bare
+# "Thank you" even at high energy. Ignore those regardless of clip energy.
+_BARE_THANK_YOU_RE = re.compile(
+    r"^\s*(?:thank you|thanks)(?:\s+for watching)?[.!,…]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def is_bare_thank_you_stt(user_text: str) -> bool:
+    """True when ASR is only 'thank you' / 'thanks' (speaker bleed / noise)."""
+    return bool(_BARE_THANK_YOU_RE.match(str(user_text or "")))
+
 
 def is_whisper_silence_hallucination(
     user_text: str,
@@ -397,6 +409,8 @@ def is_whisper_silence_hallucination(
     """Groq/Whisper often emits polite filler on noise-only clips."""
     text = str(user_text or "").strip()
     if not text:
+        return True
+    if is_bare_thank_you_stt(text):
         return True
     if not any(p.match(text) for p in _WHISPER_SILENCE_HALLUCINATIONS):
         return False

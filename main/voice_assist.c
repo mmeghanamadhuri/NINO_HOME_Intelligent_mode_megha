@@ -56,13 +56,14 @@ static const char *TAG = "voice_ast";
 #define AUX_QUIET_MAX_MS 4000
 #define AUX_REARM_DELAY_MS 1500
 #define AUX_POST_SPEAKER_IGNORE_MS 2500
+#define AUX_LISTEN_WARMUP_MS 220
 #define AUX_WAKE_PREROLL_MS 2000
 #define AUX_WAKE_PREROLL_SAMPLES ((VOICE_MIC_RATE * AUX_WAKE_PREROLL_MS) / 1000)
 #define AUX_STATUS_LOG_MS 1000
 #define AUX_REPLY_WAIT_MS 180000
 #define STREAM_LISTEN_CAP_MS 65000
 #define CAMERA_STREAM_WAIT_MS 2500
-#define FACE_HUNT_MS 13000
+#define FACE_HUNT_MS 4500
 #define SESSION_GREET_WAIT_MS 20000
 #define LOOK_SCAN_HOLD_MS 5000
 #define LOOK_SCAN_TTS_WAIT_MS 12000
@@ -918,6 +919,26 @@ static void session_camera_off(void) {
 }
 
 /* Takes ownership of @p resp (queue frees it after playback, or on queue fail). */
+static bool motion_json_is_duration_talk(const char *json) {
+  if (json == NULL || json[0] == '\0') {
+    return false;
+  }
+  if (strstr(json, "\"talk\"") == NULL && strstr(json, "\"full\"") == NULL) {
+    return false;
+  }
+  static const char *const gestures[] = {
+      "\"nod\"",    "\"nod3\"",     "\"shake\"",    "\"shake3\"", "\"greet\"",
+      "\"look_left\"", "\"look_right\"", "\"look_up\"", "\"look_down\"",
+      "\"curious\"", "\"yes\"", "\"no\"",
+  };
+  for (size_t i = 0; i < sizeof(gestures) / sizeof(gestures[0]); i++) {
+    if (strstr(json, gestures[i]) != NULL) {
+      return false;
+    }
+  }
+  return true;
+}
+
 static void play_ws_reply_wav(uint8_t *resp, size_t resp_len, const char *eye_expr,
                               const char *motion_json, bool session_open) {
   nino_eye_state_t eye_state = nino_eye_state_from_name(eye_expr);
@@ -926,7 +947,8 @@ static void play_ws_reply_wav(uint8_t *resp, size_t resp_len, const char *eye_ex
     eye_state = NINO_EYE_STATE_COUNT;
   }
   bool scripted = false;
-  if (motion_json != NULL && motion_json[0] != '\0') {
+  if (motion_json != NULL && motion_json[0] != '\0' &&
+      !motion_json_is_duration_talk(motion_json)) {
     const bool skip_curious_greet =
         session_open && strstr(motion_json, "curious") != NULL;
     if (!skip_curious_greet) {
@@ -1024,6 +1046,9 @@ static bool stream_aux_pcm(nino_voice_ws_session_t *ws, uint32_t turn,
                            const int16_t *preroll, size_t preroll_samples,
                            bool listen_led) {
   if (listen_led) {
+    /* Open Aux and dump leftover speaker energy so the first spoken word is
+     * not clipped. LED goes listen only once PCM is about to flow. */
+    nino_mic_warmup(AUX_LISTEN_WARMUP_MS);
     nino_eye_listening();
     (void)nino_rgb_led_show(NINO_RGB_SHOW_LISTEN);
     voice_log(ESP_LOG_INFO, turn, "STREAM", "sending Aux-in PCM until ASR EOS");
@@ -1057,7 +1082,9 @@ static bool stream_aux_pcm(nino_voice_ws_session_t *ws, uint32_t turn,
       vTaskDelay(pdMS_TO_TICKS(20));
       continue;
     }
-    if (aux_ignore_energy_now()) {
+    /* Conversation listen must send immediately. Speaker-ignore only applies
+     * to the idle wake path so leftover TTS does not retrigger Ok Nino. */
+    if (!listen_led && aux_ignore_energy_now()) {
       vTaskDelay(pdMS_TO_TICKS(20));
       continue;
     }
@@ -1185,7 +1212,7 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
   (void)nino_rgb_led_show(NINO_RGB_SHOW_LISTEN);
   session_camera_on();
   camera_on = true;
-  (void)nino_face_hunt_for_person(FACE_HUNT_MS, false);
+  (void)nino_face_hunt_for_person(FACE_HUNT_MS, true);
 
   nino_voice_ws_session_clear_reply(ws);
   err = nino_voice_ws_session_send_text(ws, "{\"type\":\"ready\"}");

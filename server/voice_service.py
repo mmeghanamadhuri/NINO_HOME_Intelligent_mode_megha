@@ -40,6 +40,7 @@ from llm_service import (
     recap_topic_not_found_reply,
 )
 from memory_filters import (
+    is_bare_thank_you_stt,
     is_likely_tts_echo,
     is_unintelligible_stt,
     is_whisper_silence_hallucination,
@@ -2146,6 +2147,7 @@ def _short_handled_wav(
     t_start: float,
     t_stt: float,
     look_scan: bool = False,
+    motion: list[str] | None = None,
 ) -> tuple[bytes, VoiceReplyMeta]:
     t_reply = time.perf_counter()
     wav, _voice = synthesize_sapi_wav_bytes(reply)
@@ -2156,6 +2158,8 @@ def _short_handled_wav(
     if look_scan:
         meta.look_scan = True
         meta.motion = None
+    elif motion:
+        meta.motion = list(motion)
     _mark_continue_listen(meta, reply_path, user_text)
     meta.timings = {
         "heard": user_text[:200],
@@ -2176,6 +2180,7 @@ def _short_handled_wav(
         "process_total_seconds": round(t_tts - t_start, 3),
         "continue_listen": bool(meta.prompt_medical_ack),
         "look_scan": bool(meta.look_scan),
+        "motion": meta.motion,
     }
     logger.info(
         "Latency | stt(%s)=%.2fs reply(%s)=%.2fs tts=%.2fs total=%.2fs | in=%.1fs out=%.1fs audio",
@@ -2470,6 +2475,23 @@ def process_voice_wav(
                 "turn": voice_turn,
             },
         )
+    if is_bare_thank_you_stt(user_text):
+        logger.info(
+            "Voice STT skipped bare thank-you (aux/TTS artefact) | heard: %s",
+            user_text[:80],
+        )
+        return _silent_close(
+            meta,
+            reply_path="stt_rejected",
+            heard=user_text,
+            audio_input_format=audio_input_format,
+            audio_in_seconds=audio_in_seconds,
+            wav_bytes=wav_bytes,
+            stt_engine=stt_engine,
+            t_start=t_start,
+            t_stt=t_stt,
+            extra={"session": session, "energy": peak_energy, "turn": voice_turn},
+        )
     log_nino_voice("CMD", turn=voice_turn, session=session, text=user_text[:200])
 
     from session_identity import get_session_identity
@@ -2565,6 +2587,40 @@ def process_voice_wav(
             t_stt=t_stt,
         )
 
+    from servo_tts_motion import parse_repeat_yes_no_command
+
+    repeat_yn = parse_repeat_yes_no_command(user_text)
+    if repeat_yn == "no":
+        logger.info("Voice say-no-no-no | heard: %s", user_text[:120])
+        return _short_handled_wav(
+            meta,
+            reply="No, no, no.",
+            reply_path="say_no3",
+            user_text=user_text,
+            audio_input_format=audio_input_format,
+            audio_in_seconds=audio_in_seconds,
+            wav_bytes=wav_bytes,
+            stt_engine=stt_engine,
+            t_start=t_start,
+            t_stt=t_stt,
+            motion=["shake3"],
+        )
+    if repeat_yn == "yes":
+        logger.info("Voice say-yes-yes-yes | heard: %s", user_text[:120])
+        return _short_handled_wav(
+            meta,
+            reply="Yes, yes, yes.",
+            reply_path="say_yes3",
+            user_text=user_text,
+            audio_input_format=audio_input_format,
+            audio_in_seconds=audio_in_seconds,
+            wav_bytes=wav_bytes,
+            stt_engine=stt_engine,
+            t_start=t_start,
+            t_stt=t_stt,
+            motion=["nod3"],
+        )
+
     if is_what_do_you_see_command(user_text):
         from object_detection_service import spoken_scene_report
 
@@ -2647,7 +2703,8 @@ def process_voice_wav(
                 return b"", meta
 
     if not ident_handled and (
-        is_likely_tts_echo(user_text)
+        is_bare_thank_you_stt(user_text)
+        or is_likely_tts_echo(user_text)
         or is_unintelligible_stt(user_text)
         or is_whisper_silence_hallucination(
             user_text,

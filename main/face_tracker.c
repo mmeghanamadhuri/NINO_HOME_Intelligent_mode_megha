@@ -24,13 +24,13 @@ static const char *TAG = "face_tracker";
 #define FACE_TRACK_POSITION_SPEED 70
 /** Restore the regular head-motion speed when face tracking is disabled. */
 #define FACE_TRACK_NORMAL_POSITION_SPEED 22
-/** Hunt head motion: slower than tracking so the overlay can ID a known face. */
-#define FACE_HUNT_POSITION_SPEED 16
-#define FACE_HUNT_POSE_MS 1600
-#define FACE_HUNT_FACE_SETTLE_MS 400
+/** Hunt head motion: quick pan/tilt so hello identity is not a 10s wait. */
+#define FACE_HUNT_POSITION_SPEED 40
+#define FACE_HUNT_POSE_MS 500
+#define FACE_HUNT_FACE_SETTLE_MS 180
 #define FACE_HUNT_TASK_STACK 8192
 #define FACE_HUNT_TASK_PRIO 4
-#define FACE_HUNT_DEFAULT_MS 13000
+#define FACE_HUNT_DEFAULT_MS 4500
 /** Travel time before the look-scan 5s hold so overlay/YOLO see the pose. */
 #define FACE_LOOK_MOVE_MS 800
 /** Tilt ID1 on this head: higher goal = physical up, lower goal = physical down. */
@@ -302,10 +302,10 @@ bool nino_face_hunt_for_person(uint32_t timeout_ms, bool skip_if_visible) {
   if (!s_hunt_running) {
     s_hunt_cancel = false;
   }
-  ESP_LOGI(TAG, "Face hunt start (timeout %u ms, slow pan/tilt)", (unsigned)timeout_ms);
+  ESP_LOGI(TAG, "Face hunt start (timeout %u ms)", (unsigned)timeout_ms);
 
-  /* After TTS, keep the current person if they are still in frame. */
-  vTaskDelay(pdMS_TO_TICKS(220));
+  /* Let YuNet land a frame. If the user is already visible, skip the sweep. */
+  vTaskDelay(pdMS_TO_TICKS(skip_if_visible ? 350 : 150));
   if (s_hunt_cancel) {
     ESP_LOGI(TAG, "Face hunt cancelled before sweep");
     nino_face_tracker_pause_scripted(false);
@@ -338,6 +338,11 @@ bool nino_face_hunt_for_person(uint32_t timeout_ms, bool skip_if_visible) {
       saw_face = true;
       last_face_pan = cur_pan;
       last_face_tilt = cur_tilt;
+      vTaskDelay(pdMS_TO_TICKS(FACE_HUNT_FACE_SETTLE_MS));
+      if (s_face_found) {
+        ESP_LOGI(TAG, "Face hunt: found, stop sweep");
+        break;
+      }
     }
     if (nino_servo_dxl_is_ready() && !nino_servo_recplay_is_busy() &&
         xTaskGetTickCount() >= pose_until && pose_i < nposes) {

@@ -183,11 +183,21 @@ esp_err_t nino_mic_read(int16_t *samples, int sample_count) {
 }
 
 void nino_mic_flush(void) {
+  nino_mic_warmup(130);
+}
+
+void nino_mic_warmup(uint32_t ms) {
+  if (ms == 0) {
+    return;
+  }
   int16_t dump[256];
-  for (int i = 0; i < 8; ++i) {
+  uint32_t got = 0;
+  const uint32_t need = (NINO_MIC_SAMPLE_RATE_HZ * ms) / 1000U;
+  while (got < need) {
     if (nino_mic_read(dump, 256) != ESP_OK) {
       break;
     }
+    got += 256;
   }
 }
 
