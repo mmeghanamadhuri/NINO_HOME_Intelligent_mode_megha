@@ -120,6 +120,7 @@ class SessionIdentityFlowTests(unittest.TestCase):
         self.assertFalse(self.flow.should_skip_prompt_echo("Hello"))
         self.assertFalse(self.flow.should_skip_prompt_echo("Hi"))
         self.assertFalse(self.flow.should_skip_prompt_echo("Good morning"))
+        self.assertFalse(self.flow.should_skip_prompt_echo("How are you today?"))
         self.assertFalse(self.flow.should_skip_prompt_echo("What's the weather?"))
 
     def test_unknown_offer_then_no_guest(self) -> None:

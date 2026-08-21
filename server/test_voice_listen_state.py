@@ -86,3 +86,11 @@ def test_grace_expires() -> None:
     assert vls.in_post_tts_grace("sess-exp", "dev-exp")
     time.sleep(0.08)
     assert not vls.in_post_tts_grace("sess-exp", "dev-exp")
+
+
+def test_peak_override_allows_long_low_mean_clip() -> None:
+    from voice_service import speech_like_clip
+
+    os.environ["VOICE_LONG_CLIP_PEAK_OVERRIDE"] = "80"
+    assert speech_like_clip(292, 14)
+    assert not speech_like_clip(40, 14)

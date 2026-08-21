@@ -252,6 +252,20 @@ def _piper_model_path() -> Path:
     return Path(configured).expanduser() if configured else DEFAULT_PIPER_MODEL_PATH
 
 
+def _piper_use_cuda() -> bool:
+    raw = os.environ.get(
+        "PIPER_USE_CUDA", os.environ.get("TTS_USE_CUDA", "0")
+    ).strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    try:
+        import onnxruntime as ort
+
+        return "CUDAExecutionProvider" in ort.get_available_providers()
+    except Exception:
+        return False
+
+
 def _piper_length_scale() -> float:
     raw = os.environ.get("PIPER_LENGTH_SCALE", "1.0").strip()
     try:
@@ -318,8 +332,14 @@ def _load_piper_voice() -> Any:
         except ImportError as exc:
             raise RuntimeError("Piper Python package is not installed.") from exc
         logger.info("Loading Piper voice model: %s", model_path)
-        _PIPER_VOICE = PiperVoice.load(model_path, config_path)
+        use_cuda = _piper_use_cuda()
+        _PIPER_VOICE = PiperVoice.load(model_path, config_path, use_cuda=use_cuda)
         _PIPER_VOICE_MODEL_PATH = model_path
+        logger.info(
+            "Piper voice ready: %s cuda=%s",
+            model_path.stem,
+            use_cuda,
+        )
         return _PIPER_VOICE
 
 

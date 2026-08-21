@@ -22,6 +22,7 @@ from face_registration_voice import (
     is_face_reg_prompt_echo,
     is_incomplete_name_phrase,
     is_opening_greeting_echo,
+    is_unconditional_greet_echo,
     is_registration_cancel,
     is_registration_offer_no,
     is_registration_offer_yes,
@@ -209,6 +210,8 @@ class SessionIdentityFlow:
                 return False
             budget = self._opening_echo_budget
         if is_face_reg_prompt_echo(text):
+            return True
+        if is_unconditional_greet_echo(text):
             return True
         if budget <= 0:
             return False

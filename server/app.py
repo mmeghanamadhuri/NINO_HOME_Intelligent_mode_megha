@@ -241,6 +241,8 @@ vision_eye = VisionEyeDriver(
 )
 latest_results: list[dict] = []
 _latest_results_by_device: dict[str, list[dict]] = {}
+_latest_results_at_by_device: dict[str, float] = {}
+FACE_CACHE_LIVE_MAX_AGE_S = float(os.environ.get("FACE_CACHE_LIVE_MAX_AGE_S", "2.5"))
 # Update vision-driven TTS every frame so greetings start as soon as recognition succeeds
 # (throttling here added a noticeable delay before enqueue).
 TTS_UPDATE_INTERVAL_SECONDS = 0.0
@@ -1095,6 +1097,7 @@ def _mjpeg_generator(device_id: str):
             if frame is None:
                 if is_ui_device:
                     tts.update_face_state([], device_id=device_id)
+                _clear_face_cache(device_id)
                 time.sleep(0.02)
                 continue
 
@@ -1106,9 +1109,7 @@ def _mjpeg_generator(device_id: str):
             detections = _detect_objects(frame, device_id)
             annotated, results = faces.annotate(frame, results=results)
             objects.annotate(annotated, detections)
-            key = _results_device_key(device_id)
-            if key:
-                _latest_results_by_device[key] = results
+            _store_face_cache(device_id, results)
             if is_ui_device:
                 latest_results = results
             now = time.time()
@@ -1142,6 +1143,7 @@ def _vision_tick_device(
     frame = cameras.read(device_id)
     if frame is None:
         vision_eye.update([], device_id=device_id)
+        _clear_face_cache(device_id)
         return
     results = faces.recognize(frame, device_id=device_id)
     try:
@@ -1150,9 +1152,7 @@ def _vision_tick_device(
         logger.debug("Emotion tick failed for %s", device_id, exc_info=True)
     # Keeps the object cache warm for voice queries with no browser attached.
     _detect_objects(frame, device_id)
-    key = _results_device_key(device_id)
-    if key:
-        _latest_results_by_device[key] = results
+    _store_face_cache(device_id, results)
     vision_eye.update(results, device_id=device_id)
     if update_tts:
         _update_tts_face_state(results, device_id=device_id)
@@ -1205,6 +1205,43 @@ def _results_device_key(device_id: str | None) -> str:
     return normalize_device_mac(device_id) or str(device_id or "").strip()
 
 
+def _store_face_cache(device_id: str | None, results: list[dict]) -> None:
+    key = _results_device_key(device_id)
+    if not key:
+        return
+    _latest_results_by_device[key] = results
+    _latest_results_at_by_device[key] = time.time()
+
+
+def _clear_face_cache(device_id: str | None) -> None:
+    key = _results_device_key(device_id)
+    if not key:
+        return
+    _latest_results_by_device.pop(key, None)
+    _latest_results_at_by_device.pop(key, None)
+
+
+def _cached_face_results_fresh(
+    device_id: str | None,
+    *,
+    max_age_s: float = FACE_CACHE_LIVE_MAX_AGE_S,
+) -> list[dict]:
+    key = _results_device_key(device_id)
+    if not key:
+        return []
+    seen_at = _latest_results_at_by_device.get(key)
+    if seen_at is None or time.time() - seen_at > max(0.0, max_age_s):
+        return []
+    return list(_latest_results_by_device.get(key) or [])
+
+
+def _cached_face_results(device_id: str | None) -> list[dict]:
+    key = _results_device_key(device_id)
+    if not key:
+        return []
+    return list(_latest_results_by_device.get(key) or [])
+
+
 def _update_tts_face_state(
     results: list[dict], *, device_id: str | None = None
 ) -> None:
@@ -1221,13 +1258,6 @@ def _update_tts_face_state(
     tts.update_face_state(recognized_names, primary_name=primary, device_id=device_id)
     if primary:
         _remember_voice_viewer(primary, device_id)
-
-
-def _cached_face_results(device_id: str | None) -> list[dict]:
-    key = _results_device_key(device_id)
-    if not key:
-        return []
-    return list(_latest_results_by_device.get(key) or [])
 
 
 def _primary_recognized_viewer(
@@ -1261,23 +1291,20 @@ def _recognized_viewer_names(
 
 
 def _viewer_for_voice_query(device_id: str | None = None) -> str | None:
-    """Who is speaking — overlay cache first, then live frame, then session memory."""
+    """Who is speaking — live frame first, then fresh overlay cache only."""
     active = resolve_device_id(device_id)
     name: str | None = None
 
-    cached = _cached_face_results(active)
-    if cached:
-        name = _primary_recognized_viewer(cached, allow_pending=True)
+    frame = cameras.read(active)
+    if frame is not None:
+        name = _primary_recognized_viewer(
+            faces.recognize(frame, device_id=active), allow_pending=True
+        )
 
     if not name:
-        frame = cameras.read(active)
-        if frame is not None:
-            name = _primary_recognized_viewer(
-                faces.recognize(frame, device_id=active), allow_pending=True
-            )
-
-    if not name:
-        name = _recall_voice_viewer(active)
+        cached = _cached_face_results_fresh(active)
+        if cached:
+            name = _primary_recognized_viewer(cached, allow_pending=True)
 
     if name:
         _remember_voice_viewer(name, active)
@@ -1291,6 +1318,31 @@ def _camera_identity_snapshot(
 ) -> tuple[str | None, Literal["recognized", "unknown", "no_face"]]:
     """Live camera identity for voice queries and 'who am I?' prompts."""
     active = resolve_device_id(device_id)
+
+    if require_live_face:
+        frame = cameras.read(active)
+        if frame is None:
+            return None, "no_face"
+        results = faces.recognize(frame, device_id=active)
+        _store_face_cache(active, results)
+        primary = _primary_recognized_viewer(results, allow_pending=True)
+        if primary:
+            _remember_voice_viewer(primary, active)
+            return primary, "recognized"
+        if results:
+            return None, "unknown"
+        name, state = faces.recognize_identity(
+            cameras.frame_getter(active),
+            allow_session_hint=False,
+            device_id=active,
+        )
+        if state == "recognized" and name:
+            _remember_voice_viewer(name, active)
+            return name, "recognized"
+        if state == "no_face":
+            return None, "no_face"
+        return None, "unknown"
+
     cached = _cached_face_results(active)
     # Prefer the same live detection stream shown in UI so voice identity follows
     # what the user sees in the camera overlay.
@@ -1299,10 +1351,6 @@ def _camera_identity_snapshot(
         if primary:
             _remember_voice_viewer(primary, active)
             return primary, "recognized"
-        if require_live_face:
-            has_primary_face = any(r.get("primary", True) for r in cached)
-            if has_primary_face:
-                return None, "unknown"
 
     # Fresh frame fallback (keeps identity responsive even if latest_results lags).
     frame = cameras.read(active)
@@ -1312,21 +1360,17 @@ def _camera_identity_snapshot(
         if primary:
             _remember_voice_viewer(primary, active)
             return primary, "recognized"
-        if require_live_face and results:
-            return None, "unknown"
 
     # Multi-frame vote fallback.
     name, state = faces.recognize_identity(
         cameras.frame_getter(active),
-        allow_session_hint=not require_live_face,
+        allow_session_hint=True,
         device_id=active,
     )
     if state == "recognized" and name:
         _remember_voice_viewer(name, active)
         return name, "recognized"
     if state == "no_face":
-        if require_live_face:
-            return None, "no_face"
         recalled = _recall_voice_viewer(active)
         if recalled:
             return recalled, "recognized"
@@ -1356,17 +1400,18 @@ def _live_visible_scene(
     """People (overlay, then live frame) + objects. No stale session-hint names."""
     active = resolve_device_id(device_id)
     names: list[str] = []
-    cached = _cached_face_results(active)
-    if cached:
-        names = _recognized_viewer_names(cached, allow_pending=True)
     frame = cameras.read(active)
-    if not names and frame is not None:
+    if frame is not None:
         try:
             names = _recognized_viewer_names(
                 faces.recognize(frame, device_id=active), allow_pending=True
             )
         except Exception:
             logger.debug("live scene face recognize failed", exc_info=True)
+    if not names:
+        cached = _cached_face_results_fresh(active)
+        if cached:
+            names = _recognized_viewer_names(cached, allow_pending=True)
     detections: list[dict] = []
     if objects.enabled:
         if frame is not None:
@@ -1396,7 +1441,7 @@ def _session_open_identity_snapshot(
     deadline = time.monotonic() + 2.5
     last_state: Literal["recognized", "unknown", "no_face"] = "no_face"
     while True:
-        cached = _cached_face_results(active)
+        cached = _cached_face_results_fresh(active)
         if cached:
             primary = _primary_recognized_viewer(cached, allow_pending=True)
             if primary:
@@ -1427,12 +1472,6 @@ def _session_open_identity_snapshot(
                 "session-open identity vote name=%s device=%s", cleaned, active
             )
             return cleaned, "recognized"
-    recalled = _recall_voice_viewer(active)
-    if recalled:
-        logger.info(
-            "session-open identity hunt-memory name=%s device=%s", recalled, active
-        )
-        return recalled, "recognized"
     logger.info("session-open identity state=%s device=%s", state or last_state, active)
     if state == "unknown" or last_state == "unknown":
         return None, "unknown"
@@ -1450,7 +1489,7 @@ def _live_scene_identity(
     last_state: Literal["recognized", "unknown", "no_face"] = "no_face"
     last_names: list[str] = []
     while True:
-        cached = _cached_face_results(active)
+        cached = _cached_face_results_fresh(active)
         if cached:
             names = _recognized_viewer_names(cached, allow_pending=True)
             if names:
@@ -1462,9 +1501,6 @@ def _live_scene_identity(
         if time.monotonic() >= deadline:
             break
         time.sleep(0.15)
-    recalled = _recall_voice_viewer(active)
-    if last_state == "no_face" and recalled:
-        return [recalled], "recognized"
     return last_names, last_state
 
 
@@ -1696,16 +1732,14 @@ async def _process_voice_query_audio(
                     "face",
                 }:
                     active_viewer = normalized_identity
-            if not active_viewer:
-                active_viewer = await run_in_threadpool(
-                    _recall_voice_viewer, device_id
-                )
             identity_seconds = round(time.perf_counter() - t_ident, 3)
             camera_scene = await run_in_threadpool(
                 _camera_scene_snapshot, device_id
             )
-            visible_names = _recognized_viewer_names(
-                _cached_face_results(device_id), allow_pending=True
+            visible_names = (
+                [active_viewer]
+                if active_viewer
+                else []
             )
 
             def _run_voice() -> tuple[bytes, VoiceReplyMeta]:

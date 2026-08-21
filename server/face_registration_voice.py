@@ -76,11 +76,31 @@ _FACE_REG_ECHO_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"\bis that right\b",
         r"\bkeep this as a guest\b",
         r"\bi'?ve registered you\b",
-        r"\bhey\b.+\bhow can i help you\b",
-        r"\bhow can i help you\b",
-        r"\bhow are you today\b",
     )
 )
+
+# GREET TTS fragments (no "?") — opening echo only, not registration prompts.
+_GREET_PHRASE_ECHO_RE = re.compile(
+    r"^\s*(?:"
+    r"how can i help you|"
+    r"how are you today|"
+    r"hey\b.+\bhow can i help you"
+    r")\s*[.!?…]*\s*$",
+    re.IGNORECASE,
+)
+
+# Full GREET lines always dropped — do not consume the opening-echo budget.
+_UNCONDITIONAL_GREET_ECHO_RE = re.compile(
+    r"^\s*hey\b.+\bhow can i help you\s*[.!?…]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def is_unconditional_greet_echo(user_text: str) -> bool:
+    text = (user_text or "").strip()
+    if not text or "?" in text:
+        return False
+    return bool(_UNCONDITIONAL_GREET_ECHO_RE.match(text))
 
 # GREET leftover is "Hey <name>" (or the full "how can I help you" prompt).
 # Bare hello / hi / good morning is the user's greeting — do not skip it.
@@ -477,6 +497,8 @@ def is_opening_greeting_echo(user_text: str) -> bool:
         return True
     if "?" in text or len(text) > 48:
         return False
+    if _GREET_PHRASE_ECHO_RE.match(text):
+        return True
     match = _OPENING_NAMED_HELLO_RE.match(text)
     if match is None:
         return False

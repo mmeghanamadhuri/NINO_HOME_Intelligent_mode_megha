@@ -794,6 +794,20 @@ def long_clip_min_mean_energy() -> int:
         return 18
 
 
+def long_clip_peak_override_energy() -> int:
+    """When peak frame energy exceeds this, run STT even on long low-mean clips."""
+    raw = os.environ.get("VOICE_LONG_CLIP_PEAK_OVERRIDE", "80").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 80
+
+
+def speech_like_clip(peak_energy: int, mean_energy: int) -> bool:
+    """True when peak energy shows real speech despite a low clip mean (VAD tail)."""
+    return int(peak_energy) >= long_clip_peak_override_energy()
+
+
 def long_clip_min_seconds() -> float:
     raw = os.environ.get("VOICE_LONG_CLIP_MIN_SECONDS", "6.0").strip()
     try:
@@ -2373,6 +2387,7 @@ def process_voice_wav(
         audio_in_seconds >= long_clip_s
         and mean_energy < long_mean_th
         and not post_tts_grace
+        and not speech_like_clip(peak_energy, mean_energy)
     ):
         logger.info(
             "Voice clip rejected (long low-mean noise) | mean=%s peak=%s audio_s=%.2f th=%s",
@@ -2404,7 +2419,11 @@ def process_voice_wav(
         )
     quiet_clip_s = quiet_clip_min_seconds()
     quiet_mean_th = quiet_clip_min_mean_energy()
-    if audio_in_seconds >= quiet_clip_s and mean_energy < quiet_mean_th:
+    if (
+        audio_in_seconds >= quiet_clip_s
+        and mean_energy < quiet_mean_th
+        and not speech_like_clip(peak_energy, mean_energy)
+    ):
         logger.info(
             "Voice clip rejected (quiet clip) | mean=%s peak=%s audio_s=%.2f",
             mean_energy,
@@ -2757,6 +2776,7 @@ def process_voice_wav(
             stt_engine=stt_engine,
             t_start=t_start,
             t_stt=t_stt,
+            preserve_continue_listen=preserve_continue,
             extra={"session": session, "energy": peak_energy, "turn": voice_turn},
         )
     if ident is not None and ident.in_registration():
@@ -2830,8 +2850,9 @@ def process_voice_wav(
         camera_identity_name,
         camera_identity_state,
     )
-    if not memory_name and viewer_name:
-        # Continue-listen turns may lose the live face for a moment.
+    preserve_identity = camera_identity_state == "recognized" or post_tts_grace
+    if not memory_name and viewer_name and preserve_identity:
+        # Continue-listen turns may lose the live face for a moment after TTS.
         cleaned_viewer = viewer_name.strip()
         if cleaned_viewer and cleaned_viewer.lower() not in {"unknown", "face"}:
             memory_name = cleaned_viewer
@@ -2840,8 +2861,30 @@ def process_voice_wav(
     if ident is not None:
         ident_user, ident_guest = ident.current_user()
         if ident_user:
-            memory_name = ident_user
-            viewer_name = ident_user
+            if ident_guest or preserve_identity:
+                memory_name = ident_user
+                viewer_name = ident_user
+            elif camera_identity_state == "no_face":
+                switch = ident.apply_visible_scene(
+                    visible_names=visible_names or [],
+                    scene_state="no_face",
+                    allow_register=False,
+                )
+                if switch is not None and switch.user_name:
+                    memory_name = switch.user_name
+                    viewer_name = switch.user_name
+                    if switch.is_guest and meta.session_id:
+                        from conversation_sessions import bind_session_user
+
+                        bind_session_user(
+                            meta.session_id,
+                            device_id=device_id,
+                            user_name=switch.user_name,
+                        )
+                    logger.info(
+                        "Voice session identity: no live face — guest %s",
+                        switch.user_name,
+                    )
     memory_ctx = None
     if memory_name:
         memory_ctx = memory_svc.load_context(memory_name, query_text=user_text)
