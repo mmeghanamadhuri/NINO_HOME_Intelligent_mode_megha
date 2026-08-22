@@ -8,39 +8,36 @@
 #include "battery_adc.h"
 #include "battery_endurance.h"
 #include "driver/gpio.h"
+#include "esp_attr.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "rgb_led.h"
+#include "voice_assist.h"
 #include "wifi_config.h"
 
 static const char *TAG = "push_btn";
 
 /*
  * Wiring (ESP32-P4-Function-EV-Board J1, active-low to GND):
- *  - GPIO48 (J1 pin 33): single press = hardware test on/off
- *    (CW/CCW pan records farthest left/right and saves them);
- *    double press = DEMO_main.wav; triple press = erase Wi-Fi + BLE setup
- *  - GPIO47 (J1 pin 37): single press = speaker mute on/off (solid red LED)
+ *  - GPIO48 (J1 pin 33): short press = Wi-Fi setup + guide WAV;
+ *    hold 5 s = DEMO_main.wav
+ *  - GPIO47 (J1 pin 37): single press = Aux-in / mic mute on/off
  *
  * Do NOT use:
- *  - GPIO7 / GPIO8  — BSP I2C SDA/SCL (ES8311). Pressing GPIO7
- *    shorts SDA and kills the speaker codec (I2C_If Fail to … dev 30).
+ *  - GPIO7 / GPIO8  — BSP I2C SDA/SCL (ES8311).
  *  - GPIO53         — BSP_POWER_AMP_IO (speaker amp enable).
  *  - GPIO9–13       — I2S to the codec.
  */
-#define BTN_DEMO_GPIO GPIO_NUM_48
+#define BTN_SETUP_GPIO GPIO_NUM_48
 #define BTN_MUTE_GPIO GPIO_NUM_47
 #define BTN_ACTIVE_LEVEL 0
 
 #define BTN_POLL_MS 20
 #define BTN_DEBOUNCE_MS 40
-/* Max quiet time after the last release before a click sequence is evaluated. */
-#define BTN_MULTI_GAP_MS 350
-#define BTN_CLICKS_SOAK 1
-#define BTN_CLICKS_DEMO 2
-#define BTN_CLICKS_SETUP 3
+#define BTN_DEMO_HOLD_MS 5000
 #define BTN_TASK_STACK 3072
 #define BTN_WORKER_STACK 6144
 #define BTN_TASK_PRIO 5
@@ -48,7 +45,6 @@ static const char *TAG = "push_btn";
 typedef enum {
   BTN_EVT_DEMO = 1,
   BTN_EVT_SETUP = 2,
-  BTN_EVT_SOAK = 3,
   BTN_EVT_MUTE = 4,
 } btn_evt_t;
 
@@ -60,15 +56,16 @@ extern const uint8_t nino_home_wifi_wav_end[] asm("_binary_NiNO_Home_Wifi_wav_en
 
 static QueueHandle_t s_btn_evt_q;
 static volatile bool s_demo_busy;
+static int64_t s_last_mute_us;
 
 typedef struct {
   gpio_num_t gpio;
   const char *name;
   bool stable_pressed;
   bool armed;
+  bool hold_fired;
   uint32_t debounce_ms;
-  uint8_t click_count;
-  uint32_t gap_ms;
+  uint32_t held_ms;
 } btn_state_t;
 
 static bool play_demo_clip(void) {
@@ -116,7 +113,7 @@ static void post_evt(btn_evt_t evt) {
     return;
   }
   if (evt == BTN_EVT_DEMO && s_demo_busy) {
-    ESP_LOGI(TAG, "Demo already playing — ignore extra double press");
+    ESP_LOGI(TAG, "Demo already playing — ignore extra request");
     return;
   }
   if (xQueueSend(s_btn_evt_q, &evt, 0) != pdPASS) {
@@ -134,24 +131,38 @@ esp_err_t nino_push_buttons_trigger_demo(void) {
   return ESP_OK;
 }
 
-static void apply_user_mute(bool muted) {
+void nino_mute_set(bool muted) {
   (void)nino_audio_set_muted(muted);
-  if (muted) {
-    nino_audio_queue_preempt_for_wake();
-    if (!nino_battery_low_alert_active()) {
-      (void)nino_rgb_led_show(NINO_RGB_SHOW_MUTE);
-    }
-  } else if (!nino_battery_low_alert_active()) {
-    (void)nino_rgb_led_show(NINO_RGB_SHOW_IDLE);
-  }
 }
 
-void nino_mute_set(bool muted) { apply_user_mute(muted); }
+static void toggle_aux_mute(void) {
+  const int64_t now = esp_timer_get_time();
+  if (s_last_mute_us != 0 && (now - s_last_mute_us) < 300000) {
+    return;
+  }
+  s_last_mute_us = now;
+  const bool next = !nino_voice_assist_aux_is_muted();
+  nino_voice_assist_set_aux_muted(next);
+  ESP_LOGI(TAG, "Mute toggle → Aux-in %s led=%s gpio5=%s",
+           next ? "MUTED" : "unmuted", next ? "red" : "off",
+           next ? "high" : "low");
+}
 
-static void toggle_user_mute(void) {
-  const bool next = !nino_audio_is_muted();
-  apply_user_mute(next);
-  ESP_LOGI(TAG, "Mute button → speaker %s", next ? "MUTED (solid red)" : "unmuted");
+void nino_push_buttons_trigger_mute(void) {
+  post_evt(BTN_EVT_MUTE);
+}
+
+static void IRAM_ATTR mute_isr(void *arg) {
+  (void)arg;
+  if (s_btn_evt_q == NULL) {
+    return;
+  }
+  btn_evt_t evt = BTN_EVT_MUTE;
+  BaseType_t woke = pdFALSE;
+  (void)xQueueSendFromISR(s_btn_evt_q, &evt, &woke);
+  if (woke == pdTRUE) {
+    portYIELD_FROM_ISR();
+  }
 }
 
 static void btn_worker_task(void *arg) {
@@ -162,13 +173,13 @@ static void btn_worker_task(void *arg) {
       continue;
     }
     if (evt == BTN_EVT_DEMO) {
-      ESP_LOGI(TAG, "Action: play DEMO_main.wav");
+      ESP_LOGI(TAG, "Action: Demo mode — play DEMO_main.wav");
       s_demo_busy = true;
       (void)play_demo_clip();
       vTaskDelay(pdMS_TO_TICKS(500));
       s_demo_busy = false;
     } else if (evt == BTN_EVT_SETUP) {
-      ESP_LOGI(TAG, "Action: erase Wi-Fi + enter setup mode + BLE");
+      ESP_LOGI(TAG, "Action: Wi-Fi setup + app guide");
       s_demo_busy = false;
       if (nino_battery_endurance_is_active()) {
         nino_battery_endurance_stop();
@@ -178,11 +189,8 @@ static void btn_worker_task(void *arg) {
         ESP_LOGW(TAG, "Enter setup mode failed: %s", esp_err_to_name(err));
       }
       (void)play_setup_clip();
-    } else if (evt == BTN_EVT_SOAK) {
-      ESP_LOGI(TAG, "Action: toggle hardware test");
-      nino_battery_endurance_toggle();
     } else if (evt == BTN_EVT_MUTE) {
-      toggle_user_mute();
+      toggle_aux_mute();
     }
   }
 }
@@ -202,51 +210,35 @@ static void btn_update(btn_state_t *btn) {
       ESP_LOGI(TAG, "GPIO%d (%s) %s (level=%d)", (int)btn->gpio, btn->name,
                raw_pressed ? "DOWN" : "UP", level);
 
-      if (!raw_pressed && was_pressed) {
-        /* A press→release finishes one click. Skip the very first release
-         * after a boot-held press so it does not start a phantom sequence. */
+      if (raw_pressed && !was_pressed) {
+        btn->held_ms = 0;
+        btn->hold_fired = false;
         if (!btn->armed) {
           btn->armed = true;
         } else if (btn->gpio == BTN_MUTE_GPIO) {
+          ESP_LOGI(TAG, "GPIO%d press → Aux-in mute toggle", (int)btn->gpio);
           post_evt(BTN_EVT_MUTE);
-        } else if (btn->click_count < 200) {
-          btn->click_count++;
         }
-        btn->gap_ms = 0;
+      } else if (!raw_pressed && was_pressed) {
+        if (!btn->armed) {
+          btn->armed = true;
+        } else if (btn->gpio == BTN_SETUP_GPIO && !btn->hold_fired) {
+          ESP_LOGI(TAG, "GPIO%d short press → Wi-Fi setup", (int)btn->gpio);
+          post_evt(BTN_EVT_SETUP);
+        }
+        btn->held_ms = 0;
+        btn->hold_fired = false;
       }
     }
   }
 
-  /* Evaluate the sequence once the button has been idle long enough that no
-   * further click is coming. Time only accrues while released. */
-  if (btn->armed && btn->click_count > 0 && !btn->stable_pressed) {
-    btn->gap_ms += BTN_POLL_MS;
-    if (btn->gap_ms >= BTN_MULTI_GAP_MS) {
-      const uint8_t clicks = btn->click_count;
-      btn->click_count = 0;
-      btn->gap_ms = 0;
-      /* While the test is running, any click on this button is STOP — so a
-       * hurried second press cannot fire demo or wipe Wi-Fi. */
-      if (nino_battery_endurance_is_active()) {
-        ESP_LOGI(TAG, "GPIO%d (%s) %u press during test → STOP",
-                 (int)btn->gpio, btn->name, (unsigned)clicks);
-        post_evt(BTN_EVT_SOAK);
-      } else if (clicks >= BTN_CLICKS_SETUP) {
-        ESP_LOGI(TAG, "GPIO%d (%s) triple press → setup + BLE", (int)btn->gpio,
-                 btn->name);
-        post_evt(BTN_EVT_SETUP);
-      } else if (clicks == BTN_CLICKS_DEMO) {
-        ESP_LOGI(TAG, "GPIO%d (%s) double press → demo audio", (int)btn->gpio,
-                 btn->name);
-        post_evt(BTN_EVT_DEMO);
-      } else if (clicks == BTN_CLICKS_SOAK) {
-        ESP_LOGI(TAG, "GPIO%d (%s) single press → hardware test START",
-                 (int)btn->gpio, btn->name);
-        post_evt(BTN_EVT_SOAK);
-      } else {
-        ESP_LOGI(TAG, "GPIO%d (%s) %u press ignored (need 1=hwtest, 2=demo, 3=setup)",
-                 (int)btn->gpio, btn->name, (unsigned)clicks);
-      }
+  if (btn->stable_pressed && btn->armed && btn->gpio == BTN_SETUP_GPIO) {
+    btn->held_ms += BTN_POLL_MS;
+    if (!btn->hold_fired && btn->held_ms >= BTN_DEMO_HOLD_MS) {
+      btn->hold_fired = true;
+      ESP_LOGI(TAG, "GPIO%d held %u ms → Demo", (int)btn->gpio,
+               (unsigned)btn->held_ms);
+      post_evt(BTN_EVT_DEMO);
     }
   }
 }
@@ -254,28 +246,28 @@ static void btn_update(btn_state_t *btn) {
 static void push_buttons_task(void *arg) {
   (void)arg;
 
-  btn_state_t demo = {
-      .gpio = BTN_DEMO_GPIO,
-      .name = "hwtest/demo/setup",
+  btn_state_t setup = {
+      .gpio = BTN_SETUP_GPIO,
+      .name = "setup/demo",
       .stable_pressed = false,
       .armed = true,
+      .hold_fired = false,
       .debounce_ms = 0,
-      .click_count = 0,
-      .gap_ms = 0,
+      .held_ms = 0,
   };
   btn_state_t mute = {
       .gpio = BTN_MUTE_GPIO,
-      .name = "mute",
+      .name = "aux-mute",
       .stable_pressed = false,
       .armed = true,
+      .hold_fired = false,
       .debounce_ms = 0,
-      .click_count = 0,
-      .gap_ms = 0,
+      .held_ms = 0,
   };
 
-  if (gpio_get_level(BTN_DEMO_GPIO) == BTN_ACTIVE_LEVEL) {
-    demo.stable_pressed = true;
-    demo.armed = false;
+  if (gpio_get_level(BTN_SETUP_GPIO) == BTN_ACTIVE_LEVEL) {
+    setup.stable_pressed = true;
+    setup.armed = false;
   }
   if (gpio_get_level(BTN_MUTE_GPIO) == BTN_ACTIVE_LEVEL) {
     mute.stable_pressed = true;
@@ -283,21 +275,47 @@ static void push_buttons_task(void *arg) {
   }
 
   ESP_LOGI(TAG,
-           "Buttons ready: GPIO%d single=hwtest double=Demo triple=Wi-Fi setup; "
-           "GPIO%d mute (level48=%d level47=%d, 0=pressed)",
-           (int)BTN_DEMO_GPIO, (int)BTN_MUTE_GPIO, gpio_get_level(BTN_DEMO_GPIO),
+           "Buttons ready: GPIO%d short=Wi-Fi setup hold5s=Demo; "
+           "GPIO%d Aux-in mute (level48=%d level47=%d, 0=pressed)",
+           (int)BTN_SETUP_GPIO, (int)BTN_MUTE_GPIO, gpio_get_level(BTN_SETUP_GPIO),
            gpio_get_level(BTN_MUTE_GPIO));
 
+  int last46 = gpio_get_level(GPIO_NUM_46);
+  int last53 = gpio_get_level(GPIO_NUM_53);
+  uint32_t hunt_ms = 0;
+
   while (true) {
-    btn_update(&demo);
+    btn_update(&setup);
     btn_update(&mute);
+    const int lv46 = gpio_get_level(GPIO_NUM_46);
+    const int lv53 = gpio_get_level(GPIO_NUM_53);
+    if (lv46 != last46) {
+      ESP_LOGW(TAG, "GPIO46 changed %d -> %d (not the mute pin; J1 pin 36)", last46,
+               lv46);
+      last46 = lv46;
+    }
+    if (lv53 != last53) {
+      ESP_LOGW(TAG, "GPIO53 changed %d -> %d (speaker PA — do not use for mute)",
+               last53, lv53);
+      last53 = lv53;
+    }
+    hunt_ms += BTN_POLL_MS;
+    if (hunt_ms >= 2000) {
+      hunt_ms = 0;
+      ESP_LOGI(TAG, "btn levels gpio48=%d gpio47=%d gpio46=%d gpio53=%d mute=%d",
+               gpio_get_level(BTN_SETUP_GPIO), gpio_get_level(BTN_MUTE_GPIO),
+               gpio_get_level(GPIO_NUM_46), gpio_get_level(GPIO_NUM_53),
+               nino_voice_assist_aux_is_muted() ? 1 : 0);
+    }
     vTaskDelay(pdMS_TO_TICKS(BTN_POLL_MS));
   }
 }
 
 esp_err_t nino_push_buttons_start(void) {
+  gpio_reset_pin(BTN_SETUP_GPIO);
+  gpio_reset_pin(BTN_MUTE_GPIO);
   const gpio_config_t io = {
-      .pin_bit_mask = (1ULL << BTN_DEMO_GPIO) | (1ULL << BTN_MUTE_GPIO),
+      .pin_bit_mask = (1ULL << BTN_SETUP_GPIO) | (1ULL << BTN_MUTE_GPIO),
       .mode = GPIO_MODE_INPUT,
       .pull_up_en = GPIO_PULLUP_ENABLE,
       .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -307,6 +325,19 @@ esp_err_t nino_push_buttons_start(void) {
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "gpio_config failed: %s", esp_err_to_name(err));
     return err;
+  }
+  (void)gpio_set_pull_mode(BTN_MUTE_GPIO, GPIO_PULLUP_ONLY);
+  (void)gpio_set_intr_type(BTN_MUTE_GPIO, GPIO_INTR_NEGEDGE);
+  err = gpio_install_isr_service(0);
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    ESP_LOGW(TAG, "gpio_install_isr_service: %s", esp_err_to_name(err));
+  } else {
+    err = gpio_isr_handler_add(BTN_MUTE_GPIO, mute_isr, NULL);
+    if (err != ESP_OK) {
+      ESP_LOGW(TAG, "GPIO47 ISR not installed: %s", esp_err_to_name(err));
+    } else {
+      ESP_LOGI(TAG, "GPIO47 mute ISR on falling edge");
+    }
   }
 
   s_btn_evt_q = xQueueCreate(4, sizeof(btn_evt_t));

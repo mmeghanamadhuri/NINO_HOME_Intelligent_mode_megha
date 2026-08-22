@@ -305,6 +305,7 @@ static int gatt_prov_access(uint16_t conn_handle, uint16_t attr_handle,
 
   const ble_uuid_t *uuid = NULL;
   if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+    wifi_config_note_setup_activity();
     uuid = ctxt->chr->uuid;
   } else if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
     uuid = ctxt->chr->uuid;

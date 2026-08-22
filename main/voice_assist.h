@@ -65,6 +65,14 @@ void nino_voice_assist_set_next_prompt_ack_chime(bool play_chime);
 /** True while a voice query (capture or WS job) is in flight. */
 bool nino_voice_assist_query_is_busy(void);
 
+/** GPIO47: ignore Sirena Aux-in and hold GPIO5 so Sirena closes its mics.
+ *  Speaker is unchanged. Solid red LED while muted. */
+void nino_voice_assist_set_aux_muted(bool muted);
+bool nino_voice_assist_aux_is_muted(void);
+
+/** Clear speaker-bleed ignore and resume Aux-in energy detect immediately. */
+void nino_voice_assist_aux_listen_now(void);
+
 #ifdef __cplusplus
 }
 #endif

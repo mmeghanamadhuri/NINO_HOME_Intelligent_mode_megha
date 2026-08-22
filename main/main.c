@@ -102,6 +102,12 @@ static bool s_audio_queue_ready = false;
 static volatile bool s_wifi_connected_chime_task_running = false;
 static bool s_boot_unprovisioned = false;
 static volatile bool s_provisioned_welcome_scheduled = false;
+static char s_setup_prev_ssid[WIFI_CONFIG_STA_SSID_MAX];
+static char s_setup_prev_pass[WIFI_CONFIG_STA_PASS_MAX];
+static volatile bool s_setup_waiting;
+static volatile int64_t s_setup_deadline_us;
+static TaskHandle_t s_setup_timeout_task;
+#define WIFI_SETUP_IDLE_TIMEOUT_US (120LL * 1000 * 1000)
 static bool s_boot_greeting_done = false;
 static bool s_mdns_started = false;
 
@@ -1194,6 +1200,7 @@ esp_err_t wifi_config_set_sta_credentials(const char *ssid, const char *pass) {
   /* New network: allow the connected clip once after this attempt gets an IP. */
   s_wifi_connected_chime_played = false;
   s_wifi_connected_chime_pending = true;
+  wifi_config_note_setup_activity();
   return ESP_OK;
 }
 
@@ -1201,8 +1208,58 @@ bool wifi_config_sta_connected(void) { return s_sta_connected; }
 
 bool wifi_config_is_provisioned(void) { return s_sta_ssid[0] != '\0'; }
 
+void wifi_config_note_setup_activity(void) {
+  if (s_setup_waiting) {
+    ESP_LOGI(TAG, "Wi-Fi setup: app activity — 2 min timeout cancelled");
+  }
+  s_setup_waiting = false;
+}
+
+static void setup_timeout_task(void *arg) {
+  (void)arg;
+  while (s_setup_waiting && esp_timer_get_time() < s_setup_deadline_us) {
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+  if (s_setup_waiting) {
+    s_setup_waiting = false;
+    if (s_setup_prev_ssid[0] != '\0') {
+      ESP_LOGW(TAG, "Wi-Fi setup timed out — restoring %s", s_setup_prev_ssid);
+      strncpy(s_sta_ssid, s_setup_prev_ssid, sizeof(s_sta_ssid) - 1);
+      s_sta_ssid[sizeof(s_sta_ssid) - 1] = '\0';
+      strncpy(s_sta_pass, s_setup_prev_pass, sizeof(s_sta_pass) - 1);
+      s_sta_pass[sizeof(s_sta_pass) - 1] = '\0';
+      s_boot_unprovisioned = false;
+      (void)wifi_config_sta_connect(WIFI_MODE_STA);
+    } else {
+      ESP_LOGW(TAG, "Wi-Fi setup timed out — no previous network to restore");
+    }
+  }
+  s_setup_timeout_task = NULL;
+  vTaskDelete(NULL);
+}
+
+static void setup_timeout_arm(void) {
+  s_setup_waiting = true;
+  s_setup_deadline_us = esp_timer_get_time() + WIFI_SETUP_IDLE_TIMEOUT_US;
+  if (s_setup_timeout_task == NULL) {
+    if (xTaskCreate(setup_timeout_task, "wifi_setup_to", 3072, NULL, 4,
+                    &s_setup_timeout_task) != pdPASS) {
+      s_setup_timeout_task = NULL;
+      ESP_LOGW(TAG, "Wi-Fi setup timeout task not started");
+    }
+  }
+  ESP_LOGI(TAG, "Wi-Fi setup: 2 min timeout if the app does not continue");
+}
+
 esp_err_t wifi_config_enter_setup_mode(void) {
   ESP_LOGI(TAG, "Entering setup mode — erasing Wi-Fi credentials");
+
+  if (s_sta_ssid[0] != '\0') {
+    strncpy(s_setup_prev_ssid, s_sta_ssid, sizeof(s_setup_prev_ssid) - 1);
+    s_setup_prev_ssid[sizeof(s_setup_prev_ssid) - 1] = '\0';
+    strncpy(s_setup_prev_pass, s_sta_pass, sizeof(s_setup_prev_pass) - 1);
+    s_setup_prev_pass[sizeof(s_setup_prev_pass) - 1] = '\0';
+  }
 
   memset(s_sta_ssid, 0, sizeof(s_sta_ssid));
   memset(s_sta_pass, 0, sizeof(s_sta_pass));
@@ -1245,6 +1302,7 @@ esp_err_t wifi_config_enter_setup_mode(void) {
   }
 
   ESP_LOGI(TAG, "Setup mode active — BLE advertising for provisioning");
+  setup_timeout_arm();
   return ESP_OK;
 }
 
@@ -1364,6 +1422,7 @@ static void device_cli_register(void);
 static void servo_cli_register(void);
 static void track_cli_register(void);
 static void speaker_cli_register(void);
+static void aux_cli_register(void);
 static void hstop_cli_register(void);
 static void dinner_cli_register(void);
 static void bday_cli_register(void);
@@ -1416,6 +1475,7 @@ static void console_init(void) {
   servo_cli_register();
   track_cli_register();
   speaker_cli_register();
+  aux_cli_register();
   nino_battery_adc_cli_register();
   eye_cli_register();
   nino_rgb_led_cli_register();
@@ -1635,6 +1695,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     wifi_event_ap_staconnected_t *event =
         (wifi_event_ap_staconnected_t *)event_data;
     ESP_LOGI(TAG, "AP: Device Connected AID: %d", event->aid);
+    wifi_config_note_setup_activity();
   }
 
   if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED) {
@@ -1672,6 +1733,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     schedule_wifi_network_report();
     schedule_wifi_connected_chime();
     schedule_provisioned_welcome();
+    wifi_config_note_setup_activity();
   }
 }
 
@@ -3783,6 +3845,43 @@ static void speaker_cli_register(void) {
       .help = "speaker volume [0-100] | speaker mute [on|off|toggle]",
       .hint = NULL,
       .func = &cmd_speaker,
+      .argtable = NULL,
+  };
+  ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+}
+
+static int cmd_aux(int argc, char **argv) {
+  if (argc >= 2 && strcmp(argv[1], "mute") == 0) {
+    if (argc >= 3) {
+      if (strcmp(argv[2], "off") == 0 || strcmp(argv[2], "0") == 0) {
+        nino_voice_assist_set_aux_muted(false);
+      } else if (strcmp(argv[2], "on") == 0 || strcmp(argv[2], "1") == 0) {
+        nino_voice_assist_set_aux_muted(true);
+      } else if (strcmp(argv[2], "toggle") == 0) {
+        nino_push_buttons_trigger_mute();
+      } else {
+        printf("Usage: aux mute [on|off|toggle]\n");
+        return 1;
+      }
+    } else {
+      nino_push_buttons_trigger_mute();
+    }
+    printf("aux-in %s (LED %s)\n",
+           nino_voice_assist_aux_is_muted() ? "MUTED" : "listening",
+           nino_voice_assist_aux_is_muted() ? "solid red" : "off");
+    return 0;
+  }
+  printf("aux-in mute: %s\n", nino_voice_assist_aux_is_muted() ? "on" : "off");
+  printf("Usage: aux mute [on|off|toggle]\n");
+  return 0;
+}
+
+static void aux_cli_register(void) {
+  const esp_console_cmd_t cmd = {
+      .command = "aux",
+      .help = "aux mute [on|off|toggle]  — mic / Aux-in mute (solid red LED)",
+      .hint = NULL,
+      .func = &cmd_aux,
       .argtable = NULL,
   };
   ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));

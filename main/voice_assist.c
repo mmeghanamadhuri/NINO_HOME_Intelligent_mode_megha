@@ -96,6 +96,7 @@ static volatile bool s_query_busy;
 static volatile bool s_listen_loop_started;
 static volatile bool s_aux_listen_running;
 static volatile bool s_force_session;
+static volatile bool s_aux_muted;
 static uint32_t s_aux_noise_floor = AUX_NOISE_FLOOR_DEFAULT;
 static uint32_t s_voice_turn;
 static bool s_voice_turn_ready;
@@ -167,7 +168,12 @@ static void uri_append_u32(char *uri, size_t uri_sz, const char *key, uint32_t v
   uri_append_query(uri, uri_sz, key, buf);
 }
 
+static bool s_sirena_gpio_ready;
+
 static void sirena_gpio_init(void) {
+  if (s_sirena_gpio_ready) {
+    return;
+  }
   gpio_config_t io = {
       .pin_bit_mask = 1ULL << SIRENA_MIC_CLOSE_GPIO,
       .mode = GPIO_MODE_OUTPUT,
@@ -176,18 +182,25 @@ static void sirena_gpio_init(void) {
       .intr_type = GPIO_INTR_DISABLE,
   };
   gpio_config(&io);
-  gpio_set_level(SIRENA_MIC_CLOSE_GPIO, 0);
+  gpio_set_level(SIRENA_MIC_CLOSE_GPIO, s_aux_muted ? 1 : 0);
+  s_sirena_gpio_ready = true;
 }
 
 static void sirena_mics_open(void) {
+  sirena_gpio_init();
+  if (s_aux_muted) {
+    gpio_set_level(SIRENA_MIC_CLOSE_GPIO, 1);
+    return;
+  }
   gpio_set_level(SIRENA_MIC_CLOSE_GPIO, 0);
 }
 
 static void sirena_mics_close_pulse(void) {
+  sirena_gpio_init();
   gpio_set_level(SIRENA_MIC_CLOSE_GPIO, 1);
   voice_log(ESP_LOG_INFO, s_voice_turn, "GPIO5", "high — Sirena close mics");
   vTaskDelay(pdMS_TO_TICKS(SIRENA_MIC_CLOSE_HOLD_MS));
-  gpio_set_level(SIRENA_MIC_CLOSE_GPIO, 0);
+  gpio_set_level(SIRENA_MIC_CLOSE_GPIO, s_aux_muted ? 1 : 0);
 }
 
 static void make_session_id(char *out, size_t n) {
@@ -697,6 +710,8 @@ static uint32_t wav_peak_frame_energy(const uint8_t *wav, size_t len) {
   return peak;
 }
 
+static void idle_ring_reset(void);
+
 static void aux_update_noise_floor(uint32_t energy) {
   s_aux_noise_floor = (s_aux_noise_floor * 31U + energy) / 32U;
   if (s_aux_noise_floor < 1U) {
@@ -704,7 +719,35 @@ static void aux_update_noise_floor(uint32_t energy) {
   }
 }
 
+void nino_voice_assist_set_aux_muted(bool muted) {
+  s_aux_muted = muted;
+  sirena_gpio_init();
+  gpio_set_level(SIRENA_MIC_CLOSE_GPIO, muted ? 1 : 0);
+  if (muted) {
+    idle_ring_reset();
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_MUTE);
+    voice_log(ESP_LOG_INFO, s_voice_turn, "MUTE",
+              "Aux-in ignored gpio5=high led=red");
+  } else {
+    s_aux_ignore_until_us = 0;
+    idle_ring_reset();
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_IDLE);
+    voice_log(ESP_LOG_INFO, s_voice_turn, "MUTE",
+              "Aux-in listening gpio5=low led=off");
+  }
+}
+
+bool nino_voice_assist_aux_is_muted(void) { return s_aux_muted; }
+
+void nino_voice_assist_aux_listen_now(void) {
+  s_aux_ignore_until_us = 0;
+  idle_ring_reset();
+}
+
 static void aux_ignore_energy_for_ms(uint32_t ms) {
+  if (s_aux_muted) {
+    return;
+  }
   const int64_t until = esp_timer_get_time() + (int64_t)ms * 1000LL;
   if (until > s_aux_ignore_until_us) {
     s_aux_ignore_until_us = until;
@@ -767,6 +810,21 @@ static bool wait_aux_activity(void) {
       const uint32_t turn = voice_begin_turn();
       voice_log(ESP_LOG_INFO, turn, "TRIGGER", "reason=cli stream session led=off");
       return true;
+    }
+    if (s_aux_muted) {
+      idle_ring_reset();
+      speech_streak = 0;
+      music_listen_ms = 0;
+      esp_err_t rr = nino_mic_read(frame, AUX_DETECT_SAMPLES);
+      if (rr != ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+      }
+      status_ms += AUX_DETECT_FRAME_MS;
+      if (status_ms >= AUX_STATUS_LOG_MS) {
+        voice_log(ESP_LOG_INFO, s_voice_turn + 1U, "IDLE", "hold=aux-mute led=red");
+        status_ms = 0;
+      }
+      continue;
     }
     if (s_query_busy) {
       vTaskDelay(pdMS_TO_TICKS(20));
@@ -1132,11 +1190,15 @@ done:
 static bool stream_aux_pcm(nino_voice_ws_session_t *ws, uint32_t turn,
                            const int16_t *preroll, size_t preroll_samples,
                            bool listen_led) {
+  if (s_aux_muted) {
+    voice_log(ESP_LOG_INFO, turn, "STREAM", "skip — Aux-in muted");
+    return true;
+  }
   if (listen_led) {
     /* Open Aux and dump leftover speaker energy so the first spoken word is
      * not clipped. LED goes listen only once PCM is about to flow. */
     nino_mic_warmup(AUX_LISTEN_WARMUP_MS);
-    s_aux_ignore_until_us = 0;
+    nino_voice_assist_aux_listen_now();
     (void)nino_voice_ws_session_send_text(ws, "{\"type\":\"listen\"}");
     nino_eye_listening();
     (void)nino_rgb_led_show(NINO_RGB_SHOW_LISTEN);
@@ -1167,6 +1229,10 @@ static bool stream_aux_pcm(nino_voice_ws_session_t *ws, uint32_t turn,
       (uint32_t)((preroll_samples * 1000U) / (uint32_t)VOICE_MIC_RATE);
   bool tx_failed = false;
   while (!nino_voice_ws_session_should_pause(ws)) {
+    if (s_aux_muted) {
+      voice_log(ESP_LOG_INFO, turn, "STREAM", "stop — Aux-in muted");
+      break;
+    }
     if (nino_music_blocks_mic()) {
       vTaskDelay(pdMS_TO_TICKS(20));
       continue;
@@ -1255,6 +1321,10 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
   bool wake_confirmed = false;
   bool sent_preroll = false;
   while (!wake_confirmed && nino_voice_ws_session_is_open(ws)) {
+    if (s_aux_muted) {
+      voice_log(ESP_LOG_INFO, s_voice_turn, "MUTE", "wake abandoned");
+      goto session_done;
+    }
     nino_voice_ws_session_clear_reply(ws);
     const int16_t *clip = sent_preroll ? NULL : preroll;
     const size_t clip_n = sent_preroll ? 0 : preroll_samples;
@@ -1332,6 +1402,10 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
   bool first_turn = true;
 
   while (!session_end && nino_voice_ws_session_is_open(ws)) {
+    if (s_aux_muted) {
+      voice_log(ESP_LOG_INFO, s_voice_turn, "MUTE", "session abandoned");
+      break;
+    }
     const uint32_t turn = first_turn ? s_voice_turn : voice_begin_turn();
     first_turn = false;
     nino_voice_ws_session_begin_turn(ws);
@@ -1398,12 +1472,20 @@ session_done:
   s_query_busy = false;
   nino_music_pause_for_speech(false);
   nino_eye_idle();
-  (void)nino_rgb_led_show(NINO_RGB_SHOW_IDLE);
+  if (s_aux_muted) {
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_MUTE);
+  } else {
+    (void)nino_rgb_led_show(NINO_RGB_SHOW_IDLE);
+  }
   if (ws != NULL) {
     nino_voice_ws_session_close(ws);
   }
-  /* GPIO 5 high after goodbye TTS or a false-wake reject — not on WS fail. */
-  if (session_end) {
+  /* GPIO 5 high after goodbye TTS, mic mute, or a false-wake reject. */
+  if (s_aux_muted) {
+    gpio_set_level(SIRENA_MIC_CLOSE_GPIO, 1);
+    voice_log(ESP_LOG_INFO, s_voice_turn, "GPIO5",
+              "high — Sirena mics closed (aux mute)");
+  } else if (session_end) {
     sirena_mics_close_pulse();
   } else {
     gpio_set_level(SIRENA_MIC_CLOSE_GPIO, 0);
@@ -1438,7 +1520,14 @@ static void aux_listen_task(void *arg) {
       vTaskDelay(pdMS_TO_TICKS(500));
       continue;
     }
+    if (s_aux_muted) {
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
     if (!wait_aux_activity()) {
+      continue;
+    }
+    if (s_aux_muted) {
       continue;
     }
     if (s_query_busy) {

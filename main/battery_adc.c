@@ -16,6 +16,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "rgb_led.h"
+#include "voice_assist.h"
 
 static const char *TAG = "battery_adc";
 
@@ -366,7 +367,7 @@ static void enter_low_battery(int32_t battery_mv) {
 static void exit_low_battery(int32_t battery_mv, const char *why) {
   s_low_alert = false;
   nino_audio_refresh_mute();
-  if (nino_audio_is_muted()) {
+  if (nino_voice_assist_aux_is_muted()) {
     (void)nino_rgb_led_show(NINO_RGB_SHOW_MUTE);
   } else {
     (void)nino_rgb_led_show(NINO_RGB_SHOW_IDLE);

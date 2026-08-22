@@ -14,6 +14,7 @@
 #include "audio_playback.h"
 #include "battery_adc.h"
 #include "battery_endurance.h"
+#include "voice_assist.h"
 
 static const char *TAG = "rgb_led";
 
@@ -195,14 +196,16 @@ nino_rgb_show_t nino_rgb_led_current(void) { return s_show; }
 
 esp_err_t nino_rgb_led_show(nino_rgb_show_t show)
 {
-  if (nino_battery_endurance_owns_actuators() && !nino_battery_endurance_is_self()) {
+  const bool mute_or_batt =
+      (show == NINO_RGB_SHOW_MUTE || show == NINO_RGB_SHOW_BATTERY);
+  if (!mute_or_batt && nino_battery_endurance_owns_actuators() &&
+      !nino_battery_endurance_is_self()) {
     return ESP_OK;
   }
   if (nino_battery_low_alert_active() && show != NINO_RGB_SHOW_BATTERY) {
     return ESP_OK;
   }
-  if (nino_audio_is_muted() && show != NINO_RGB_SHOW_MUTE &&
-      show != NINO_RGB_SHOW_BATTERY) {
+  if (!mute_or_batt && nino_voice_assist_aux_is_muted()) {
     return ESP_OK;
   }
   if (s_blink_timer == NULL) {
@@ -416,7 +419,7 @@ static void print_help(void) {
   printf("      tts          solid green     (voice reply playing)\n");
   printf("      idle         off\n");
   printf("      battery      blink red 400 ms (low battery)\n");
-  printf("      mute         solid red        (speaker muted)\n");
+      printf("      mute         solid red        (Aux-in / mic muted)\n");
   printf("      ota          solid purple     (firmware update)\n");
   printf("      error        solid red       (capture/WS/error)\n");
   printf("      wifi-wait    blink white     (boot / Wi-Fi connecting)\n");
