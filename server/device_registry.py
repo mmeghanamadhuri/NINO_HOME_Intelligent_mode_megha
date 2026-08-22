@@ -14,6 +14,12 @@ from pathlib import Path
 
 from user_devices import format_device_mac, normalize_device_mac
 
+try:
+    from camera import effective_camera_rotation
+except ImportError:
+    def effective_camera_rotation(device_rotation: str | None = None) -> str:  # type: ignore[misc]
+        return str(device_rotation or "none").strip() or "none"
+
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -231,7 +237,11 @@ class DeviceRegistry:
             camera_url=discovered.effective_camera_url(),
             play_wav_url=discovered.effective_play_wav_url(),
             base_url=discovered.effective_base_url(),
-            camera_rotation=existing.camera_rotation if existing else "none",
+            camera_rotation=(
+                effective_camera_rotation(existing.camera_rotation)
+                if existing
+                else effective_camera_rotation(None)
+            ),
             latitude=existing.latitude if existing else None,
             longitude=existing.longitude if existing else None,
             location_name=existing.location_name if existing else "",
@@ -441,10 +451,9 @@ class DeviceRegistry:
                     camera_url=str(item.get("camera_url") or "").strip(),
                     play_wav_url=str(item.get("play_wav_url") or "").strip(),
                     base_url=str(item.get("base_url") or "").strip(),
-                    camera_rotation=str(
-                        item.get("camera_rotation") or "none"
-                    ).strip()
-                    or "none",
+                    camera_rotation=effective_camera_rotation(
+                        str(item.get("camera_rotation") or "").strip() or None
+                    ),
                     latitude=_parse_coordinate(item.get("latitude"), -90.0, 90.0),
                     longitude=_parse_coordinate(item.get("longitude"), -180.0, 180.0),
                     location_name=_parse_location_name(item.get("location_name")),
@@ -483,7 +492,7 @@ class DeviceRegistry:
                 camera_url=camera,
                 play_wav_url=play,
                 base_url=base,
-                camera_rotation="none",
+                camera_rotation=effective_camera_rotation(None),
                 latitude=None,
                 longitude=None,
                 location_name="",

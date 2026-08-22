@@ -61,6 +61,15 @@ def normalize_camera_rotation(raw: str | None) -> str | None:
     return None
 
 
+def effective_camera_rotation(device_rotation: str | None = None) -> str:
+    """Per-device rotation, falling back to CAMERA_ROTATION env when unset/none."""
+    normalized = normalize_camera_rotation(device_rotation)
+    if normalized and normalized != "none":
+        return normalized
+    env = normalize_camera_rotation(os.getenv("CAMERA_ROTATION", ""))
+    return env if env else "none"
+
+
 def _rotation_label(rotate_code: int | None) -> str:
     if rotate_code == cv2.ROTATE_90_CLOCKWISE:
         return "cw90"
@@ -133,12 +142,7 @@ class CameraStream:
     def start(self, source: str | None = None) -> None:
         if source:
             self.source = source
-        rotation = (
-            self._rotation_setting
-            if self._rotation_setting is not None
-            else os.getenv("CAMERA_ROTATION", "")
-        )
-        self._rotation_code = parse_camera_rotation(rotation)
+        self._sync_rotation_code()
 
         if self._thread and self._thread.is_alive():
             # A prior stop() may still be draining (e.g. blocked in urlopen).
@@ -168,12 +172,17 @@ class CameraStream:
         self.stop()
         self.start(source)
 
+    def _sync_rotation_code(self) -> None:
+        self._rotation_code = parse_camera_rotation(
+            effective_camera_rotation(self._rotation_setting)
+        )
+
     def set_rotation(self, rotation: str) -> str:
         normalized = normalize_camera_rotation(rotation)
         if normalized is None:
             raise ValueError(f"Unsupported camera rotation: {rotation!r}")
         self._rotation_setting = normalized
-        self._rotation_code = parse_camera_rotation(normalized)
+        self._sync_rotation_code()
         return normalized
 
     def _mark_connected(self, connected: bool, source: object = "", *, error: str = "") -> None:

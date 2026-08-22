@@ -82,6 +82,16 @@ def test_transcript_without_ok_nino_is_not_rejected() -> None:
     assert found is False
     assert command == "please tell john hello later"
 
+    found, command, phrase = extract_wake_and_command("Okay, hello.")
+    assert found is True
+    assert phrase == "okay"
+
+    found, command, phrase = extract_wake_and_command("Okay, no hello.")
+    assert found is True
+
+    found, command, phrase = extract_wake_and_command("Okay, now.")
+    assert found is True
+
 
 def test_speech_without_wake_phrase_is_answered() -> None:
     os.environ["VOICE_MIN_ENERGY"] = "5"

@@ -1669,12 +1669,25 @@ def _device_id_from_websocket(websocket: WebSocket) -> str:
     raw = (websocket.query_params.get("device_id") or "").strip()
     if not raw:
         raw = (websocket.headers.get("x-nino-device-id") or "").strip()
-    mac = normalize_device_mac(raw)
-    if mac:
-        return resolve_device_id(mac)
     host = ""
     if websocket.client is not None:
         host = str(getattr(websocket.client, "host", "") or "")
+    mac = normalize_device_mac(raw)
+    if mac:
+        resolved = resolve_device_id(mac)
+        if resolved:
+            return resolved
+        # P4 firmware may send eFuse/base MAC while discovery registers Wi-Fi MAC.
+        mapped = get_device_registry().find_device_id_by_host(host)
+        if mapped:
+            logger.info(
+                "Voice WS remapped unknown mac=%s client=%s -> %s",
+                mac,
+                _ws_client_label(websocket),
+                mapped,
+            )
+            return mapped
+        return ""
     mapped = get_device_registry().find_device_id_by_host(host)
     created = False
     if not mapped:

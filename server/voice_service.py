@@ -440,6 +440,20 @@ _WAKE_HELLO_RE = re.compile(
     r"(?P<phrase>hell+o|hallo|hullo)(?:\s+there)?\b",
     re.IGNORECASE,
 )
+# Whisper often drops "Nino" on wake clips: "ok nino hello" -> "okay hello" / "okay no hello".
+_WAKE_OKAY_HELLO_RE = re.compile(
+    r"^(?:(?:um+|uh+|er+|ah+|mm+)\s+){0,3}"
+    r"(?P<phrase>ok(?:ay)?)\s+"
+    r"(?:(?:no|now|know|nino|nano|neno|nina|nenu|neeno|knee\s*no|you know)\s+)?"
+    r"hell+o\b",
+    re.IGNORECASE,
+)
+# "ok nino" alone is often heard as "okay now" / "okay no".
+_WAKE_OKAY_NINO_MISHEAR_RE = re.compile(
+    r"^(?:(?:um+|uh+|er+|ah+|mm+)\s+){0,3}"
+    r"(?P<phrase>ok(?:ay)?)\s+(?:no|now|know)\b",
+    re.IGNORECASE,
+)
 _WAKE_NAME_RE = re.compile(
     r"\b(?P<phrase>nino|nano|neno|nina)\b",
     re.IGNORECASE,
@@ -467,6 +481,10 @@ def extract_wake_and_command(text: str) -> tuple[bool, str, str]:
     match = _WAKE_RE.search(norm)
     if match is None:
         match = _WAKE_HELLO_RE.search(norm)
+    if match is None:
+        match = _WAKE_OKAY_HELLO_RE.search(norm)
+    if match is None:
+        match = _WAKE_OKAY_NINO_MISHEAR_RE.search(norm)
     if match is None:
         # "nino" alone in the first few words still counts as the wake name.
         match = _WAKE_NAME_RE.search(norm)
@@ -1876,14 +1894,17 @@ def _resample_linear(samples: np.ndarray, src_rate: int, dst_rate: int) -> np.nd
     return np.interp(x_new, x_old, samples).astype(np.float32)
 
 
-def _transcribe_whisper(wav_bytes: bytes) -> str:
+def _transcribe_whisper(wav_bytes: bytes, *, vad_filter: bool | None = None) -> str:
     model = _ensure_whisper()
     audio = _wav_bytes_to_float_mono(wav_bytes)
+    if vad_filter is None:
+        raw = os.environ.get("WHISPER_VAD_FILTER", "1").strip().lower()
+        vad_filter = raw not in {"0", "false", "no", "off"}
     segments, _ = model.transcribe(
         audio,
         language=SETTINGS.whisper_language,
         beam_size=1,
-        vad_filter=True,
+        vad_filter=vad_filter,
         vad_parameters={"min_silence_duration_ms": 250},
         condition_on_previous_text=False,
         log_progress=False,
@@ -1972,7 +1993,9 @@ def _transcribe_elevenlabs(wav_bytes: bytes) -> str:
     return text
 
 
-def transcribe_wav(wav_bytes: bytes) -> tuple[str, str]:
+def transcribe_wav(
+    wav_bytes: bytes, *, vad_filter: bool | None = None
+) -> tuple[str, str]:
     """Transcribe device WAV. Returns (text, engine_used)."""
     audio_s = _wav_seconds(wav_bytes)
     pipeline_log(
@@ -2029,7 +2052,7 @@ def transcribe_wav(wav_bytes: bytes) -> tuple[str, str]:
                     stage_s=time.perf_counter() - t0,
                 )
                 logger.warning("ElevenLabs STT failed (%s); falling back to Whisper.", exc)
-        text = _transcribe_whisper(wav_bytes)
+        text = _transcribe_whisper(wav_bytes, vad_filter=vad_filter)
         engine = "whisper"
         pipeline_log(
             "ASR",
@@ -2452,7 +2475,9 @@ def process_voice_wav(
             },
         )
 
-    user_text, stt_engine = transcribe_wav(wav_bytes)
+    user_text, stt_engine = transcribe_wav(
+        wav_bytes, vad_filter=False if session == "wake" else None
+    )
     t_stt = time.perf_counter()
     reply_path = "llm"
     log_nino_voice(
