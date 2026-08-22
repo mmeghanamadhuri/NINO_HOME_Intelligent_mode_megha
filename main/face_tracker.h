@@ -72,6 +72,15 @@ void nino_face_hunt_wait_idle(uint32_t timeout_ms);
  */
 void nino_face_look_hold_pan(int pan_goal, uint32_t hold_ms);
 
+/** Same as nino_face_look_hold_pan, with an explicit Dynamixel moving speed. */
+void nino_face_look_hold_pan_at_speed(int pan_goal, uint32_t hold_ms, int speed);
+
+/**
+ * Continuous pan to @p pan_goal (no intermediate steps, no camera hold).
+ * Waits until present position is near the goal or @p timeout_ms elapses.
+ */
+void nino_face_pan_glide(int pan_goal, int speed, uint32_t timeout_ms);
+
 #ifdef __cplusplus
 }
 #endif

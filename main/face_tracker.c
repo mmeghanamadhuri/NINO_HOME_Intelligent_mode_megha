@@ -31,8 +31,10 @@ static const char *TAG = "face_tracker";
 #define FACE_HUNT_TASK_STACK 8192
 #define FACE_HUNT_TASK_PRIO 4
 #define FACE_HUNT_DEFAULT_MS 4500
-/** Travel time before the look-scan 5s hold so overlay/YOLO see the pose. */
-#define FACE_LOOK_MOVE_MS 800
+#define FACE_LOOK_ARRIVE_TIMEOUT_MS 4500
+#define FACE_LOOK_ARRIVE_TOLERANCE 18
+/** Faster than face-track so a calibrated wide pan can actually reach the stop. */
+#define FACE_LOOK_POSITION_SPEED 180
 /** Tilt ID1 on this head: higher goal = physical up, lower goal = physical down. */
 #define FACE_TRACK_TILT_UP_LIMIT_DEG 15
 #define FACE_TRACK_TILT_DOWN_LIMIT_DEG 10
@@ -283,8 +285,8 @@ bool nino_face_hunt_for_person(uint32_t timeout_ms, bool skip_if_visible) {
     int tilt;
   } poses[] = {
       {NINO_SERVO_AXIS_CENTER, NINO_SERVO_AXIS_CENTER},
-      {NINO_SERVO_PAN_LEFT, NINO_SERVO_AXIS_CENTER},
-      {NINO_SERVO_PAN_RIGHT, NINO_SERVO_AXIS_CENTER},
+      {nino_servo_pan_left(), NINO_SERVO_AXIS_CENTER},
+      {nino_servo_pan_right(), NINO_SERVO_AXIS_CENTER},
       {NINO_SERVO_AXIS_CENTER, NINO_SERVO_AXIS_CENTER},
       {NINO_SERVO_AXIS_CENTER, NINO_SERVO_TILT_UP},
       {NINO_SERVO_AXIS_CENTER, NINO_SERVO_TILT_DOWN},
@@ -434,17 +436,68 @@ void nino_face_hunt_wait_idle(uint32_t timeout_ms) {
   }
 }
 
-void nino_face_look_hold_pan(int pan_goal, uint32_t hold_ms) {
-  if (nino_servo_dxl_is_ready() && !nino_servo_recplay_is_busy()) {
-    nino_servo_dxl_set_position_speed(FACE_TRACK_POSITION_SPEED);
-    nino_servo_dxl_set_pan_tilt(pan_goal, NINO_SERVO_AXIS_CENTER);
+static bool wait_pan_arrived(int pan_goal, uint32_t timeout_ms) {
+  const TickType_t start = xTaskGetTickCount();
+  const TickType_t timeout = pdMS_TO_TICKS(timeout_ms);
+  while ((xTaskGetTickCount() - start) < timeout) {
+    int present = 0;
+    if (nino_servo_dxl_get_present_position(NINO_SERVO_PAN_ID, &present) == ESP_OK) {
+      int delta = present - pan_goal;
+      if (delta < 0) {
+        delta = -delta;
+      }
+      if (delta <= FACE_LOOK_ARRIVE_TOLERANCE) {
+        return true;
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(40));
   }
-  vTaskDelay(pdMS_TO_TICKS(FACE_LOOK_MOVE_MS));
-  if (hold_ms > 0) {
-    vTaskDelay(pdMS_TO_TICKS(hold_ms));
-  }
+  return false;
+}
+
+static void restore_look_speed(void) {
   if (nino_servo_dxl_is_ready() && !nino_servo_recplay_is_busy()) {
     nino_servo_dxl_set_position_speed(s_enabled ? FACE_TRACK_POSITION_SPEED
                                                 : FACE_TRACK_NORMAL_POSITION_SPEED);
   }
+}
+
+void nino_face_look_hold_pan(int pan_goal, uint32_t hold_ms) {
+  nino_face_look_hold_pan_at_speed(pan_goal, hold_ms, FACE_LOOK_POSITION_SPEED);
+}
+
+void nino_face_look_hold_pan_at_speed(int pan_goal, uint32_t hold_ms, int speed) {
+  if (speed < 1) {
+    speed = 1;
+  }
+  if (nino_servo_dxl_is_ready() && !nino_servo_recplay_is_busy()) {
+    nino_servo_dxl_set_position_speed(speed);
+    nino_servo_dxl_set_pan_tilt(pan_goal, NINO_SERVO_AXIS_CENTER);
+  }
+  if (!wait_pan_arrived(pan_goal, FACE_LOOK_ARRIVE_TIMEOUT_MS)) {
+    ESP_LOGW(TAG, "look pan=%d did not arrive within %d ms", pan_goal,
+             FACE_LOOK_ARRIVE_TIMEOUT_MS);
+  }
+  if (hold_ms > 0) {
+    vTaskDelay(pdMS_TO_TICKS(hold_ms));
+  }
+  restore_look_speed();
+}
+
+void nino_face_pan_glide(int pan_goal, int speed, uint32_t timeout_ms) {
+  if (speed < 1) {
+    speed = 1;
+  }
+  if (timeout_ms < 500) {
+    timeout_ms = 500;
+  }
+  if (nino_servo_dxl_is_ready() && !nino_servo_recplay_is_busy()) {
+    nino_servo_dxl_set_position_speed(speed);
+    nino_servo_dxl_set_pan_tilt(pan_goal, NINO_SERVO_AXIS_CENTER);
+  }
+  if (!wait_pan_arrived(pan_goal, timeout_ms)) {
+    ESP_LOGW(TAG, "glide pan=%d did not arrive within %u ms", pan_goal,
+             (unsigned)timeout_ms);
+  }
+  restore_look_speed();
 }

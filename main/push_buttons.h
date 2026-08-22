@@ -6,7 +6,9 @@
 
 /**
  * GPIO48 push button (active-low, internal pull-up, press to GND):
- *  - single press: start/stop hardware test (motors + camera + RGB + TFT)
+ *  - single press: start/stop hardware test (motors + camera + RGB + TFT).
+ *    The CW/CCW head sweep records the farthest left/right pan and stores
+ *    those two extrema for look-scan / "what do you see?".
  *  - double press: play DEMO_main.wav
  *  - triple press: erase Wi-Fi credentials, enable BLE provisioning,
  *    play NiNO-Home_Wifi.wav

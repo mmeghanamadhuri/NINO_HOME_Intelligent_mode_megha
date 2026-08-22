@@ -2174,7 +2174,10 @@ async def _voice_ws_stream_pipeline(
             logger.exception("stream identity_scan failed device=%s", device_id)
             return await send_skip("identity_scan_error")
 
-    async def send_look_scan(side: str) -> bool:
+    last_look_key = None
+    last_look_side = None
+
+    async def send_look_scan(side: str, force: bool = False) -> bool:
         """Snapshot people+objects at the current pose and speak a report."""
         pose = "left" if str(side or "").strip().lower() == "left" else "right"
         try:
@@ -2184,6 +2187,27 @@ async def _voice_ws_stream_pipeline(
             names, detections = await run_in_threadpool(
                 lambda: _live_visible_scene(device_id, force_objects=True)
             )
+            name_key = tuple(
+                str(n).strip().lower() for n in (names or []) if str(n).strip()
+            )
+            label_key = tuple(
+                sorted(
+                    str(d.get("label") or "").strip().lower()
+                    for d in (detections or [])
+                    if str(d.get("label") or "").strip()
+                )
+            )
+            scene_key = (name_key, label_key)
+            nonlocal last_look_key, last_look_side
+            if not force and last_look_side == pose and last_look_key == scene_key:
+                logger.info(
+                    "stream look_scan skip unchanged side=%s device=%s",
+                    pose,
+                    device_id,
+                )
+                return await send_skip("look_scan_unchanged")
+            last_look_key = scene_key
+            last_look_side = pose
             reply = spoken_scene_report(names, detections, pose=pose)
             wav_out, reply_meta = await run_in_threadpool(
                 lambda: synthesize_look_scan_wav(
@@ -2493,13 +2517,20 @@ async def _voice_ws_stream_pipeline(
                 return await send_identity_refresh()
             if str(payload.get("type") or "").strip().lower() == "look_scan":
                 side = str(payload.get("side") or "").strip().lower()
+                force_raw = payload.get("force")
+                force = force_raw is True or str(force_raw).strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                }
                 logger.info(
-                    "stream look_scan side=%s device=%s session=%s",
+                    "stream look_scan side=%s force=%s device=%s session=%s",
                     side or "right",
+                    force,
                     device_id,
                     session_id,
                 )
-                return await send_look_scan(side)
+                return await send_look_scan(side, force=force)
             return True
         chunk = message.get("bytes")
         if not chunk:

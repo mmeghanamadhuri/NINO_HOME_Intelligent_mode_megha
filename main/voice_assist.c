@@ -65,8 +65,13 @@ static const char *TAG = "voice_ast";
 #define CAMERA_STREAM_WAIT_MS 2500
 #define FACE_HUNT_MS 4500
 #define SESSION_GREET_WAIT_MS 20000
-#define LOOK_SCAN_HOLD_MS 5000
+#define LOOK_SCAN_HOLD_MS 800
 #define LOOK_SCAN_TTS_WAIT_MS 12000
+#define LOOK_SCAN_STEP 40
+#define LOOK_SCAN_MAX_STEPS 8
+#define LOOK_SCAN_STEP_SPEED 40
+#define LOOK_SCAN_RETURN_SPEED 55
+#define LOOK_SCAN_RETURN_TIMEOUT_MS 8000
 /* Scripted nod/shake finishes in ~2 s. Longer clips keep L/R/U/D until WAV ends. */
 #define TALK_MOTION_MIN_WAV_MS 4000
 #define AUX_MUSIC_LISTEN_MS 200
@@ -1038,40 +1043,90 @@ static bool wait_and_play_ws_wav(nino_voice_ws_session_t *ws, uint32_t wait_ms,
   return err == ESP_OK || err == ESP_ERR_TIMEOUT;
 }
 
-/* Scripted left/right look for "what do you see". Completes before listen.
+static int look_scan_fill_steps(int from, int to, int *out, int max_n) {
+  if (out == NULL || max_n <= 0 || from == to) {
+    return 0;
+  }
+  const int dir = (to > from) ? 1 : -1;
+  int absd = to - from;
+  if (absd < 0) {
+    absd = -absd;
+  }
+  int step = LOOK_SCAN_STEP;
+  const int nfit = (absd + step - 1) / step;
+  if (nfit > max_n) {
+    step = (absd + max_n - 1) / max_n;
+    if (step < 1) {
+      step = 1;
+    }
+  }
+  int n = 0;
+  int pos = from + dir * step;
+  while (n < max_n - 1) {
+    if ((dir > 0 && pos >= to) || (dir < 0 && pos <= to)) {
+      break;
+    }
+    out[n++] = pos;
+    pos += dir * step;
+  }
+  out[n++] = to;
+  return n;
+}
+
+static bool look_scan_speak_at(nino_voice_ws_session_t *ws, const char *side, bool force,
+                               bool *session_end) {
+  char msg[96];
+  snprintf(msg, sizeof(msg), "{\"type\":\"look_scan\",\"side\":\"%s\",\"force\":%s}",
+           side, force ? "true" : "false");
+  nino_voice_ws_session_clear_reply(ws);
+  if (nino_voice_ws_session_send_text(ws, msg) != ESP_OK) {
+    voice_log(ESP_LOG_WARN, s_voice_turn, "LOOK", "send %s failed", side);
+    return session_end == NULL || !*session_end;
+  }
+  (void)wait_and_play_ws_wav(ws, LOOK_SCAN_TTS_WAIT_MS, "LOOK", false, session_end);
+  return session_end == NULL || !*session_end;
+}
+
+static bool look_scan_sweep_side(nino_voice_ws_session_t *ws, int from, int to,
+                                 const char *side, bool *session_end) {
+  int steps[LOOK_SCAN_MAX_STEPS];
+  const int n = look_scan_fill_steps(from, to, steps, LOOK_SCAN_MAX_STEPS);
+  if (n <= 0) {
+    return true;
+  }
+  voice_log(ESP_LOG_INFO, s_voice_turn, "LOOK", "%s %d steps %d -> %d", side, n, from, to);
+  for (int i = 0; i < n; i++) {
+    const bool force = (i == 0) || (i == n - 1);
+    nino_face_look_hold_pan_at_speed(steps[i], LOOK_SCAN_HOLD_MS, LOOK_SCAN_STEP_SPEED);
+    if (!look_scan_speak_at(ws, side, force, session_end)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/* Step slowly toward each extreme, speak what is in view, then glide to center.
  * Hunt is not started for this turn — this motion IS the answer. */
 static void run_post_tts_look_scan(nino_voice_ws_session_t *ws, bool *session_end) {
-  voice_log(ESP_LOG_INFO, s_voice_turn, "LOOK", "scan left then right");
-  /* Do not wait out a 13s hunt — take the head now. */
+  const int left = nino_servo_pan_left();
+  const int right = nino_servo_pan_right();
+  const int center = NINO_SERVO_AXIS_CENTER;
+  voice_log(ESP_LOG_INFO, s_voice_turn, "LOOK", "step scan right=%d then left=%d", right,
+            left);
   nino_face_hunt_cancel();
   nino_face_hunt_wait_idle(2500);
   nino_face_tracker_pause_scripted(true);
 
-  nino_face_look_hold_pan(NINO_SERVO_PAN_LEFT, LOOK_SCAN_HOLD_MS);
-  nino_voice_ws_session_clear_reply(ws);
-  if (nino_voice_ws_session_send_text(ws, "{\"type\":\"look_scan\",\"side\":\"left\"}") ==
-      ESP_OK) {
-    if (!wait_and_play_ws_wav(ws, LOOK_SCAN_TTS_WAIT_MS, "LOOK", false, session_end)) {
-      /* continue to the right even if left TTS timed out */
-    }
+  if (!look_scan_sweep_side(ws, center, right, "right", session_end)) {
+    goto done;
   }
-  if (session_end != NULL && *session_end) {
-    nino_servo_dxl_go_neutral();
-    nino_face_tracker_pause_scripted(false);
-    return;
+  nino_face_pan_glide(center, LOOK_SCAN_RETURN_SPEED, LOOK_SCAN_RETURN_TIMEOUT_MS);
+  if (!look_scan_sweep_side(ws, center, left, "left", session_end)) {
+    goto done;
   }
 
-  nino_face_look_hold_pan(NINO_SERVO_PAN_RIGHT, LOOK_SCAN_HOLD_MS);
-  nino_voice_ws_session_clear_reply(ws);
-  if (nino_voice_ws_session_send_text(ws, "{\"type\":\"look_scan\",\"side\":\"right\"}") ==
-      ESP_OK) {
-    if (!wait_and_play_ws_wav(ws, LOOK_SCAN_TTS_WAIT_MS, "LOOK", false, session_end)) {
-      /* return to center anyway */
-    }
-  }
-
-  nino_servo_dxl_go_neutral();
-  vTaskDelay(pdMS_TO_TICKS(400));
+done:
+  nino_face_pan_glide(center, LOOK_SCAN_RETURN_SPEED, LOOK_SCAN_RETURN_TIMEOUT_MS);
   nino_face_tracker_pause_scripted(false);
 }
 

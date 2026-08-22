@@ -2861,7 +2861,7 @@ static int app_status_json(char *buf, size_t buf_sz) {
   nino_face_tracker_get_status(&face_track);
   char mac_hex[13];
   make_default_device_id_from_mac(mac_hex, sizeof(mac_hex));
-  char servo_frag[128];
+  char servo_frag[160];
   int sn = nino_servo_recplay_status_json(servo_frag, sizeof(servo_frag));
   if (sn < 0 || sn >= (int)sizeof(servo_frag)) {
     snprintf(servo_frag, sizeof(servo_frag), "\"ready\":false,\"mode\":\"idle\",\"ids_online\":[1,2]");
@@ -3525,14 +3525,30 @@ static int cmd_servo(int argc, char **argv) {
   if (argc >= 2 && strcmp(argv[1], "360") == 0) {
     return cmd_servo_360(argc - 1, argv + 1);
   }
-  printf("Usage: servo status | servo 360\n");
+  if (argc >= 2 && strcmp(argv[1], "pan") == 0) {
+    printf("pan limits left=%d right=%d (defaults %d/%d)\n", nino_servo_pan_left(),
+           nino_servo_pan_right(), NINO_SERVO_PAN_LEFT, NINO_SERVO_PAN_RIGHT);
+    return 0;
+  }
+  if (argc >= 2 && strcmp(argv[1], "pan-cal") == 0) {
+    printf("Calibrating pan extrema (wide left then right)...\n");
+    const esp_err_t err = nino_servo_pan_calibrate();
+    if (err != ESP_OK) {
+      printf("pan-cal failed: %s\n", esp_err_to_name(err));
+      return 1;
+    }
+    printf("pan limits saved left=%d right=%d\n", nino_servo_pan_left(),
+           nino_servo_pan_right());
+    return 0;
+  }
+  printf("Usage: servo status | servo 360 | servo pan | servo pan-cal\n");
   return 0;
 }
 
 static void servo_cli_register(void) {
   const esp_console_cmd_t servo_cmd = {
       .command = "servo",
-      .help = "servo status | servo 360",
+      .help = "servo status | servo 360 | servo pan | servo pan-cal",
       .hint = NULL,
       .func = &cmd_servo,
       .argtable = NULL,
@@ -4418,6 +4434,7 @@ void app_main(void) {
   assert(s_frame_queue != NULL);
   nino_face_tracker_init();
   nino_servo_recplay_init();
+  nino_servo_limits_init();
 
   if (nino_rgb_led_init() != ESP_OK) {
     ESP_LOGW(TAG, "RGB LED init failed (GPIO 2/3/4)");

@@ -631,6 +631,7 @@ static bool track_hon_wait_target_or_stop(uint8_t id, int target, TickType_t tim
         }
         int pos = 0;
         if (nino_servo_dxl_get_present_position(id, &pos) == ESP_OK) {
+            nino_servo_limits_observe_pan(pos);
             if (position_delta(pos, target) <= DXL_POSITION_TOLERANCE) {
                 return true;
             }
@@ -709,6 +710,8 @@ static void track_hon_task(void *arg)
         goto done;
     }
 
+    nino_servo_limits_capture_begin();
+    bool pan_limits_saved = false;
     while (!s_track_hon_stop_requested) {
         for (size_t i = 0; i < sizeof(waypoints) / sizeof(waypoints[0]); i++) {
             if (s_track_hon_stop_requested) {
@@ -729,8 +732,15 @@ static void track_hon_task(void *arg)
             const TickType_t hold_start = xTaskGetTickCount();
             while (!s_track_hon_stop_requested &&
                    (xTaskGetTickCount() - hold_start) < pdMS_TO_TICKS(DXL_TRACK_HON_HOLD_MS)) {
-                vTaskDelay(pdMS_TO_TICKS(20));
+                int hold_pos = 0;
+                if (nino_servo_dxl_get_present_position(servo_id, &hold_pos) == ESP_OK) {
+                    nino_servo_limits_observe_pan(hold_pos);
+                }
+                vTaskDelay(pdMS_TO_TICKS(40));
             }
+        }
+        if (!pan_limits_saved) {
+            pan_limits_saved = nino_servo_limits_capture_end();
         }
     }
 
@@ -747,6 +757,7 @@ static void track_hon_task(void *arg)
     }
 
 done:
+    (void)nino_servo_limits_capture_end();
     s_track_hon_stop_requested = false;
     s_track_hon_task = NULL;
     vTaskDelete(NULL);

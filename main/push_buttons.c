@@ -19,7 +19,8 @@ static const char *TAG = "push_btn";
 
 /*
  * Wiring (ESP32-P4-Function-EV-Board J1, active-low to GND):
- *  - GPIO48 (J1 pin 33): single press = hardware test on/off;
+ *  - GPIO48 (J1 pin 33): single press = hardware test on/off
+ *    (CW/CCW pan records farthest left/right and saves them);
  *    double press = DEMO_main.wav; triple press = erase Wi-Fi + BLE setup
  *  - GPIO47 (J1 pin 37): single press = speaker mute on/off (solid red LED)
  *

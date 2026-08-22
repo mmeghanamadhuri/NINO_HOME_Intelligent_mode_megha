@@ -155,6 +155,7 @@ static void log_start_banner(void) {
   ESP_LOGI(TAG, "cam=%s #%lu   servos=%s", cam, (unsigned long)cam_seq,
            servo_status());
   ESP_LOGI(TAG, "motors: continuous pan+tilt CW/CCW until the same button is pressed");
+  ESP_LOGI(TAG, "pan capture: farthest left/right present position will be saved");
   ESP_LOGI(TAG, "camera stream  |  RGB cycle %d ms  |  TFT expr every %d s",
            RGB_STEP_MS, EYE_STEP_MS / 1000);
   ESP_LOGI(TAG, "Press GPIO48 once more (or type 'hwtest') to STOP");

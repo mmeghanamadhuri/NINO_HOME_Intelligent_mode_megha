@@ -269,8 +269,10 @@ int nino_servo_recplay_status_json(char *buf, size_t buf_sz) {
     return -1;
   }
   return snprintf(buf, buf_sz,
-                  "\"ready\":%s,\"mode\":\"%s\",\"ids_online\":[1,2]",
-                  nino_servo_dxl_is_ready() ? "true" : "false", mode_str(s_mode));
+                  "\"ready\":%s,\"mode\":\"%s\",\"ids_online\":[1,2],"
+                  "\"pan_left\":%d,\"pan_right\":%d",
+                  nino_servo_dxl_is_ready() ? "true" : "false", mode_str(s_mode),
+                  nino_servo_pan_left(), nino_servo_pan_right());
 }
 
 int nino_servo_recplay_position_json(char *buf, size_t buf_sz) {
@@ -289,11 +291,13 @@ int nino_servo_recplay_position_json(char *buf, size_t buf_sz) {
   return snprintf(
       buf, buf_sz,
       "{\"ok\":true,\"ready\":%s,\"mode\":\"%s\","
+      "\"pan_left\":%d,\"pan_right\":%d,"
       "\"servos\":["
       "{\"id\":1,\"position\":%d,\"torque\":%s,\"ok\":%s},"
       "{\"id\":2,\"position\":%d,\"torque\":%s,\"ok\":%s}"
       "]}",
-      nino_servo_dxl_is_ready() ? "true" : "false", mode_str(s_mode), tilt,
+      nino_servo_dxl_is_ready() ? "true" : "false", mode_str(s_mode),
+      nino_servo_pan_left(), nino_servo_pan_right(), tilt,
       nino_servo_dxl_torque_is_on(NINO_SERVO_TILT_ID) ? "true" : "false",
       e1 == ESP_OK ? "true" : "false", pan,
       nino_servo_dxl_torque_is_on(NINO_SERVO_PAN_ID) ? "true" : "false",
@@ -463,11 +467,13 @@ static size_t parse_play_frames(const char *body, nino_servo_play_frame_t *frame
 }
 
 static int clamp_pan_goal(int v) {
-  if (v < NINO_SERVO_PAN_LEFT) {
-    return NINO_SERVO_PAN_LEFT;
+  const int left = nino_servo_pan_left();
+  const int right = nino_servo_pan_right();
+  if (v < left) {
+    return left;
   }
-  if (v > NINO_SERVO_PAN_RIGHT) {
-    return NINO_SERVO_PAN_RIGHT;
+  if (v > right) {
+    return right;
   }
   return v;
 }
@@ -541,10 +547,10 @@ static size_t append_named_action(nino_servo_play_frame_t *frames, size_t count,
     append_pose(frames, &count, max, true, c, true, NINO_SERVO_TILT_DOWN, beat);
     append_pose(frames, &count, max, true, c, true, c, beat);
   } else if (action_token_is(name, name_len, "look_left")) {
-    append_pose(frames, &count, max, true, NINO_SERVO_PAN_LEFT, true, c, hold);
+    append_pose(frames, &count, max, true, nino_servo_pan_left(), true, c, hold);
     append_pose(frames, &count, max, true, c, true, c, hold);
   } else if (action_token_is(name, name_len, "look_right")) {
-    append_pose(frames, &count, max, true, NINO_SERVO_PAN_RIGHT, true, c, hold);
+    append_pose(frames, &count, max, true, nino_servo_pan_right(), true, c, hold);
     append_pose(frames, &count, max, true, c, true, c, hold);
   } else if (action_token_is(name, name_len, "look_up")) {
     append_pose(frames, &count, max, true, c, true, NINO_SERVO_TILT_UP, hold);
@@ -682,6 +688,28 @@ static esp_err_t servo_position_handler(httpd_req_t *req) {
   }
   char body[384];
   int n = nino_servo_recplay_position_json(body, sizeof(body));
+  if (n < 0 || n >= (int)sizeof(body)) {
+    return httpd_resp_send_500(req);
+  }
+  httpd_resp_set_type(req, "application/json");
+  recplay_cors(req);
+  return httpd_resp_send(req, body, n);
+}
+
+static esp_err_t servo_pan_range_handler(httpd_req_t *req) {
+  if (req->method == HTTP_OPTIONS) {
+    httpd_resp_set_status(req, "204 No Content");
+    recplay_cors(req);
+    return httpd_resp_send(req, NULL, 0);
+  }
+  if (req->method != HTTP_GET) {
+    return recplay_send_json(req, "405 Method Not Allowed",
+                             "{\"ok\":false,\"error\":\"GET only\"}");
+  }
+  char body[96];
+  const int n = snprintf(body, sizeof(body),
+                         "{\"ok\":true,\"pan_left\":%d,\"pan_right\":%d}",
+                         nino_servo_pan_left(), nino_servo_pan_right());
   if (n < 0 || n >= (int)sizeof(body)) {
     return httpd_resp_send_500(req);
   }
@@ -899,8 +927,21 @@ esp_err_t nino_servo_recplay_register_http(httpd_handle_t server) {
       .handler = servo_play_handler,
   };
 
+  const httpd_uri_t pan_range_get = {
+      .uri = "/servo/pan_range",
+      .method = HTTP_GET,
+      .handler = servo_pan_range_handler,
+  };
+  const httpd_uri_t pan_range_opts = {
+      .uri = "/servo/pan_range",
+      .method = HTTP_OPTIONS,
+      .handler = servo_pan_range_handler,
+  };
+
   ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &position_get), TAG, "pos get");
   ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &position_opts), TAG, "pos opts");
+  ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &pan_range_get), TAG, "pan range get");
+  ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &pan_range_opts), TAG, "pan range opts");
   ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &record_post), TAG, "record post");
   ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &record_opts), TAG, "record opts");
   ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &goal_post), TAG, "goal post");
