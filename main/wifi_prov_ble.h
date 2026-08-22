@@ -16,6 +16,9 @@ esp_err_t wifi_prov_ble_start_if_needed(void);
  */
 esp_err_t wifi_prov_ble_enable_provisioning(void);
 
+/** Stop BLE advertising when leaving setup. Host stays up for a later re-enter. */
+void wifi_prov_ble_stop_advertising(void);
+
 /** Call when STA gets or loses IP (updates status characteristic notify). */
 void wifi_prov_ble_on_sta_ip_changed(bool connected);
 

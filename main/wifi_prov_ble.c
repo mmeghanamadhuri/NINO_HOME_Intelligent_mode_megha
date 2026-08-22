@@ -535,6 +535,14 @@ esp_err_t wifi_prov_ble_start_if_needed(void) {
   return wifi_prov_ble_start();
 }
 
+void wifi_prov_ble_stop_advertising(void) {
+  if (!s_ble_started) {
+    return;
+  }
+  (void)ble_gap_adv_stop();
+  ESP_LOGI(TAG, "BLE provisioning advertising stopped");
+}
+
 esp_err_t wifi_prov_ble_enable_provisioning(void) {
   s_pending_ssid[0] = '\0';
   s_pending_pass[0] = '\0';
@@ -588,6 +596,8 @@ esp_err_t wifi_prov_ble_start_if_needed(void) {
 esp_err_t wifi_prov_ble_enable_provisioning(void) {
   return wifi_prov_ble_start();
 }
+
+void wifi_prov_ble_stop_advertising(void) {}
 
 void wifi_prov_ble_on_sta_ip_changed(bool connected) {
   (void)connected;

@@ -21,8 +21,15 @@ int wifi_config_status_json(char *buf, size_t buf_sz);
 bool wifi_config_is_provisioned(void);
 
 /** Erase STA credentials from RAM + NVS, switch to AP, start BLE provisioning.
- *  Previous network is restored if the app never continues within 2 minutes. */
+ *  Previous network is restored if the app never continues within 2 minutes,
+ *  or if wifi_config_exit_setup_mode() is called (GPIO48 toggle). */
 esp_err_t wifi_config_enter_setup_mode(void);
+
+/** True after enter_setup_mode until restore, successful provision, or exit. */
+bool wifi_config_is_setup_mode(void);
+
+/** Leave setup: restore the previous STA network and cancel the idle timeout. */
+esp_err_t wifi_config_exit_setup_mode(void);
 
 /** App/BLE/HTTP took the next setup step — cancel the 2-minute idle timeout. */
 void wifi_config_note_setup_activity(void);

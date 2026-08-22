@@ -103,10 +103,13 @@ class StreamEndOfSpeechTests(unittest.TestCase):
     def test_default_max_ms_is_30s(self) -> None:
         self.assertEqual(DEFAULT_MAX_MS, 30000)
 
-    def test_register_max_ms_is_60s(self) -> None:
-        self.assertEqual(DEFAULT_REGISTER_MAX_MS, 60000)
-        self.assertEqual(stream_listen_max_ms(in_registration=True), 60000)
+    def test_register_max_ms_is_30s(self) -> None:
+        self.assertEqual(DEFAULT_REGISTER_MAX_MS, 30000)
+        self.assertEqual(stream_listen_max_ms(in_registration=True), 30000)
         self.assertEqual(stream_listen_max_ms(in_registration=False), 30000)
+        self.assertEqual(
+            stream_listen_max_ms(in_registration=True, register_max_ms=5000), 5000
+        )
 
     def test_idle_timeout_ends_session_not_skip(self) -> None:
         self.assertTrue(stream_idle_timeout_ends_session("timeout"))
@@ -123,9 +126,9 @@ class StreamEndOfSpeechTests(unittest.TestCase):
         self.assertEqual(vad.feed(_frame(1)), "timeout")
         self.assertFalse(vad.heard_speech)
 
-    def test_60s_register_silence_times_out(self) -> None:
-        vad = StreamEndOfSpeech(start_energy=50, max_ms=60000, frame_ms=20)
-        for _ in range((60000 // 20) - 1):
+    def test_30s_register_silence_times_out(self) -> None:
+        vad = StreamEndOfSpeech(start_energy=50, max_ms=30000, frame_ms=20)
+        for _ in range((30000 // 20) - 1):
             self.assertEqual(vad.feed(_frame(1)), "idle")
         self.assertEqual(vad.feed(_frame(1)), "timeout")
         self.assertFalse(vad.heard_speech)

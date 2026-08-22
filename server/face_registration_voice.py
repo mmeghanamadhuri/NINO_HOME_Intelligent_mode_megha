@@ -753,11 +753,11 @@ def spell_name_aloud(name: str) -> str:
     return ", ".join(letters) if letters else (name or "")
 
 
-def parse_spelled_name(user_text: str) -> str | None:
-    """Turn spoken spelling ('H A R I' / 'aitch ay ar eye') into a name."""
+def parse_spoken_letters(user_text: str) -> list[str]:
+    """Return A–Z letters heard in spoken spelling, including a single letter."""
     text = _strip_trailing_punct(user_text or "")
     if not text:
-        return None
+        return []
     tokens = re.split(r"[\s,.\-/]+", text.lower())
     letters: list[str] = []
     i = 0
@@ -780,6 +780,20 @@ def parse_spelled_name(user_text: str) -> str | None:
             i += 1
             continue
         i += 1
+    return letters
+
+
+def parse_next_spell_letter(user_text: str) -> str | None:
+    """One spoken letter ('H', 'aitch'). None if empty or more than one letter."""
+    letters = parse_spoken_letters(user_text)
+    if len(letters) != 1:
+        return None
+    return letters[0]
+
+
+def parse_spelled_name(user_text: str) -> str | None:
+    """Turn spoken spelling ('H A R I' / 'aitch ay ar eye') into a name."""
+    letters = parse_spoken_letters(user_text)
     if len(letters) < 2:
         return None
     return "".join(letters).title()

@@ -6,9 +6,9 @@
 
 /**
  * GPIO48 (J1 pin 33, active-low to GND):
- *  - short press: Wi-Fi setup (AP + BLE) and play the in-app setup guide.
- *    If the app never continues, setup times out after two minutes and the
- *    previous network is restored.
+ *  - short press: toggle Wi-Fi setup (AP + BLE) and play the in-app setup
+ *    guide. A second press leaves setup and restores the previous network.
+ *    If the app never continues, setup still times out after two minutes.
  *  - hold 5 seconds: Demo mode — play DEMO_main.wav.
  *
  * GPIO47 (J1 pin 37): single press toggles Aux-in / Sirena-mic mute.

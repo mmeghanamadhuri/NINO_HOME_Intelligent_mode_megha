@@ -22,7 +22,7 @@ static const char *TAG = "push_btn";
 
 /*
  * Wiring (ESP32-P4-Function-EV-Board J1, active-low to GND):
- *  - GPIO48 (J1 pin 33): short press = Wi-Fi setup + guide WAV;
+ *  - GPIO48 (J1 pin 33): short press = toggle Wi-Fi setup + guide WAV;
  *    hold 5 s = DEMO_main.wav
  *  - GPIO47 (J1 pin 37): single press = Aux-in / mic mute on/off
  *
@@ -179,16 +179,25 @@ static void btn_worker_task(void *arg) {
       vTaskDelay(pdMS_TO_TICKS(500));
       s_demo_busy = false;
     } else if (evt == BTN_EVT_SETUP) {
-      ESP_LOGI(TAG, "Action: Wi-Fi setup + app guide");
       s_demo_busy = false;
       if (nino_battery_endurance_is_active()) {
         nino_battery_endurance_stop();
       }
-      esp_err_t err = wifi_config_enter_setup_mode();
-      if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Enter setup mode failed: %s", esp_err_to_name(err));
+      if (wifi_config_is_setup_mode()) {
+        ESP_LOGI(TAG, "Action: leave Wi-Fi setup — restore previous network");
+        nino_audio_queue_stop();
+        esp_err_t err = wifi_config_exit_setup_mode();
+        if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+          ESP_LOGW(TAG, "Exit setup mode failed: %s", esp_err_to_name(err));
+        }
+      } else {
+        ESP_LOGI(TAG, "Action: Wi-Fi setup + app guide");
+        esp_err_t err = wifi_config_enter_setup_mode();
+        if (err != ESP_OK) {
+          ESP_LOGW(TAG, "Enter setup mode failed: %s", esp_err_to_name(err));
+        }
+        (void)play_setup_clip();
       }
-      (void)play_setup_clip();
     } else if (evt == BTN_EVT_MUTE) {
       toggle_aux_mute();
     }
@@ -223,7 +232,7 @@ static void btn_update(btn_state_t *btn) {
         if (!btn->armed) {
           btn->armed = true;
         } else if (btn->gpio == BTN_SETUP_GPIO && !btn->hold_fired) {
-          ESP_LOGI(TAG, "GPIO%d short press → Wi-Fi setup", (int)btn->gpio);
+          ESP_LOGI(TAG, "GPIO%d short press → Wi-Fi setup toggle", (int)btn->gpio);
           post_evt(BTN_EVT_SETUP);
         }
         btn->held_ms = 0;
@@ -275,7 +284,7 @@ static void push_buttons_task(void *arg) {
   }
 
   ESP_LOGI(TAG,
-           "Buttons ready: GPIO%d short=Wi-Fi setup hold5s=Demo; "
+           "Buttons ready: GPIO%d short=Wi-Fi setup toggle hold5s=Demo; "
            "GPIO%d Aux-in mute (level48=%d level47=%d, 0=pressed)",
            (int)BTN_SETUP_GPIO, (int)BTN_MUTE_GPIO, gpio_get_level(BTN_SETUP_GPIO),
            gpio_get_level(BTN_MUTE_GPIO));

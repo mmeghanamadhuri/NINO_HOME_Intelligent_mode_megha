@@ -104,6 +104,7 @@ static bool s_boot_unprovisioned = false;
 static volatile bool s_provisioned_welcome_scheduled = false;
 static char s_setup_prev_ssid[WIFI_CONFIG_STA_SSID_MAX];
 static char s_setup_prev_pass[WIFI_CONFIG_STA_PASS_MAX];
+static volatile bool s_setup_active;
 static volatile bool s_setup_waiting;
 static volatile int64_t s_setup_deadline_us;
 static TaskHandle_t s_setup_timeout_task;
@@ -1200,6 +1201,7 @@ esp_err_t wifi_config_set_sta_credentials(const char *ssid, const char *pass) {
   /* New network: allow the connected clip once after this attempt gets an IP. */
   s_wifi_connected_chime_played = false;
   s_wifi_connected_chime_pending = true;
+  s_setup_active = false;
   wifi_config_note_setup_activity();
   return ESP_OK;
 }
@@ -1215,25 +1217,42 @@ void wifi_config_note_setup_activity(void) {
   s_setup_waiting = false;
 }
 
+bool wifi_config_is_setup_mode(void) { return s_setup_active; }
+
+static esp_err_t setup_restore_previous_network(const char *reason) {
+  s_setup_waiting = false;
+  s_setup_active = false;
+  wifi_prov_ble_stop_advertising();
+  if (s_setup_prev_ssid[0] == '\0') {
+    ESP_LOGW(TAG, "Wi-Fi setup %s — no previous network to restore", reason);
+    return ESP_ERR_NOT_FOUND;
+  }
+  ESP_LOGI(TAG, "Wi-Fi setup %s — restoring %s", reason, s_setup_prev_ssid);
+  strncpy(s_sta_ssid, s_setup_prev_ssid, sizeof(s_sta_ssid) - 1);
+  s_sta_ssid[sizeof(s_sta_ssid) - 1] = '\0';
+  strncpy(s_sta_pass, s_setup_prev_pass, sizeof(s_sta_pass) - 1);
+  s_sta_pass[sizeof(s_sta_pass) - 1] = '\0';
+  s_boot_unprovisioned = false;
+  return wifi_config_sta_connect(WIFI_MODE_STA);
+}
+
+esp_err_t wifi_config_exit_setup_mode(void) {
+  if (!s_setup_active) {
+    ESP_LOGI(TAG, "Wi-Fi setup exit ignored — not in setup mode");
+    return ESP_ERR_INVALID_STATE;
+  }
+  return setup_restore_previous_network("cancelled");
+}
+
 static void setup_timeout_task(void *arg) {
   (void)arg;
   while (s_setup_waiting && esp_timer_get_time() < s_setup_deadline_us) {
     vTaskDelay(pdMS_TO_TICKS(200));
   }
-  if (s_setup_waiting) {
-    s_setup_waiting = false;
-    if (s_setup_prev_ssid[0] != '\0') {
-      ESP_LOGW(TAG, "Wi-Fi setup timed out — restoring %s", s_setup_prev_ssid);
-      strncpy(s_sta_ssid, s_setup_prev_ssid, sizeof(s_sta_ssid) - 1);
-      s_sta_ssid[sizeof(s_sta_ssid) - 1] = '\0';
-      strncpy(s_sta_pass, s_setup_prev_pass, sizeof(s_sta_pass) - 1);
-      s_sta_pass[sizeof(s_sta_pass) - 1] = '\0';
-      s_boot_unprovisioned = false;
-      (void)wifi_config_sta_connect(WIFI_MODE_STA);
-    } else {
-      ESP_LOGW(TAG, "Wi-Fi setup timed out — no previous network to restore");
-    }
+  if (s_setup_waiting && s_setup_active) {
+    (void)setup_restore_previous_network("timed out");
   }
+  s_setup_waiting = false;
   s_setup_timeout_task = NULL;
   vTaskDelete(NULL);
 }
@@ -1302,6 +1321,7 @@ esp_err_t wifi_config_enter_setup_mode(void) {
   }
 
   ESP_LOGI(TAG, "Setup mode active — BLE advertising for provisioning");
+  s_setup_active = true;
   setup_timeout_arm();
   return ESP_OK;
 }

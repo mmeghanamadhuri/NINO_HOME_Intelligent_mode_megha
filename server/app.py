@@ -2036,7 +2036,14 @@ async def _voice_ws_stream_pipeline(
     def apply_listen_timeout() -> None:
         ident = get_session_identity(device_id)
         registering = ident is not None and ident.in_registration()
-        buf.set_listen_max_ms(stream_listen_max_ms(in_registration=registering))
+        register_max_ms = (
+            ident.registration_listen_max_ms() if ident is not None and registering else None
+        )
+        buf.set_listen_max_ms(
+            stream_listen_max_ms(
+                in_registration=registering, register_max_ms=register_max_ms
+            )
+        )
 
     apply_listen_timeout()
 
@@ -2398,8 +2405,44 @@ async def _voice_ws_stream_pipeline(
         if not await _ws_send_json(websocket, {"type": "end_of_speech", "reason": reason}):
             return False
         if reason == "timeout" and registering and ident is not None:
-            guest_result = ident.timeout_to_guest()
-            guest = guest_result.registered_name
+            timeout_result = ident.handle_listen_timeout()
+            if timeout_result.reply:
+                from voice_service import synthesize_session_open_wav
+
+                if timeout_result.registered_name:
+                    bind_session_user(
+                        session_id,
+                        device_id=device_id,
+                        user_name=timeout_result.registered_name,
+                    )
+                logger.info(
+                    "stream register letter idle — confirm name device=%s session=%s",
+                    device_id,
+                    session_id,
+                )
+                wav_out, reply_meta = await run_in_threadpool(
+                    lambda: synthesize_session_open_wav(
+                        timeout_result.reply,
+                        session_id=session_id,
+                        device_id=device_id,
+                        reply_path="session_confirm",
+                    )
+                )
+                sent = await _voice_ws_send_reply(
+                    websocket,
+                    device_id=device_id,
+                    session_id=session_id,
+                    wav_out=wav_out,
+                    reply_meta=reply_meta,
+                    client_label=client_label,
+                )
+                if not sent:
+                    return False
+                apply_listen_timeout()
+                accepting = True
+                first_turn = False
+                return True
+            guest = timeout_result.registered_name
             if guest:
                 bind_session_user(
                     session_id, device_id=device_id, user_name=guest

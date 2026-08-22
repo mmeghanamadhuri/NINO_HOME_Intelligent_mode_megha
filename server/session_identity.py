@@ -15,12 +15,10 @@ from face_registration_service import (
     same_person_refresh_reply,
 )
 from face_registration_voice import (
-    extract_registration_name,
     is_already_registered_claim,
     is_confirm_no,
     is_confirm_yes,
     is_face_reg_prompt_echo,
-    is_incomplete_name_phrase,
     is_opening_greeting_echo,
     is_unconditional_greet_echo,
     is_registration_cancel,
@@ -28,36 +26,38 @@ from face_registration_voice import (
     is_registration_offer_yes,
     is_registration_stop_process,
     is_session_goodbye_utterance,
+    parse_next_spell_letter,
     parse_spelled_name,
     spell_name_aloud,
 )
-from stream_asr import DEFAULT_REGISTER_MAX_MS
+from stream_asr import DEFAULT_REGISTER_MAX_MS, DEFAULT_MAX_MS
 
 logger = logging.getLogger(__name__)
 
 SessionIdentState = Literal[
     "idle",
     "offer_register",
-    "awaiting_name",
     "awaiting_spell",
+    "awaiting_letter_confirm",
     "awaiting_confirm",
     "guest",
     "identified",
 ]
 
 OFFER_REGISTER_PROMPT = "Looks like you are a new user, can I register you"
-ASK_NAME_PROMPT = "What should I call you?"
-ASK_SPELL_PROMPT = "Please spell that name for me."
+ASK_SPELL_PROMPT = "Please spell your name, one letter at a time."
 GUEST_REPLY = "No problem. I'll keep this as a guest chat. How can I help you?"
 NO_FACE_GUEST_REPLY = "How can I help you"
 STILL_UNKNOWN_REPLY = (
     "I still don't recognize you. Looks like you are a new user, can I register you"
 )
-# Silence during register → guest (same as saying "no"). Skip extra TTS.
+# No activity during register → guest and keep the session.
 REGISTER_SILENCE_MS = DEFAULT_REGISTER_MAX_MS
-NAME_RETRY_PROMPT = "I didn't catch your name. Please say your name."
-SPELL_RETRY_PROMPT = "I didn't catch the spelling. Please spell the name."
-CONFIRM_RETRY_PROMPT = "Okay, let's try again. What should I call you?"
+# After at least one letter, this much silence means spelling is finished.
+SPELL_LETTER_IDLE_MS = 5000
+SPELL_RETRY_PROMPT = "I didn't catch that letter. Please say the next letter."
+LETTER_AGAIN_PROMPT = "Sorry, please say that letter again."
+CONFIRM_RETRY_PROMPT = "Okay, let's start over. Please spell your name, one letter at a time."
 
 
 def greet_recognized_user(name: str) -> str:
@@ -69,7 +69,12 @@ def greet_recognized_user(name: str) -> str:
 
 def confirm_name_prompt(name: str) -> str:
     letters = spell_name_aloud(name)
-    return f"I heard {name}. That's {letters}. Is that right?"
+    return f"That's {letters}. Is that right?"
+
+
+def confirm_letter_prompt(letter: str) -> str:
+    cleaned = (letter or "").strip().upper()[:1]
+    return f"Is it {cleaned}?" if cleaned else SPELL_RETRY_PROMPT
 
 
 def new_guest_name() -> str:
@@ -100,6 +105,8 @@ class SessionIdentityFlow:
         self._lock = threading.Lock()
         self._state: SessionIdentState = "idle"
         self._pending_name: str = ""
+        self._pending_letters: list[str] = []
+        self._pending_letter: str = ""
         self._user_name: str | None = None
         self._is_guest = False
         self._session_id = ""
@@ -123,10 +130,33 @@ class SessionIdentityFlow:
         with self._lock:
             return self._state in {
                 "offer_register",
-                "awaiting_name",
                 "awaiting_spell",
+                "awaiting_letter_confirm",
                 "awaiting_confirm",
             }
+
+    def registration_listen_max_ms(self) -> int:
+        """VAD listen cap while registering: 5s after a letter, else 30s."""
+        with self._lock:
+            if self._state == "awaiting_spell" and self._pending_letters:
+                return SPELL_LETTER_IDLE_MS
+            if self._state in {
+                "offer_register",
+                "awaiting_spell",
+                "awaiting_letter_confirm",
+                "awaiting_confirm",
+            }:
+                return REGISTER_SILENCE_MS
+        return DEFAULT_MAX_MS
+
+    def _clear_pending_spelling(self) -> None:
+        self._pending_name = ""
+        self._pending_letters = []
+        self._pending_letter = ""
+
+    def _name_from_letters(self) -> str:
+        letters = [ch for ch in self._pending_letters if ch.isalpha()]
+        return "".join(letters).title() if letters else ""
 
     def start_session(
         self,
@@ -140,7 +170,7 @@ class SessionIdentityFlow:
             self._active = True
             self._session_id = session_id
             self._device_id = device_id
-            self._pending_name = ""
+            self._clear_pending_spelling()
             self._is_guest = False
             self._declined_register = False
             self._opening_echo_budget = 2
@@ -195,7 +225,7 @@ class SessionIdentityFlow:
         with self._lock:
             self._active = False
             self._state = "idle"
-            self._pending_name = ""
+            self._clear_pending_spelling()
             self._session_id = ""
             self._opening_echo_budget = 0
             self._declined_register = False
@@ -249,10 +279,10 @@ class SessionIdentityFlow:
 
         if state == "offer_register":
             return self._handle_offer(text)
-        if state == "awaiting_name":
-            return self._handle_name(text)
         if state == "awaiting_spell":
-            return self._handle_spell(text)
+            return self._handle_spell_letter(text)
+        if state == "awaiting_letter_confirm":
+            return self._handle_letter_confirm(text)
         if state == "awaiting_confirm":
             return self._handle_confirm(text)
         return FaceRegVoiceResult(handled=False)
@@ -263,7 +293,7 @@ class SessionIdentityFlow:
             self._state = "identified"
             self._user_name = cleaned
             self._is_guest = False
-            self._pending_name = ""
+            self._clear_pending_spelling()
             self._declined_register = False
         logger.info("Session identity: identified name=%s", cleaned)
         return FaceRegVoiceResult(handled=True, reply=reply, registered_name=cleaned)
@@ -280,7 +310,7 @@ class SessionIdentityFlow:
             self._state = "guest"
             self._user_name = guest
             self._is_guest = True
-            self._pending_name = ""
+            self._clear_pending_spelling()
             self._declined_register = declined_register
         logger.info(
             "Session identity: guest %s declined_register=%s", guest, declined_register
@@ -291,16 +321,26 @@ class SessionIdentityFlow:
         )
 
     def timeout_to_guest(self) -> FaceRegVoiceResult:
-        """60s of no speech during register: same as declining — guest, keep STREAM."""
+        """No activity during register: guest, keep STREAM."""
         if not self.in_registration():
             return FaceRegVoiceResult(handled=False)
         result = self._become_guest(declined_register=True, spoken=False)
-        # Skip the spoken guest line so listen resumes immediately.
         return FaceRegVoiceResult(
             handled=True,
             reply="",
             registered_name=result.registered_name,
         )
+
+    def handle_listen_timeout(self) -> FaceRegVoiceResult:
+        """5s after letters → confirm the name. Otherwise 30s → guest."""
+        with self._lock:
+            if not self._active:
+                return FaceRegVoiceResult(handled=False)
+            state = self._state
+            letters = list(self._pending_letters)
+        if state == "awaiting_spell" and letters:
+            return self._finish_spelling()
+        return self.timeout_to_guest()
 
     def _rerecognize_known_user(self) -> FaceRegVoiceResult:
         """User says they are not new — check the camera again before giving up."""
@@ -328,7 +368,7 @@ class SessionIdentityFlow:
             )
         with self._lock:
             self._state = "offer_register"
-            self._pending_name = ""
+            self._clear_pending_spelling()
         logger.info("Session identity: not-new claim still unknown")
         return FaceRegVoiceResult(handled=True, reply=STILL_UNKNOWN_REPLY)
 
@@ -358,8 +398,8 @@ class SessionIdentityFlow:
         with self._lock:
             if not self._active or self._state in {
                 "offer_register",
-                "awaiting_name",
                 "awaiting_spell",
+                "awaiting_letter_confirm",
                 "awaiting_confirm",
             }:
                 return None
@@ -381,7 +421,7 @@ class SessionIdentityFlow:
                 self._state = "identified"
                 self._user_name = other_known
                 self._is_guest = False
-                self._pending_name = ""
+                self._clear_pending_spelling()
                 self._declined_register = False
             logger.info(
                 "Session identity: switch to visible user %s (was %s)",
@@ -408,7 +448,7 @@ class SessionIdentityFlow:
                 self._state = "offer_register"
                 self._user_name = None
                 self._is_guest = False
-                self._pending_name = ""
+                self._clear_pending_spelling()
             logger.info("Session identity: unknown face after hunt — register offer")
             return SessionOpenResult(
                 reply=OFFER_REGISTER_PROMPT,
@@ -421,7 +461,7 @@ class SessionIdentityFlow:
                 self._state = "guest"
                 self._user_name = guest
                 self._is_guest = True
-                self._pending_name = ""
+                self._clear_pending_spelling()
             logger.info("Session identity: no person after hunt — guest %s", guest)
             return SessionOpenResult(
                 reply="",
@@ -431,92 +471,110 @@ class SessionIdentityFlow:
             )
         return None
 
+    def _begin_spelling(self) -> FaceRegVoiceResult:
+        with self._lock:
+            self._clear_pending_spelling()
+            self._state = "awaiting_spell"
+        return FaceRegVoiceResult(handled=True, reply=ASK_SPELL_PROMPT)
+
+    def _finish_spelling(self) -> FaceRegVoiceResult:
+        with self._lock:
+            name = self._name_from_letters()
+            if not name:
+                self._state = "awaiting_spell"
+                return FaceRegVoiceResult(handled=True, reply=ASK_SPELL_PROMPT)
+            self._pending_name = name
+            self._state = "awaiting_confirm"
+        return FaceRegVoiceResult(handled=True, reply=confirm_name_prompt(name))
+
     def _handle_offer(self, text: str) -> FaceRegVoiceResult:
         if is_registration_offer_no(text) or is_registration_cancel(text):
             return self._become_guest(declined_register=True)
         if is_registration_offer_yes(text):
-            with self._lock:
-                self._state = "awaiting_name"
-            return FaceRegVoiceResult(handled=True, reply=ASK_NAME_PROMPT)
-        # "My name is X" during the offer still counts as yes + name.
-        name = extract_registration_name(text)
-        if name:
-            return self._accept_spoken_name(name)
+            return self._begin_spelling()
         return FaceRegVoiceResult(handled=True, reply=OFFER_REGISTER_PROMPT)
 
-    def _handle_name(self, text: str) -> FaceRegVoiceResult:
+    def _handle_spell_letter(self, text: str) -> FaceRegVoiceResult:
         if is_registration_cancel(text) or is_registration_offer_no(text):
             return self._become_guest(declined_register=True)
-        if is_incomplete_name_phrase(text):
-            return FaceRegVoiceResult(handled=True, reply=NAME_RETRY_PROMPT)
-        name = extract_registration_name(text)
-        if not name:
-            return FaceRegVoiceResult(handled=True, reply=NAME_RETRY_PROMPT)
-        return self._accept_spoken_name(name)
+        letter = parse_next_spell_letter(text)
+        if letter:
+            with self._lock:
+                self._pending_letter = letter
+                self._state = "awaiting_letter_confirm"
+            return FaceRegVoiceResult(handled=True, reply=confirm_letter_prompt(letter))
+        spelled = parse_spelled_name(text)
+        if spelled:
+            with self._lock:
+                self._pending_letters = [ch.upper() for ch in spelled if ch.isalpha()]
+                self._pending_letter = ""
+            return self._finish_spelling()
+        return FaceRegVoiceResult(handled=True, reply=SPELL_RETRY_PROMPT)
 
-    def _accept_spoken_name(self, name: str) -> FaceRegVoiceResult:
-        with self._lock:
-            self._pending_name = name
-            self._state = "awaiting_spell"
-        return FaceRegVoiceResult(
-            handled=True,
-            reply=f"Thanks. {ASK_SPELL_PROMPT}",
-        )
-
-    def _handle_spell(self, text: str) -> FaceRegVoiceResult:
+    def _handle_letter_confirm(self, text: str) -> FaceRegVoiceResult:
         if is_registration_cancel(text):
             return self._become_guest(declined_register=True)
-        spelled = parse_spelled_name(text)
+        if is_confirm_yes(text):
+            with self._lock:
+                letter = self._pending_letter
+                if letter:
+                    self._pending_letters.append(letter)
+                self._pending_letter = ""
+                self._state = "awaiting_spell"
+            logger.info(
+                "Session identity: accepted letter=%s so_far=%s",
+                letter,
+                "".join(self._pending_letters),
+            )
+            return FaceRegVoiceResult(handled=True, reply="", relisten_after_reply=True)
+        if is_confirm_no(text):
+            with self._lock:
+                self._pending_letter = ""
+                self._state = "awaiting_spell"
+            return FaceRegVoiceResult(handled=True, reply=LETTER_AGAIN_PROMPT)
+        letter = parse_next_spell_letter(text)
+        if letter:
+            with self._lock:
+                self._pending_letter = letter
+                self._state = "awaiting_letter_confirm"
+            return FaceRegVoiceResult(handled=True, reply=confirm_letter_prompt(letter))
         with self._lock:
-            pending = self._pending_name
-        if spelled:
-            # Prefer letters when they match, otherwise keep the spoken name
-            # if the spelling is a plausible confirmation of the same word.
-            if spelled.lower() == pending.lower() or spelled.lower().replace(" ", "") == pending.lower().replace(" ", ""):
-                pending = spelled if len(spelled) >= len(pending) else pending
-            elif len(spelled) >= 2:
-                pending = spelled
-            with self._lock:
-                self._pending_name = pending
-                self._state = "awaiting_confirm"
-            return FaceRegVoiceResult(handled=True, reply=confirm_name_prompt(pending))
-        # They may have repeated the name instead of spelling.
-        repeated = extract_registration_name(text)
-        if repeated:
-            with self._lock:
-                self._pending_name = repeated
-                self._state = "awaiting_confirm"
-            return FaceRegVoiceResult(handled=True, reply=confirm_name_prompt(repeated))
-        return FaceRegVoiceResult(handled=True, reply=SPELL_RETRY_PROMPT)
+            pending = self._pending_letter
+        return FaceRegVoiceResult(handled=True, reply=confirm_letter_prompt(pending))
 
     def _handle_confirm(self, text: str) -> FaceRegVoiceResult:
         if is_confirm_no(text):
-            with self._lock:
-                self._pending_name = ""
-                self._state = "awaiting_name"
-            return FaceRegVoiceResult(handled=True, reply=CONFIRM_RETRY_PROMPT)
+            return self._begin_spelling()
         if not is_confirm_yes(text):
-            # Another spelling pass.
             spelled = parse_spelled_name(text)
             if spelled:
                 with self._lock:
+                    self._pending_letters = [ch.upper() for ch in spelled if ch.isalpha()]
                     self._pending_name = spelled
                 return FaceRegVoiceResult(
                     handled=True, reply=confirm_name_prompt(spelled)
                 )
-            return FaceRegVoiceResult(
-                handled=True,
-                reply=confirm_name_prompt(self._pending_name),
-            )
+            letter = parse_next_spell_letter(text)
+            if letter:
+                with self._lock:
+                    self._pending_letter = letter
+                    self._state = "awaiting_letter_confirm"
+                return FaceRegVoiceResult(
+                    handled=True, reply=confirm_letter_prompt(letter)
+                )
+            with self._lock:
+                name = self._pending_name or self._name_from_letters()
+            return FaceRegVoiceResult(handled=True, reply=confirm_name_prompt(name))
+        with self._lock:
+            if not self._pending_name:
+                self._pending_name = self._name_from_letters()
         return self._save_pending_user()
 
     def _save_pending_user(self) -> FaceRegVoiceResult:
         with self._lock:
-            name = self._pending_name
+            name = self._pending_name or self._name_from_letters()
         if not name:
-            with self._lock:
-                self._state = "awaiting_name"
-            return FaceRegVoiceResult(handled=True, reply=NAME_RETRY_PROMPT)
+            return self._begin_spelling()
 
         frame = self._read_frame() if self._read_frame else None
         existing_before: str | None = None
@@ -529,7 +587,7 @@ class SessionIdentityFlow:
                     self._state = "identified"
                     self._user_name = existing
                     self._is_guest = False
-                    self._pending_name = ""
+                    self._clear_pending_spelling()
                 return FaceRegVoiceResult(
                     handled=True,
                     reply=already_registered_reply(existing),
@@ -546,13 +604,13 @@ class SessionIdentityFlow:
             interval_ms=150,
         )
         with self._lock:
-            self._pending_name = ""
+            self._clear_pending_spelling()
             if capture.saved_samples > 0:
                 self._state = "identified"
                 self._user_name = name
                 self._is_guest = False
             else:
-                self._state = "awaiting_name"
+                self._state = "awaiting_spell"
 
         if capture.saved_samples == 0:
             detail = capture.errors[-1] if capture.errors else "No samples saved"
@@ -573,7 +631,7 @@ class SessionIdentityFlow:
                 handled=True,
                 reply=(
                     f"I heard {name}, but I couldn't capture your face. "
-                    "Please look at the camera and say your name again."
+                    "Please look at the camera and spell your name again."
                 ),
             )
 

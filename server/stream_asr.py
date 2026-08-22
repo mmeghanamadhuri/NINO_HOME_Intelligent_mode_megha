@@ -19,8 +19,8 @@ DEFAULT_CONTINUE_ENERGY = 50
 DEFAULT_SPEECH_MS = 160
 DEFAULT_SILENCE_MS = 450
 DEFAULT_MAX_MS = 30000
-# Registration yes/no/name/spell/confirm: 60s of no speech → guest, not goodbye.
-DEFAULT_REGISTER_MAX_MS = 60000
+# Registration yes/no/spell/confirm: 30s of no speech → guest, not goodbye.
+DEFAULT_REGISTER_MAX_MS = 30000
 DEFAULT_MIN_SPEECH_MS = 200
 # Quiet Aux can drop the start bar, but not into electrical-tick range.
 ADAPTIVE_START_MIN = 6
@@ -154,9 +154,11 @@ class StreamEndOfSpeech:
         return "speech" if self.heard_speech else "idle"
 
 
-def stream_listen_max_ms(*, in_registration: bool) -> int:
-    """VAD listen cap: 60s while registering, 30s idle-goodbye afterwards."""
-    return DEFAULT_REGISTER_MAX_MS if in_registration else DEFAULT_MAX_MS
+def stream_listen_max_ms(*, in_registration: bool, register_max_ms: int | None = None) -> int:
+    """VAD listen cap: 30s while registering (or 5s between letters), 30s idle-goodbye afterwards."""
+    if in_registration:
+        return register_max_ms if register_max_ms is not None else DEFAULT_REGISTER_MAX_MS
+    return DEFAULT_MAX_MS
 
 
 def stream_idle_timeout_ends_session(

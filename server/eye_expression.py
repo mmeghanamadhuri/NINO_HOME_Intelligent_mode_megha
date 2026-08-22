@@ -506,6 +506,7 @@ IDENTIFY_IDLE_PATHS: frozenset[str] = frozenset(
         "session_ask_name",
         "session_spell",
         "session_confirm",
+        "session_letter",
         "face_registration",
     }
 )

@@ -428,16 +428,16 @@ _GOODBYE_REPLIES = (
     "Take care! Talk soon.",
 )
 
-# Wake session: STT often misspells Nino. Match near the start, then strip.
-# "Ok Nino" (and hey/hi/hello + name) or a leading "Hello" both start a session.
+# Wake session: STT often misspells Nino / Hello. Hello anywhere starts a session.
+# "Ok Nino" (and hey/hi/hello + name) still counts. Near-misses of Hello
+# (Nilo, elo, ilo, ello, illo) are treated as Hello.
 _WAKE_RE = re.compile(
     r"\b(?P<phrase>(?:ok(?:ay)?|hey|hi|hello)\s+"
     r"(?:nino|nano|neno|nina|nenu|neeno|knee\s*no|you know))\b",
     re.IGNORECASE,
 )
 _WAKE_HELLO_RE = re.compile(
-    r"^(?:(?:um+|uh+|er+|ah+|mm+)\s+){0,3}"
-    r"(?P<phrase>hell+o|hallo|hullo)(?:\s+there)?\b",
+    r"\b(?P<phrase>hell+o|hallo|hullo|nilo|ello|illo|elo|ilo)\b",
     re.IGNORECASE,
 )
 # Whisper often drops "Nino" on wake clips: "ok nino hello" -> "okay hello" / "okay no hello".
@@ -472,15 +472,22 @@ def _normalize_wake_text(text: str) -> str:
 def extract_wake_and_command(text: str) -> tuple[bool, str, str]:
     """Return (found, command_after_wake, matched_phrase).
 
-    Used only to strip a leading wake phrase from STT, not to reject queries.
+    Hello anywhere wakes the robot. A leading wake phrase is stripped so the
+    rest can be treated as the command; a mid-sentence hello is left in place.
     """
     raw = str(text or "").strip()
     norm = _normalize_wake_text(raw)
     if not norm:
         return False, "", ""
     match = _WAKE_RE.search(norm)
+    leading = False
+    if match is not None:
+        leading = True
     if match is None:
         match = _WAKE_HELLO_RE.search(norm)
+        if match is not None:
+            prefix = norm[: match.start()]
+            leading = bool(re.match(r"^(?:(?:um+|uh+|er+|ah+|mm+)\s*)*$", prefix))
     if match is None:
         match = _WAKE_OKAY_HELLO_RE.search(norm)
     if match is None:
@@ -490,10 +497,15 @@ def extract_wake_and_command(text: str) -> tuple[bool, str, str]:
         match = _WAKE_NAME_RE.search(norm)
         if match is not None and match.start() > 24:
             match = None
+        elif match is not None:
+            leading = True
     if match is None:
         return False, raw, ""
+    phrase = _normalize_wake_text(match.group("phrase"))
+    if not leading:
+        return True, raw, phrase
     rest = norm[match.end() :].strip(" ,.-")
-    return True, rest, _normalize_wake_text(match.group("phrase"))
+    return True, rest, phrase
 
 
 def log_nino_voice(stage: str, *, turn: object = None, **fields: object) -> None:
@@ -3401,6 +3413,7 @@ def process_voice_wav(
         "session_ask_name",
         "session_spell",
         "session_confirm",
+        "session_letter",
         "face_registration",
     }:
         # Keep idle through hunt / "can I register you" / name prompts.

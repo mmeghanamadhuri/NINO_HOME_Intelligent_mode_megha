@@ -61,6 +61,7 @@ def motion_actions_for_reply(
         "session_ask_name",
         "session_spell",
         "session_confirm",
+        "session_letter",
         "face_registration",
     }:
         return []

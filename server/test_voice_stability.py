@@ -79,8 +79,18 @@ def test_transcript_without_ok_nino_is_not_rejected() -> None:
     assert command == "what time is it"
 
     found, command, phrase = extract_wake_and_command("please tell john hello later")
-    assert found is False
+    assert found is True
     assert command == "please tell john hello later"
+    assert "hell" in phrase
+
+    for heard in ("nilo", "elo", "ilo", "ello", "illo", "hey there nilo"):
+        found, command, phrase = extract_wake_and_command(heard)
+        assert found is True, heard
+        assert phrase
+
+    found, command, phrase = extract_wake_and_command("um elo what time is it")
+    assert found is True
+    assert command == "what time is it"
 
     found, command, phrase = extract_wake_and_command("Okay, hello.")
     assert found is True

@@ -84,6 +84,23 @@ static int clampi(int value, int lo, int hi) {
   return value;
 }
 
+/** Calibrated head sweep (NVS), falling back to the full AX range. */
+static int track_pan_min(void) {
+  const int left = nino_servo_pan_left();
+  if (left < FACE_TRACK_PAN_MIN) {
+    return FACE_TRACK_PAN_MIN;
+  }
+  return left;
+}
+
+static int track_pan_max(void) {
+  const int right = nino_servo_pan_right();
+  if (right > FACE_TRACK_PAN_MAX) {
+    return FACE_TRACK_PAN_MAX;
+  }
+  return right;
+}
+
 static int axis_step_from_error(float err, float kp) {
   if (fabsf(err) <= FACE_TRACK_DEADZONE_PX) {
     return 0;
@@ -141,9 +158,9 @@ void nino_face_tracker_init(void) {
   s_last_frame_sequence = 0;
   reset_track_state();
   update_pause_flags();
-  ESP_LOGI(TAG, "Pan/tilt tracker ready (tilt ID %d [%d..%d], pan ID %d)",
+  ESP_LOGI(TAG, "Pan/tilt tracker ready (tilt ID %d [%d..%d], pan ID %d [%d..%d])",
            FACE_TRACK_TILT_SERVO_ID, FACE_TRACK_TILT_MIN, FACE_TRACK_TILT_MAX,
-           FACE_TRACK_PAN_SERVO_ID);
+           FACE_TRACK_PAN_SERVO_ID, track_pan_min(), track_pan_max());
 }
 
 void nino_face_tracker_set_enabled(bool enabled) {
@@ -232,8 +249,8 @@ void nino_face_tracker_update(bool face_found, int face_cx, int face_cy,
       axis_step_from_error((frame_h / 2.0f) - s_smooth_y, FACE_TRACK_KP_TILT);
 
   const int new_pan =
-      clampi(s_pan_goal + FACE_TRACK_PAN_SIGN * pan_delta, FACE_TRACK_PAN_MIN,
-             FACE_TRACK_PAN_MAX);
+      clampi(s_pan_goal + FACE_TRACK_PAN_SIGN * pan_delta, track_pan_min(),
+             track_pan_max());
   const int new_tilt =
       clampi(s_tilt_goal + FACE_TRACK_TILT_SIGN * tilt_delta, FACE_TRACK_TILT_MIN,
              FACE_TRACK_TILT_MAX);

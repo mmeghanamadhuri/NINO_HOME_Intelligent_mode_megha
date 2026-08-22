@@ -65,7 +65,7 @@ static const char *TAG = "voice_ast";
 #define CAMERA_STREAM_WAIT_MS 2500
 #define FACE_HUNT_MS 4500
 #define SESSION_GREET_WAIT_MS 20000
-#define LOOK_SCAN_HOLD_MS 800
+#define LOOK_SCAN_HOLD_MS 1800
 #define LOOK_SCAN_TTS_WAIT_MS 12000
 #define LOOK_SCAN_STEP 40
 #define LOOK_SCAN_MAX_STEPS 8
