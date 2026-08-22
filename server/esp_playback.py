@@ -24,6 +24,11 @@ ESP_MAX_PLAY_WAV_BYTES = int(os.environ.get("ESP_MAX_PLAY_WAV_BYTES", str(380 * 
 # idle, ack chime, etc.). Keeps the vision-emotion eye driver from stomping on speech.
 _EYE_BUSY_TAIL_SECONDS = float(os.environ.get("EYE_BUSY_TAIL_SECONDS", "1.5"))
 
+# After estimated TTS duration, keep dropping Aux PCM this long for I2S/room echo.
+# Do not use VOICE_POST_TTS_GRACE_SECONDS here — that grace is for STT energy
+# rejection, and adding it here makes the robot deaf for ~4s after playback.
+_STREAM_ECHO_TAIL_SECONDS = float(os.environ.get("VOICE_STREAM_ECHO_TAIL_SECONDS", "0.25"))
+
 # Shared "device is speaking" window. post_wav_to_esp() extends it so lower-priority
 # eye updates (camera emotion) can yield to voice replies, alarms, and greetings.
 _busy_lock = threading.Lock()
@@ -54,12 +59,24 @@ def _wav_duration_seconds(wav: bytes) -> float:
         return 0.0
 
 
+def stream_echo_tail_seconds() -> float:
+    """Short tail after estimated TTS before streamed Aux PCM is accepted."""
+    return max(0.0, _STREAM_ECHO_TAIL_SECONDS)
+
+
 def mark_device_busy_for(seconds: float, device_id: str | None = None) -> None:
     """Extend the 'device is speaking' window to at least now + seconds."""
     key = _busy_key(device_id)
     until = time.time() + max(0.0, seconds)
     with _busy_lock:
         _device_busy_until[key] = max(_device_busy_until.get(key, 0.0), until)
+
+
+def clear_device_busy(device_id: str | None = None) -> None:
+    """Device finished TTS and is listening — accept Aux PCM immediately."""
+    key = _busy_key(device_id)
+    with _busy_lock:
+        _device_busy_until.pop(key, None)
 
 
 def device_busy_speaking(device_id: str | None = None) -> bool:

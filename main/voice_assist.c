@@ -1030,7 +1030,6 @@ static bool wait_and_play_ws_wav(nino_voice_ws_session_t *ws, uint32_t wait_ms,
               "bytes=%u end_session=%d eye=%s", (unsigned)resp_len,
               end_session ? 1 : 0, eye_expr[0] ? eye_expr : "idle");
     nino_audio_queue_wait_idle(AUX_REPLY_WAIT_MS);
-    aux_ignore_energy_for_ms(AUX_POST_SPEAKER_IGNORE_MS);
   } else if (err == ESP_ERR_TIMEOUT) {
     voice_log(ESP_LOG_INFO, s_voice_turn, stage, "timeout — continue");
   } else if (skip) {
@@ -1137,6 +1136,8 @@ static bool stream_aux_pcm(nino_voice_ws_session_t *ws, uint32_t turn,
     /* Open Aux and dump leftover speaker energy so the first spoken word is
      * not clipped. LED goes listen only once PCM is about to flow. */
     nino_mic_warmup(AUX_LISTEN_WARMUP_MS);
+    s_aux_ignore_until_us = 0;
+    (void)nino_voice_ws_session_send_text(ws, "{\"type\":\"listen\"}");
     nino_eye_listening();
     (void)nino_rgb_led_show(NINO_RGB_SHOW_LISTEN);
     voice_log(ESP_LOG_INFO, turn, "STREAM", "sending Aux-in PCM until ASR EOS");
@@ -1371,7 +1372,6 @@ static void run_conversation_session(const int16_t *preroll, size_t preroll_samp
               "bytes=%u end_session=%d eye=%s", (unsigned)resp_len,
               end_session ? 1 : 0, eye_expr[0] ? eye_expr : "idle");
     nino_audio_queue_wait_idle(AUX_REPLY_WAIT_MS);
-    aux_ignore_energy_for_ms(AUX_POST_SPEAKER_IGNORE_MS);
     if (end_session) {
       session_end = true;
       voice_log(ESP_LOG_INFO, turn, "SESSION", "ended after TTS id=%s", session_id);

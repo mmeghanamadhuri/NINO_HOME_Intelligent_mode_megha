@@ -55,11 +55,13 @@ from face_service import FaceService
 from memory_service import configure_from_environ as configure_memory_from_environ
 from memory_service import get_memory_service, normalize_database_url
 from esp_playback import (
+    clear_device_busy,
     device_base_url,
     device_busy_speaking,
     ensure_esp_play_wav_url_configured,
     esp_play_wav_url,
     mark_device_busy_for,
+    stream_echo_tail_seconds,
 )
 from emotion_service import EmotionService
 from object_detection_service import ObjectDetectionService, summarize_detections
@@ -1951,7 +1953,6 @@ async def _voice_ws_send_reply(
         mark_session_closed,
         mark_session_open,
         mark_tts_playback,
-        post_tts_grace_seconds,
     )
 
     if meta.end_session:
@@ -1971,7 +1972,9 @@ async def _voice_ws_send_reply(
             tts_seconds=float(meta.timings.get("tts_seconds") or 0.0),
             audio_out_seconds=play_s,
         )
-        mark_device_busy_for(play_s + post_tts_grace_seconds(), device_id=device_id)
+        # Busy only while the clip should still be playing. A 4s post-TTS grace
+        # used to drop the user's first words after the LED went listen.
+        mark_device_busy_for(play_s + stream_echo_tail_seconds(), device_id=device_id)
 
     from voice_service import SERVO_360_TRIGGER_DELAY_SECONDS
 
@@ -2498,6 +2501,15 @@ async def _voice_ws_stream_pipeline(
             try:
                 payload = json.loads(raw)
             except ValueError:
+                return True
+            if str(payload.get("type") or "").strip().lower() == "listen":
+                # Board finished TTS and is about to send Aux PCM.
+                clear_device_busy(device_id)
+                logger.info(
+                    "stream listen — accept Aux now device=%s session=%s",
+                    device_id,
+                    session_id,
+                )
                 return True
             if str(payload.get("type") or "").strip().lower() == "ready":
                 logger.info(
