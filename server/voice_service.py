@@ -962,6 +962,36 @@ def minimal_voice_reply_wav() -> bytes:
     return bio.getvalue()
 
 
+def voice_error_tts_enabled() -> bool:
+    """When false, pipeline failures return silent audio instead of speaking errors aloud."""
+    raw = os.environ.get("VOICE_ERROR_TTS", "silent").strip().lower()
+    return raw not in {"0", "false", "no", "off", "silent", "none"}
+
+
+def voice_pipeline_recovery_wav(exc: BaseException) -> bytes:
+    """Build recovery audio after a voice pipeline failure.
+
+    Default is silent recovery so the bot does not speak long LLM-down messages in a
+    fallback espeak voice while intelligent mode is trying to fix the server.
+    Set VOICE_ERROR_TTS=speak to restore spoken error prompts.
+    """
+    if not voice_error_tts_enabled():
+        logger.warning("Voice pipeline failed (silent recovery): %s", exc)
+        return minimal_voice_reply_wav()
+
+    from llm_service import OLLAMA_UNAVAILABLE_REPLY, is_ollama_error
+    from tts_service import synthesize_sapi_wav_bytes
+    from wav_resample import ESP_PCM_SAMPLE_RATE_HZ, resample_wav_bytes_to_mono_16bit
+
+    if is_ollama_error(exc):
+        txt = OLLAMA_UNAVAILABLE_REPLY
+    else:
+        txt = "Sorry, something went wrong. Please try again."
+    logger.warning("Voice pipeline failed (spoken recovery): %s", exc)
+    raw, _ = synthesize_sapi_wav_bytes(txt)
+    return resample_wav_bytes_to_mono_16bit(raw, ESP_PCM_SAMPLE_RATE_HZ)
+
+
 def _ctranslate2_cuda_device_count() -> int:
     """How many GPUs CTranslate2 (faster-whisper) can actually use."""
     global _CTRANSLATE2_CUDA_COUNT
@@ -2851,6 +2881,29 @@ def process_voice_wav(
                     "stt_seconds": round(t_stt - t_start, 3),
                 }
                 return b"", meta
+    elif ident is not None and ident.is_active():
+        ident_result = ident.handle_voice(user_text)
+        if ident_result.handled:
+            ident_handled = True
+            reply_path = "identity_correction" if ident_result.registered_name else "face_registration"
+            reply = ident_result.reply
+            if ident_result.registered_name:
+                meta.registered_face_name = ident_result.registered_name
+                from conversation_sessions import bind_session_user
+
+                if meta.session_id:
+                    bind_session_user(
+                        meta.session_id,
+                        device_id=device_id,
+                        user_name=ident_result.registered_name,
+                    )
+            if ident_result.relisten_after_reply:
+                meta.face_reg_relisten = True
+            logger.info(
+                "Voice session identity (active) | registered=%s heard: %s",
+                ident_result.registered_name or "(none)",
+                user_text[:120],
+            )
 
     if not ident_handled and (
         is_bare_thank_you_stt(user_text)
@@ -3295,6 +3348,34 @@ def process_voice_wav(
                 "Voice LLM memory | path=%s viewer=%s heard: %s",
                 reply_path,
                 memory_name,
+                user_text[:120],
+            )
+    if reply_path == "llm":
+        from conversation_correction import is_correction_request, rework_voice_reply
+
+        if is_correction_request(user_text):
+            last_turn = None
+            if memory_svc.ready and memory_name:
+                last_turn = memory_svc.get_last_conversation_turn(
+                    memory_name, getattr(meta, "session_id", "") or ""
+                )
+            reply, reply_path = rework_voice_reply(
+                user_text=user_text,
+                viewer_name=memory_name or viewer_name,
+                device_id=device_id,
+                last_turn=last_turn,
+            )
+            if memory_svc.ready and memory_name:
+                memory_svc.log_conversation_correction(
+                    memory_name,
+                    correction_text=user_text,
+                    reworked_assistant_text=reply,
+                    conversation_id=(last_turn or {}).get("id"),
+                )
+            logger.info(
+                "Voice conversation correction | viewer=%s path=%s heard: %s",
+                memory_name or viewer_name or "-",
+                reply_path,
                 user_text[:120],
             )
     if reply_path == "llm" and is_identity_question(user_text):

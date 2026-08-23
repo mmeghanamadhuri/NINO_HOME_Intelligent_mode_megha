@@ -663,6 +663,7 @@ def is_alarm_or_reminder_command(user_text: str) -> bool:
         is_list_alarm_command,
         is_reminder_command,
         is_set_alarm_command,
+        is_timer_command,
     )
 
     if looks_like_medicine_reminder_set(text):
@@ -672,6 +673,7 @@ def is_alarm_or_reminder_command(user_text: str) -> bool:
         for fn in (
             is_set_alarm_command,
             is_reminder_command,
+            is_timer_command,
             is_list_alarm_command,
             is_cancel_all_alarm_command,
             is_delete_one_alarm_command,

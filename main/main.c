@@ -61,6 +61,7 @@
 #include "push_buttons.h"
 #include "voice_assist.h"
 #include "music_stream.h"
+#include "ota_update.h"
 #include "sd_record.h"
 #include "wifi_config.h"
 #include "wifi_prov_ble.h"
@@ -2393,6 +2394,62 @@ static esp_err_t music_stop_handler(httpd_req_t *req) {
   return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t ota_update_handler(httpd_req_t *req) {
+  if (req->method != HTTP_POST) {
+    return music_json_error(req, "405 Method Not Allowed", "POST only");
+  }
+  if (req->content_len <= 0 || req->content_len > 768) {
+    return music_json_error(req, "400 Bad Request", "bad_body");
+  }
+  char body[769] = {0};
+  int received = 0;
+  while (received < req->content_len) {
+    int r = httpd_req_recv(req, body + received, req->content_len - received);
+    if (r <= 0) {
+      return music_json_error(req, "400 Bad Request", "recv");
+    }
+    received += r;
+  }
+  body[received] = '\0';
+
+  char url[512] = {0};
+  if (!parse_json_string_field(body, "url", url, sizeof(url))) {
+    return music_json_error(req, "400 Bad Request", "missing url");
+  }
+  if (ota_update_in_progress()) {
+    return music_json_error(req, "409 Conflict", "ota_busy");
+  }
+  esp_err_t err = ota_update_start(url);
+  if (err == ESP_ERR_NOT_SUPPORTED) {
+    return music_json_error(req, "501 Not Implemented", "ota_not_capable");
+  }
+  if (err != ESP_OK) {
+    return music_json_error(req, "503 Service Unavailable", "ota_start_failed");
+  }
+  httpd_resp_set_type(req, "application/json");
+  wifi_http_set_cors(req);
+  return httpd_resp_send(req, "{\"ok\":true,\"started\":true}",
+                         HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t ota_status_handler(httpd_req_t *req) {
+  if (req->method != HTTP_GET) {
+    return music_json_error(req, "405 Method Not Allowed", "GET only");
+  }
+  httpd_resp_set_type(req, "application/json");
+  wifi_http_set_cors(req);
+  char body[160];
+  int n = snprintf(
+      body, sizeof(body),
+      "{\"ok\":true,\"capable\":%s,\"in_progress\":%s}",
+      ota_update_capable() ? "true" : "false",
+      ota_update_in_progress() ? "true" : "false");
+  if (n <= 0 || n >= (int)sizeof(body)) {
+    return httpd_resp_send_500(req);
+  }
+  return httpd_resp_send(req, body, n);
+}
+
 static esp_err_t music_status_handler(httpd_req_t *req) {
   if (req->method != HTTP_GET) {
     return music_json_error(req, "405 Method Not Allowed", "GET only");
@@ -2955,14 +3012,23 @@ static int app_status_json(char *buf, size_t buf_sz) {
       "\"wifi_ssid\":\"%s\","
       "\"volume\":%d,\"firmware\":\"%s\",\"sta_connected\":%s,"
       "\"ip\":\"%s\",\"mdns_host\":\"%s.local\","
+      "\"camera\":{\"session_active\":%s,\"streaming\":%s,"
+      "\"uvc_connected\":%s,\"frame_sequence\":%lu},"
       "\"face_track\":{\"enabled\":%s,\"detector_ready\":%s,"
       "\"face_found\":%s},"
-      "\"servo\":{%s}}",
+      "\"servo\":{%s},"
+      "\"ota\":{\"capable\":%s,\"in_progress\":%s}}",
       s_device_name, s_device_id, mac_hex, s_sta_ssid, nino_audio_get_volume_percent(),
       fw_version, s_sta_connected ? "true" : "false", sta_ip, mdns_host,
+      nino_camera_session_is_active() ? "true" : "false",
+      nino_camera_is_streaming() ? "true" : "false",
+      nino_uvc_camera_connected() ? "true" : "false",
+      (unsigned long)nino_uvc_frame_sequence(),
       face_track.enabled ? "true" : "false",
       face_track.detector_ready ? "true" : "false",
-      face_track.face_found ? "true" : "false", servo_frag);
+      face_track.face_found ? "true" : "false", servo_frag,
+      ota_update_capable() ? "true" : "false",
+      ota_update_in_progress() ? "true" : "false");
 }
 
 int wifi_config_status_json(char *buf, size_t buf_sz) {
@@ -4052,6 +4118,18 @@ static void start_http_server(void) {
       .handler = status_handler,
       .user_ctx = NULL,
   };
+  const httpd_uri_t ota_update_uri = {
+      .uri = "/ota/update",
+      .method = HTTP_POST,
+      .handler = ota_update_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t ota_status_uri = {
+      .uri = "/ota/status",
+      .method = HTTP_GET,
+      .handler = ota_status_handler,
+      .user_ctx = NULL,
+  };
   const httpd_uri_t face_track_get_uri = {
       .uri = "/face/track",
       .method = HTTP_GET,
@@ -4143,6 +4221,8 @@ static void start_http_server(void) {
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &volume_get_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &volume_post_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &status_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &ota_update_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &ota_status_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &face_track_get_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &face_track_post_uri));
   ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &face_track_opts_uri));

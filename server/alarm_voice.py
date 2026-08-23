@@ -70,6 +70,27 @@ _REMINDER_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     )
 )
 
+_TIMER_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bset\s+(?:a\s+)?timer\s+(?:for\s+)?(.+)",
+        r"\bstart\s+(?:a\s+)?timer\s+(?:for\s+)?(.+)",
+        r"\btimer\s+(?:for\s+)?(.+)",
+    )
+)
+
+_RELATIVE_DURATION = re.compile(
+    r"""
+    (?:
+        ^(?:in\s+)?
+        (?P<amount_only>\d+)\s*(?P<unit_only>minutes?|mins?|hours?|hrs?)
+        |
+        (?:(?P<label>.+?)\s+)?in\s+(?P<amount>\d+)\s*(?P<unit>minutes?|mins?|hours?|hrs?)
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
 _AT_TIME_SUFFIX = re.compile(r"\s+(?:at|for|by)\s+(.+)$", re.IGNORECASE)
 
 _TIME_TOKEN = re.compile(
@@ -103,6 +124,7 @@ class AlarmParseResult:
     fire_at: datetime | None = None
     error: str | None = None
     rolled_to_tomorrow: bool = False
+    label: str = ""
 
 
 def is_set_alarm_command(user_text: str) -> bool:
@@ -151,6 +173,41 @@ def is_reminder_command(user_text: str) -> bool:
     if not text:
         return False
     return any(p.search(text) for p in _REMINDER_PATTERNS)
+
+
+def is_timer_command(user_text: str) -> bool:
+    text = user_text.strip()
+    if not text:
+        return False
+    if "timer" in text.lower():
+        return True
+    return any(p.search(text) for p in _TIMER_PATTERNS)
+
+
+def parse_relative_duration(phrase: str) -> AlarmParseResult:
+    """Parse '2 minutes', 'in 5 minutes', or 'drink water in 5 minutes'."""
+    cleaned = (phrase or "").strip()
+    if not cleaned:
+        return AlarmParseResult(error="missing duration")
+
+    match = _RELATIVE_DURATION.search(cleaned)
+    if not match:
+        return AlarmParseResult(error="could not parse timer duration")
+
+    amount_raw = match.group("amount") or match.group("amount_only")
+    unit_raw = match.group("unit") or match.group("unit_only") or "minutes"
+    label = (match.group("label") or "").strip(" .,")
+    try:
+        amount = int(amount_raw)
+    except (TypeError, ValueError):
+        return AlarmParseResult(error="invalid timer amount")
+    if amount <= 0 or amount > 24 * 60:
+        return AlarmParseResult(error="timer duration out of range")
+
+    unit = unit_raw.lower()
+    delta = timedelta(hours=amount) if unit.startswith("h") else timedelta(minutes=amount)
+    fire_at = system_now() + delta
+    return AlarmParseResult(fire_at=fire_at, label=label)
 
 
 def _resolve_person_name(
@@ -218,6 +275,13 @@ def handle_alarm_voice(
     if is_reminder_command(text):
         regex_set_attempted = True
         result = _handle_set_reminder(
+            text, person_name=resolved_name, user_id=user_id, device_id=device_id
+        )
+        if result.handled:
+            return result
+    if is_timer_command(text):
+        regex_set_attempted = True
+        result = _handle_set_timer(
             text, person_name=resolved_name, user_id=user_id, device_id=device_id
         )
         if result.handled:
@@ -616,20 +680,63 @@ def _handle_set_reminder(
         return AlarmVoiceResult(handled=False)
 
     split = _split_label_and_time_phrase(tail)
-    if not split:
-        return AlarmVoiceResult(handled=False)
+    if split:
+        raw_label, time_phrase = split
+        label = _clean_reminder_label(raw_label)
+        parsed = parse_alarm_datetime(time_phrase)
+        if parsed.error or parsed.fire_at is None:
+            return AlarmVoiceResult(handled=False)
+    else:
+        relative = parse_relative_duration(tail)
+        if relative.error or relative.fire_at is None:
+            return AlarmVoiceResult(handled=False)
+        parsed = relative
+        label = _clean_reminder_label(relative.label or tail)
 
-    raw_label, time_phrase = split
-    label = _clean_reminder_label(raw_label)
-    parsed = parse_alarm_datetime(time_phrase)
+    logger.info(
+        "Voice reminder (regex) | person=%r label=%r fire_at=%s",
+        person_name or "(none)",
+        label,
+        parsed.fire_at.isoformat(timespec="seconds") if parsed.fire_at else None,
+    )
+    return _save_alarm(
+        parsed.fire_at,
+        parsed,
+        label=label,
+        person_name=person_name,
+        user_id=user_id,
+        device_id=device_id,
+        source_text=user_text,
+    )
+
+
+def _extract_timer_phrase(user_text: str) -> str:
+    text = user_text.strip()
+    for pattern in _TIMER_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return (match.group(1) or "").strip()
+    return ""
+
+
+def _handle_set_timer(
+    user_text: str,
+    *,
+    person_name: str = "",
+    user_id: int | None = None,
+    device_id: str = "",
+) -> AlarmVoiceResult:
+    phrase = _extract_timer_phrase(user_text) or user_text.strip()
+    parsed = parse_relative_duration(phrase)
     if parsed.error or parsed.fire_at is None:
         return AlarmVoiceResult(handled=False)
 
+    label = _clean_reminder_label(parsed.label or "timer")
     logger.info(
-        "Voice reminder (regex) | person=%r label=%r time_phrase=%r",
+        "Voice timer | person=%r label=%r fire_at=%s",
         person_name or "(none)",
         label,
-        time_phrase,
+        parsed.fire_at.isoformat(timespec="seconds"),
     )
     return _save_alarm(
         parsed.fire_at,

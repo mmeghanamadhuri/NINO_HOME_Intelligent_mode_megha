@@ -14,10 +14,16 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from pipeline_log import pipeline_log
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_OLLAMA_HTTP_RETRIES = 6
+DEFAULT_OLLAMA_HTTP_RETRY_DELAY_S = 0.4
+_ollama_http_session: requests.Session | None = None
 
 DEFAULT_OLLAMA_GPU_URL = "http://127.0.0.1:11435/api/generate"
 DEFAULT_OLLAMA_CPU_URL = "http://127.0.0.1:11434/api/generate"
@@ -30,6 +36,47 @@ VOICE_QUERY_TIMEOUT_S = 60
 OLLAMA_UNAVAILABLE_REPLY = (
     "Sorry, I could not reach the language model in time. Please try again."
 )
+
+
+def _ollama_http_retries() -> int:
+    raw = os.environ.get("OLLAMA_HTTP_RETRIES", str(DEFAULT_OLLAMA_HTTP_RETRIES)).strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return DEFAULT_OLLAMA_HTTP_RETRIES
+
+
+def _ollama_http_retry_delay_s() -> float:
+    raw = os.environ.get(
+        "OLLAMA_HTTP_RETRY_DELAY_S",
+        str(DEFAULT_OLLAMA_HTTP_RETRY_DELAY_S),
+    ).strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return DEFAULT_OLLAMA_HTTP_RETRY_DELAY_S
+
+
+def _ollama_http_session_get() -> requests.Session:
+    """Shared requests session with configurable retries for Ollama HTTP calls."""
+    global _ollama_http_session
+    if _ollama_http_session is not None:
+        return _ollama_http_session
+    retries = _ollama_http_retries()
+    retry = Retry(
+        total=retries,
+        connect=retries,
+        read=retries,
+        backoff_factor=_ollama_http_retry_delay_s(),
+        allowed_methods=["GET", "POST"],
+        raise_on_status=False,
+    )
+    session = requests.Session()
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    _ollama_http_session = session
+    return session
 
 
 def resolve_ollama_api_url(
@@ -124,21 +171,29 @@ def try_start_gpu_ollama() -> None:
 
 def _normalize_ollama_generate_url(url: str) -> str:
     """Ensure POST target is .../api/generate (not the server root)."""
-    raw = url.strip().rstrip("/")
-    if not raw:
+    base = _ollama_base_url(url)
+    if not base:
         return DEFAULT_OLLAMA_URL
-    if raw.endswith("/api/generate") or raw.endswith("/api/chat"):
-        return raw
-    return f"{raw}/api/generate"
+    return f"{base}/api/generate"
 
 
 def _ollama_base_url(api_url: str | None = None) -> str:
-    raw = (api_url or os.environ.get("OLLAMA_URL") or DEFAULT_OLLAMA_URL).strip()
-    if raw.endswith("/api/generate"):
-        return raw[: -len("/api/generate")]
-    if raw.endswith("/api/chat"):
-        return raw[: -len("/api/chat")]
-    return raw.rstrip("/")
+    """Strip /api/generate or /api/chat suffixes to get the Ollama server root."""
+    raw = (api_url or os.environ.get("OLLAMA_URL") or DEFAULT_OLLAMA_URL).strip().rstrip("/")
+    while raw.endswith("/api/generate") or raw.endswith("/api/chat"):
+        if raw.endswith("/api/generate"):
+            raw = raw[: -len("/api/generate")].rstrip("/")
+        elif raw.endswith("/api/chat"):
+            raw = raw[: -len("/api/chat")].rstrip("/")
+    return raw
+
+
+def set_ollama_env_url(api_url: str | None = None) -> str:
+    """Normalize and persist OLLAMA_URL (always .../api/generate, never doubled)."""
+    raw = (api_url or os.environ.get("OLLAMA_URL") or resolve_ollama_api_url()).strip()
+    normalized = _normalize_ollama_generate_url(raw)
+    os.environ["OLLAMA_URL"] = normalized
+    return normalized
 
 
 def ollama_model_available(*, model: str, api_url: str, timeout_s: int = 3) -> bool:
@@ -150,7 +205,7 @@ def ollama_model_available(*, model: str, api_url: str, timeout_s: int = 3) -> b
     if ":" not in wanted:
         names.add(f"{wanted}:latest")
     try:
-        response = requests.get(
+        response = _ollama_http_session_get().get(
             f"{_ollama_base_url(api_url)}/api/tags",
             timeout=timeout_s,
         )
@@ -225,7 +280,7 @@ def ollama_runtime_status(
         "warning": "",
     }
     try:
-        r = requests.get(f"{base}/api/ps", timeout=timeout_s)
+        r = _ollama_http_session_get().get(f"{base}/api/ps", timeout=timeout_s)
         r.raise_for_status()
         out["reachable"] = True
         loaded_models: list[str] = []
@@ -268,6 +323,11 @@ def ollama_runtime_status(
     except Exception as exc:
         out["warning"] = f"Ollama status check failed: {exc}"
     return out
+
+
+def ollama_is_reachable(*, api_url: str | None = None, timeout_s: int = 2) -> bool:
+    """Fast check used by intelligent mode to skip LLM report generation when Ollama is down."""
+    return bool(ollama_runtime_status(api_url=api_url, timeout_s=timeout_s).get("reachable"))
 
 
 def is_ollama_error(exc: BaseException) -> bool:
@@ -372,7 +432,7 @@ def ollama_generate(
     )
     t0 = time.perf_counter()
     try:
-        r = requests.post(url, json=payload, timeout=timeout_s)
+        r = _ollama_http_session_get().post(url, json=payload, timeout=timeout_s)
         r.raise_for_status()
         data = r.json()
         text = str(data.get("response", "")).strip()

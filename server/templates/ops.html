@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NiNO Ops — Intelligent Mode Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css?v=16" />
+    <link rel="stylesheet" href="/static/ops.css?v=7" />
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="site-header-inner">
+        <h1>NiNO Ops</h1>
+        <div class="header-actions">
+          <a class="header-link" href="/">Camera</a>
+          <a class="header-link" href="/actions">Actions</a>
+          <div class="status-pill" id="connectionStatus">Connecting…</div>
+        </div>
+      </div>
+    </header>
+
+    <main class="page ops-page">
+      <div class="ops-top-bar">
+        <p class="intro">
+          Intelligent Mode runs automated tests, detects issues, and fixes what it can.
+          <strong>Green = agent handled.</strong> <strong>Red = developer needed.</strong>
+        </p>
+        <div class="ops-toolbar">
+          <span class="ops-updated" id="lastUpdated">—</span>
+          <button class="secondary ops-btn-inline" id="refreshBtn" type="button">Refresh</button>
+          <button class="secondary ops-btn-inline" id="runTickBtn" type="button">Run check now</button>
+          <button class="secondary ops-btn-inline" id="runSmokeBtn" type="button">Smoke tests</button>
+        </div>
+      </div>
+
+      <section class="ops-summary-grid" id="summaryGrid">
+        <div class="ops-stat-card ops-stat-clickable" data-stat-filter="overview" tabindex="-1" role="button">
+          <span class="ops-stat-label">Bots online</span>
+          <strong class="ops-stat-value" id="statTotalBots">—</strong>
+        </div>
+        <div class="ops-stat-card ops-stat-healthy ops-stat-clickable" data-stat-filter="healthy" tabindex="-1" role="button">
+          <span class="ops-stat-label">Healthy</span>
+          <strong class="ops-stat-value" id="statHealthy">—</strong>
+        </div>
+        <div class="ops-stat-card ops-stat-agent ops-stat-clickable" data-stat-filter="agent_working" tabindex="-1" role="button">
+          <span class="ops-stat-label">Agent working</span>
+          <strong class="ops-stat-value" id="statAgentWorking">—</strong>
+        </div>
+        <div class="ops-stat-card ops-stat-code-bug ops-stat-clickable" data-stat-filter="developer" tabindex="-1" role="button">
+          <span class="ops-stat-label">Developer needed</span>
+          <strong class="ops-stat-value" id="statDeveloper">—</strong>
+        </div>
+        <div class="ops-stat-card ops-stat-resolved ops-stat-clickable" data-stat-filter="agent_resolved" tabindex="-1" role="button">
+          <span class="ops-stat-label">Auto-fixed</span>
+          <strong class="ops-stat-value" id="statAutoFixed">—</strong>
+        </div>
+        <div class="ops-stat-card ops-stat-fixing ops-stat-clickable" data-stat-filter="fixing" tabindex="-1" role="button">
+          <span class="ops-stat-label">Fixing now</span>
+          <strong class="ops-stat-value" id="statFixing">—</strong>
+        </div>
+      </section>
+
+      <section class="ops-stat-detail" id="statInlineDetail" hidden>
+        <div class="ops-stat-detail-header">
+          <h2 id="statInlineTitle">Details</h2>
+          <button class="secondary ops-btn-inline" id="statInlineClose" type="button">Close</button>
+        </div>
+        <div id="statInlineBody"></div>
+      </section>
+
+      <nav class="ops-tabs" id="opsTabs" role="tablist" aria-label="Ops dashboard sections">
+        <button class="ops-tab ops-tab-active" id="ops-tab-overview" data-tab="overview" type="button" role="tab" aria-selected="true" aria-controls="tab-overview">Overview</button>
+        <button class="ops-tab" id="ops-tab-bots" data-tab="bots" type="button" role="tab" aria-selected="false" aria-controls="tab-bots">Bot fleet</button>
+        <button class="ops-tab" id="ops-tab-tests" data-tab="tests" type="button" role="tab" aria-selected="false" aria-controls="tab-tests">Tests</button>
+        <button class="ops-tab" id="ops-tab-developer" data-tab="developer" type="button" role="tab" aria-selected="false" aria-controls="tab-developer">Developer</button>
+        <button class="ops-tab" id="ops-tab-system" data-tab="system" type="button" role="tab" aria-selected="false" aria-controls="tab-system">System</button>
+      </nav>
+
+      <!-- OVERVIEW TAB -->
+      <div class="ops-tab-panel ops-tab-panel-active" id="tab-overview" role="tabpanel" aria-labelledby="ops-tab-overview">
+        <section class="ops-action-center">
+          <article class="ops-queue-card ops-queue-agent" id="queueAgentWorking">
+            <header class="ops-queue-header">
+              <h2>Agents working now</h2>
+              <span class="ops-queue-count" id="queueAgentCount">0</span>
+            </header>
+            <div class="ops-queue-body" id="queueAgentBody">
+              <p class="ops-empty">No active agent work — fleet looks healthy.</p>
+            </div>
+          </article>
+          <article class="ops-queue-card ops-queue-developer" id="queueDeveloper">
+            <header class="ops-queue-header">
+              <h2>Needs developer</h2>
+              <span class="ops-queue-count" id="queueDeveloperCount">0</span>
+            </header>
+            <div class="ops-queue-body" id="queueDeveloperBody">
+              <p class="ops-empty">No software bugs open. Intelligent Mode handles routine issues.</p>
+            </div>
+          </article>
+          <article class="ops-queue-card ops-queue-resolved" id="queueResolved">
+            <header class="ops-queue-header">
+              <h2>Recently auto-fixed</h2>
+              <span class="ops-queue-count" id="queueResolvedCount">0</span>
+            </header>
+            <div class="ops-queue-body" id="queueResolvedBody">
+              <p class="ops-empty">No recent auto-fixes yet.</p>
+            </div>
+          </article>
+        </section>
+
+        <section class="card ops-runtime-card">
+          <div class="card-header">
+            <h2>Intelligent Mode runtime</h2>
+            <span class="ops-health-badge" id="imRunningBadge">—</span>
+          </div>
+          <div class="ops-agent-grid" id="agentStatus">
+            <p class="ops-empty">Loading…</p>
+          </div>
+        </section>
+      </div>
+
+      <!-- BOTS TAB -->
+      <div class="ops-tab-panel" id="tab-bots" role="tabpanel" aria-labelledby="ops-tab-bots" hidden>
+        <section class="card">
+          <div class="card-header">
+            <h2>Bot fleet</h2>
+            <span class="status-label" id="botFleetCount">—</span>
+          </div>
+          <div id="botFleet" class="ops-bot-grid">
+            <p class="ops-empty">Loading bots…</p>
+          </div>
+        </section>
+      </div>
+
+      <!-- TESTS TAB -->
+      <div class="ops-tab-panel" id="tab-tests" role="tabpanel" aria-labelledby="ops-tab-tests" hidden>
+        <section class="card">
+          <div class="card-header">
+            <h2>Soak voice tests</h2>
+            <span class="status-label" id="soakRunSummary">—</span>
+          </div>
+          <div id="soakPanel">
+            <p class="ops-empty">Continuous live voice Q&amp;A on the robot.</p>
+          </div>
+        </section>
+        <section class="card">
+          <div class="card-header">
+            <h2>Smoke tests</h2>
+            <span class="status-label" id="smokeRunSummary">—</span>
+          </div>
+          <div id="smokePanel">
+            <p class="ops-empty">Loading smoke tests…</p>
+          </div>
+        </section>
+      </div>
+
+      <!-- DEVELOPER TAB -->
+      <div class="ops-tab-panel" id="tab-developer" role="tabpanel" aria-labelledby="ops-tab-developer" hidden>
+        <section class="card">
+          <div class="card-header">
+            <h2>Developer action required</h2>
+            <span class="status-label" id="developerIssueCount">—</span>
+          </div>
+          <p class="ops-tab-note">
+            Only true software or firmware bugs appear here. WAV limits, STT retries, and soak false alarms are handled by Intelligent Mode automatically.
+          </p>
+          <div id="developerPanel">
+            <p class="ops-empty">No developer issues open.</p>
+          </div>
+        </section>
+        <section class="card">
+          <div class="card-header">
+            <h2>Coding Agent — pending fix proposals</h2>
+            <span class="status-label" id="codingAgentStatus">—</span>
+          </div>
+          <p class="ops-tab-note">
+            AI-proposed code fixes require your approval before server patches or OTA deploy.
+          </p>
+          <div id="codingAgentPanel">
+            <p class="ops-empty">No pending proposals.</p>
+          </div>
+        </section>
+        <section class="card">
+          <div class="card-header">
+            <h2>All active incidents</h2>
+            <span class="status-label" id="incidentCount">—</span>
+          </div>
+          <div id="incidentPanel">
+            <p class="ops-empty">Loading incidents…</p>
+          </div>
+        </section>
+      </div>
+
+      <!-- SYSTEM TAB -->
+      <div class="ops-tab-panel" id="tab-system" role="tabpanel" aria-labelledby="ops-tab-system" hidden>
+        <section class="card">
+          <div class="card-header">
+            <h2>Server brain</h2>
+            <span class="ops-health-badge" id="serverHealthBadge">—</span>
+          </div>
+          <div id="serverPanel">
+            <p class="ops-empty">Loading server status…</p>
+          </div>
+        </section>
+        <section class="card">
+          <div class="card-header">
+            <h2>Firmware OTA</h2>
+            <span class="status-label" id="firmwareBuildCount">—</span>
+          </div>
+          <div class="ops-toolbar" style="margin-bottom: 0.75rem;">
+            <input type="file" id="firmwareUploadInput" accept=".bin" />
+            <button class="secondary ops-btn-inline" id="firmwareUploadBtn" type="button">Upload .bin</button>
+          </div>
+          <div id="firmwarePanel"></div>
+          <div id="otaPendingPanel" style="margin-top: 0.75rem;"></div>
+        </section>
+      </div>
+    </main>
+
+    <script src="/static/ops.js?v=8"></script>
+  </body>
+</html>

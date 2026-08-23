@@ -14,7 +14,7 @@ endif()
 
 set(main_requires esp_psram esp_wifi esp_event esp_netif nvs_flash esp_http_server esp_http_client mdns
     console esp32_p4_function_ev_board esp_websocket_client driver usb
-    esp_hosted fatfs sdmmc esp_adc)
+    esp_hosted fatfs sdmmc esp_adc app_update)
 
 set(main_priv_requires bt)
 
@@ -22,7 +22,7 @@ set(main_srcs
     servo_recplay.c mic_input.c wifi_prov_ble.c servo_dxl.c servo_motion.c
     face_tracker.c face_detect.cpp main.c audio_playback.c audio_capture.c audio_queue.c
     voice_ws_client.c voice_assist.c nino_eye.c push_buttons.c rgb_led.c
-    music_stream.c sd_record.c battery_adc.c battery_endurance.c)
+    music_stream.c sd_record.c battery_adc.c battery_endurance.c ota_update.c)
 
 if(CONFIG_NINO_EYE_DISPLAY_TFT)
     list(APPEND main_srcs st7735.c tft_neutral.c)

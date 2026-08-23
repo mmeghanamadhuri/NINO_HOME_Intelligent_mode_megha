@@ -26,6 +26,7 @@ from face_registration_voice import (
     is_registration_offer_yes,
     is_registration_stop_process,
     is_session_goodbye_utterance,
+    parse_misidentification_denial,
     parse_next_spell_letter,
     parse_spelled_name,
     spell_name_aloud,
@@ -50,6 +51,12 @@ GUEST_REPLY = "No problem. I'll keep this as a guest chat. How can I help you?"
 NO_FACE_GUEST_REPLY = "How can I help you"
 STILL_UNKNOWN_REPLY = (
     "I still don't recognize you. Looks like you are a new user, can I register you"
+)
+MISIDENTIFY_APOLOGY = (
+    "Sorry, I got the wrong person. Let me look at the camera again."
+)
+MISIDENTIFY_STILL_UNKNOWN = (
+    "I still don't see a match. Would you like to register, or tell me your name?"
 )
 # No activity during register → guest and keep the session.
 REGISTER_SILENCE_MS = DEFAULT_REGISTER_MAX_MS
@@ -265,7 +272,16 @@ class SessionIdentityFlow:
         if is_face_reg_prompt_echo(text):
             return FaceRegVoiceResult(handled=True, reply="", relisten_after_reply=True)
 
-        if state == "idle" or state == "identified" or state == "guest":
+        if state == "idle":
+            return FaceRegVoiceResult(handled=False)
+
+        if state == "identified":
+            denied, wrong_name = parse_misidentification_denial(text)
+            if denied:
+                return self._handle_misidentification(wrong_name)
+            return FaceRegVoiceResult(handled=False)
+
+        if state == "guest":
             return FaceRegVoiceResult(handled=False)
 
         if is_already_registered_claim(text):
@@ -341,6 +357,72 @@ class SessionIdentityFlow:
         if state == "awaiting_spell" and letters:
             return self._finish_spelling()
         return self.timeout_to_guest()
+
+    def _handle_misidentification(self, wrong_name: str | None) -> FaceRegVoiceResult:
+        """User denied the greeted name — re-scan camera and learn if possible."""
+        with self._lock:
+            prior = self._user_name
+            self._user_name = None
+        logger.info(
+            "Session identity: misidentification denied wrong=%s prior=%s",
+            wrong_name or "(unspecified)",
+            prior,
+        )
+
+        name: str | None = None
+        state = "no_face"
+        if hasattr(self._faces, "recognize_identity"):
+            try:
+                name, state = self._faces.recognize_identity(
+                    self._read_frame,
+                    allow_session_hint=False,
+                    allow_pending=True,
+                    device_id=self._device_id,
+                )
+            except Exception:
+                logger.exception("Session identity: misidentification re-scan failed")
+                name, state = None, "no_face"
+
+        cleaned = (name or "").strip()
+        if state == "recognized" and cleaned and cleaned.lower() not in {
+            "unknown",
+            "face",
+        }:
+            if wrong_name and cleaned.lower() == wrong_name.lower():
+                with self._lock:
+                    self._state = "offer_register"
+                    self._clear_pending_spelling()
+                return FaceRegVoiceResult(
+                    handled=True,
+                    reply=MISIDENTIFY_STILL_UNKNOWN,
+                )
+            try:
+                capture_face_samples(
+                    self._faces,
+                    self._read_frame,
+                    cleaned,
+                    samples=5,
+                    interval_ms=200,
+                )
+                if hasattr(self._faces, "train"):
+                    self._faces.train()
+                logger.info(
+                    "Session identity: correction learned samples for %s", cleaned
+                )
+            except Exception:
+                logger.exception("Session identity: correction sample capture failed")
+            return self._become_identified(
+                cleaned,
+                reply=f"Sorry about that, {cleaned}. I see you now. How can I help?",
+            )
+
+        with self._lock:
+            self._state = "offer_register"
+            self._clear_pending_spelling()
+        return FaceRegVoiceResult(
+            handled=True,
+            reply=f"{MISIDENTIFY_APOLOGY} {MISIDENTIFY_STILL_UNKNOWN}",
+        )
 
     def _rerecognize_known_user(self) -> FaceRegVoiceResult:
         """User says they are not new — check the camera again before giving up."""

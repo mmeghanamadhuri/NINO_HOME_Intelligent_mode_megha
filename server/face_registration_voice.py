@@ -388,6 +388,24 @@ _ALREADY_REGISTERED_CLAIM_RE = re.compile(
     re.IGNORECASE,
 )
 
+# User denies the name NiNO used ("I'm not Sam", "wrong person", etc.).
+_MISIDENTIFICATION_DENIAL_RE = re.compile(
+    r"\b(?:"
+    r"i(?:'?m| am)\s+not\s+(?P<name>[_A-Za-z][\w'-]{1,30})"
+    r"|that(?:'?s| is)\s+not\s+(?:me|my\s+name)"
+    r"|(?:you(?:'?ve| have)?\s+)?(?:got|get)\s+(?:the\s+)?wrong\s+(?:person|name|guy|one)"
+    r"|wrong\s+person"
+    r"|not\s+my\s+name"
+    r"|i(?:'?m| am)\s+not\s+(?:him|her|them)"
+    r")\b",
+    re.IGNORECASE,
+)
+_MISIDENTIFICATION_WRONG_NAME_RE = re.compile(
+    r"\b(?:that(?:'?s| is)\s+not\s+(?P<name>[_A-Za-z][\w'-]{1,30})"
+    r"|i(?:'?m| am)\s+not\s+(?P<name2>[_A-Za-z][\w'-]{1,30}))\b",
+    re.IGNORECASE,
+)
+
 _MIN_ASCII_LETTERS = 3
 _MIN_ASCII_LETTERS_BARE = 4
 
@@ -565,6 +583,22 @@ def is_already_registered_claim(user_text: str) -> bool:
     if not text or len(text) > 100:
         return False
     return bool(_ALREADY_REGISTERED_CLAIM_RE.search(text))
+
+
+def parse_misidentification_denial(user_text: str) -> tuple[bool, str | None]:
+    """True when user denies the identity NiNO used. Returns (denied, wrong_name)."""
+    text = _strip_trailing_punct(user_text or "")
+    if not text or len(text) > 120:
+        return False, None
+    if not _MISIDENTIFICATION_DENIAL_RE.search(text):
+        return False, None
+    wrong: str | None = None
+    m = _MISIDENTIFICATION_WRONG_NAME_RE.search(text)
+    if m:
+        wrong = (m.group("name") or m.group("name2") or "").strip().title() or None
+    if wrong and wrong.lower() in _REJECT_NAMES:
+        wrong = None
+    return True, wrong
 
 
 def is_registration_cancel(user_text: str) -> bool:

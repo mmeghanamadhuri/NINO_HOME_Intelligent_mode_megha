@@ -502,15 +502,25 @@ class ObjectDetectionService:
 
     def _resolve_device(self) -> str:
         configured = os.environ.get("OBJECT_DETECTION_DEVICE", "auto").strip().lower()
-        if configured and configured != "auto":
+        if configured and configured not in {"auto", "detect"}:
             return configured
         try:
             import torch
 
-            if torch.cuda.is_available():
-                return "cuda:0"
-        except Exception:
-            pass
+            if not torch.cuda.is_available():
+                return "cpu"
+            device = os.environ.get("OBJECT_DETECTION_CUDA_DEVICE", "cuda:0").strip() or "cuda:0"
+            probe = torch.zeros(1, device=device)
+            del probe
+            torch.cuda.synchronize()
+            logger.info("YOLO26 using GPU %s (%s)", device, torch.cuda.get_device_name(0))
+            return device
+        except Exception as exc:
+            logger.warning(
+                "YOLO26 GPU unavailable (%s); using CPU. "
+                "For GTX 10xx install PyTorch cu126: bash server/scripts/fix_pytorch_pascal_gpu.sh",
+                exc,
+            )
         return "cpu"
 
     def _resolve_class_filter(self) -> list[int] | None:

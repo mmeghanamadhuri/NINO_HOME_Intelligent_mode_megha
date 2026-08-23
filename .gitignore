@@ -99,3 +99,18 @@ server/data/faces/**/*.jpg
 server/recordings/
 server/sessions/
 
+# Intelligent Mode / soak runtime (local ops data — not source)
+server/data/*.pid
+server/data/latency_log.json
+server/data/intelligent_incidents.json
+server/data/intelligent_incidents_archive.json
+server/data/intelligent_smoke_tests.json
+server/data/intelligent_baselines.json
+server/data/intelligent_experience_playbook.json
+server/data/soak_test.json
+server/data/strength_scorecard.json
+server/data/models/*.pt
+
+# Cursor local IDE config (optional per machine)
+.cursor/
+

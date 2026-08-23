@@ -15,7 +15,7 @@ from typing import Literal
 os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
 
 import cv2
-from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Header, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
@@ -130,6 +130,69 @@ def voice_pipeline_active(device_id: str | None = None) -> bool:
         return any(count > 0 for count in _voice_query_by_device.values())
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, str(int(default))).strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _maybe_start_soak_runner() -> None:
+    if not _env_bool("SOAK_TEST_ENABLED", False):
+        return
+    try:
+        from intelligent_mode.context import get_context
+        from intelligent_mode.orchestrator import get_orchestrator
+        from intelligent_mode.soak_test import SoakTestRunner, configure_soak_runner
+
+        ctx = get_context()
+        orch = get_orchestrator()
+        if orch is None:
+            logger.warning("SOAK_TEST_ENABLED=1 but Intelligent Mode is not running")
+            return
+
+        interval = int(os.environ.get("SOAK_TEST_INTERVAL_SECONDS", "90"))
+
+        def _remediate(snapshot: dict, candidates: list) -> dict:
+            return orch.run_remediation_pass(snapshot, extra_candidates=candidates)
+
+        runner = SoakTestRunner(
+            interval_seconds=max(30, interval),
+            collect_status=ctx.collect_status,
+            remediate=_remediate,
+            voice_active_fn=ctx.voice_active_fn,
+        )
+        configure_soak_runner(runner)
+        runner.start()
+        logger.info("Soak test runner started (interval=%ss)", runner.interval_seconds)
+    except Exception:
+        logger.exception("Failed to start soak test runner")
+
+
+def _maybe_start_coding_agent_worker() -> None:
+    if not _env_bool("CODING_AGENT_ENABLED", False):
+        return
+    try:
+        from intelligent_mode.coding_agent_worker import start_coding_agent_worker
+        from intelligent_mode.orchestrator import get_orchestrator
+
+        orch = get_orchestrator()
+        if orch is None:
+            logger.warning("CODING_AGENT_ENABLED=1 but Intelligent Mode is not running")
+            return
+
+        def _get_incidents() -> list:
+            return orch.store.list_incidents(limit=200)
+
+        worker = start_coding_agent_worker(get_incidents=_get_incidents)
+        if worker:
+            logger.info(
+                "Coding agent worker started (poll=%ss, parallel=%d)",
+                worker.poll_seconds,
+                worker.parallel_workers,
+            )
+    except Exception:
+        logger.exception("Failed to start coding agent worker")
+
+
 class _GracefulShutdownFilter(logging.Filter):
     """Suppress expected Ctrl+C / CancelledError tracebacks during uvicorn shutdown."""
 
@@ -217,6 +280,14 @@ class NoCacheStaticFiles(StarletteStaticFiles):
 
 
 app.mount("/static", NoCacheStaticFiles(directory=str(BASE_DIR / "static")), name="static")
+
+from ota_service import firmware_dir
+
+app.mount(
+    "/firmware",
+    StarletteStaticFiles(directory=str(firmware_dir()), check_dir=False),
+    name="firmware",
+)
 
 registry = get_device_registry()
 cameras = CameraPool()
@@ -433,15 +504,64 @@ def startup() -> None:
             stats.get("detector", "haar"),
         )
 
+    from intelligent_mode.context import IntelligentContext, build_default_status_collector
+    from intelligent_mode.orchestrator import start_intelligent_mode
+
+    start_intelligent_mode(
+        IntelligentContext(
+            registry=registry,
+            cameras=cameras,
+            tts=tts,
+            face_registration=face_registration,
+            faces=faces,
+            collect_status=build_default_status_collector(
+                registry=registry,
+                cameras=cameras,
+                tts=tts,
+                face_registration=face_registration,
+                faces=faces,
+            ),
+            on_registry_updated=cameras.configure_from_registry,
+            voice_active_fn=voice_pipeline_active,
+        )
+    )
+
+    _maybe_start_soak_runner()
+    _maybe_start_coding_agent_worker()
+
+    from daily_training_service import start_daily_training
+
+    start_daily_training(faces=faces, memory_service=get_memory_service())
+
 
 @app.on_event("shutdown")
 def shutdown() -> None:
+    try:
+        from intelligent_mode.soak_test import get_soak_runner
+
+        runner = get_soak_runner()
+        if runner is not None:
+            runner.stop()
+    except BaseException:
+        pass
+    try:
+        from intelligent_mode.orchestrator import stop_intelligent_mode
+
+        stop_intelligent_mode()
+    except BaseException:
+        pass
     try:
         stop_discovery_loop()
     except BaseException:
         pass
     try:
         get_memory_service().stop()
+    except BaseException:
+        pass
+    try:
+        from daily_training_service import get_daily_training_service
+
+        get_daily_training_service().stop()
     except BaseException:
         pass
     try:
@@ -562,6 +682,14 @@ def actions_page(request: Request):
             "devices": registry.status().get("devices", []),
         },
     )
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
+@app.get("/ops")
+def ops_page(request: Request):
+    response = templates.TemplateResponse(request, "ops.html", {})
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     response.headers["Pragma"] = "no-cache"
     return response
@@ -896,6 +1024,531 @@ def _stt_status() -> dict:
     from voice_service import whisper_runtime_status
 
     return whisper_runtime_status()
+
+
+@app.get("/api/intelligent-mode/status")
+def intelligent_mode_status() -> dict:
+    from intelligent_mode.orchestrator import get_orchestrator
+
+    orch = get_orchestrator()
+    if orch is None:
+        return {"ok": True, "enabled": False, "running": False}
+    return {"ok": True, **orch.status()}
+
+
+@app.get("/api/intelligent-mode/dashboard")
+def intelligent_mode_dashboard() -> dict:
+    from intelligent_mode.dashboard import build_dashboard
+    from intelligent_mode.orchestrator import get_orchestrator
+    from intelligent_mode.soak_test import get_soak_runner, get_soak_store
+    from llm_service import ollama_runtime_status, resolve_ollama_api_url, set_ollama_env_url
+
+    orch = get_orchestrator()
+    intelligent_status: dict = {"enabled": False, "running": False}
+    incidents: list[dict] = []
+    last_smoke_run = None
+
+    if orch is not None:
+        intelligent_status = orch.status()
+        incidents = [inc.to_dict() for inc in orch.store.list_incidents(limit=200)]
+        last_smoke_run = orch.smoke_store.last_run_dict()
+
+    soak_store = get_soak_store()
+    soak_runner = get_soak_runner()
+    intelligent_status["server_runtime"] = {
+        "pid": os.getpid(),
+        "running": True,
+    }
+
+    api_url = set_ollama_env_url(resolve_ollama_api_url())
+    active = resolve_device_id(None)
+    snapshot = {
+        "device_id": active,
+        "devices": registry.status(),
+        "discovery": discovery_status(),
+        "camera": cameras.status(active),
+        "cameras": cameras.status(),
+        "tts": tts.status(),
+        "stt": _stt_status(),
+        "llm": ollama_runtime_status(
+            model=os.environ.get("OLLAMA_MODEL"),
+            api_url=api_url,
+        ),
+        "memory": get_memory_service().status(),
+        "face_registration": face_registration.status(),
+    }
+
+    from intelligent_mode.soak_test import _soak_live_esp_enabled, resolve_soak_device
+
+    soak_device = resolve_soak_device(snapshot) if _soak_live_esp_enabled() else None
+    intelligent_status["soak_test"] = {
+        **soak_store.status(),
+        "runner_alive": bool(soak_runner and soak_runner.running),
+        "interval_seconds": getattr(soak_runner, "interval_seconds", None),
+        "live_esp": _soak_live_esp_enabled(),
+        "live_esp_device_id": soak_device[0] if soak_device else None,
+        "live_esp_device_name": soak_device[2] if soak_device else None,
+        "live_esp_play_url": soak_device[1] if soak_device else None,
+    }
+
+    return build_dashboard(
+        snapshot=snapshot,
+        intelligent_status=intelligent_status,
+        incidents=incidents,
+        last_smoke_run=last_smoke_run,
+        voice_active_fn=voice_pipeline_active,
+    )
+
+
+@app.get("/api/intelligent-mode/incidents")
+def intelligent_mode_incidents(limit: int = 50) -> dict:
+    from intelligent_mode.orchestrator import get_orchestrator
+
+    orch = get_orchestrator()
+    if orch is None:
+        return {"ok": True, "incidents": []}
+    limit = max(1, min(limit, 200))
+    incidents = orch.store.list_incidents(limit=limit)
+    return {
+        "ok": True,
+        "total": len(incidents),
+        "incidents": [inc.to_dict() for inc in incidents],
+    }
+
+
+@app.post("/api/intelligent-mode/run")
+def intelligent_mode_run() -> dict:
+    from intelligent_mode.orchestrator import get_orchestrator
+
+    orch = get_orchestrator()
+    if orch is None:
+        raise HTTPException(status_code=503, detail="Intelligent mode is not enabled")
+    summary = orch.run_once()
+    return {"ok": True, **summary}
+
+
+@app.post("/api/intelligent-mode/reload")
+def intelligent_mode_reload() -> dict:
+    """Reload Intelligent Mode config and job rules without restarting NiNO server."""
+    from intelligent_mode.context import get_context
+    from intelligent_mode.orchestrator import get_orchestrator, reload_intelligent_mode
+
+    before = get_orchestrator()
+    remaining_before = (
+        len(before.store.list_incidents(limit=500)) if before is not None else 0
+    )
+    orch = reload_intelligent_mode(get_context(), prune=False)
+    if orch is None:
+        return {
+            "ok": True,
+            "reloaded": False,
+            "detail": "INTELLIGENT_MODE is disabled",
+        }
+    return {
+        "ok": True,
+        "reloaded": True,
+        "incidents_before": remaining_before,
+        "incidents_after": len(orch.store.list_incidents(limit=500)),
+        "poll_seconds": orch.config.poll_seconds,
+        "llm_grace_seconds": orch.config.llm_grace_seconds,
+    }
+
+
+@app.post("/api/intelligent-mode/incidents/prune")
+def intelligent_mode_prune_incidents(keep: int = 50, confirm: bool = False) -> dict:
+    """Opt-in only: archive and remove resolved benign/noise incidents. Never runs automatically."""
+    if not confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="Pass confirm=true to prune. Incidents are never deleted automatically.",
+        )
+    from intelligent_mode.orchestrator import get_orchestrator
+
+    orch = get_orchestrator()
+    if orch is None:
+        raise HTTPException(status_code=503, detail="Intelligent mode is not enabled")
+    keep = max(10, min(keep, 200))
+    stats = orch.store.prune_resolved(keep_recent=keep)
+    return {"ok": True, **stats}
+
+
+@app.get("/api/intelligent-mode/tests")
+def intelligent_mode_tests(limit: int = 20) -> dict:
+    from intelligent_mode.orchestrator import get_orchestrator
+
+    orch = get_orchestrator()
+    if orch is None:
+        return {"ok": True, "last_run": None, "history": []}
+    limit = max(1, min(limit, 100))
+    return {
+        "ok": True,
+        "last_run": orch.smoke_store.last_run_dict(),
+        "history": orch.smoke_store.history(limit=limit),
+    }
+
+
+@app.post("/api/intelligent-mode/tests/run")
+def intelligent_mode_tests_run() -> dict:
+    from intelligent_mode.orchestrator import get_orchestrator
+
+    orch = get_orchestrator()
+    if orch is None:
+        raise HTTPException(status_code=503, detail="Intelligent mode is not enabled")
+    result = orch.run_smoke_tests()
+    return {"ok": True, **result}
+
+
+@app.get("/api/intelligent-mode/developer-issues")
+def intelligent_mode_developer_issues(limit: int = 50) -> dict:
+    from intelligent_mode.incident_ui import classify_incident_for_ui
+    from intelligent_mode.orchestrator import get_orchestrator
+
+    orch = get_orchestrator()
+    if orch is None:
+        return {"ok": True, "issues": []}
+    issues = []
+    for inc in orch.store.list_incidents(limit=max(1, min(limit, 200))):
+        if str(inc.status or "") not in {"open", "fixing", "escalated"}:
+            continue
+        raw = inc.to_dict()
+        ui = classify_incident_for_ui(raw)
+        if not ui.get("show_developer_issue"):
+            continue
+        report = inc.debug_report if isinstance(inc.debug_report, dict) else {}
+        code_bug = report.get("code_bug") if isinstance(report.get("code_bug"), dict) else {}
+        issues.append(
+            {
+                "incident_id": inc.incident_id,
+                "device_id": inc.device_id,
+                "display_name": inc.display_name,
+                "subsystem": inc.subsystem,
+                "error": inc.error,
+                "status": inc.status,
+                "category": report.get("category") or ui.get("issue_kind"),
+                "issue_kind": ui.get("issue_kind"),
+                "plain_english": ui.get("plain_english"),
+                "root_cause": report.get("root_cause") or code_bug.get("bug_summary"),
+                "suggested_actions": report.get("suggested_actions") or [],
+                "affected_files": code_bug.get("affected_files") or [],
+                "firmware_update_recommended": bool(code_bug.get("firmware_update_recommended")),
+            }
+        )
+    return {"ok": True, "issues": issues}
+
+
+@app.get("/api/coding-agent/status")
+def coding_agent_status() -> dict:
+    from intelligent_mode.coding_agent_worker import get_coding_agent_worker
+
+    worker = get_coding_agent_worker()
+    if worker is None:
+        return {"ok": True, "enabled": False, "running": False}
+    return {"ok": True, "enabled": True, **worker.status()}
+
+
+@app.get("/api/coding-agent/models")
+def coding_agent_models() -> dict:
+    from intelligent_mode.coding_agent import list_available_coding_models, select_coding_model
+
+    selected, reason = select_coding_model()
+    return {
+        "ok": True,
+        "selected_model": selected,
+        "selection_reason": reason,
+        "models": list_available_coding_models(),
+    }
+
+
+@app.get("/api/coding-agent/proposals")
+def coding_agent_proposals(status: str | None = None, limit: int = 50) -> dict:
+    from intelligent_mode.coding_agent import list_proposals
+
+    rows = list_proposals(status=status, limit=max(1, min(limit, 200)))
+    return {"ok": True, "proposals": [r.to_dict() for r in rows]}
+
+
+@app.get("/api/coding-agent/proposals/{proposal_id}")
+def coding_agent_proposal_detail(proposal_id: str) -> dict:
+    from intelligent_mode.coding_agent import get_proposal
+
+    proposal = get_proposal(proposal_id)
+    if proposal is None:
+        raise HTTPException(status_code=404, detail=f"Unknown proposal: {proposal_id}")
+    return {"ok": True, "proposal": proposal.to_dict()}
+
+
+@app.post("/api/coding-agent/propose/{incident_id}")
+def coding_agent_propose(incident_id: str) -> dict:
+    from intelligent_mode.coding_agent import propose_fix, send_proposal_email
+    from intelligent_mode.config import load_config
+    from intelligent_mode.orchestrator import get_orchestrator
+
+    orch = get_orchestrator()
+    if orch is None:
+        raise HTTPException(status_code=503, detail="Intelligent mode is not enabled")
+    incident = orch.store.get_incident(incident_id)
+    if incident is None:
+        raise HTTPException(status_code=404, detail=f"Unknown incident: {incident_id}")
+    proposal = propose_fix(incident, force=True)
+    if proposal is None:
+        raise HTTPException(status_code=400, detail="Not a code-bug incident or agent disabled")
+    config = load_config()
+    emailed = False
+    if config.coding_agent_email:
+        emailed, _ = send_proposal_email(proposal, config=config)
+    return {"ok": True, "proposal": proposal.to_dict(), "email_sent": emailed}
+
+
+@app.post("/api/coding-agent/approve/{proposal_id}")
+def coding_agent_approve(proposal_id: str, token: str | None = None) -> dict:
+    from intelligent_mode.coding_agent import approve_proposal
+
+    return approve_proposal(proposal_id, token=token)
+
+
+@app.get("/api/coding-agent/approve/{proposal_id}")
+def coding_agent_approve_get(proposal_id: str, token: str | None = None) -> dict:
+    """Allow one-click approve from email link."""
+    from intelligent_mode.coding_agent import approve_proposal
+
+    return approve_proposal(proposal_id, token=token)
+
+
+@app.post("/api/coding-agent/reject/{proposal_id}")
+def coding_agent_reject(proposal_id: str, token: str | None = None, reason: str = "") -> dict:
+    from intelligent_mode.coding_agent import reject_proposal
+
+    return reject_proposal(proposal_id, token=token, reason=reason)
+
+
+@app.get("/api/coding-agent/reject/{proposal_id}")
+def coding_agent_reject_get(proposal_id: str, token: str | None = None) -> dict:
+    from intelligent_mode.coding_agent import reject_proposal
+
+    return reject_proposal(proposal_id, token=token)
+
+
+@app.get("/api/intelligent-mode/soak/status")
+def soak_test_status() -> dict:
+    from intelligent_mode.context import get_context
+    from intelligent_mode.soak_test import (
+        _soak_live_esp_enabled,
+        get_soak_runner,
+        get_soak_store,
+        resolve_soak_device,
+    )
+
+    runner = get_soak_runner()
+    store = get_soak_store()
+    payload = {"ok": True, **store.status()}
+    payload["runner_alive"] = bool(runner and runner.running)
+    payload["interval_seconds"] = runner.interval_seconds if runner else None
+    payload["live_esp"] = _soak_live_esp_enabled()
+    try:
+        snapshot = get_context().collect_status()
+        soak_device = resolve_soak_device(snapshot) if payload["live_esp"] else None
+        payload["live_esp_device_id"] = soak_device[0] if soak_device else None
+        payload["live_esp_device_name"] = soak_device[2] if soak_device else None
+        payload["live_esp_play_url"] = soak_device[1] if soak_device else None
+    except Exception:
+        payload["live_esp_device_id"] = None
+        payload["live_esp_device_name"] = None
+        payload["live_esp_play_url"] = None
+    return payload
+
+
+@app.post("/api/intelligent-mode/soak/start")
+def soak_test_start(
+    interval_seconds: int | None = None,
+    max_duration_seconds: int | None = None,
+) -> dict:
+    from intelligent_mode.context import get_context
+    from intelligent_mode.orchestrator import get_orchestrator
+    from intelligent_mode.soak_test import SoakTestRunner, configure_soak_runner, get_soak_runner
+
+    runner = get_soak_runner()
+    if runner and runner.running:
+        from intelligent_mode.soak_test import get_soak_store
+
+        return {"ok": True, "message": "Soak test already running", **get_soak_store().status()}
+
+    ctx = get_context()
+    orch = get_orchestrator()
+    if orch is None:
+        raise HTTPException(status_code=503, detail="Intelligent mode is not enabled")
+
+    interval = max(30, int(interval_seconds or os.environ.get("SOAK_TEST_INTERVAL_SECONDS", "90")))
+    max_duration = max_duration_seconds
+    if max_duration is None:
+        raw = os.environ.get("SOAK_TEST_MAX_DURATION_SECONDS", "").strip()
+        if raw:
+            try:
+                max_duration = int(raw)
+            except ValueError:
+                max_duration = None
+
+    def _remediate(snapshot: dict, candidates: list) -> dict:
+        return orch.run_remediation_pass(snapshot, extra_candidates=candidates)
+
+    runner = SoakTestRunner(
+        interval_seconds=interval,
+        collect_status=ctx.collect_status,
+        remediate=_remediate,
+        voice_active_fn=ctx.voice_active_fn,
+    )
+    if max_duration and max_duration > 0:
+        runner.max_duration_seconds = max_duration
+    configure_soak_runner(runner)
+    runner.start(max_duration_seconds=max_duration)
+    return {
+        "ok": True,
+        "message": "Soak test started",
+        "interval_seconds": interval,
+        "max_duration_seconds": max_duration,
+    }
+
+
+@app.post("/api/intelligent-mode/soak/stop")
+def soak_test_stop() -> dict:
+    from intelligent_mode.soak_test import get_soak_runner
+
+    runner = get_soak_runner()
+    if runner is None or not runner.running:
+        return {"ok": True, "message": "Soak test was not running"}
+    runner.stop()
+    return {"ok": True, "message": "Soak test stopped"}
+
+
+@app.post("/api/intelligent-mode/soak/cycle")
+def soak_test_cycle() -> dict:
+    from intelligent_mode.context import get_context
+    from intelligent_mode.orchestrator import get_orchestrator
+    from intelligent_mode.soak_test import get_soak_runner, run_soak_cycle
+
+    ctx = get_context()
+    orch = get_orchestrator()
+    if orch is None:
+        raise HTTPException(status_code=503, detail="Intelligent mode is not enabled")
+
+    runner = get_soak_runner()
+    cycle_number = (runner._cycle_number + 1) if runner else 1
+
+    def _remediate(snapshot: dict, candidates: list) -> dict:
+        return orch.run_remediation_pass(snapshot, extra_candidates=candidates)
+
+    cycle = run_soak_cycle(
+        collect_status=ctx.collect_status,
+        remediate=_remediate,
+        voice_active_fn=ctx.voice_active_fn,
+        cycle_number=cycle_number,
+    )
+    from intelligent_mode.soak_test import get_soak_store
+
+    get_soak_store().record_cycle(cycle)
+    if runner:
+        runner._cycle_number = cycle.cycle_number
+    return {"ok": True, **cycle.to_dict()}
+
+
+@app.get("/api/training/status")
+def training_status() -> dict:
+    from daily_training_service import get_daily_training_service
+
+    return {"ok": True, **get_daily_training_service().status()}
+
+
+@app.post("/api/training/run")
+def training_run_now() -> dict:
+    from daily_training_service import get_daily_training_service
+
+    svc = get_daily_training_service()
+    try:
+        result = svc.run_now()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"ok": True, **result}
+
+
+@app.get("/api/ota/firmware")
+def ota_list_firmware() -> dict:
+    from ota_service import list_firmware_builds
+
+    return {"ok": True, "builds": list_firmware_builds()}
+
+
+@app.post("/api/ota/firmware/upload")
+async def ota_upload_firmware(file: UploadFile = File(...)) -> dict:
+    from ota_service import save_firmware_upload
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty firmware file")
+    try:
+        saved = save_firmware_upload(file.filename or "firmware.bin", data)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, **saved}
+
+
+@app.get("/api/ota/pending")
+def ota_pending() -> dict:
+    from ota_service import list_pending_deployments
+
+    return {"ok": True, "pending": list_pending_deployments()}
+
+
+@app.post("/api/ota/approve/{approval_id}")
+def ota_approve(approval_id: str) -> dict:
+    from ota_service import approve_deployment
+
+    try:
+        result = approve_deployment(approval_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"ok": True, "deployment": result}
+
+
+@app.post("/api/ota/deploy/{device_id}")
+def ota_deploy(device_id: str, body: dict[str, Any]) -> dict:
+    from device_registry import get_registry
+    from ota_service import bot_firmware_status, request_firmware_deploy
+
+    filename = str(body.get("filename") or "").strip()
+    if not filename:
+        raise HTTPException(status_code=400, detail="filename required")
+    record = get_registry().get(device_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Unknown device {device_id}")
+    base = record.effective_base_url()
+    if not base:
+        raise HTTPException(status_code=400, detail="Device has no base URL")
+    require_approval = body.get("require_approval")
+    try:
+        result = request_firmware_deploy(
+            device_id=device_id,
+            filename=filename,
+            base_url=base,
+            requested_by=str(body.get("requested_by") or "ops"),
+            require_approval=require_approval if require_approval is not None else None,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    status = bot_firmware_status(base)
+    return {"ok": True, "deployment": result, "bot_status": status}
+
+
+@app.get("/api/ota/status/{device_id}")
+def ota_device_status(device_id: str) -> dict:
+    from device_registry import get_registry
+    from ota_service import bot_firmware_status
+
+    record = get_registry().get(device_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Unknown device {device_id}")
+    base = record.effective_base_url()
+    if not base:
+        raise HTTPException(status_code=400, detail="Device has no base URL")
+    return {"ok": True, "status": bot_firmware_status(base)}
 
 
 @app.get("/api/status")
@@ -1780,26 +2433,9 @@ async def _process_voice_query_audio(
             pipeline_error = str(exc)[:200]
             err_note = str(exc)[:512]
             try:
-                from llm_service import (
-                    OLLAMA_UNAVAILABLE_REPLY,
-                    brief_spoken_message,
-                    is_ollama_error,
-                )
-                from wav_resample import ESP_PCM_SAMPLE_RATE_HZ, resample_wav_bytes_to_mono_16bit
+                from voice_service import voice_pipeline_recovery_wav
 
-                def _recover_wav(pipeline_exc: BaseException = exc) -> bytes:
-                    if is_ollama_error(pipeline_exc):
-                        txt = OLLAMA_UNAVAILABLE_REPLY
-                    else:
-                        txt = brief_spoken_message(
-                            err_note,
-                            model=os.environ.get("OLLAMA_MODEL"),
-                            api_url=os.environ.get("OLLAMA_URL"),
-                        )
-                    raw, _ = synthesize_sapi_wav_bytes(txt)
-                    return resample_wav_bytes_to_mono_16bit(raw, ESP_PCM_SAMPLE_RATE_HZ)
-
-                wav_out = await run_in_threadpool(_recover_wav)
+                wav_out = await run_in_threadpool(voice_pipeline_recovery_wav, exc)
             except Exception:
                 logger.exception("Voice pipeline recovery failed")
                 wav_out = minimal_voice_reply_wav()
@@ -1985,9 +2621,9 @@ async def _voice_ws_send_reply(
             tts_seconds=float(meta.timings.get("tts_seconds") or 0.0),
             audio_out_seconds=play_s,
         )
-        # Busy only while the clip should still be playing. A 4s post-TTS grace
-        # used to drop the user's first words after the LED went listen.
-        mark_device_busy_for(play_s + stream_echo_tail_seconds(), device_id=device_id)
+        from esp_playback import extend_playback_busy
+
+        extend_playback_busy(wav_out, device_id=device_id)
 
     from voice_service import SERVO_360_TRIGGER_DELAY_SECONDS
 
@@ -2396,6 +3032,13 @@ async def _voice_ws_stream_pipeline(
     async def finish_utterance(reason: str) -> bool:
         """Send EOS (receive not in flight). Skip now or start STT off-websocket."""
         nonlocal accepting, first_turn, voice_turn, stt_task
+        if stt_task is not None and not stt_task.done():
+            buf.reset()
+            return True
+        if device_busy_speaking(device_id):
+            buf.reset()
+            accepting = True
+            return True
         ident = get_session_identity(device_id)
         registering = ident is not None and ident.in_registration()
         peak_energy = buf.vad.peak_energy
@@ -2518,6 +3161,9 @@ async def _voice_ws_stream_pipeline(
         if not accepting:
             # Same-task drain: drop PCM so uvicorn max_queue cannot stall TCP.
             return True
+        if stt_task is not None and not stt_task.done():
+            buf.reset()
+            return True
         if device_busy_speaking(device_id):
             buf.reset()
             return True
@@ -2559,13 +3205,21 @@ async def _voice_ws_stream_pipeline(
             except ValueError:
                 return True
             if str(payload.get("type") or "").strip().lower() == "listen":
-                # Board finished TTS and is about to send Aux PCM.
-                clear_device_busy(device_id)
-                logger.info(
-                    "stream listen — accept Aux now device=%s session=%s",
-                    device_id,
-                    session_id,
-                )
+                # Board arms Aux after wait_idle, but server may still be inside the
+                # playback window — do not open ASR until TTS has fully finished.
+                if device_busy_speaking(device_id):
+                    logger.info(
+                        "stream listen deferred — TTS still playing device=%s session=%s",
+                        device_id,
+                        session_id,
+                    )
+                else:
+                    clear_device_busy(device_id)
+                    logger.info(
+                        "stream listen — accept Aux now device=%s session=%s",
+                        device_id,
+                        session_id,
+                    )
                 return True
             if str(payload.get("type") or "").strip().lower() == "ready":
                 logger.info(
@@ -2904,26 +3558,9 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                     pipeline_error = str(exc)[:200]
                     err_note = str(exc)[:512]
                     try:
-                        from llm_service import (
-                            OLLAMA_UNAVAILABLE_REPLY,
-                            brief_spoken_message,
-                            is_ollama_error,
-                        )
-                        from wav_resample import ESP_PCM_SAMPLE_RATE_HZ, resample_wav_bytes_to_mono_16bit
+                        from voice_service import voice_pipeline_recovery_wav
 
-                        def _recover_wav(pipeline_exc: BaseException = exc) -> bytes:
-                            if is_ollama_error(pipeline_exc):
-                                txt = OLLAMA_UNAVAILABLE_REPLY
-                            else:
-                                txt = brief_spoken_message(
-                                    err_note,
-                                    model=os.environ.get("OLLAMA_MODEL"),
-                                    api_url=os.environ.get("OLLAMA_URL"),
-                                )
-                            raw, _ = synthesize_sapi_wav_bytes(txt)
-                            return resample_wav_bytes_to_mono_16bit(raw, ESP_PCM_SAMPLE_RATE_HZ)
-
-                        wav_out = await run_in_threadpool(_recover_wav)
+                        wav_out = await run_in_threadpool(voice_pipeline_recovery_wav, exc)
                     except Exception:
                         logger.exception("Voice pipeline recovery failed")
                         wav_out = minimal_voice_reply_wav()
@@ -3301,14 +3938,15 @@ def main() -> None:
     if args.alarm_wav.strip():
         os.environ["ALARM_WAV_PATH"] = args.alarm_wav.strip()
 
-    from llm_service import resolve_ollama_api_url, try_start_gpu_ollama
+    from llm_service import resolve_ollama_api_url, set_ollama_env_url, try_start_gpu_ollama
 
     try_start_gpu_ollama()
-    ollama_url = resolve_ollama_api_url(
-        model=args.ollama_model.strip(),
-        preferred=args.ollama_url,
+    ollama_url = set_ollama_env_url(
+        resolve_ollama_api_url(
+            model=args.ollama_model.strip(),
+            preferred=args.ollama_url,
+        )
     )
-    os.environ["OLLAMA_URL"] = ollama_url
     os.environ["OLLAMA_MODEL"] = args.ollama_model.strip()
     os.environ["WHISPER_MODEL"] = args.whisper_model.strip()
     if args.whisper_device.strip():

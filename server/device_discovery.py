@@ -10,6 +10,7 @@ import threading
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
+from typing import Any
 
 import requests
 
@@ -117,6 +118,11 @@ class DeviceDiscovery:
         self._last_found = 0
         self._last_updated = 0
         self._last_error: str | None = None
+        self._bot_runtime: dict[str, dict[str, Any]] = {}
+
+    def bot_runtime_status(self) -> dict[str, dict[str, Any]]:
+        with self._state_lock:
+            return {device_id: dict(row) for device_id, row in self._bot_runtime.items()}
 
     def status(self) -> dict:
         with self._state_lock:
@@ -406,6 +412,7 @@ class DeviceDiscovery:
                 ).add(record.effective_base_url())
                 continue
             records[mac_id] = record
+            self._store_bot_runtime(mac_id, payload)
 
         for device_id, endpoints in duplicate_ids.items():
             # A MAC is the routing key for voice, camera, playback and alarms.
@@ -419,6 +426,50 @@ class DeviceDiscovery:
                 ", ".join(sorted(endpoints)),
             )
         return list(records.values())
+
+    def _store_bot_runtime(self, device_id: str, payload: dict[str, Any]) -> None:
+        camera = payload.get("camera")
+        if not isinstance(camera, dict):
+            return
+        with self._state_lock:
+            self._bot_runtime[device_id] = {
+                "session_active": bool(camera.get("session_active")),
+                "streaming": bool(camera.get("streaming")),
+                "uvc_connected": bool(camera.get("uvc_connected")),
+                "frame_sequence": camera.get("frame_sequence"),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+
+def poll_bot_runtime(registry: DeviceRegistry, *, timeout_s: float = 1.5) -> dict[str, dict[str, Any]]:
+    """Refresh session-gated camera state from each bot's ``/status``."""
+    runtime: dict[str, dict[str, Any]] = {}
+    for record in registry.list_devices():
+        base_url = record.effective_base_url()
+        if not base_url:
+            continue
+        try:
+            response = requests.get(f"{base_url.rstrip('/')}/status", timeout=timeout_s)
+            response.raise_for_status()
+            payload = response.json()
+        except (requests.RequestException, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        camera = payload.get("camera")
+        if not isinstance(camera, dict):
+            continue
+        runtime[record.device_id] = {
+            "session_active": bool(camera.get("session_active")),
+            "streaming": bool(camera.get("streaming")),
+            "uvc_connected": bool(camera.get("uvc_connected")),
+            "frame_sequence": camera.get("frame_sequence"),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    if _discovery is not None and runtime:
+        with _discovery._state_lock:
+            _discovery._bot_runtime.update(runtime)
+    return runtime
 
 
 _discovery: DeviceDiscovery | None = None
@@ -455,3 +506,9 @@ def discovery_status() -> dict:
     if _discovery is None:
         return {"enabled": _env_bool("NINO_DISCOVERY_ENABLED", True), "running": False}
     return _discovery.status()
+
+
+def bot_runtime_status() -> dict[str, dict[str, Any]]:
+    if _discovery is None:
+        return {}
+    return _discovery.bot_runtime_status()
