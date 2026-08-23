@@ -1,6 +1,6 @@
 import unittest
 
-from intelligent_mode.dashboard import build_dashboard
+from intelligent_mode.dashboard import build_dashboard, filter_dashboard_for_device
 
 
 class DashboardTests(unittest.TestCase):
@@ -97,6 +97,18 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(payload["bots"][0]["agent_status"], "fixing")
         self.assertTrue(payload["bots"][0]["voice_pipeline_active"])
         self.assertEqual(payload["server"]["health"], "healthy")
+        self.assertEqual(len(payload["project_tasks"]), 13)
+
+        filtered = filter_dashboard_for_device(payload, "aa11bb22cc33")
+        self.assertEqual(filtered["focus"]["mode"], "bot")
+        self.assertEqual(filtered["focus"]["device_id"], "aa11bb22cc33")
+        self.assertEqual(len(filtered["bots"]), 1)
+        self.assertEqual(filtered["summary"]["total_bots"], 1)
+        self.assertEqual(len(filtered["issue_queues"]["agent_working"]), 1)
+
+        fleet = filter_dashboard_for_device(payload, None)
+        self.assertEqual(fleet["focus"]["mode"], "fleet")
+        self.assertEqual(len(fleet["bots"]), 1)
 
 
 if __name__ == "__main__":

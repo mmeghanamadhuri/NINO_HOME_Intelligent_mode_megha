@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import unittest
 
-from emotion_service import EmotionService, _box_iou, _format_emotion_label
+from emotion_service import (
+    EmotionService,
+    _box_iou,
+    _format_emotion_label,
+    emotion_scene_context,
+)
 
 
 class EmotionLabelTests(unittest.TestCase):
@@ -24,6 +29,34 @@ class FaceAnnotateLabelTests(unittest.TestCase):
 
         result = {"name": "Chakri", "emotion": "Happy"}
         self.assertEqual(FaceService._overlay_label_text(result), "Chakri | Happy")
+
+
+class EmotionSceneContextTests(unittest.TestCase):
+    def test_focus_viewer_gets_speaking_to_phrase(self) -> None:
+        results = [
+            {
+                "name": "Hari",
+                "recognized": True,
+                "detection_valid": True,
+                "emotion": "Happy",
+                "box": {"x": 0, "y": 0, "w": 120, "h": 120},
+            }
+        ]
+        ctx = emotion_scene_context(results, focus_name="Hari")
+        self.assertIn("person you're speaking to", ctx)
+        self.assertIn("happy", ctx.lower())
+
+    def test_skips_uncertain(self) -> None:
+        results = [
+            {
+                "name": "Sam",
+                "recognized": True,
+                "detection_valid": True,
+                "emotion": "Uncertain",
+                "box": {"x": 0, "y": 0, "w": 80, "h": 80},
+            }
+        ]
+        self.assertEqual(emotion_scene_context(results), "")
 
 
 class EmotionServiceStatsTests(unittest.TestCase):

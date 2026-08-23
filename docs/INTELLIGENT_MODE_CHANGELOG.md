@@ -418,6 +418,35 @@ bash server/scripts/run_soak_test_env.sh
 
 ---
 
+## 2026-08-23 — CSV voice question bank for diverse soak + agent learning
+
+### Prompt
+User asked to restart server/soak and continuously test with varied ASR questions from `voice_assistant_test_questions.csv` to generate real incidents and validate agent learning.
+
+### Why
+Built-in soak pool (~40 questions) repeats quickly and misses categories like memory, adversarial phrasing, math edge cases, and honest-capability limits — limiting incident diversity and playbook learning.
+
+### What we changed
+
+| Fix | Detail | Files |
+|-----|--------|-------|
+| **CSV question loader** | 502 questions with category rotation per cycle + keyword inference for math/time/alarms | `soak_voice_questions.py` (new) |
+| **Soak integration** | Core checks + 5 CSV picks/cycle (8 total); auto-uses `server/data/voice_assistant_test_questions.csv` | `soak_test.py`, `run_soak_test_env.sh` |
+| **Question bank copy** | CSV copied from Downloads into repo data dir | `data/voice_assistant_test_questions.csv` |
+| **Tests** | Load, math keywords, category rotation, soak pick | `test_intelligent_soak_voice_csv.py` |
+
+Default soak env now: `SOAK_VOICE_QUESTIONS_PER_CYCLE=8`, `SOAK_VOICE_ALL_AGES=0`, CSV enabled.
+
+### How to verify
+```bash
+cd server
+python3 -m unittest test_intelligent_soak_voice_csv.py -q
+bash scripts/run_soak_test_env.sh
+# Ops → Tests tab: each cycle should show varied CSV questions
+```
+
+---
+
 ```markdown
 ## YYYY-MM-DD — Short title
 

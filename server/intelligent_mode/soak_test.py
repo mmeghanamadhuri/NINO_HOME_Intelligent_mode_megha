@@ -151,9 +151,19 @@ def _soak_voice_all_ages_enabled() -> bool:
 
 def _soak_voice_questions_per_cycle() -> int:
     try:
-        return max(1, min(20, int(os.environ.get("SOAK_VOICE_QUESTIONS_PER_CYCLE", "6"))))
+        cap = 30 if _soak_voice_csv_enabled() else 20
+        return max(1, min(cap, int(os.environ.get("SOAK_VOICE_QUESTIONS_PER_CYCLE", "6"))))
     except (TypeError, ValueError):
         return 6
+
+
+def _soak_voice_csv_enabled() -> bool:
+    try:
+        from intelligent_mode.soak_voice_questions import csv_questions_enabled
+
+        return csv_questions_enabled()
+    except Exception:
+        return False
 
 
 def _soak_max_duration_seconds() -> int | None:
@@ -168,7 +178,32 @@ def _soak_max_duration_seconds() -> int | None:
 
 
 def pick_soak_voice_questions(*, cycle_number: int = 0) -> list[tuple[str, tuple[str, ...]]]:
-    """Pick voice Q&A scenarios — core checks plus all age groups and timers."""
+    """Pick voice Q&A scenarios — core checks plus CSV bank / age groups."""
+    per_cycle = _soak_voice_questions_per_cycle()
+    core = list(SOAK_VOICE_CORE)
+    seen = {q for q, _ in core}
+
+    if _soak_voice_csv_enabled():
+        try:
+            from intelligent_mode.soak_voice_questions import pick_csv_voice_questions
+
+            csv_picks = pick_csv_voice_questions(
+                cycle_number=cycle_number,
+                count=max(0, per_cycle - len(core)),
+                exclude=seen,
+            )
+            for question, expected in csv_picks:
+                if question not in seen:
+                    core.append((question, expected))
+                    seen.add(question)
+            if len(core) >= per_cycle:
+                return core[:per_cycle]
+        except Exception:
+            logger.debug("CSV soak voice question pick failed", exc_info=True)
+
+    if _soak_voice_csv_enabled() and not _soak_voice_all_ages_enabled():
+        return core[:per_cycle]
+
     if _soak_voice_all_ages_enabled():
         rng = random.Random()
         rng.seed(f"soak-voice-ages-{cycle_number}-{time.time()}")

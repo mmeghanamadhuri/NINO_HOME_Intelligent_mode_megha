@@ -72,6 +72,10 @@ def motion_actions_for_reply(
     # Incidental "yes" / "?" / "hello" in a story must not replace talk-for-duration.
     if _word_count(text) >= _LONG_REPLY_WORDS:
         return ["talk"]
+    if path in {"spatial_report", "observe_briefing"}:
+        return ["talk"]
+    if path in {"observe", "observe_ack"}:
+        return ["look_left", "look_right"]
     if path in {"session_greet", "greeting"} or _GREET_RE.search(text):
         return ["greet"]
     if _QUESTION_RE.search(text):

@@ -12,11 +12,12 @@ import os
 from dataclasses import dataclass, field
 
 DEFAULT_FRAME_MS = 20
-DEFAULT_START_ENERGY = 50
-DEFAULT_QUIET_ENERGY = 20
+# Same start bar for wake and in-session listen (matches P4 Aux gate).
+DEFAULT_START_ENERGY = 12
+DEFAULT_QUIET_ENERGY = 5
 # Once speech started, only frames at/above this reset the silence hangover.
-DEFAULT_CONTINUE_ENERGY = 50
-DEFAULT_SPEECH_MS = 160
+DEFAULT_CONTINUE_ENERGY = 12
+DEFAULT_SPEECH_MS = 80
 DEFAULT_SILENCE_MS = 450
 DEFAULT_MAX_MS = 30000
 # Registration yes/no/spell/confirm: 30s of no speech → guest, not goodbye.
@@ -81,6 +82,7 @@ class StreamEndOfSpeech:
     max_ms: int = DEFAULT_MAX_MS
     min_speech_ms: int = DEFAULT_MIN_SPEECH_MS
     frame_ms: int = DEFAULT_FRAME_MS
+    adaptive_start_min: int = ADAPTIVE_START_MIN
     heard_speech: bool = False
     speech_streak_ms: int = 0
     silence_ms_run: int = 0
@@ -110,7 +112,7 @@ class StreamEndOfSpeech:
             return self.start_energy
         noise_mean = self.noise_sum // self.noise_n
         adaptive = noise_mean * 3 + 8
-        return max(ADAPTIVE_START_MIN, min(self.start_energy, adaptive))
+        return max(self.adaptive_start_min, min(self.start_energy, adaptive))
 
     def feed(self, pcm: bytes) -> str:
         """Feed one PCM frame. Returns idle, speech, end_of_speech, or timeout."""
@@ -187,6 +189,7 @@ def stream_vad_from_environ() -> StreamEndOfSpeech:
         silence_ms=_env_int("ASR_EOS_SILENCE_MS", DEFAULT_SILENCE_MS),
         max_ms=_env_int("ASR_EOS_MAX_MS", DEFAULT_MAX_MS),
         min_speech_ms=_env_int("ASR_EOS_MIN_SPEECH_MS", DEFAULT_MIN_SPEECH_MS),
+        adaptive_start_min=_env_int("ASR_EOS_ADAPTIVE_MIN", ADAPTIVE_START_MIN),
     )
 
 

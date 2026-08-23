@@ -5,9 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>NiNO Ops — Intelligent Mode Dashboard</title>
     <link rel="stylesheet" href="/static/styles.css?v=16" />
-    <link rel="stylesheet" href="/static/ops.css?v=7" />
+    <link rel="stylesheet" href="/static/ops.css?v=9" />
   </head>
-  <body>
+  <body data-focus-device="{{ focus_device_id or '' }}">
     <header class="site-header">
       <div class="site-header-inner">
         <h1>NiNO Ops</h1>
@@ -57,6 +57,27 @@
         <div class="ops-stat-card ops-stat-fixing ops-stat-clickable" data-stat-filter="fixing" tabindex="-1" role="button">
           <span class="ops-stat-label">Fixing now</span>
           <strong class="ops-stat-value" id="statFixing">—</strong>
+        </div>
+      </section>
+
+      <section class="ops-device-nav card" id="deviceNavSection">
+        <div class="card-header ops-device-nav-header">
+          <h2>Devices</h2>
+          <span class="status-label" id="deviceNavHint">Fleet view</span>
+        </div>
+        <div class="ops-device-nav-strip" id="deviceNavStrip">
+          <p class="ops-empty">Loading devices…</p>
+        </div>
+      </section>
+
+      <section class="ops-focus-banner" id="focusBanner" hidden>
+        <div class="ops-focus-banner-inner">
+          <div>
+            <span class="ops-focus-label">Viewing</span>
+            <strong id="focusBannerTitle">—</strong>
+            <span class="ops-focus-meta" id="focusBannerMeta"></span>
+          </div>
+          <a class="secondary ops-btn-inline ops-focus-back" id="focusBannerBack" href="/ops">← All fleet</a>
         </div>
       </section>
 
@@ -117,10 +138,27 @@
             <p class="ops-empty">Loading…</p>
           </div>
         </section>
+
+        <section class="card" id="projectTasksSection">
+          <div class="card-header">
+            <h2>Project tasks &amp; agents</h2>
+            <span class="status-label">What Intelligent Mode does each cycle</span>
+          </div>
+          <div id="projectTasksPanel">
+            <p class="ops-empty">Loading task roster…</p>
+          </div>
+        </section>
       </div>
 
       <!-- BOTS TAB -->
       <div class="ops-tab-panel" id="tab-bots" role="tabpanel" aria-labelledby="ops-tab-bots" hidden>
+        <section class="card" id="botFocusPanel" hidden>
+          <div class="card-header">
+            <h2 id="botFocusTitle">Bot ops</h2>
+            <span class="ops-health-badge" id="botFocusHealth">—</span>
+          </div>
+          <div id="botFocusBody"></div>
+        </section>
         <section class="card">
           <div class="card-header">
             <h2>Bot fleet</h2>
@@ -217,6 +255,6 @@
       </div>
     </main>
 
-    <script src="/static/ops.js?v=8"></script>
+    <script src="/static/ops.js?v=10"></script>
   </body>
 </html>

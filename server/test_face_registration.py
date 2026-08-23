@@ -94,6 +94,14 @@ class ExtractRegistrationNameTests(unittest.TestCase):
         from face_registration_voice import is_opening_greeting_echo
 
         self.assertTrue(is_opening_greeting_echo("Hey Hari, how can I help you"))
+        self.assertTrue(
+            is_opening_greeting_echo("Hey Hari, you look happy. How can I help you")
+        )
+        self.assertTrue(
+            is_opening_greeting_echo("Hey Hari, you look happy. Let me see where you are")
+        )
+        self.assertTrue(is_opening_greeting_echo("Hi there. Let me see where you are"))
+        self.assertTrue(is_opening_greeting_echo("Let me see where you are"))
         self.assertTrue(is_opening_greeting_echo("Hey Hari"))
         self.assertTrue(is_opening_greeting_echo("how can I help you"))
         self.assertTrue(is_opening_greeting_echo("how are you today"))

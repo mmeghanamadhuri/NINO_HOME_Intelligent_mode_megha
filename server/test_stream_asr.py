@@ -6,13 +6,16 @@ import array
 import unittest
 
 from stream_asr import (
+    DEFAULT_CONTINUE_ENERGY,
     DEFAULT_MAX_MS,
     DEFAULT_REGISTER_MAX_MS,
+    DEFAULT_START_ENERGY,
     StreamEndOfSpeech,
     UtteranceBuffer,
     pcm_frame_energy,
     stream_idle_timeout_ends_session,
     stream_listen_max_ms,
+    stream_vad_from_environ,
 )
 
 
@@ -197,6 +200,22 @@ class StreamEndOfSpeechTests(unittest.TestCase):
         for _ in range(10):
             self.assertEqual(vad.feed(_frame(25)), "idle")
         self.assertFalse(vad.heard_speech)
+
+
+class SharedListenEnergyTests(unittest.TestCase):
+    def test_wake_and_session_use_the_same_start(self) -> None:
+        vad = stream_vad_from_environ()
+        self.assertEqual(vad.start_energy, DEFAULT_START_ENERGY)
+        self.assertEqual(vad.continue_energy, DEFAULT_CONTINUE_ENERGY)
+        self.assertEqual(DEFAULT_START_ENERGY, 12)
+        buf = UtteranceBuffer()
+        self.assertEqual(buf.vad.start_energy, DEFAULT_START_ENERGY)
+
+    def test_soft_speech_starts_a_turn(self) -> None:
+        vad = stream_vad_from_environ()
+        states = [vad.feed(_frame(16)) for _ in range(8)]
+        self.assertIn("speech", states)
+        self.assertTrue(vad.heard_speech)
 
 
 class StreamPcmFrameDetectTests(unittest.TestCase):

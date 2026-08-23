@@ -695,11 +695,6 @@ class FaceRegistrationService:
             return True
         return False
 
-    def reset_to_idle(self) -> None:
-        """Public reset for intelligent mode / ops when registration state is stuck."""
-        with self._lock:
-            self._reset_locked()
-
     def _reset_locked(self) -> None:
         self._state = "idle"
         self._unknown_since = None

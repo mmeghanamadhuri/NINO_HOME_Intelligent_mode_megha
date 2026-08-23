@@ -77,19 +77,3 @@ CREATE INDEX IF NOT EXISTS idx_alarms_user_fire
 CREATE INDEX IF NOT EXISTS idx_alarms_pending
     ON alarms (fire_at)
     WHERE fired = FALSE OR ack_state NOT IN ('none', '', 'confirmed');
-
--- Conversation corrections (append-only; original rows preserved)
-CREATE TABLE IF NOT EXISTS conversation_corrections (
-    id BIGSERIAL PRIMARY KEY,
-    conversation_id BIGINT REFERENCES conversations(id) ON DELETE SET NULL,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    correction_text TEXT NOT NULL,
-    previous_assistant_text TEXT,
-    reworked_assistant_text TEXT,
-    created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_conversation_corrections_user
-    ON conversation_corrections (user_id, created_at DESC);
-
-ALTER TABLE conversations ADD COLUMN IF NOT EXISTS corrected BOOLEAN DEFAULT FALSE;

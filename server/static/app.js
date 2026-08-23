@@ -8,10 +8,14 @@ const retrain = document.querySelector("#retrain");
 const statusBox = document.querySelector("#statusBox");
 const connectionStatus = document.querySelector("#connectionStatus");
 const stream = document.querySelector("#stream");
+const streamOffline = document.querySelector("#streamOffline");
+const streamOfflineDetail = document.querySelector("#streamOfflineDetail");
 const alarmList = document.querySelector("#alarmList");
 const clearAllAlarms = document.querySelector("#clearAllAlarms");
 const deviceSelect = document.querySelector("#deviceSelect");
 const snapshotLink = document.querySelector("#snapshotLink");
+
+let cameraConnected = false;
 
 function currentDeviceId() {
   if (deviceSelect && deviceSelect.value) {
@@ -39,6 +43,18 @@ function refreshStream() {
   stream.src = `/video_feed?device_id=${encodeURIComponent(id)}&t=${Date.now()}`;
   if (snapshotLink) {
     snapshotLink.href = `/snapshot.jpg?device_id=${encodeURIComponent(id)}`;
+  }
+}
+
+function updateStreamOffline(connected, cameraError) {
+  if (!stream || !streamOffline) {
+    return;
+  }
+  const offline = !connected;
+  streamOffline.hidden = !offline;
+  stream.classList.toggle("stream-hidden", offline);
+  if (streamOfflineDetail) {
+    streamOfflineDetail.textContent = offline && cameraError ? cameraError : "";
   }
 }
 
@@ -180,19 +196,23 @@ async function refreshStatus() {
     if (typeof data.devices?.count === "number") {
       setDeviceCount(data.devices.count);
     }
-    const connected = data.camera?.connected;
+    const connected = Boolean(data.camera?.connected);
+    cameraConnected = connected;
+    const cameraError = String(data.camera?.last_error || "").trim();
     if (cameraOrientation && data.camera?.rotation) {
       cameraOrientation.value = data.camera.rotation;
     }
     connectionStatus.textContent = connected
       ? `Camera connected (${data.device_id || id})`
-      : `Waiting for camera (${data.device_id || id})`;
+      : `Camera offline — wake robot or start stream (${data.device_id || id})`;
     connectionStatus.classList.toggle("connected", connected);
+    updateStreamOffline(connected, cameraError);
     statusBox.textContent = JSON.stringify(data, null, 2);
     renderAlarms(data.alarms?.pending || [], data.alarms?.awaiting_ack || []);
   } catch (error) {
     connectionStatus.textContent = "Server error";
     connectionStatus.classList.remove("connected");
+    updateStreamOffline(false, error.message);
     statusBox.textContent = error.message;
     renderAlarms([], []);
   }
@@ -303,7 +323,18 @@ retrain.addEventListener("click", async () => {
   }
 });
 
+stream.addEventListener("load", () => {
+  if (!cameraConnected) {
+    return;
+  }
+  stream.classList.remove("stream-hidden");
+  if (streamOffline) {
+    streamOffline.hidden = true;
+  }
+});
+
 stream.addEventListener("error", () => {
+  updateStreamOffline(false, "Live feed unavailable");
   window.setTimeout(refreshStream, 1500);
 });
 

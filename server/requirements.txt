@@ -10,6 +10,8 @@ jinja2>=3.1.0
 # --- Vision / face recognition ---
 opencv-contrib-python>=4.8.0
 numpy>=1.24.0
+# Open-palm stop gesture (Hands). YOLO pose is used if MediaPipe 1.x lacks solutions API.
+mediapipe>=0.10.14
 
 # --- Object detection (Ultralytics YOLO26n; weights auto-download on first run) ---
 # Install this one with --no-deps: ultralytics declares opencv-python, which pip
@@ -23,6 +25,8 @@ ultralytics>=8.4.0
 boto3>=1.34
 torch>=2.0
 torchvision>=0.15
+torchaudio>=2.0
+speechbrain>=1.0.0
 transformers>=4.40
 safetensors
 pillow

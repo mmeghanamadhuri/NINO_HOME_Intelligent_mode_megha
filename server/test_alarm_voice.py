@@ -11,13 +11,7 @@ from alarm_medical import (
     is_medical_set_command,
     looks_like_medicine_reminder_set,
 )
-from alarm_voice import (
-    handle_alarm_voice,
-    is_set_alarm_command,
-    is_timer_command,
-    parse_alarm_datetime,
-    parse_relative_duration,
-)
+from alarm_voice import handle_alarm_voice, is_set_alarm_command, parse_alarm_datetime
 
 
 class AlarmVoiceRoutingTests(unittest.TestCase):
@@ -142,44 +136,6 @@ class MedicalFireMessageTests(unittest.TestCase):
                 "Please confirm if you have taken it or not."
             ),
         )
-
-
-class TimerVoiceTests(unittest.TestCase):
-    def test_timer_phrases_recognized(self) -> None:
-        for text in (
-            "Set a timer for 2 minutes",
-            "Timer for 5 minutes",
-            "Start a timer for 1 hour",
-        ):
-            self.assertTrue(is_timer_command(text), msg=text)
-
-    def test_parse_relative_duration_minutes(self) -> None:
-        parsed = parse_relative_duration("2 minutes")
-        self.assertIsNone(parsed.error)
-        self.assertIsNotNone(parsed.fire_at)
-
-    def test_parse_relative_duration_with_label(self) -> None:
-        parsed = parse_relative_duration("drink water in 5 minutes")
-        self.assertIsNone(parsed.error)
-        self.assertIn("drink", parsed.label.lower())
-
-    @patch("alarm_voice._save_alarm")
-    def test_set_timer_voice(self, save_alarm) -> None:
-        from alarm_voice import AlarmVoiceResult
-
-        save_alarm.return_value = AlarmVoiceResult(handled=True, reply="OK, timer set.")
-        result = handle_alarm_voice("Set a timer for 2 minutes.")
-        self.assertTrue(result.handled)
-        save_alarm.assert_called_once()
-
-    @patch("alarm_voice._save_alarm")
-    def test_relative_reminder_in_minutes(self, save_alarm) -> None:
-        from alarm_voice import AlarmVoiceResult
-
-        save_alarm.return_value = AlarmVoiceResult(handled=True, reply="OK, reminder set.")
-        result = handle_alarm_voice("Remind me to drink water in 5 minutes.")
-        self.assertTrue(result.handled)
-        save_alarm.assert_called_once()
 
 
 if __name__ == "__main__":

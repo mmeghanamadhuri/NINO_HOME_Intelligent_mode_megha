@@ -84,7 +84,7 @@ def test_grace_expires() -> None:
     os.environ["VOICE_POST_TTS_GRACE_TTS_FACTOR"] = "0"
     vls.mark_tts_playback("sess-exp", "dev-exp", audio_out_seconds=1.0)
     assert vls.in_post_tts_grace("sess-exp", "dev-exp")
-    time.sleep(0.08)
+    time.sleep(1.15)
     assert not vls.in_post_tts_grace("sess-exp", "dev-exp")
 
 

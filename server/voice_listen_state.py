@@ -48,7 +48,10 @@ def mark_tts_playback(
 ) -> None:
     """Extend post-TTS grace after a spoken reply is sent to the device."""
     duration = max(float(tts_seconds), float(audio_out_seconds), 0.0)
-    grace_until = time.time() + post_tts_grace_seconds() + duration * post_tts_grace_tts_factor()
+    # Cover full playback plus a fixed echo buffer; the old factor-based formula
+    # expired before long spatial greetings finished and the mic captured TTS echo.
+    grace_until = time.time() + duration + post_tts_grace_seconds()
+    grace_until += duration * post_tts_grace_tts_factor()
     key = _session_key(session_id, device_id)
     with _lock:
         entry = _state.setdefault(key, {})

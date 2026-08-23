@@ -14,21 +14,15 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 from pipeline_log import pipeline_log
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_OLLAMA_HTTP_RETRIES = 6
-DEFAULT_OLLAMA_HTTP_RETRY_DELAY_S = 0.4
-_ollama_http_session: requests.Session | None = None
-
 DEFAULT_OLLAMA_GPU_URL = "http://127.0.0.1:11435/api/generate"
 DEFAULT_OLLAMA_CPU_URL = "http://127.0.0.1:11434/api/generate"
 DEFAULT_OLLAMA_URL = DEFAULT_OLLAMA_GPU_URL
-DEFAULT_MODEL = "qwen2.5:1.5b"
+DEFAULT_MODEL = "qwen2.5vl:3b"
 DEFAULT_KEEP_ALIVE = "30m"
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11435"
 # CPU fallback can exceed 90s; GPU replies are typically under 5s.
@@ -36,47 +30,6 @@ VOICE_QUERY_TIMEOUT_S = 60
 OLLAMA_UNAVAILABLE_REPLY = (
     "Sorry, I could not reach the language model in time. Please try again."
 )
-
-
-def _ollama_http_retries() -> int:
-    raw = os.environ.get("OLLAMA_HTTP_RETRIES", str(DEFAULT_OLLAMA_HTTP_RETRIES)).strip()
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        return DEFAULT_OLLAMA_HTTP_RETRIES
-
-
-def _ollama_http_retry_delay_s() -> float:
-    raw = os.environ.get(
-        "OLLAMA_HTTP_RETRY_DELAY_S",
-        str(DEFAULT_OLLAMA_HTTP_RETRY_DELAY_S),
-    ).strip()
-    try:
-        return max(0.0, float(raw))
-    except ValueError:
-        return DEFAULT_OLLAMA_HTTP_RETRY_DELAY_S
-
-
-def _ollama_http_session_get() -> requests.Session:
-    """Shared requests session with configurable retries for Ollama HTTP calls."""
-    global _ollama_http_session
-    if _ollama_http_session is not None:
-        return _ollama_http_session
-    retries = _ollama_http_retries()
-    retry = Retry(
-        total=retries,
-        connect=retries,
-        read=retries,
-        backoff_factor=_ollama_http_retry_delay_s(),
-        allowed_methods=["GET", "POST"],
-        raise_on_status=False,
-    )
-    session = requests.Session()
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    _ollama_http_session = session
-    return session
 
 
 def resolve_ollama_api_url(
@@ -171,29 +124,21 @@ def try_start_gpu_ollama() -> None:
 
 def _normalize_ollama_generate_url(url: str) -> str:
     """Ensure POST target is .../api/generate (not the server root)."""
-    base = _ollama_base_url(url)
-    if not base:
+    raw = url.strip().rstrip("/")
+    if not raw:
         return DEFAULT_OLLAMA_URL
-    return f"{base}/api/generate"
+    if raw.endswith("/api/generate") or raw.endswith("/api/chat"):
+        return raw
+    return f"{raw}/api/generate"
 
 
 def _ollama_base_url(api_url: str | None = None) -> str:
-    """Strip /api/generate or /api/chat suffixes to get the Ollama server root."""
-    raw = (api_url or os.environ.get("OLLAMA_URL") or DEFAULT_OLLAMA_URL).strip().rstrip("/")
-    while raw.endswith("/api/generate") or raw.endswith("/api/chat"):
-        if raw.endswith("/api/generate"):
-            raw = raw[: -len("/api/generate")].rstrip("/")
-        elif raw.endswith("/api/chat"):
-            raw = raw[: -len("/api/chat")].rstrip("/")
-    return raw
-
-
-def set_ollama_env_url(api_url: str | None = None) -> str:
-    """Normalize and persist OLLAMA_URL (always .../api/generate, never doubled)."""
-    raw = (api_url or os.environ.get("OLLAMA_URL") or resolve_ollama_api_url()).strip()
-    normalized = _normalize_ollama_generate_url(raw)
-    os.environ["OLLAMA_URL"] = normalized
-    return normalized
+    raw = (api_url or os.environ.get("OLLAMA_URL") or DEFAULT_OLLAMA_URL).strip()
+    if raw.endswith("/api/generate"):
+        return raw[: -len("/api/generate")]
+    if raw.endswith("/api/chat"):
+        return raw[: -len("/api/chat")]
+    return raw.rstrip("/")
 
 
 def ollama_model_available(*, model: str, api_url: str, timeout_s: int = 3) -> bool:
@@ -205,7 +150,7 @@ def ollama_model_available(*, model: str, api_url: str, timeout_s: int = 3) -> b
     if ":" not in wanted:
         names.add(f"{wanted}:latest")
     try:
-        response = _ollama_http_session_get().get(
+        response = requests.get(
             f"{_ollama_base_url(api_url)}/api/tags",
             timeout=timeout_s,
         )
@@ -280,7 +225,7 @@ def ollama_runtime_status(
         "warning": "",
     }
     try:
-        r = _ollama_http_session_get().get(f"{base}/api/ps", timeout=timeout_s)
+        r = requests.get(f"{base}/api/ps", timeout=timeout_s)
         r.raise_for_status()
         out["reachable"] = True
         loaded_models: list[str] = []
@@ -325,8 +270,16 @@ def ollama_runtime_status(
     return out
 
 
+def set_ollama_env_url(api_url: str | None = None) -> str:
+    """Normalize and persist OLLAMA_URL (always .../api/generate, never doubled)."""
+    raw = (api_url or os.environ.get("OLLAMA_URL") or resolve_ollama_api_url()).strip()
+    normalized = _normalize_ollama_generate_url(raw)
+    os.environ["OLLAMA_URL"] = normalized
+    return normalized
+
+
 def ollama_is_reachable(*, api_url: str | None = None, timeout_s: int = 2) -> bool:
-    """Fast check used by intelligent mode to skip LLM report generation when Ollama is down."""
+    """Fast check used by intelligent mode to skip LLM work when Ollama is down."""
     return bool(ollama_runtime_status(api_url=api_url, timeout_s=timeout_s).get("reachable"))
 
 
@@ -432,7 +385,7 @@ def ollama_generate(
     )
     t0 = time.perf_counter()
     try:
-        r = _ollama_http_session_get().post(url, json=payload, timeout=timeout_s)
+        r = requests.post(url, json=payload, timeout=timeout_s)
         r.raise_for_status()
         data = r.json()
         text = str(data.get("response", "")).strip()
@@ -461,6 +414,95 @@ def ollama_generate(
         raise
     if not text:
         raise RuntimeError("Ollama returned an empty response.")
+    return text
+
+
+def ollama_chat(
+    messages: list[dict[str, Any]],
+    *,
+    model: str | None = None,
+    api_url: str | None = None,
+    timeout_s: int = 90,
+    num_predict: int | None = 96,
+    keep_alive: str | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+) -> str:
+    """Multimodal chat (vision). Messages may include an ``images`` list of base64 JPEG."""
+    base = _ollama_base_url(api_url)
+    url = f"{base}/api/chat"
+    m = (model or os.environ.get("OLLAMA_MODEL") or DEFAULT_MODEL).strip()
+    alive = (
+        keep_alive
+        if keep_alive is not None
+        else os.environ.get("OLLAMA_KEEP_ALIVE", DEFAULT_KEEP_ALIVE)
+    ).strip()
+    payload: dict[str, Any] = {
+        "model": m,
+        "messages": messages,
+        "stream": False,
+        "keep_alive": alive,
+    }
+    options: dict[str, Any] = {}
+    if num_predict is not None:
+        options["num_predict"] = num_predict
+    if temperature is not None:
+        options["temperature"] = float(max(0.0, min(2.0, temperature)))
+    if top_p is not None:
+        options["top_p"] = float(max(0.05, min(1.0, top_p)))
+    if os.environ.get("OLLAMA_FORCE_GPU", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        raw_gpu = os.environ.get("OLLAMA_NUM_GPU", "-1").strip()
+        try:
+            options["num_gpu"] = int(raw_gpu)
+        except ValueError:
+            options["num_gpu"] = -1
+    if options:
+        payload["options"] = options
+
+    pipeline_log(
+        "LLM",
+        "START",
+        model=m,
+        url=url,
+        prompt_chars=sum(len(str(msg.get("content") or "")) for msg in messages),
+        timeout_s=timeout_s,
+        vision=any(msg.get("images") for msg in messages),
+    )
+    t0 = time.perf_counter()
+    try:
+        r = requests.post(url, json=payload, timeout=timeout_s)
+        r.raise_for_status()
+        data = r.json()
+        message = data.get("message") or {}
+        text = str(message.get("content", "")).strip()
+        pipeline_log(
+            "LLM",
+            "DONE",
+            model=m,
+            url=url,
+            status=r.status_code,
+            text=text[:120] or "(empty)",
+            eval_ns=data.get("eval_duration"),
+            load_ns=data.get("load_duration"),
+            stage_s=time.perf_counter() - t0,
+        )
+    except Exception as exc:
+        pipeline_log(
+            "LLM",
+            "FAIL",
+            model=m,
+            url=url,
+            error=str(exc),
+            stage_s=time.perf_counter() - t0,
+        )
+        raise
+    if not text:
+        raise RuntimeError("Ollama chat returned an empty response.")
     return text
 
 
@@ -1738,6 +1780,7 @@ def answer_voice_query(
     recent_assistant_replies: list[str] | None = None,
     is_follow_up: bool = False,
     vision_context: str | None = None,
+    emotion_context: str | None = None,
 ) -> str:
     if viewer_name:
         who = (
@@ -1777,10 +1820,23 @@ def answer_voice_query(
     scene = (vision_context or "").strip()
     if scene:
         vision_rules = (
-            f"Your camera can see right now: {scene}. "
-            "Use this only when they ask what you can see or about objects around them. "
-            "Describe it naturally in a sentence; never read it out as a list of labels, "
-            "and never claim to see anything that is not listed.\n"
+            f"Your camera view right now: {scene}. "
+            "You have real eyes — use this when they ask what you see, what's around them, "
+            "or where something is (left, right, near, far). "
+            "Describe the scene like a curious companion in one flowing sentence; "
+            "mention positions naturally when relevant. "
+            "Never invent objects or people not in the camera view. "
+            "Never read labels as a dry list.\n"
+        )
+    emotion_rules = ""
+    mood = (emotion_context or "").strip()
+    if mood:
+        emotion_rules = (
+            f"Facial mood from your camera (expression reading, not mind-reading): {mood}. "
+            "You may reflect their energy when it fits — warm if they look happy, gentle if "
+            "tired or sad, calm if they seem stressed. Never mention mood on every reply; "
+            "only when it naturally fits or they ask how they look. Never claim certainty or "
+            "diagnose mental health.\n"
         )
     memory_rules = ""
     if memory_context:
@@ -1807,15 +1863,19 @@ def answer_voice_query(
         )
 
     prompt = (
-        "You are NiNO, an enthusiastic voice assistant for a smart home with a camera.\n"
+        "You are NiNO, a warm witty home robot with a camera and a playful personality. "
+        "You notice details, remember context, and speak like a sharp friendly companion — "
+        "never a corporate assistant.\n"
         f"{who}\n"
         f"{clock_line}"
         f"{vision_rules}"
+        f"{emotion_rules}"
         f"{memory_rules}"
         f"{_memory_context_block(memory_context)}"
         "Style rules:\n"
         f"- {style_hint}\n"
-        "- Sound warm, curious, and interactive — like a lively friend, not a helpdesk.\n"
+        "- Sound curious and present — react to what you see and hear, not generic filler.\n"
+        "- Use spatial language when helpful: left, right, close, in the back.\n"
         "- Never start a factual answer with good morning/afternoon/evening or their name as a greeting.\n"
         "- Never say \"how can I assist you\", \"how may I help\", "
         "\"further assistance\", or similar service-desk phrases.\n"

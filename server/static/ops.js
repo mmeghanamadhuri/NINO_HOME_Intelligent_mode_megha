@@ -3,6 +3,32 @@ let firmwareBuilds = [];
 let dashboardCache = null;
 let activeTab = "overview";
 let activeQueueFilter = null;
+let focusDeviceId = null;
+let fleetBotsCache = [];
+let initialFocusTabHandled = false;
+
+function parseFocusDeviceFromPage() {
+  const fromBody = document.body?.getAttribute("data-focus-device")?.trim();
+  if (fromBody) return fromBody;
+  const match = window.location.pathname.match(/^\/ops\/device\/([^/]+)\/?$/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+function deviceOpsUrl(deviceId) {
+  const id = String(deviceId || "").trim();
+  if (!id || id === "fleet" || id === "all") return "/ops";
+  return `/ops/device/${encodeURIComponent(id)}`;
+}
+
+function navigateToDevice(deviceId) {
+  const url = deviceOpsUrl(deviceId);
+  if (window.location.pathname + window.location.search !== url) {
+    window.location.href = url;
+    return;
+  }
+  focusDeviceId = deviceId && deviceId !== "fleet" ? String(deviceId).trim() : null;
+  loadDashboard().catch(console.error);
+}
 
 function esc(text) {
   return String(text ?? "")
@@ -211,6 +237,282 @@ function bindStatCards() {
       closeStatInlineDetail();
     };
   }
+}
+
+function layerBadge(layer) {
+  const value = String(layer || "ops").toLowerCase();
+  return `<span class="ops-task-layer ops-task-layer-${esc(value)}">${esc(value.replaceAll("_", " "))}</span>`;
+}
+
+function renderProjectTasks(tasks) {
+  const panel = document.getElementById("projectTasksPanel");
+  if (!panel) return;
+  const rows = tasks || [];
+  if (!rows.length) {
+    panel.innerHTML = `<p class="ops-empty">No task roster available.</p>`;
+    return;
+  }
+  panel.innerHTML = `
+    <div class="ops-task-grid">
+      ${rows
+        .map(
+          (task) => `
+            <article class="ops-task-card">
+              <header class="ops-task-header">
+                <h3>${esc(task.name)}</h3>
+                ${layerBadge(task.layer)}
+              </header>
+              <div class="ops-task-interval">Every ${esc(task.interval || "—")}</div>
+              <p class="ops-task-role">${esc(task.role)}</p>
+              <p class="ops-task-handles"><strong>Handles:</strong> ${esc(task.handles)}</p>
+            </article>
+          `
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function renderDeviceNav(data) {
+  const strip = document.getElementById("deviceNavStrip");
+  const hint = document.getElementById("deviceNavHint");
+  if (!strip) return;
+
+  const server = data.server || {};
+  const bots = fleetBotsCache.length ? fleetBotsCache : data.bots || [];
+  const focus = data.focus || {};
+  const currentFocus = focus.device_id || focusDeviceId || null;
+
+  if (hint) {
+    hint.textContent = currentFocus
+      ? `${focus.display_name || currentFocus}`
+      : `${bots.length} bot(s) + server`;
+  }
+
+  const chips = [
+    {
+      device_id: "fleet",
+      display_name: "All fleet",
+      health: data.summary?.server_health || "unknown",
+      isFleet: true,
+    },
+    {
+      device_id: "server",
+      display_name: server.display_name || "NiNO Server",
+      health: server.health || "unknown",
+      agent_status: server.agent_status,
+    },
+    ...bots.map((bot) => ({
+      device_id: bot.device_id,
+      display_name: bot.display_name || bot.device_id,
+      subtitle:
+        bot.location_name && bot.location_name !== bot.display_name
+          ? bot.location_name
+          : bot.device_id !== bot.display_name
+            ? bot.device_id
+            : "",
+      health: bot.health,
+      agent_status: bot.agent_status,
+      incident_count: (bot.incidents || []).length,
+    })),
+  ];
+
+  strip.innerHTML = chips
+    .map((chip) => {
+      const active =
+        chip.isFleet && !currentFocus
+          ? true
+          : !chip.isFleet && String(chip.device_id) === String(currentFocus);
+      const issueDot =
+        chip.incident_count > 0
+          ? `<span class="ops-device-issue-dot" title="${esc(chip.incident_count)} open issue(s)"></span>`
+          : "";
+      return `
+        <button
+          type="button"
+          class="ops-device-chip ops-device-chip-${esc(String(chip.health || "unknown").toLowerCase())}${active ? " ops-device-chip-active" : ""}"
+          data-device-id="${esc(chip.device_id)}"
+          aria-current="${active ? "true" : "false"}"
+        >
+          ${issueDot}
+          <span class="ops-device-chip-text">
+            <span class="ops-device-chip-name">${esc(chip.display_name)}</span>
+            ${chip.subtitle ? `<span class="ops-device-chip-sub">${esc(chip.subtitle)}</span>` : ""}
+          </span>
+          ${healthBadge(chip.health, "ops-badge-sm")}
+        </button>
+      `;
+    })
+    .join("");
+
+  strip.querySelectorAll(".ops-device-chip").forEach((btn) => {
+    btn.onclick = (event) => {
+      event.preventDefault();
+      const deviceId = btn.getAttribute("data-device-id");
+      if (deviceId === "fleet") {
+        window.location.href = "/ops";
+      } else {
+        window.location.href = deviceOpsUrl(deviceId);
+      }
+    };
+  });
+}
+
+function renderFocusBanner(data) {
+  const banner = document.getElementById("focusBanner");
+  const title = document.getElementById("focusBannerTitle");
+  const meta = document.getElementById("focusBannerMeta");
+  if (!banner || !title || !meta) return;
+
+  const focus = data.focus || {};
+  if (!focus.device_id || focus.mode === "fleet") {
+    banner.hidden = true;
+    return;
+  }
+
+  if (focus.mode === "missing") {
+    banner.hidden = false;
+    title.textContent = focus.display_name || focus.device_id;
+    meta.textContent = " — device not found on network";
+    return;
+  }
+
+  banner.hidden = false;
+  title.textContent = focus.display_name || focus.device_id;
+  const health = focus.health || "unknown";
+  meta.innerHTML = ` · ${healthBadge(health)} · ${esc(focus.device_id)}`;
+}
+
+function renderBotFocusPanel(data) {
+  const panel = document.getElementById("botFocusPanel");
+  const title = document.getElementById("botFocusTitle");
+  const healthBadgeEl = document.getElementById("botFocusHealth");
+  const body = document.getElementById("botFocusBody");
+  if (!panel || !body) return;
+
+  const focus = data.focus || {};
+  if (!focus.device_id || focus.mode === "fleet") {
+    panel.hidden = true;
+    return;
+  }
+
+  panel.hidden = false;
+
+  if (focus.mode === "missing") {
+    if (title) title.textContent = "Device not found";
+    if (healthBadgeEl) healthBadgeEl.textContent = "unknown";
+    body.innerHTML = `<p class="ops-empty">No bot with ID <code>${esc(focus.device_id)}</code> is currently discovered. Check LAN discovery or devices.json.</p>`;
+    return;
+  }
+
+  if (focus.mode === "server") {
+    if (title) title.textContent = "NiNO Server ops";
+    const server = data.server || {};
+    if (healthBadgeEl) {
+      const health = String(server.health || "unknown").toLowerCase();
+      healthBadgeEl.className = `ops-health-badge ops-health-${health}`;
+      healthBadgeEl.textContent = health;
+    }
+    body.innerHTML = renderServerDetails(server, { expanded: true });
+    return;
+  }
+
+  const bot = (data.bots || [])[0];
+  if (!bot) {
+    panel.hidden = true;
+    return;
+  }
+
+  if (title) title.textContent = `${bot.display_name || bot.device_id} ops`;
+  if (healthBadgeEl) {
+    const health = String(bot.health || "unknown").toLowerCase();
+    healthBadgeEl.className = `ops-health-badge ops-health-${health}`;
+    healthBadgeEl.textContent = health;
+  }
+  body.innerHTML = renderBotDetails(bot, { expanded: true });
+}
+
+function renderServerDetails(server, { expanded = false } = {}) {
+  const llm = server.llm || {};
+  const memory = server.memory || {};
+  const incidents = server.incidents || [];
+  return `
+    <div class="ops-bot-header">
+      <div>
+        <h3>${esc(server.display_name || "NiNO Server")}</h3>
+        <div class="ops-bot-meta">Agent: ${agentBadge(server.agent_status)}</div>
+      </div>
+    </div>
+    ${renderSubsystems(server.subsystems)}
+    <div class="ops-bot-meta">
+      LLM: ${esc(llm.reachable ? "reachable" : "down")}
+      ${llm.model ? ` · ${esc(llm.model)}` : ""}
+      ${memory.database_url_set ? ` · Memory: ${memory.ready ? "ready" : "not ready"}` : ""}
+    </div>
+    ${
+      incidents.length
+        ? `<div class="ops-incident-list" style="margin-top: 12px;">${incidents
+            .map(
+              (inc) => `
+              <article class="ops-incident ops-incident-agent_working">
+                <div class="ops-incident-title">${esc(inc.subsystem)} · ${esc(inc.status)}</div>
+                <div class="ops-incident-error">${esc(inc.error)}</div>
+              </article>`
+            )
+            .join("")}</div>`
+        : `<div class="ops-incident-meta">All server checks passing</div>`
+    }
+  `;
+}
+
+function renderBotDetails(bot, { expanded = false } = {}) {
+  const incidents = bot.incidents || [];
+  const openCount = incidents.length;
+  return `
+    <div class="ops-bot-header">
+      <div>
+        <h3>${esc(bot.display_name || bot.device_id)}</h3>
+        <div class="ops-bot-meta">${esc(bot.device_id)} · Agent ${agentBadge(bot.agent_status)}</div>
+      </div>
+    </div>
+    <div class="ops-bot-meta">
+      Camera: <span class="ops-camera-state ops-camera-${esc(String(bot.camera_state || "unknown").toLowerCase())}">${esc(cameraStateLabel(bot))}</span>
+      ${bot.voice_pipeline_active ? " · voice active" : ""}
+      ${bot.wifi_ssid ? `<div>Wi‑Fi: ${esc(bot.wifi_ssid)}${bot.wifi_rssi != null ? ` (${esc(bot.wifi_rssi)} dBm)` : ""}</div>` : ""}
+      ${bot.base_url ? `<div>Base: <code>${esc(bot.base_url)}</code></div>` : ""}
+      ${bot.camera_url ? `<div>Camera: <code>${esc(bot.camera_url)}</code></div>` : ""}
+    </div>
+    ${renderSubsystems(bot.subsystems)}
+    ${
+      openCount
+        ? `<div class="ops-incident-list" style="margin-top: 12px;">${incidents
+            .map(
+              (inc) => `
+              <article class="ops-incident ops-incident-agent_working">
+                <div class="ops-incident-title">${esc(inc.subsystem)} · ${esc(inc.status)}</div>
+                <div class="ops-incident-error">${esc(inc.error)}</div>
+              </article>`
+            )
+            .join("")}</div>`
+        : `<div class="ops-incident-meta">All checks passing</div>`
+    }
+    ${bot.camera_last_error ? `<div class="ops-incident-error">${esc(bot.camera_last_error)}</div>` : ""}
+    ${
+      bot.base_url && firmwareBuilds.length
+        ? `<div class="ops-ota-row">
+            <select class="ops-ota-select" data-device-id="${esc(bot.device_id)}">
+              ${firmwareBuilds
+                .map(
+                  (b) =>
+                    `<option value="${esc(b.filename)}">${esc(b.filename)} (${Math.round((b.size_bytes || 0) / 1024)} KB)</option>`
+                )
+                .join("")}
+            </select>
+            <button class="secondary ops-btn-inline ops-ota-deploy" data-device-id="${esc(bot.device_id)}" type="button">Update firmware</button>
+          </div>`
+        : ""
+    }
+  `;
 }
 
 function renderSummary(summary) {
@@ -456,8 +758,8 @@ function renderBotCard(bot) {
     <details class="ops-bot-card ops-bot-card-compact">
       <summary class="ops-bot-summary">
         <div class="ops-bot-summary-main">
-          <h3>${esc(bot.display_name || bot.device_id)}</h3>
-          <div class="ops-bot-meta">${esc(bot.device_id)}</div>
+          <h3><a class="ops-bot-link" href="${esc(deviceOpsUrl(bot.device_id))}" onclick="event.stopPropagation()">${esc(bot.display_name || bot.device_id)}</a></h3>
+          <div class="ops-bot-meta">${esc(bot.device_id)} · <a class="ops-bot-link-sub" href="${esc(deviceOpsUrl(bot.device_id))}" onclick="event.stopPropagation()">Open bot ops →</a></div>
         </div>
         <div class="ops-bot-summary-badges">
           ${healthBadge(bot.health)}
@@ -865,6 +1167,10 @@ function bindTabs() {
 function renderDashboard(data) {
   dashboardCache = data;
   renderSummary(data.summary || {});
+  renderFocusBanner(data);
+  renderDeviceNav(data);
+  renderProjectTasks(data.project_tasks || []);
+  renderBotFocusPanel(data);
   renderIssueQueues(data.issue_queues || {});
   renderAgentStatus(data);
   renderServer(data.server || {});
@@ -875,6 +1181,11 @@ function renderDashboard(data) {
   document.getElementById("lastUpdated").textContent = `Updated ${formatTime(data.generated_at)}`;
   if (activeQueueFilter) {
     renderStatInlineDetail(activeQueueFilter, data);
+  }
+  const focus = data.focus || {};
+  if (focus.device_id && focus.mode !== "fleet" && !initialFocusTabHandled) {
+    initialFocusTabHandled = true;
+    switchTab("bots");
   }
 }
 
@@ -908,7 +1219,18 @@ function renderCodingAgentStatus(status) {
 async function loadDashboard() {
   const statusPill = document.getElementById("connectionStatus");
   try {
-    const data = await api("/api/intelligent-mode/dashboard");
+    const fleetData = await api("/api/intelligent-mode/dashboard");
+    fleetBotsCache = fleetData.bots || [];
+
+    const dashboardPath =
+      focusDeviceId && focusDeviceId !== "fleet"
+        ? `/api/intelligent-mode/dashboard?device_id=${encodeURIComponent(focusDeviceId)}`
+        : "/api/intelligent-mode/dashboard";
+    const data =
+      dashboardPath === "/api/intelligent-mode/dashboard"
+        ? fleetData
+        : await api(dashboardPath);
+
     await loadExtraPanels();
     renderDashboard(data);
     bindOtaActions();
@@ -977,6 +1299,7 @@ async function runAction(button, path, successMessage) {
 }
 
 function initOpsDashboard() {
+  focusDeviceId = parseFocusDeviceFromPage();
   bindTabs();
   bindStatCards();
 

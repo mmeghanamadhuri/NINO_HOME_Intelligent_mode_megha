@@ -313,36 +313,6 @@ def _piper_available() -> bool:
     return True
 
 
-_PIPER_DOWNLOAD_BASE = (
-    "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/amy/low"
-)
-
-
-def ensure_piper_model(*, timeout_s: int = 120) -> tuple[bool, str]:
-    """Download the default Piper voice if missing (.onnx + .onnx.json)."""
-    model_path = _piper_model_path()
-    config_path = Path(f"{model_path}.json")
-    if model_path.is_file() and config_path.is_file():
-        return True, f"Piper model already present: {model_path.name}"
-
-    model_path.parent.mkdir(parents=True, exist_ok=True)
-    files = (
-        (model_path, f"{_PIPER_DOWNLOAD_BASE}/{model_path.name}"),
-        (config_path, f"{_PIPER_DOWNLOAD_BASE}/{model_path.name}.json"),
-    )
-    for dest, url in files:
-        if dest.is_file():
-            continue
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "nino-server/1.0"})
-            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                dest.write_bytes(resp.read())
-            logger.info("Downloaded Piper asset: %s", dest.name)
-        except Exception as exc:
-            return False, f"Failed to download {dest.name}: {exc}"
-    return _piper_available(), f"Downloaded Piper voice to {model_path.parent}"
-
-
 def _load_piper_voice() -> Any:
     """Return the cached Piper model, loading it once per configured voice."""
     global _PIPER_VOICE, _PIPER_VOICE_MODEL_PATH
@@ -389,17 +359,6 @@ def preload_piper_voice() -> bool:
     except Exception as exc:
         logger.warning("Piper fallback preload failed: %s", exc)
         return False
-
-
-def reload_piper_voice(*, use_cuda: bool | None = None) -> None:
-    """Drop cached Piper voice so the next synthesis reloads with fresh settings."""
-    global _PIPER_VOICE, _PIPER_VOICE_MODEL_PATH
-
-    if use_cuda is not None:
-        os.environ["PIPER_USE_CUDA"] = "1" if use_cuda else "0"
-    with _PIPER_LOCK:
-        _PIPER_VOICE = None
-        _PIPER_VOICE_MODEL_PATH = None
 
 
 def _kokoro_model_path() -> Path:

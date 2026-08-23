@@ -146,6 +146,50 @@ class PhraseVisibleSceneTests(unittest.TestCase):
             f"On my left {EMPTY_SCENE_NOTE}.",
         )
 
+    def test_spoken_people_include_emotion(self) -> None:
+        self.assertEqual(
+            phrase_visible_scene(["Hari"], [], emotions={"Hari": "Happy"}),
+            "Hari, who looks happy",
+        )
+        self.assertEqual(
+            spoken_scene_report(
+                ["Hari"],
+                [{"label": "cup"}],
+                pose="center",
+                emotions={"Hari": "sad"},
+            ),
+            "Right now I see Hari, who looks a bit down, and a cup.",
+        )
+        self.assertEqual(
+            spoken_scene_report(
+                ["Hari", "Nora"],
+                [],
+                pose="left",
+                emotions={"Hari": "Happy", "Nora": "surprise"},
+            ),
+            "On my left I see Hari, who looks happy and Nora, who looks surprised.",
+        )
+
+    def test_spoken_up_down_at_each_side(self) -> None:
+        self.assertEqual(
+            spoken_scene_report(
+                ["Hari"], [{"label": "cup"}, {"label": "chair"}], pose="right", tilt="up"
+            ),
+            "Looking up on my right I see Hari and a chair and a cup.",
+        )
+        self.assertEqual(
+            spoken_scene_report([], [{"label": "laptop"}], pose="left", tilt="down"),
+            "Looking down on my left I see a laptop.",
+        )
+        self.assertEqual(
+            spoken_scene_report(["Nora"], [], pose="front", tilt="up"),
+            "Looking up I see Nora.",
+        )
+        self.assertEqual(
+            spoken_scene_report([], [], pose="right", tilt="down"),
+            f"Looking down on my right {EMPTY_SCENE_NOTE}.",
+        )
+
 
 class DetectTests(unittest.TestCase):
     def test_disabled_service_never_runs_inference(self) -> None:

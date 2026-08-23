@@ -1,3 +1,21 @@
 {
-  "devices": []
+  "devices": [
+    {
+      "device_id": "b0a6048addd4",
+      "display_name": "NINO - HOME Vaseekaran",
+      "camera_url": "http://192.168.1.148/stream",
+      "play_wav_url": "http://192.168.1.148/play_wav",
+      "base_url": "http://192.168.1.148",
+      "camera_rotation": "none",
+      "latitude": null,
+      "longitude": null,
+      "location_name": "",
+      "location_updated_at": "",
+      "wifi_ssid": "okgoogle",
+      "wifi_bssid": "30:23:03:C2:AD:5B",
+      "wifi_rssi": -41,
+      "wifi_channel": 9,
+      "wifi_updated_at": "2026-08-23T09:15:50.480655+00:00"
+    }
+  ]
 }

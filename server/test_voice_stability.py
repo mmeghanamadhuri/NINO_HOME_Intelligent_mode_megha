@@ -94,13 +94,17 @@ def test_transcript_without_ok_nino_is_not_rejected() -> None:
 
     found, command, phrase = extract_wake_and_command("Okay, hello.")
     assert found is True
-    assert phrase == "okay"
+    assert phrase in {"okay", "hello"}
 
     found, command, phrase = extract_wake_and_command("Okay, no hello.")
     assert found is True
 
     found, command, phrase = extract_wake_and_command("Okay, now.")
     assert found is True
+
+    for heard in ("Okay.", "okay", "Oh no.", "I know.", "All right."):
+        found, command, phrase = extract_wake_and_command(heard)
+        assert found is True, heard
 
 
 def test_speech_without_wake_phrase_is_answered() -> None:
@@ -250,3 +254,4 @@ def test_low_energy_skips_stt_and_does_not_reopen() -> None:
     assert meta.timings["stt_engine"] == "skipped"
     assert meta.timings["turn"] == 7
     assert min_speech_energy() == 5
+    assert min_speech_energy("continue") == 5

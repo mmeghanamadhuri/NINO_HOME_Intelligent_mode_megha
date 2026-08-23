@@ -87,6 +87,10 @@ def _detection_enabled() -> bool:
     return _env_flag("OBJECT_DETECTION_ENABLED")
 
 
+def _detection_backend() -> str:
+    return os.environ.get("OBJECT_DETECTION_BACKEND", "yolo").strip().lower() or "yolo"
+
+
 def _model_name() -> str:
     return os.environ.get("OBJECT_DETECTION_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
 
@@ -132,8 +136,54 @@ def _class_color(class_id: int) -> tuple[int, int, int]:
     return _BOX_PALETTE[class_id % len(_BOX_PALETTE)]
 
 
+def _spatial_suffix(det: dict[str, Any]) -> str:
+    """Optional 'on the left', 'up close', etc. from VLM metadata."""
+    parts: list[str] = []
+    pos = str(det.get("position") or "").strip().lower()
+    depth = str(det.get("depth") or "").strip().lower()
+    if pos == "left":
+        parts.append("on the left")
+    elif pos == "right":
+        parts.append("on the right")
+    elif pos in {"centre", "center"}:
+        parts.append("in the centre")
+    elif pos == "top":
+        parts.append("at the top")
+    elif pos == "bottom":
+        parts.append("at the bottom")
+    if depth == "near":
+        parts.append("up close")
+    elif depth == "far":
+        parts.append("in the back")
+    return " ".join(parts)
+
+
+def _phrase_detection(det: dict[str, Any]) -> str:
+    label = str(det.get("label", "")).strip().lower()
+    if not label:
+        return ""
+    spatial = _spatial_suffix(det)
+    base = _with_article(label)
+    return f"{base} {spatial}".strip() if spatial else base
+
+
 def summarize_detections(detections: list[dict[str, Any]]) -> str:
-    """Natural-language scene phrase, e.g. "2 people, a laptop and a cup"."""
+    """Natural-language scene phrase, with spatial hints when available."""
+    if not detections:
+        return ""
+    has_spatial = any(
+        str(det.get("position") or det.get("depth") or "").strip()
+        for det in detections
+    )
+    if has_spatial:
+        phrases = [_phrase_detection(det) for det in detections]
+        phrases = [p for p in phrases if p]
+        if not phrases:
+            return ""
+        if len(phrases) == 1:
+            return phrases[0]
+        return f"{', '.join(phrases[:-1])} and {phrases[-1]}"
+
     counts: dict[str, int] = {}
     for det in detections:
         label = str(det.get("label", "")).strip().lower()
@@ -151,8 +201,35 @@ def summarize_detections(detections: list[dict[str, Any]]) -> str:
     return f"{', '.join(phrases[:-1])} and {phrases[-1]}"
 
 
+def spatial_scene_context(
+    detections: list[dict[str, Any]] | None,
+    *,
+    scene_summary: str = "",
+    names: list[str] | None = None,
+) -> str:
+    """Rich camera context for the LLM — scene summary plus people/objects."""
+    parts: list[str] = []
+    summary = str(scene_summary or "").strip()
+    if summary:
+        parts.append(summary.rstrip("."))
+    visible = phrase_visible_scene(names, detections)
+    if visible and visible not in summary:
+        parts.append(f"Visible: {visible}")
+    return ". ".join(parts).strip()
+
+
 _PERSON_LABELS = {"person", "people"}
 EMPTY_SCENE_NOTE = "I don't see anyone or anything distinctive"
+
+
+def _join_phrases(parts: list[str]) -> str:
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 2:
+        return f"{parts[0]} and {parts[1]}"
+    return f"{', '.join(parts[:-1])} and {parts[-1]}"
 
 
 def join_visible_names(names: list[str] | None) -> str:
@@ -166,25 +243,44 @@ def join_visible_names(names: list[str] | None) -> str:
             continue
         seen.add(key)
         cleaned.append(name)
-    if not cleaned:
-        return ""
-    if len(cleaned) == 1:
-        return cleaned[0]
-    if len(cleaned) == 2:
-        return f"{cleaned[0]} and {cleaned[1]}"
-    return f"{', '.join(cleaned[:-1])} and {cleaned[-1]}"
+    return _join_phrases(cleaned)
+
+
+def join_visible_people(
+    names: list[str] | None,
+    emotions: dict[str, str] | None = None,
+) -> str:
+    """'Hari, who looks happy' / 'Hari, who looks happy and Nora'."""
+    from session_emotion import phrase_person_looking
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    emo_map = {
+        str(key).strip().lower(): str(value).strip()
+        for key, value in (emotions or {}).items()
+        if str(key).strip()
+    }
+    for raw in names or []:
+        name = str(raw or "").strip()
+        key = name.lower()
+        if not name or key in {"unknown", "face"} or key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(phrase_person_looking(name, emo_map.get(key)))
+    return _join_phrases(cleaned)
 
 
 def phrase_visible_scene(
     names: list[str] | None,
     detections: list[dict[str, Any]] | None,
+    emotions: dict[str, str] | None = None,
 ) -> str:
-    """People + objects together, e.g. 'Hari and a laptop'.
+    """People + objects together, e.g. 'Hari, who looks happy and a laptop'.
 
     Registered names suppress YOLO 'person' counts so we do not say
     'Hari and a person'.
     """
-    people = join_visible_names(names)
+    people = join_visible_people(names, emotions)
     dets = list(detections or [])
     if people:
         dets = [
@@ -194,8 +290,24 @@ def phrase_visible_scene(
         ]
     objects = summarize_detections(dets)
     if people and objects:
+        if ", who looks " in people:
+            return f"{people}, and {objects}"
         return f"{people} and {objects}"
     return people or objects or ""
+
+
+def _look_scan_prefix(side: str, tilt: str) -> str:
+    elev = (tilt or "center").strip().lower()
+    looking = {"up": "Looking up", "down": "Looking down"}.get(elev)
+    if side == "left":
+        return f"{looking} on my left" if looking else "On my left"
+    if side == "right":
+        return f"{looking} on my right" if looking else "On my right"
+    if looking:
+        return looking
+    if side == "front":
+        return "Right in front of me"
+    return "Right now"
 
 
 def spoken_scene_report(
@@ -203,27 +315,27 @@ def spoken_scene_report(
     detections: list[dict[str, Any]] | None,
     *,
     pose: str = "center",
+    tilt: str = "center",
+    emotions: dict[str, str] | None = None,
 ) -> str:
-    """Full spoken line for a look-scan pose."""
-    content = phrase_visible_scene(names, detections)
+    """Full spoken line for a look-scan pose (lists every person and object)."""
+    content = phrase_visible_scene(names, detections, emotions=emotions)
     side = (pose or "center").strip().lower()
-    if side == "left":
-        if not content:
-            return f"On my left {EMPTY_SCENE_NOTE}."
-        return f"On my left I see {content}."
-    if side == "right":
-        if not content:
-            return f"On my right {EMPTY_SCENE_NOTE}."
-        return f"On my right I see {content}."
+    prefix = _look_scan_prefix(side, tilt)
     if not content:
-        return f"{EMPTY_SCENE_NOTE}."
-    if side == "front":
-        return f"Right in front of me I see {content}."
-    return f"Right now I see {content}."
+        if prefix in {"Right now", "Right in front of me"}:
+            return f"{EMPTY_SCENE_NOTE}."
+        return f"{prefix} {EMPTY_SCENE_NOTE}."
+    return f"{prefix} I see {content}."
+
+
+_VLM_BACKENDS = frozenset(
+    {"llama4", "llama", "vision", "vlm", "qwen", "qwen2.5vl", "qwen-vl", "qwen_vl"}
+)
 
 
 class ObjectDetectionService:
-    """Detect COCO objects in camera frames with Ultralytics YOLO26n.
+    """Detect objects in camera frames — YOLO26n or Qwen-VL (``OBJECT_DETECTION_BACKEND``).
 
     Inference is throttled to one pass per interval and the last result is
     replayed on intermediate frames, so the MJPEG stream and the background
@@ -232,6 +344,7 @@ class ObjectDetectionService:
 
     def __init__(self) -> None:
         self._enabled = _detection_enabled()
+        self._backend = _detection_backend()
         self._model_name = _model_name()
         self._interval_s = _detection_interval_s()
         self._confidence = _detection_confidence()
@@ -251,8 +364,17 @@ class ObjectDetectionService:
         # device_id -> (timestamp, detections)
         self._cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self._cache_lock = threading.Lock()
+        self._vision: Any | None = None
+        if self._enabled and self._backend in _VLM_BACKENDS:
+            from vision_scene_service import VisionSceneService
 
-        if not self._enabled:
+            self._vision = VisionSceneService()
+            logger.info(
+                "Object detection using Qwen-VL backend model=%s interval=%ss",
+                self._vision.stats().get("model"),
+                self._vision.stats().get("interval_s"),
+            )
+        elif not self._enabled:
             logger.info("Object detection disabled (OBJECT_DETECTION_ENABLED=0)")
 
     # ------------------------------------------------------------------ state
@@ -263,14 +385,19 @@ class ObjectDetectionService:
 
     @property
     def available(self) -> bool:
-        return self._enabled and self._model is not None
+        if not self._enabled:
+            return False
+        if self._vision is not None:
+            return True
+        return self._model is not None
 
     def stats(self) -> dict[str, Any]:
-        return {
+        base = {
             "enabled": self._enabled,
             "available": self.available,
-            "model": self._model_name,
-            "device": self._device,
+            "backend": self._backend,
+            "model": self._model_name if self._vision is None else self._vision.stats().get("model"),
+            "device": self._device if self._vision is None else "qwen-vl",
             "interval_s": self._interval_s,
             "confidence": self._confidence,
             "imgsz": self._imgsz,
@@ -279,6 +406,14 @@ class ObjectDetectionService:
             "last_latency_ms": round(self._last_latency_ms, 1),
             "last_error": self._last_error,
         }
+        if self._vision is not None:
+            base.update(self._vision.stats())
+        return base
+
+    def scene_summary(self, device_id: str = "default") -> str:
+        if self._vision is not None:
+            return str(self._vision.scene_summary(device_id) or "")
+        return ""
 
     def latest(self, device_id: str = "default") -> list[dict[str, Any]]:
         """Most recent detections for a device without running inference."""
@@ -286,11 +421,27 @@ class ObjectDetectionService:
             cached = self._cache.get(device_id)
         return list(cached[1]) if cached else []
 
+    def clear_device(self, device_id: str = "default") -> None:
+        key = str(device_id or "").strip() or "default"
+        with self._cache_lock:
+            self._cache.pop(key, None)
+        if self._vision is not None:
+            self._vision.clear_device(key)
+
+    def bump_vision_generation(self) -> None:
+        if self._vision is not None:
+            self._vision.bump_generation()
+
     # -------------------------------------------------------------- inference
 
     def warmup(self) -> None:
         """Load weights and run one dummy pass so the first real frame is fast."""
-        if not self._enabled or not self._ensure_model():
+        if not self._enabled:
+            return
+        if self._vision is not None:
+            self._vision.warmup()
+            return
+        if not self._ensure_model():
             return
         try:
             blank = np.zeros((self._imgsz, self._imgsz, 3), dtype=np.uint8)
@@ -312,6 +463,22 @@ class ObjectDetectionService:
         """Detections for a frame, reusing the cached pass inside the interval."""
         if not self._enabled or frame_bgr is None:
             return []
+
+        if self._vision is not None:
+            from vision_pause import vision_inference_paused
+
+            if not force and vision_inference_paused(device_id):
+                with self._cache_lock:
+                    cached = self._cache.get(device_id)
+                return list(cached[1]) if cached else []
+            detections = self._vision.detect(
+                frame_bgr, device_id=device_id, force=force
+            )
+            self._last_latency_ms = float(self._vision.stats().get("last_latency_ms") or 0)
+            self._last_error = str(self._vision.stats().get("last_error") or "")
+            with self._cache_lock:
+                self._cache[device_id] = (time.time(), detections)
+            return detections
 
         now = time.time()
         if not force:
@@ -502,25 +669,15 @@ class ObjectDetectionService:
 
     def _resolve_device(self) -> str:
         configured = os.environ.get("OBJECT_DETECTION_DEVICE", "auto").strip().lower()
-        if configured and configured not in {"auto", "detect"}:
+        if configured and configured != "auto":
             return configured
         try:
             import torch
 
-            if not torch.cuda.is_available():
-                return "cpu"
-            device = os.environ.get("OBJECT_DETECTION_CUDA_DEVICE", "cuda:0").strip() or "cuda:0"
-            probe = torch.zeros(1, device=device)
-            del probe
-            torch.cuda.synchronize()
-            logger.info("YOLO26 using GPU %s (%s)", device, torch.cuda.get_device_name(0))
-            return device
-        except Exception as exc:
-            logger.warning(
-                "YOLO26 GPU unavailable (%s); using CPU. "
-                "For GTX 10xx install PyTorch cu126: bash server/scripts/fix_pytorch_pascal_gpu.sh",
-                exc,
-            )
+            if torch.cuda.is_available():
+                return "cuda:0"
+        except Exception:
+            pass
         return "cpu"
 
     def _resolve_class_filter(self) -> list[int] | None:

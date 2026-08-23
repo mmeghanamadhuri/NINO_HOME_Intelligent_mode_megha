@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
@@ -17,23 +17,75 @@ EYE_EXPRESSIONS: tuple[str, ...] = (
     "recalling",
 )
 
+BITMAP_EYE_EXPRESSIONS: tuple[str, ...] = (
+    "tv",
+    "radio",
+    "bulb",
+    "robot",
+    "pencil",
+    "sparkle",
+    "fire",
+    "bigsmile",
+    "smile",
+)
+
 LLM_RESPONSE_PATHS: frozenset[str] = frozenset(
     {
         "llm",
         "identity_llm",
         "recap",
+        "recap_answer",
         "recap_blocked_no_face",
         "joke",
         "joke_and_time",
         "football_joke",
+        "look_scan_llm",
+        "spatial_report",
+        "observe_briefing",
+        "memory_llm_recall",
+        "memory_llm_store",
+        "greeting",
+        "smalltalk",
     }
+)
+
+LOOK_SCAN_PATHS: frozenset[str] = frozenset(
+    {"look_scan", "look_scan_llm", "spatial_report", "observe_briefing"}
 )
 
 # Joke paths always show happy eyes, whatever words the punchline uses.
 ALWAYS_HAPPY_PATHS: frozenset[str] = frozenset(
     {"joke", "joke_and_time", "football_joke"}
 )
-_VALID = frozenset(EYE_EXPRESSIONS) | frozenset({"heart", "smile", "sparkle", "fire"})
+_VALID = frozenset(EYE_EXPRESSIONS) | frozenset({"heart"}) | frozenset(BITMAP_EYE_EXPRESSIONS)
+
+# Keywords (substring) -> firmware bitmap eye tag.
+_SPATIAL_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("television", " tv", "monitor", "screen"), "tv"),
+    (("radio", "podcast"), "radio"),
+    (("lamp", "light bulb", "bulb"), "bulb"),
+    (("robot", " bot"), "robot"),
+    (("pencil", " pen", "writing"), "pencil"),
+    (("music", "song", "singing"), "radio"),
+    (("fire", "flame", "burning"), "fire"),
+    (("sparkle", "star", "magic", "twinkle"), "sparkle"),
+    (("big smile", "grinning", "beaming"), "bigsmile"),
+    (("smile", "smiling"), "smile"),
+)
+
+
+@dataclass(frozen=True)
+class EyeContext:
+    """Live context for picking an eye emoji beyond reply text alone."""
+
+    person_name: str = ""
+    camera_emotion: str = ""
+    camera_scene: str = ""
+    memory_turn_count: int = 0
+    session_turn_count: int = 0
+    is_follow_up: bool = False
+    visible_names: tuple[str, ...] = field(default_factory=tuple)
+    reply_path: str = "llm"
 
 # User mood statements weigh more than incidental words in the assistant reply.
 _USER_SCORE_MULTIPLIER = 2
@@ -498,6 +550,71 @@ def normalize_eye_expression(value: str | None) -> str | None:
     return None
 
 
+def spatial_eye_from_text(*texts: str) -> str | None:
+    """Map mentioned objects/topics to firmware bitmap eyes (tv, bulb, …)."""
+    combined = " ".join(str(t or "").strip() for t in texts if t).lower()
+    if not combined:
+        return None
+    best_score = 0
+    best_eye: str | None = None
+    for keywords, eye in _SPATIAL_RULES:
+        for kw in keywords:
+            if kw in combined and len(kw) > best_score:
+                best_score = len(kw)
+                best_eye = eye
+    if best_eye and normalize_eye_expression(best_eye):
+        return best_eye
+    return None
+
+
+def emotion_eye_from_context(camera_emotion: str) -> str | None:
+    """DrGM/Rekognition mood string -> animated eye tag."""
+    low = str(camera_emotion or "").strip().lower()
+    if not low:
+        return None
+    for phrase, eye in (
+        ("looks happy", "happy"),
+        ("looks surprise", "surprised"),
+        ("looks sad", "sad"),
+        ("looks angry", "sad"),
+        ("looks fear", "surprised"),
+        ("looks disgust", "sad"),
+        (" looks happy", "happy"),
+        (" looks sad", "sad"),
+        (" looks surprise", "surprised"),
+    ):
+        if phrase in low and eye:
+            return eye
+    return None
+
+
+def spatial_eye_from_context(
+    ctx: EyeContext,
+    *,
+    user_text: str = "",
+    reply_text: str = "",
+) -> str | None:
+    """Spatial/object emoji when the user, reply, or look-scan scene mentions it."""
+    direct = spatial_eye_from_text(user_text, reply_text)
+    if direct:
+        return direct
+    if ctx.reply_path in LOOK_SCAN_PATHS:
+        return spatial_eye_from_text(ctx.camera_scene)
+    return None
+
+
+def _apply_context_biases(scores: dict[str, int], ctx: EyeContext) -> None:
+    if ctx.reply_path in {"memory_llm_recall", "recap", "recap_answer", "recap_blocked_no_face"}:
+        scores["recalling"] += 5
+    if ctx.is_follow_up or ctx.memory_turn_count >= 3 or ctx.session_turn_count >= 2:
+        scores["recalling"] += 2
+    if ctx.person_name and ctx.reply_path in {"greeting", "smalltalk", "session_greet"}:
+        scores["happy"] += 2
+    mood_eye = emotion_eye_from_context(ctx.camera_emotion)
+    if mood_eye:
+        scores[mood_eye] += 3
+
+
 IDENTIFY_HEART_PATHS: frozenset[str] = frozenset({"session_greet"})
 # Hunt / "can I register you" / name-spell-confirm: no LCD emoji until identified.
 IDENTIFY_IDLE_PATHS: frozenset[str] = frozenset(
@@ -517,17 +634,50 @@ def infer_eye_expression_for_response(
     *,
     user_text: str = "",
     reply_path: str = "llm",
+    context: EyeContext | None = None,
+    person_name: str = "",
+    camera_emotion: str = "",
+    camera_scene: str = "",
+    memory_turn_count: int = 0,
+    session_turn_count: int = 0,
+    is_follow_up: bool = False,
+    visible_names: tuple[str, ...] | list[str] | None = None,
 ) -> str | None:
-    """Return an expression for LLM replies only; None leaves the bot on idle."""
+    """Return an expression for LLM replies; None leaves the bot on idle."""
+    ctx = context or EyeContext(
+        person_name=person_name,
+        camera_emotion=camera_emotion,
+        camera_scene=camera_scene,
+        memory_turn_count=memory_turn_count,
+        session_turn_count=session_turn_count,
+        is_follow_up=is_follow_up,
+        visible_names=tuple(visible_names or ()),
+        reply_path=reply_path,
+    )
     if reply_path in IDENTIFY_HEART_PATHS:
         return "heart"
     if reply_path in IDENTIFY_IDLE_PATHS:
         return None
-    if reply_path not in LLM_RESPONSE_PATHS:
+    if reply_path not in LLM_RESPONSE_PATHS and reply_path not in LOOK_SCAN_PATHS:
         return None
     try:
-        tag = infer_eye_expression(reply_text, user_text=user_text, reply_path=reply_path)
-        return normalize_eye_expression(tag)
+        spatial = spatial_eye_from_context(
+            ctx, user_text=user_text, reply_text=reply_text
+        )
+        tag = infer_eye_expression(
+            reply_text,
+            user_text=user_text,
+            reply_path=reply_path,
+            context=ctx,
+        )
+        normalized = normalize_eye_expression(tag)
+        if spatial and (
+            reply_path in LOOK_SCAN_PATHS
+            or not normalized
+            or normalized == "curious"
+        ):
+            return spatial
+        return normalized
     except Exception:
         logger.exception("Eye expression inference failed; omitting tag")
         return None
@@ -663,24 +813,33 @@ def infer_eye_expression(
     *,
     user_text: str = "",
     reply_path: str = "llm",
+    context: EyeContext | None = None,
 ) -> str:
     reply = _normalize_text(reply_text)
     user = _normalize_text(user_text)
+    ctx = context or EyeContext(reply_path=reply_path)
 
     if reply_path in ALWAYS_HAPPY_PATHS:
         return "happy"
 
     if not reply:
-        return _fallback_from_reply("", user, reply_path)
+        base = _fallback_from_reply("", user, reply_path)
+        mood = emotion_eye_from_context(ctx.camera_emotion)
+        return mood or base
 
     scores = _score_text(reply, _REPLY_SCORE_MULTIPLIER)
     scores = _merge_scores(scores, _score_text(user, _USER_SCORE_MULTIPLIER))
+    _apply_context_biases(scores, ctx)
 
-    if reply_path in {"recap", "recap_blocked_no_face"}:
+    if reply_path in {"recap", "recap_blocked_no_face", "recap_answer"}:
         scores["recalling"] += 6
 
     best = _pick_best(scores)
     if best is not None:
         return best
+
+    mood = emotion_eye_from_context(ctx.camera_emotion)
+    if mood:
+        return mood
 
     return _fallback_from_reply(reply, user, reply_path)

@@ -663,7 +663,6 @@ def is_alarm_or_reminder_command(user_text: str) -> bool:
         is_list_alarm_command,
         is_reminder_command,
         is_set_alarm_command,
-        is_timer_command,
     )
 
     if looks_like_medicine_reminder_set(text):
@@ -673,7 +672,6 @@ def is_alarm_or_reminder_command(user_text: str) -> bool:
         for fn in (
             is_set_alarm_command,
             is_reminder_command,
-            is_timer_command,
             is_list_alarm_command,
             is_cancel_all_alarm_command,
             is_delete_one_alarm_command,
@@ -686,7 +684,14 @@ def user_shares_personal_fact(user_text: str) -> bool:
 
 
 # Face welcome TTS — logged as assistant turns so sessions include the greeting.
-_VISION_GREETING_LOG_PATHS = frozenset({"vision_greeting", "startup_greeting"})
+_VISION_GREETING_LOG_PATHS = frozenset(
+    {
+        "vision_greeting",
+        "startup_greeting",
+        "spatial_report",
+        "observe_briefing",
+    }
+)
 
 
 def conversation_log_skip_reason(user_text: str, *, reply_path: str = "llm") -> str | None:

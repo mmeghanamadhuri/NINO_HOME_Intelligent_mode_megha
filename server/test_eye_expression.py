@@ -6,9 +6,12 @@ import unittest
 
 from eye_expression import (
     EYE_EXPRESSIONS,
+    EyeContext,
+    emotion_eye_from_context,
     infer_eye_expression,
     infer_eye_expression_for_response,
     normalize_eye_expression,
+    spatial_eye_from_text,
 )
 
 
@@ -98,6 +101,39 @@ class EyeExpressionTests(unittest.TestCase):
             reply_path="llm",
         )
         self.assertEqual(tag, "sad")
+
+    def test_camera_emotion_biases_happy(self) -> None:
+        tag = infer_eye_expression(
+            "Nice to chat with you today.",
+            user_text="hello",
+            reply_path="llm",
+            context=EyeContext(
+                camera_emotion="Hari (the person you're speaking to) looks happy",
+                reply_path="llm",
+            ),
+        )
+        self.assertEqual(tag, "happy")
+
+    def test_spatial_tv_from_user_question(self) -> None:
+        tag = infer_eye_expression_for_response(
+            "That screen on your left is a television.",
+            user_text="what is that tv",
+            reply_path="look_scan_llm",
+            camera_scene="a television on the left",
+        )
+        self.assertEqual(tag, "tv")
+
+    def test_spatial_bulb_from_scene(self) -> None:
+        self.assertEqual(
+            spatial_eye_from_text("a lamp on the desk"),
+            "bulb",
+        )
+
+    def test_emotion_context_parser(self) -> None:
+        self.assertEqual(
+            emotion_eye_from_context("Hari looks sad"),
+            "sad",
+        )
 
 
 if __name__ == "__main__":

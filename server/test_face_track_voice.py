@@ -203,20 +203,15 @@ class VoicePipelineInterceptTests(unittest.TestCase):
         set_track.assert_called_once_with(True, device_id="30eda0e34fc4")
         llm.assert_not_called()
 
-    def test_what_do_you_see_skips_llm_and_sets_look_scan(self) -> None:
+    def test_what_do_you_see_starts_spatial_sweep(self) -> None:
         with (
-            patch(
-                "voice_service.snapshot_visible_scene",
-                return_value=(["Hari"], [{"label": "laptop"}]),
-            ),
+            patch("voice_service._should_trigger_look_scan", return_value=True),
             patch("llm_service.answer_voice_query") as llm,
         ):
             _out, meta = _process_continue("what do you see")
         self.assertEqual(meta.timings["reply_path"], "look_scan")
         self.assertTrue(meta.look_scan)
-        self.assertIsNone(meta.motion)
-        self.assertIn("hari", meta.timings["reply_text"].lower())
-        self.assertIn("laptop", meta.timings["reply_text"].lower())
+        self.assertIn("let me see where you are", meta.timings["reply_text"].lower())
         llm.assert_not_called()
 
     def test_next_utterance_applies_scene_without_register(self) -> None:
@@ -264,6 +259,89 @@ class VoicePipelineInterceptTests(unittest.TestCase):
         self.assertIs(
             ident.apply_visible_scene.call_args.kwargs["allow_register"], False
         )
+
+    def test_voice_mismatch_adopts_speaker_and_looks(self) -> None:
+        ident = MagicMock()
+        ident.should_skip_prompt_echo.return_value = False
+        ident.in_registration.return_value = False
+        ident.is_active.return_value = True
+        ident.current_user.return_value = ("Kartik", False)
+        ident.apply_visible_scene.return_value = None
+        ident.adopt_recognized_user.return_value = True
+        ident.enrollment_name.return_value = None
+        profiles = MagicMock()
+        profiles.enabled = True
+        profiles.recognize_speaker.return_value = ("Hari", 0.88, "recognized")
+        profiles.needs_enrollment.return_value = False
+        profiles.same_person = None
+        with (
+            patch("session_identity.get_session_identity", return_value=ident),
+            patch("voice_service.get_voice_profiles", return_value=profiles),
+        ):
+            _out, meta = _process_continue(
+                "what time is it",
+                visible_names=["Kartik"],
+                camera_identity_name="Kartik",
+                camera_identity_state="recognized",
+            )
+        self.assertTrue(meta.look_scan)
+        self.assertTrue(meta.identity_mismatch)
+        self.assertEqual(meta.identity_source, "face_voice_mismatch_voice")
+        self.assertEqual(
+            ident.apply_visible_scene.call_args.kwargs["voice_name"], "Hari"
+        )
+        ident.adopt_recognized_user.assert_called_with("Hari")
+        ident.set_voice_hint.assert_called()
+
+
+class ObserveRegisterVoiceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from scene_agent import reset_scene_agent
+
+        reset_scene_agent("30eda0e34fc4")
+
+    def tearDown(self) -> None:
+        from scene_agent import reset_scene_agent
+
+        reset_scene_agent("30eda0e34fc4")
+
+    def test_observe_then_silent_then_join(self) -> None:
+        from scene_agent import OBSERVE_ACK
+
+        _out, meta = _process_continue("you can observe and help")
+        self.assertEqual(meta.timings["reply_path"], "observe_ack")
+        self.assertTrue(meta.observe)
+        self.assertTrue(meta.look_scan)
+        self.assertEqual(meta.timings["reply_text"], OBSERVE_ACK)
+
+        _out, note = _process_continue("they are talking about lunch")
+        self.assertEqual(note.timings["reply_path"], "observe_note")
+        self.assertTrue(note.prompt_medical_ack)
+
+        with patch(
+            "scene_agent.SceneAgent.compose_report",
+            return_value="You were talking about lunch. How can I help you?",
+        ):
+            _out, join = _process_continue("ok Nino, now you can join in")
+        self.assertEqual(join.timings["reply_path"], "observe_briefing")
+        self.assertIs(join.observe, False)
+        self.assertIn("lunch", join.timings["reply_text"].lower())
+
+    def test_register_me_starts_spelling(self) -> None:
+        from session_identity import ASK_SPELL_PROMPT, SessionIdentityFlow
+
+        flow = SessionIdentityFlow(MagicMock(), MagicMock(return_value=None))
+        flow.start_session(
+            session_id="s1",
+            device_id="30eda0e34fc4",
+            identity_name=None,
+            identity_state="unknown",
+        )
+        with patch("session_identity.get_session_identity", return_value=flow):
+            _out, meta = _process_continue("register me")
+        self.assertEqual(meta.timings["reply_path"], "face_registration")
+        self.assertEqual(meta.timings["reply_text"], ASK_SPELL_PROMPT)
+        self.assertTrue(flow.in_registration())
 
 
 if __name__ == "__main__":

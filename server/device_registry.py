@@ -23,8 +23,47 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
+
+
+def _host_from_url(url: str) -> str:
+    raw = (url or "").strip()
+    if not raw.lower().startswith(("http://", "https://")):
+        return ""
+    parsed = urllib.parse.urlparse(raw)
+    return (parsed.hostname or "").strip()
 DEFAULT_DEVICES_PATH = BASE_DIR / "data" / "devices.json"
 LEGACY_DEVICE_ID = "default"
+
+
+def _display_name_is_mac_like(name: str, device_id: str) -> bool:
+    """True when the label is empty or just the device MAC in another format."""
+    label = str(name or "").strip()
+    if not label:
+        return True
+    mac = normalize_device_mac(device_id)
+    if not mac:
+        return False
+    if normalize_device_mac(label) == mac:
+        return True
+    compact = label.replace(":", "").replace("-", "").replace(" ", "").lower()
+    return compact == mac
+
+
+def effective_device_display_name(
+    *,
+    device_id: str,
+    display_name: str = "",
+    location_name: str = "",
+) -> str:
+    """Pick the best human label for ops UI, camera picker, and incidents."""
+    custom = str(display_name or "").strip()
+    location = str(location_name or "").strip()
+    mac = normalize_device_mac(device_id)
+    if custom and not _display_name_is_mac_like(custom, device_id):
+        return custom
+    if location:
+        return location
+    return format_device_mac(mac) or str(device_id or "").strip() or "Unknown device"
 
 
 @dataclass(frozen=True)
@@ -84,10 +123,12 @@ class DeviceRegistry:
         # Warn once per unknown ID so the fallback remains visible without flooding logs.
         # "default" is an alias for the UI device, not an unknown robot.
         self._warned_unknown_device_ids: set[str] = set()
+        # Firmware eFuse/base MAC -> discovery Wi-Fi MAC (same robot, different ID).
+        self._mac_aliases: dict[str, str] = {}
         self.reload()
 
     def reload(self) -> None:
-        file_records, dirty = self._load_from_file()
+        file_records, aliases, dirty = self._load_from_file()
         persisted_ids = {d.device_id for d in file_records}
         loaded = file_records
         if not loaded:
@@ -99,14 +140,17 @@ class DeviceRegistry:
                     LEGACY_DEVICE_ID,
                 )
         with self._lock:
-            if dirty:
-                logger.info(
-                    "Dropping non-MAC device registry entries; keeping %s",
-                    list(persisted_ids) or ["(none)"],
-                )
-                self._write_devices_locked(file_records)
             self._devices = {d.device_id: d for d in loaded}
+            self._mac_aliases = aliases
             self._persisted_device_ids = persisted_ids
+            sanitized = self._sanitize_locked()
+            if dirty or sanitized:
+                self._persisted_device_ids = set(self._devices)
+                logger.info(
+                    "Sanitized device registry; keeping %s",
+                    list(self._persisted_device_ids) or ["(none)"],
+                )
+                self._write_devices_locked(self._devices.values())
             if self._ui_device_id not in self._devices and self._devices:
                 self._ui_device_id = next(iter(self._devices))
             elif not self._devices:
@@ -137,14 +181,28 @@ class DeviceRegistry:
                 removed = merged.pop(LEGACY_DEVICE_ID, None) is not None
 
             changed: list[DeviceRecord] = []
+            aliased = False
             for device_id, discovered in cleaned.items():
+                host = _host_from_url(discovered.effective_base_url())
+                if host:
+                    existing_ip = self._find_by_host_locked(host)
+                    if existing_ip and existing_ip.device_id != device_id:
+                        if self._alias_mac_locked(device_id, existing_ip.device_id):
+                            aliased = True
+                            logger.info(
+                                "Deduped discovery MAC %s -> %s (same IP %s)",
+                                device_id,
+                                existing_ip.device_id,
+                                host,
+                            )
+                        continue
                 existing = merged.get(device_id)
                 record = self._merge_discovered_record(existing, discovered)
                 if existing != record:
                     merged[device_id] = record
                     changed.append(record)
 
-            if not changed and not removed:
+            if not changed and not removed and not aliased:
                 return []
 
             self._write_devices_locked(merged.values())
@@ -227,13 +285,22 @@ class DeviceRegistry:
     def _merge_discovered_record(
         existing: DeviceRecord | None, discovered: DeviceRecord
     ) -> DeviceRecord:
+        existing_name = existing.display_name.strip() if existing else ""
+        discovered_name = discovered.display_name.strip()
+        location = existing.location_name.strip() if existing else ""
+        if existing_name and not _display_name_is_mac_like(existing_name, discovered.device_id):
+            display_name = existing_name
+        elif location:
+            display_name = location
+        elif discovered_name and not _display_name_is_mac_like(discovered_name, discovered.device_id):
+            display_name = discovered_name
+        elif existing_name:
+            display_name = existing_name
+        else:
+            display_name = discovered_name or format_device_mac(discovered.device_id)
         return DeviceRecord(
             device_id=discovered.device_id.strip(),
-            display_name=(
-                existing.display_name.strip()
-                if existing and existing.display_name.strip()
-                else discovered.display_name.strip()
-            ),
+            display_name=display_name,
             camera_url=discovered.effective_camera_url(),
             play_wav_url=discovered.effective_play_wav_url(),
             base_url=discovered.effective_base_url(),
@@ -410,6 +477,20 @@ class DeviceRegistry:
                     "wifi_rssi": d.wifi_rssi,
                     "wifi_channel": d.wifi_channel,
                     "wifi_updated_at": d.wifi_updated_at,
+                    **(
+                        {
+                            "alternate_macs": sorted(
+                                alias
+                                for alias, canonical in self._mac_aliases.items()
+                                if canonical == d.device_id
+                            )
+                        }
+                        if any(
+                            canonical == d.device_id
+                            for canonical in self._mac_aliases.values()
+                        )
+                        else {}
+                    ),
                 }
                 for d in records
             ]
@@ -419,18 +500,19 @@ class DeviceRegistry:
         temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         temporary.replace(self._path)
 
-    def _load_from_file(self) -> tuple[list[DeviceRecord], bool]:
+    def _load_from_file(self) -> tuple[list[DeviceRecord], dict[str, str], bool]:
         if not self._path.is_file():
-            return [], False
+            return [], {}, False
         try:
             raw = json.loads(self._path.read_text(encoding="utf-8"))
         except Exception as exc:
             logger.warning("Could not read %s: %s", self._path, exc)
-            return [], False
+            return [], {}, False
         items = raw.get("devices", raw) if isinstance(raw, dict) else raw
         if not isinstance(items, list):
-            return [], False
+            return [], {}, False
         out: list[DeviceRecord] = []
+        aliases: dict[str, str] = {}
         dirty = False
         for item in items:
             if not isinstance(item, dict):
@@ -467,7 +549,11 @@ class DeviceRegistry:
                     wifi_updated_at=str(item.get("wifi_updated_at") or "").strip(),
                 )
             )
-        return out, dirty
+            for alt_raw in item.get("alternate_macs") or []:
+                alt_mac = normalize_device_mac(str(alt_raw or ""))
+                if alt_mac and alt_mac != device_id:
+                    aliases[alt_mac] = device_id
+        return out, aliases, dirty
 
     @staticmethod
     def _legacy_from_environ() -> list[DeviceRecord]:
@@ -513,6 +599,12 @@ class DeviceRegistry:
                 for device_id, record in self._devices.items()
                 if device_id not in wanted
             }
+            removed_set = set(removed)
+            self._mac_aliases = {
+                alias: canonical
+                for alias, canonical in self._mac_aliases.items()
+                if alias not in removed_set and canonical not in removed_set
+            }
             self._write_devices_locked(updated.values())
             self._devices = updated
             self._persisted_device_ids = set(updated)
@@ -524,6 +616,38 @@ class DeviceRegistry:
     def list_devices(self) -> list[DeviceRecord]:
         with self._lock:
             return list(self._devices.values())
+
+    def add_mac_alias(self, alias_mac: str, device_id: str) -> bool:
+        """Persist a firmware MAC that maps to an already-registered robot."""
+        alias = normalize_device_mac(alias_mac)
+        canonical = normalize_device_mac(device_id) or (device_id or "").strip()
+        if not alias or not canonical or alias == canonical:
+            return False
+        with self._lock:
+            if canonical not in self._devices:
+                return False
+            existing = self._mac_aliases.get(alias)
+            if existing == canonical and alias not in self._devices:
+                return False
+            if existing and existing != canonical:
+                logger.warning(
+                    "MAC alias %s already maps to %s — not remapping to %s",
+                    alias,
+                    existing,
+                    canonical,
+                )
+                return False
+            changed = self._alias_mac_locked(alias, canonical)
+            if not changed:
+                return False
+            self._write_devices_locked(self._devices.values())
+            self._persisted_device_ids = set(self._devices)
+            logger.info(
+                "Registered MAC alias %s -> %s",
+                format_device_mac(alias) or alias,
+                canonical,
+            )
+            return True
 
     def find_device_id_by_host(self, host: str) -> str:
         """Map a voice-WS client IP to a discovered robot MAC."""
@@ -554,12 +678,83 @@ class DeviceRegistry:
         found = self.get(mac)
         if found is not None:
             return found.device_id, False
+        existing_ip = self._find_by_host_locked(needle)
+        if existing_ip is not None:
+            if mac != existing_ip.device_id:
+                self._alias_mac_locked(mac, existing_ip.device_id)
+                self._write_devices_locked(self._devices.values())
+                self._persisted_device_ids = set(self._devices)
+            return existing_ip.device_id, False
         record = self.ensure_registered(
             mac,
             display_name=display_name,
             base_url=f"http://{needle}",
         )
         return record.device_id, True
+
+    def _find_by_host_locked(self, host: str) -> DeviceRecord | None:
+        """Return a registered robot on this LAN IP. Caller must hold ``_lock``."""
+        needle = (host or "").strip()
+        if not needle:
+            return None
+        for record in self._devices.values():
+            if _host_from_url(record.effective_base_url()) == needle:
+                return record
+        return None
+
+    def _alias_mac_locked(self, alias: str, canonical: str) -> bool:
+        """Map ``alias`` to ``canonical`` and drop a duplicate primary row. Caller holds ``_lock``."""
+        alias_mac = normalize_device_mac(alias)
+        canonical_mac = normalize_device_mac(canonical) or (canonical or "").strip()
+        if not alias_mac or not canonical_mac or alias_mac == canonical_mac:
+            return False
+        if canonical_mac not in self._devices:
+            return False
+        changed = False
+        existing = self._mac_aliases.get(alias_mac)
+        if existing != canonical_mac:
+            if existing and existing != canonical_mac:
+                logger.warning(
+                    "MAC alias %s already maps to %s — not remapping to %s",
+                    alias_mac,
+                    existing,
+                    canonical_mac,
+                )
+                return False
+            self._mac_aliases[alias_mac] = canonical_mac
+            changed = True
+        if alias_mac in self._devices:
+            del self._devices[alias_mac]
+            changed = True
+        return changed
+
+    def _sanitize_locked(self) -> bool:
+        """Remove alias MAC rows and duplicate robots that share one LAN IP."""
+        changed = False
+        for alias_id in list(self._devices):
+            if alias_id in self._mac_aliases:
+                del self._devices[alias_id]
+                changed = True
+        by_host: dict[str, str] = {}
+        for device_id in list(self._devices):
+            if device_id not in self._devices:
+                continue
+            host = _host_from_url(self._devices[device_id].effective_base_url())
+            if not host:
+                continue
+            canonical = by_host.get(host)
+            if canonical is None:
+                by_host[host] = device_id
+                continue
+            if self._alias_mac_locked(device_id, canonical):
+                changed = True
+                logger.info(
+                    "Sanitized duplicate device %s -> %s (same IP %s)",
+                    device_id,
+                    canonical,
+                    host,
+                )
+        return changed
 
     def _find_locked(self, device_id: str) -> DeviceRecord | None:
         """Exact match, then case-insensitive. Caller must hold ``self._lock``."""
@@ -581,6 +776,12 @@ class DeviceRegistry:
             for stored_id, record in self._devices.items():
                 if normalize_device_mac(stored_id) == mac:
                     return record
+        if mac:
+            canonical = self._mac_aliases.get(mac)
+            if canonical:
+                found = self._devices.get(canonical)
+                if found is not None:
+                    return found
         return None
 
     def get(self, device_id: str | None) -> DeviceRecord | None:
@@ -646,6 +847,15 @@ class DeviceRegistry:
             found = self._find_locked(key)
             if found is not None:
                 return found
+            host = _host_from_url(base_url)
+            if host:
+                existing_ip = self._find_by_host_locked(host)
+                if existing_ip is not None:
+                    if key != existing_ip.device_id:
+                        self._alias_mac_locked(key, existing_ip.device_id)
+                        self._write_devices_locked(self._devices.values())
+                        self._persisted_device_ids = set(self._devices)
+                    return existing_ip
             pretty = format_device_mac(key)
             record = DeviceRecord(
                 device_id=key,
@@ -686,7 +896,12 @@ class DeviceRegistry:
                 "devices": [
                     {
                         "device_id": d.device_id,
-                        "display_name": d.display_name or d.device_id,
+                        "display_name": effective_device_display_name(
+                            device_id=d.device_id,
+                            display_name=d.display_name,
+                            location_name=d.location_name,
+                        ),
+                        "location_name": d.location_name,
                         "camera_url": d.effective_camera_url(),
                         "play_wav_url": d.effective_play_wav_url(),
                         "base_url": d.effective_base_url(),
@@ -716,11 +931,14 @@ def get_device_registry() -> DeviceRegistry:
     return _REGISTRY
 
 
-def resolve_device_id(raw: str | None) -> str:
+def resolve_device_id(raw: str | None, *, client_host: str = "") -> str:
     """Normalize a client MAC. Names are rejected; unknown MACs are not persisted.
 
     Discovery is the only path that adds robots. HTTP/camera callers that still
     send a powered-off MAC must not resurrect it in devices.json.
+
+    When ``client_host`` matches a registered robot's LAN IP, an unknown firmware
+    MAC is auto-aliased to that robot and persisted in devices.json.
     """
     reg = get_device_registry()
     cleaned = (raw or "").strip()
@@ -733,6 +951,25 @@ def resolve_device_id(raw: str | None) -> str:
     found = reg.get(mac)
     if found is not None:
         return found.device_id
+    devices = reg.list_devices()
+    if len(devices) == 1:
+        only = devices[0].device_id
+        if mac != only:
+            reg.add_mac_alias(mac, only)
+            logger.info("Resolved unknown mac=%s -> sole device %s", mac, only)
+        return only
+    host = (client_host or "").strip()
+    if host:
+        mapped = reg.find_device_id_by_host(host)
+        if mapped:
+            reg.add_mac_alias(mac, mapped)
+            logger.info(
+                "Resolved unknown mac=%s via client host=%s -> %s",
+                mac,
+                host,
+                mapped,
+            )
+            return mapped
     logger.warning("Unknown device mac=%s — not remapped", mac)
     return ""
 

@@ -9,6 +9,15 @@ import socket
 logger = logging.getLogger(__name__)
 
 
+def public_http_base() -> str:
+    """http://<lan-host>:<port> that robots can reach this server on."""
+    host = os.environ.get("NINO_SERVER_LAN_HOST", "").strip() or guess_lan_ipv4()
+    if not host:
+        return ""
+    port = int(os.environ.get("NINO_SERVER_PORT", "8000"))
+    return f"http://{host}:{port}"
+
+
 def guess_lan_ipv4() -> str:
     """Best-effort local IPv4 used to reach the internet (not 127.0.0.1)."""
     try:

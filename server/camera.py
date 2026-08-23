@@ -27,7 +27,11 @@ AUTO_CAMERA_INDEXES = range(0, 8)
 # UI / status: treat camera as connected if a frame arrived within this window (covers bad JPEG skips).
 STATUS_STALE_FRAME_SECONDS = 4.0
 SNAPSHOT_HTTP_TIMEOUT_SECONDS = 3.0
-SNAPSHOT_POLL_INTERVAL_SECONDS = 0.04
+SNAPSHOT_POLL_INTERVAL_SECONDS = max(
+    0.008, float(os.environ.get("CAMERA_SNAPSHOT_POLL_S", "0.02"))
+)
+# snapshot = poll /snapshot.jpg (ESP-friendly); ffmpeg = OpenCV MJPEG (lower latency).
+CAMERA_TRANSPORT = os.environ.get("CAMERA_TRANSPORT", "snapshot").strip().lower()
 _JPEG_DECODE_LOCK = threading.Lock()
 
 
@@ -167,6 +171,21 @@ class CameraStream:
         # Wait long enough for an in-flight snapshot HTTP call to time out.
         self._join_worker(SNAPSHOT_HTTP_TIMEOUT_SECONDS + 1.0)
         self._connected = False
+        with self._lock:
+            self._frame = None
+            self._last_frame_at = 0.0
+
+    def clear_frame(self) -> None:
+        """Drop the last decoded frame so UI/vision cannot reuse a stale image."""
+        with self._lock:
+            self._frame = None
+            self._last_frame_at = 0.0
+
+    def frame_age_seconds(self) -> float | None:
+        with self._lock:
+            if self._last_frame_at <= 0:
+                return None
+            return time.time() - self._last_frame_at
 
     def restart(self, source: str) -> None:
         self.stop()
@@ -280,6 +299,7 @@ class CameraStream:
     def _run_http_snapshot_loop(self, snapshot_url: str) -> None:
         self._release_capture()
         while not self._stop_event.is_set():
+            loop_start = time.time()
             try:
                 req = urllib.request.Request(
                     snapshot_url,
@@ -307,6 +327,7 @@ class CameraStream:
                 self.active_source = snapshot_url
             except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
                 self._mark_connected(False, snapshot_url, error=str(exc)[:240])
+                self.clear_frame()
             except ValueError as exc:
                 # Bad or partial JPEG: keep last good frame; do not flip "connected" off
                 # if we were already streaming (avoids UI flicker with MJPEG-style JPEGs).
@@ -316,13 +337,17 @@ class CameraStream:
             except Exception as exc:
                 # Keep the poller alive; a single decode/FD glitch must not freeze the UI.
                 self._mark_connected(False, snapshot_url, error=str(exc)[:240])
-            time.sleep(SNAPSHOT_POLL_INTERVAL_SECONDS)
+                self.clear_frame()
+            elapsed = time.time() - loop_start
+            remaining = SNAPSHOT_POLL_INTERVAL_SECONDS - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
 
         self._mark_connected(False, snapshot_url)
 
     def _run(self) -> None:
         snapshot_url = self._http_snapshot_poll_url(self.source)
-        if snapshot_url:
+        if snapshot_url and CAMERA_TRANSPORT != "ffmpeg":
             self._run_http_snapshot_loop(snapshot_url)
             return
 
@@ -522,6 +547,21 @@ class CameraPool:
             return self.ensure(record.device_id).read()
         except RuntimeError:
             return None
+
+    def clear_frame(self, device_id: str | None = None) -> None:
+        record = self._record_for(device_id)
+        with self._lock:
+            stream = self._streams.get(record.device_id)
+            if stream is not None:
+                stream.clear_frame()
+
+    def frame_age_seconds(self, device_id: str | None = None) -> float | None:
+        record = self._record_for(device_id)
+        with self._lock:
+            stream = self._streams.get(record.device_id)
+            if stream is None:
+                return None
+            return stream.frame_age_seconds()
 
     def restart(self, device_id: str | None, source: str) -> CameraStream:
         record = self._record_for(device_id)

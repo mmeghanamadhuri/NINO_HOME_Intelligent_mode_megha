@@ -91,6 +91,19 @@ class CameraIdentitySnapshotTests(unittest.TestCase):
 
         self.assertNotIn(key, app_module._latest_results_by_device)
 
+    def test_stale_frame_skips_vision_and_clears_object_cache(self) -> None:
+        device = "b0a6048ad4e0"
+        app_module.objects.clear_device(device)
+        app_module.objects._cache[device] = (time.time(), [{"label": "cup"}])
+
+        with patch.object(
+            app_module.cameras, "frame_age_seconds", return_value=999.0
+        ), patch.object(app_module.cameras, "clear_frame") as clear_frame:
+            app_module._vision_tick_device(device, update_tts=False)
+
+        clear_frame.assert_called_once_with(device)
+        self.assertEqual(app_module.objects.latest(device), [])
+
 
 if __name__ == "__main__":
     unittest.main()

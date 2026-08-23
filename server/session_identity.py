@@ -26,7 +26,6 @@ from face_registration_voice import (
     is_registration_offer_yes,
     is_registration_stop_process,
     is_session_goodbye_utterance,
-    parse_misidentification_denial,
     parse_next_spell_letter,
     parse_spelled_name,
     spell_name_aloud,
@@ -48,15 +47,12 @@ SessionIdentState = Literal[
 OFFER_REGISTER_PROMPT = "Looks like you are a new user, can I register you"
 ASK_SPELL_PROMPT = "Please spell your name, one letter at a time."
 GUEST_REPLY = "No problem. I'll keep this as a guest chat. How can I help you?"
-NO_FACE_GUEST_REPLY = "How can I help you"
+OPENING_LOOK_LINE = "Let me see where you are."
+GUEST_OPENING_REPLY = f"Hi there. {OPENING_LOOK_LINE}"
+NO_FACE_GUEST_REPLY = GUEST_OPENING_REPLY
+ALREADY_REGISTERED_REPLY = "You're already registered as {name}."
 STILL_UNKNOWN_REPLY = (
     "I still don't recognize you. Looks like you are a new user, can I register you"
-)
-MISIDENTIFY_APOLOGY = (
-    "Sorry, I got the wrong person. Let me look at the camera again."
-)
-MISIDENTIFY_STILL_UNKNOWN = (
-    "I still don't see a match. Would you like to register, or tell me your name?"
 )
 # No activity during register → guest and keep the session.
 REGISTER_SILENCE_MS = DEFAULT_REGISTER_MAX_MS
@@ -67,11 +63,14 @@ LETTER_AGAIN_PROMPT = "Sorry, please say that letter again."
 CONFIRM_RETRY_PROMPT = "Okay, let's start over. Please spell your name, one letter at a time."
 
 
-def greet_recognized_user(name: str) -> str:
-    cleaned = (name or "").strip()
-    if not cleaned:
-        return "Hey, how can I help you"
-    return f"Hey {cleaned}, how can I help you"
+def greet_recognized_user(name: str, emotion: str | None = None) -> str:
+    from session_emotion import greet_with_emotion
+
+    return greet_with_emotion(name, emotion)
+
+
+def opening_greet_recognized_user(name: str, emotion: str | None = None) -> str:
+    return f"{greet_recognized_user(name, emotion)} {OPENING_LOOK_LINE}"
 
 
 def confirm_name_prompt(name: str) -> str:
@@ -121,6 +120,7 @@ class SessionIdentityFlow:
         self._active = False
         self._opening_echo_budget = 0
         self._declined_register = False
+        self._voice_hint: str | None = None
 
     def set_frame_getter(self, read_frame: Callable[[], Any]) -> None:
         self._read_frame = read_frame
@@ -133,6 +133,17 @@ class SessionIdentityFlow:
         with self._lock:
             return self._user_name, self._is_guest
 
+    def set_voice_hint(self, name: str | None) -> None:
+        cleaned = (name or "").strip()
+        with self._lock:
+            if not cleaned or is_guest_name(cleaned) or cleaned.lower() in {
+                "unknown",
+                "face",
+            }:
+                self._voice_hint = None
+            else:
+                self._voice_hint = cleaned
+
     def in_registration(self) -> bool:
         with self._lock:
             return self._state in {
@@ -141,6 +152,21 @@ class SessionIdentityFlow:
                 "awaiting_letter_confirm",
                 "awaiting_confirm",
             }
+
+    def enrollment_name(self) -> str | None:
+        """Display name to attach voice samples during registration or when identified."""
+        with self._lock:
+            if self._state == "identified" and self._user_name and not self._is_guest:
+                return self._user_name.strip()
+            if self._state in {
+                "awaiting_spell",
+                "awaiting_letter_confirm",
+                "awaiting_confirm",
+            }:
+                name = (self._pending_name or self._name_from_letters()).strip()
+                if name and len(name) >= 2:
+                    return name
+        return None
 
     def registration_listen_max_ms(self) -> int:
         """VAD listen cap while registering: 5s after a letter, else 30s."""
@@ -172,6 +198,7 @@ class SessionIdentityFlow:
         device_id: str,
         identity_name: str | None,
         identity_state: str,
+        identity_emotion: str | None = None,
     ) -> SessionOpenResult:
         with self._lock:
             self._active = True
@@ -181,6 +208,7 @@ class SessionIdentityFlow:
             self._is_guest = False
             self._declined_register = False
             self._opening_echo_budget = 2
+            self._voice_hint = None
             name = (identity_name or "").strip()
             if identity_state == "recognized" and name and name.lower() not in {
                 "unknown",
@@ -194,38 +222,27 @@ class SessionIdentityFlow:
                     session_id,
                 )
                 return SessionOpenResult(
-                    reply=greet_recognized_user(name),
+                    reply=opening_greet_recognized_user(name, identity_emotion),
                     reply_path="session_greet",
                     user_name=name,
                     eye_expression="heart",
                     identified=True,
                 )
-            if identity_state == "no_face":
-                guest = new_guest_name()
-                self._state = "guest"
-                self._user_name = guest
-                self._is_guest = True
-                logger.info(
-                    "Session identity: no face after hunt — guest %s session=%s",
-                    guest,
-                    session_id,
-                )
-                return SessionOpenResult(
-                    reply=NO_FACE_GUEST_REPLY,
-                    reply_path="session_greet",
-                    user_name=guest,
-                    is_guest=True,
-                )
-            self._state = "offer_register"
-            self._user_name = None
+            guest = new_guest_name()
+            self._state = "guest"
+            self._user_name = guest
+            self._is_guest = True
             logger.info(
-                "Session identity: register-offer state=%s session=%s",
+                "Session identity: guest greet state=%s name=%s session=%s",
                 identity_state,
+                guest,
                 session_id,
             )
             return SessionOpenResult(
-                reply=OFFER_REGISTER_PROMPT,
-                reply_path="session_register_offer",
+                reply=GUEST_OPENING_REPLY,
+                reply_path="session_greet",
+                user_name=guest,
+                is_guest=True,
             )
 
     def end_session(self) -> None:
@@ -236,6 +253,7 @@ class SessionIdentityFlow:
             self._session_id = ""
             self._opening_echo_budget = 0
             self._declined_register = False
+            self._voice_hint = None
 
     def should_skip_prompt_echo(self, user_text: str) -> bool:
         """Drop GREET / hello TTS that the Aux-in mics picked up after session open."""
@@ -272,16 +290,7 @@ class SessionIdentityFlow:
         if is_face_reg_prompt_echo(text):
             return FaceRegVoiceResult(handled=True, reply="", relisten_after_reply=True)
 
-        if state == "idle":
-            return FaceRegVoiceResult(handled=False)
-
-        if state == "identified":
-            denied, wrong_name = parse_misidentification_denial(text)
-            if denied:
-                return self._handle_misidentification(wrong_name)
-            return FaceRegVoiceResult(handled=False)
-
-        if state == "guest":
+        if state == "idle" or state == "identified" or state == "guest":
             return FaceRegVoiceResult(handled=False)
 
         if is_already_registered_claim(text):
@@ -302,6 +311,39 @@ class SessionIdentityFlow:
         if state == "awaiting_confirm":
             return self._handle_confirm(text)
         return FaceRegVoiceResult(handled=False)
+
+    def adopt_recognized_user(self, name: str) -> bool:
+        """Promote or switch to a voice/face-recognized person without speaking."""
+        cleaned = (name or "").strip()
+        if not cleaned or is_guest_name(cleaned) or cleaned.lower() in {
+            "unknown",
+            "face",
+        }:
+            return False
+        with self._lock:
+            if not self._active or self._state in {
+                "offer_register",
+                "awaiting_spell",
+                "awaiting_letter_confirm",
+                "awaiting_confirm",
+            }:
+                return False
+            current = (self._user_name or "").strip()
+            if (
+                self._state == "identified"
+                and current
+                and current.lower() == cleaned.lower()
+                and not self._is_guest
+            ):
+                return False
+            self._state = "identified"
+            self._user_name = cleaned
+            self._is_guest = False
+            self._clear_pending_spelling()
+            self._declined_register = False
+            self._voice_hint = cleaned
+        logger.info("Session identity: adopt recognized user %s", cleaned)
+        return True
 
     def _become_identified(self, name: str, *, reply: str) -> FaceRegVoiceResult:
         cleaned = (name or "").strip()
@@ -358,72 +400,6 @@ class SessionIdentityFlow:
             return self._finish_spelling()
         return self.timeout_to_guest()
 
-    def _handle_misidentification(self, wrong_name: str | None) -> FaceRegVoiceResult:
-        """User denied the greeted name — re-scan camera and learn if possible."""
-        with self._lock:
-            prior = self._user_name
-            self._user_name = None
-        logger.info(
-            "Session identity: misidentification denied wrong=%s prior=%s",
-            wrong_name or "(unspecified)",
-            prior,
-        )
-
-        name: str | None = None
-        state = "no_face"
-        if hasattr(self._faces, "recognize_identity"):
-            try:
-                name, state = self._faces.recognize_identity(
-                    self._read_frame,
-                    allow_session_hint=False,
-                    allow_pending=True,
-                    device_id=self._device_id,
-                )
-            except Exception:
-                logger.exception("Session identity: misidentification re-scan failed")
-                name, state = None, "no_face"
-
-        cleaned = (name or "").strip()
-        if state == "recognized" and cleaned and cleaned.lower() not in {
-            "unknown",
-            "face",
-        }:
-            if wrong_name and cleaned.lower() == wrong_name.lower():
-                with self._lock:
-                    self._state = "offer_register"
-                    self._clear_pending_spelling()
-                return FaceRegVoiceResult(
-                    handled=True,
-                    reply=MISIDENTIFY_STILL_UNKNOWN,
-                )
-            try:
-                capture_face_samples(
-                    self._faces,
-                    self._read_frame,
-                    cleaned,
-                    samples=5,
-                    interval_ms=200,
-                )
-                if hasattr(self._faces, "train"):
-                    self._faces.train()
-                logger.info(
-                    "Session identity: correction learned samples for %s", cleaned
-                )
-            except Exception:
-                logger.exception("Session identity: correction sample capture failed")
-            return self._become_identified(
-                cleaned,
-                reply=f"Sorry about that, {cleaned}. I see you now. How can I help?",
-            )
-
-        with self._lock:
-            self._state = "offer_register"
-            self._clear_pending_spelling()
-        return FaceRegVoiceResult(
-            handled=True,
-            reply=f"{MISIDENTIFY_APOLOGY} {MISIDENTIFY_STILL_UNKNOWN}",
-        )
-
     def _rerecognize_known_user(self) -> FaceRegVoiceResult:
         """User says they are not new — check the camera again before giving up."""
         name: str | None = None
@@ -460,6 +436,7 @@ class SessionIdentityFlow:
         visible_names: list[str],
         scene_state: str,
         allow_register: bool = True,
+        voice_name: str | None = None,
     ) -> SessionOpenResult | None:
         """After a hunt: keep / switch user, offer register, or become guest.
 
@@ -487,10 +464,16 @@ class SessionIdentityFlow:
                 return None
             current = (self._user_name or "").strip()
             state = self._state
-            declined = self._declined_register
+            stored_voice = self._voice_hint
 
         def _same_user(candidate: str) -> bool:
             return bool(current) and candidate.lower() == current.lower()
+
+        voice = (voice_name or stored_voice or "").strip()
+        voice_ok = bool(voice) and not is_guest_name(voice) and voice.lower() not in {
+            "unknown",
+            "face",
+        }
 
         current_visible = next((n for n in names if _same_user(n)), None)
         other_known = next((n for n in names if not _same_user(n)), None)
@@ -498,7 +481,22 @@ class SessionIdentityFlow:
         if current_visible:
             return None
 
+        if voice_ok and current and voice.lower() == current.lower():
+            logger.info(
+                "Session identity: keep %s — voice still matches (camera=%s)",
+                current,
+                scene,
+            )
+            return None
+
         if other_known:
+            if voice_ok and other_known.lower() != voice.lower():
+                logger.info(
+                    "Session identity: skip switch to %s — voice is %s",
+                    other_known,
+                    voice,
+                )
+                return None
             with self._lock:
                 self._state = "identified"
                 self._user_name = other_known
@@ -518,32 +516,22 @@ class SessionIdentityFlow:
             )
 
         if scene == "unknown":
-            if not allow_register:
-                logger.info(
-                    "Session identity: unknown face — skip register offer "
-                    "(allow_register=False)"
-                )
-                return None
-            if state == "guest" and declined:
-                return None
-            with self._lock:
-                self._state = "offer_register"
-                self._user_name = None
-                self._is_guest = False
-                self._clear_pending_spelling()
-            logger.info("Session identity: unknown face after hunt — register offer")
-            return SessionOpenResult(
-                reply=OFFER_REGISTER_PROMPT,
-                reply_path="session_register_offer",
+            logger.info(
+                "Session identity: unknown face — stay %s (no auto-register)",
+                state,
             )
+            return None
 
         if state == "identified":
+            if voice_ok and current and voice.lower() == current.lower():
+                return None
             guest = new_guest_name()
             with self._lock:
                 self._state = "guest"
                 self._user_name = guest
                 self._is_guest = True
                 self._clear_pending_spelling()
+                self._voice_hint = None
             logger.info("Session identity: no person after hunt — guest %s", guest)
             return SessionOpenResult(
                 reply="",
@@ -552,6 +540,30 @@ class SessionIdentityFlow:
                 is_guest=True,
             )
         return None
+
+    def begin_explicit_registration(self) -> FaceRegVoiceResult:
+        """Start spelling only when the user asked to register."""
+        with self._lock:
+            if not self._active:
+                return FaceRegVoiceResult(handled=False)
+            if (
+                self._state == "identified"
+                and self._user_name
+                and not self._is_guest
+                and not is_guest_name(self._user_name)
+            ):
+                name = self._user_name
+                already = True
+            else:
+                name = ""
+                already = False
+        if already:
+            return FaceRegVoiceResult(
+                handled=True,
+                reply=ALREADY_REGISTERED_REPLY.format(name=name),
+            )
+        logger.info("Session identity: explicit registration requested")
+        return self._begin_spelling()
 
     def _begin_spelling(self) -> FaceRegVoiceResult:
         with self._lock:

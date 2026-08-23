@@ -326,6 +326,12 @@ class VoiceReplyMeta:
     device_id: str = ""
     # After this WAV, firmware pans left/right and asks for pose reports.
     look_scan: bool = False
+    # None = unchanged. True/False sticks on the P4 until the next explicit value.
+    observe: bool | None = None
+    voice_identity_name: str | None = None
+    voice_identity_score: float | None = None
+    identity_mismatch: bool = False
+    identity_source: str | None = None
     # None = unchanged. True/False is sent on the WS reply so the P4 enables
     # pan/tilt tracking locally (HTTP POST to /face/track is best-effort).
     face_track: bool | None = None
@@ -382,6 +388,11 @@ CONTINUE_LISTEN_REPLY_PATHS = frozenset(
         "face_registration",
         "face_track",
         "look_scan",
+        "look_scan_llm",
+        "spatial_report",
+        "observe",
+        "observe_ack",
+        "observe_briefing",
         "volume",
     }
 )
@@ -454,6 +465,16 @@ _WAKE_OKAY_NINO_MISHEAR_RE = re.compile(
     r"(?P<phrase>ok(?:ay)?)\s+(?:no|now|know)\b",
     re.IGNORECASE,
 )
+# Whisper drops Nino entirely on short wake clips.
+_WAKE_OKAY_ALONE_RE = re.compile(
+    r"^(?:(?:um+|uh+|er+|ah+|mm+)\s+){0,3}(?P<phrase>ok(?:ay)?)\s*$",
+    re.IGNORECASE,
+)
+_WAKE_NINO_MISHEAR_RE = re.compile(
+    r"^(?:(?:um+|uh+|er+|ah+|mm+)\s+){0,3}"
+    r"(?P<phrase>(?:oh\s+no|i\s+know|alright|all\s+right))\s*$",
+    re.IGNORECASE,
+)
 _WAKE_NAME_RE = re.compile(
     r"\b(?P<phrase>nino|nano|neno|nina)\b",
     re.IGNORECASE,
@@ -492,6 +513,10 @@ def extract_wake_and_command(text: str) -> tuple[bool, str, str]:
         match = _WAKE_OKAY_HELLO_RE.search(norm)
     if match is None:
         match = _WAKE_OKAY_NINO_MISHEAR_RE.search(norm)
+    if match is None:
+        match = _WAKE_OKAY_ALONE_RE.search(norm)
+    if match is None:
+        match = _WAKE_NINO_MISHEAR_RE.search(norm)
     if match is None:
         # "nino" alone in the first few words still counts as the wake name.
         match = _WAKE_NAME_RE.search(norm)
@@ -641,13 +666,16 @@ def synthesize_session_open_wav(
     from voice_listen_state import mark_session_open
 
     mark_session_open(session_id, device_id)
-    # Identified greet -> heart; hunt / register-offer -> no LCD emoji.
-    inferred = infer_eye_expression_for_response(reply, reply_path=reply_path)
-    if inferred == "heart" or (eye_expression or "").strip().lower() == "heart":
+    # Identified greet -> heart; guest opening look-around -> curious.
+    if (eye_expression or "").strip().lower() == "heart":
         meta.eye_expression = "heart"
+    elif reply_path == "session_greet":
+        meta.eye_expression = "curious"
     else:
         meta.eye_expression = None
     meta.motion = motion_actions_for_reply(reply, reply_path=reply_path)
+    if reply_path == "session_greet":
+        meta.look_scan = True
     wav, _voice = synthesize_sapi_wav_bytes(reply)
     wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
     meta.timings = {
@@ -658,8 +686,9 @@ def synthesize_session_open_wav(
         "voice_viewer": user_name or "",
         "audio_out_seconds": round(_wav_seconds(wav_out), 2),
         "audio_out_bytes": len(wav_out),
-        "eye_expression": eye_expression or "",
+        "eye_expression": meta.eye_expression or "",
         "motion": meta.motion,
+        "look_scan": True,
     }
     return wav_out, meta
 
@@ -808,7 +837,8 @@ _WHISPER_CUDA_FALLBACK_LOGGED = False
 DEFAULT_MIN_SPEECH_ENERGY = 5
 
 
-def min_speech_energy() -> int:
+def min_speech_energy(session: str = "wake") -> int:
+    del session  # Wake and in-session use the same clip gate.
     raw = os.environ.get("VOICE_MIN_ENERGY", str(DEFAULT_MIN_SPEECH_ENERGY)).strip()
     try:
         return max(1, int(raw))
@@ -969,12 +999,7 @@ def voice_error_tts_enabled() -> bool:
 
 
 def voice_pipeline_recovery_wav(exc: BaseException) -> bytes:
-    """Build recovery audio after a voice pipeline failure.
-
-    Default is silent recovery so the bot does not speak long LLM-down messages in a
-    fallback espeak voice while intelligent mode is trying to fix the server.
-    Set VOICE_ERROR_TTS=speak to restore spoken error prompts.
-    """
+    """Build recovery audio after a voice pipeline failure."""
     if not voice_error_tts_enabled():
         logger.warning("Voice pipeline failed (silent recovery): %s", exc)
         return minimal_voice_reply_wav()
@@ -1811,30 +1836,75 @@ def is_what_do_you_see_command(user_text: str) -> bool:
     return any(p.search(text) for p in _WHAT_DO_YOU_SEE_PATTERNS)
 
 
-_visible_scene_snapshot: Callable[[str | None], tuple[list[str], list[dict]]] | None = (
+_visible_scene_snapshot: Callable[[str | None], tuple] | None = (
     None
 )
 
 
+_voice_profiles: Any | None = None
+_look_scan_last_at: dict[str, float] = {}
+LOOK_SCAN_COOLDOWN_S = float(os.environ.get("VOICE_LOOK_SCAN_COOLDOWN_S", "45"))
+
+
+def configure_voice_profiles(profiles: Any | None) -> None:
+    global _voice_profiles
+    _voice_profiles = profiles
+
+
+def get_voice_profiles() -> Any | None:
+    return _voice_profiles
+
+
+def _should_trigger_look_scan(device_id: str, *, force: bool = False) -> bool:
+    if force:
+        return True
+    key = str(device_id or "").strip()
+    now = time.time()
+    last = _look_scan_last_at.get(key, 0.0)
+    if now - last < LOOK_SCAN_COOLDOWN_S:
+        return False
+    _look_scan_last_at[key] = now
+    return True
+
+
 def configure_visible_scene_snapshot(
-    fn: Callable[[str | None], tuple[list[str], list[dict]]] | None,
+    fn: Callable[[str | None], tuple] | None,
 ) -> None:
     """Live overlay names + YOLO detections for 'what do you see' / look-scan."""
     global _visible_scene_snapshot
     _visible_scene_snapshot = fn
 
 
+def _vision_context_with_emotion(
+    camera_scene: str | None,
+    viewer_name: str | None,
+    viewer_emotion: str | None,
+) -> str:
+    from session_emotion import looking_phrase
+
+    scene = str(camera_scene or "").strip()
+    look = looking_phrase(viewer_emotion)
+    name = str(viewer_name or "").strip()
+    if name and look:
+        mood = f"{name} currently looks {look}."
+        return f"{scene} {mood}".strip() if scene else mood
+    return scene
+
+
 def snapshot_visible_scene(
     device_id: str | None = None,
-) -> tuple[list[str], list[dict]]:
+) -> tuple[list[str], list[dict], dict[str, str]]:
     if _visible_scene_snapshot is None:
-        return [], []
+        return [], [], {}
     try:
-        names, detections = _visible_scene_snapshot(device_id)
-        return list(names or []), list(detections or [])
+        result = _visible_scene_snapshot(device_id)
+        names = list(result[0] or []) if result else []
+        detections = list(result[1] or []) if result and len(result) > 1 else []
+        emotions = dict(result[2] or {}) if result and len(result) > 2 else {}
+        return names, detections, emotions
     except Exception:
         logger.exception("visible scene snapshot failed device=%s", device_id)
-        return [], []
+        return [], [], {}
 
 
 def synthesize_look_scan_wav(
@@ -1856,6 +1926,42 @@ def synthesize_look_scan_wav(
         "reply_path": "look_scan",
         "audio_out_seconds": round(_wav_seconds(wav_out), 2),
         "audio_out_bytes": len(wav_out),
+    }
+    return wav_out, meta
+
+
+def synthesize_spatial_report_wav(
+    reply: str,
+    *,
+    session_id: str = "",
+    device_id: str = "",
+    reply_path: str = "spatial_report",
+    eye_expression: str | None = None,
+    motion: list[str] | None = None,
+    observe: bool | None = None,
+) -> tuple[bytes, VoiceReplyMeta]:
+    """One spoken report after a silent spatial sweep."""
+    from scene_agent import trim_spatial_report
+
+    reply = trim_spatial_report(reply)
+    meta = VoiceReplyMeta(session_id=session_id, device_id=device_id)
+    meta.end_session = False
+    meta.prompt_medical_ack = True
+    meta.look_scan = False
+    meta.observe = observe
+    meta.eye_expression = eye_expression
+    if motion:
+        meta.motion = list(motion)
+    wav, _voice = synthesize_sapi_wav_bytes(reply)
+    wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
+    meta.timings = {
+        "heard": "",
+        "reply_text": reply[:200],
+        "reply_path": reply_path,
+        "audio_out_seconds": round(_wav_seconds(wav_out), 2),
+        "audio_out_bytes": len(wav_out),
+        "eye_expression": eye_expression or "",
+        "motion": meta.motion,
     }
     return wav_out, meta
 
@@ -1952,6 +2058,20 @@ def _transcribe_whisper(wav_bytes: bytes, *, vad_filter: bool | None = None) -> 
         log_progress=False,
     )
     text = " ".join(seg.text.strip() for seg in segments).strip()
+    if not text and vad_filter:
+        logger.info(
+            "Whisper VAD removed all speech (audio %.2fs); retrying without VAD.",
+            len(audio) / 16000.0,
+        )
+        segments, _ = model.transcribe(
+            audio,
+            language=SETTINGS.whisper_language,
+            beam_size=1,
+            vad_filter=False,
+            condition_on_previous_text=False,
+            log_progress=False,
+        )
+        text = " ".join(seg.text.strip() for seg in segments).strip()
     if not text:
         logger.warning("Whisper returned no speech (audio %.2fs).", len(audio) / 16000.0)
     return text
@@ -2291,6 +2411,8 @@ def _short_handled_wav(
     look_scan: bool = False,
     motion: list[str] | None = None,
     face_track: bool | None = None,
+    observe: bool | None = None,
+    eye_expression: str | None = None,
 ) -> tuple[bytes, VoiceReplyMeta]:
     t_reply = time.perf_counter()
     wav, _voice = synthesize_sapi_wav_bytes(reply)
@@ -2298,13 +2420,20 @@ def _short_handled_wav(
     wav_out = resample_wav_bytes_to_mono_16bit(wav, VOICE_ASSIST_PLAYBACK_HZ)
     t_tts = time.perf_counter()
     audio_out_seconds = _wav_seconds(wav_out)
+    meta.look_scan = bool(look_scan)
     if look_scan:
-        meta.look_scan = True
-        meta.motion = None
+        if motion:
+            meta.motion = list(motion)
+        else:
+            meta.motion = None
     elif motion:
         meta.motion = list(motion)
     if face_track is not None:
         meta.face_track = bool(face_track)
+    if observe is not None:
+        meta.observe = bool(observe)
+    if eye_expression:
+        meta.eye_expression = eye_expression
     _mark_continue_listen(meta, reply_path, user_text)
     meta.timings = {
         "heard": user_text[:200],
@@ -2325,6 +2454,7 @@ def _short_handled_wav(
         "process_total_seconds": round(t_tts - t_start, 3),
         "continue_listen": bool(meta.prompt_medical_ack),
         "look_scan": bool(meta.look_scan),
+        "observe": meta.observe,
         "motion": meta.motion,
     }
     logger.info(
@@ -2348,7 +2478,10 @@ def process_voice_wav(
     camera_identity_name: str | None = None,
     camera_identity_state: CameraIdentityState = "no_face",
     camera_scene: str | None = None,
+    camera_emotion: str | None = None,
     visible_names: list[str] | None = None,
+    visible_emotions: dict[str, str] | None = None,
+    viewer_emotion: str | None = None,
     device_id: str = "",
     session_kind: str = "wake",
     session_id: str = "",
@@ -2401,7 +2534,7 @@ def process_voice_wav(
     audio_in_seconds = _wav_seconds(wav_bytes)
     peak_energy = clip_peak_energy(wav_bytes, aux_energy)
     mean_energy = wav_mean_frame_energy(wav_bytes)
-    energy_gate = min_speech_energy()
+    energy_gate = min_speech_energy(session)
     preserve_continue = _preserve_continue_on_skip(
         session=session,
         session_id=meta.session_id,
@@ -2522,6 +2655,8 @@ def process_voice_wav(
     )
     t_stt = time.perf_counter()
     reply_path = "llm"
+    eye_follow_up = False
+    eye_memory_turns = 0
     log_nino_voice(
         "STT",
         turn=voice_turn,
@@ -2561,6 +2696,7 @@ def process_voice_wav(
             stt_engine=stt_engine,
             t_start=t_start,
             t_stt=t_stt,
+            preserve_continue_listen=preserve_continue,
             extra={
                 "session": session,
                 "wake_ok": False,
@@ -2675,6 +2811,59 @@ def process_voice_wav(
     from session_identity import get_session_identity
 
     ident = get_session_identity(device_id)
+    resolved_memory_name: str | None = None
+    speaker = None
+    voice_for_scene: str | None = None
+    profiles = get_voice_profiles()
+    if profiles is not None and getattr(profiles, "enabled", False):
+        voice_name, voice_score, voice_state = profiles.recognize_speaker(wav_bytes)
+        meta.voice_identity_name = voice_name
+        meta.voice_identity_score = round(voice_score, 3) if voice_score else None
+        ident_user_pre: str | None = None
+        ident_guest_pre = False
+        if ident is not None:
+            ident_user_pre, ident_guest_pre = ident.current_user()
+        from speaker_identity import resolve_speaker_identity
+
+        speaker = resolve_speaker_identity(
+            face_name=camera_identity_name,
+            face_state=camera_identity_state,
+            voice_name=voice_name,
+            voice_score=voice_score,
+            voice_state=voice_state,
+            session_user=ident_user_pre,
+            session_guest=ident_guest_pre,
+            visible_names=visible_names,
+            same_person=getattr(profiles, "same_person", None),
+        )
+        meta.identity_source = speaker.source
+        meta.identity_mismatch = speaker.identity_mismatch
+        resolved_memory_name = speaker.memory_name
+        if speaker.viewer_name:
+            viewer_name = speaker.viewer_name
+        voice_for_scene = speaker.voice_name or speaker.memory_name
+        if (
+            speaker.trigger_look_scan
+            and not (ident is not None and ident.in_registration())
+            and _should_trigger_look_scan(device_id, force=speaker.identity_mismatch)
+        ):
+            meta.look_scan = True
+        enroll_name = ident.enrollment_name() if ident is not None else None
+        if enroll_name:
+            profiles.register_sample(enroll_name, wav_bytes)
+        elif speaker.memory_name and profiles.needs_enrollment(speaker.memory_name):
+            profiles.maybe_enroll_turn(speaker.memory_name, wav_bytes)
+        logger.info(
+            "Voice speaker identity | face=%s voice=%s(%.2f) resolved=%s source=%s mismatch=%s look_scan=%s",
+            speaker.face_name,
+            speaker.voice_name,
+            speaker.voice_score,
+            speaker.viewer_name,
+            speaker.source,
+            speaker.identity_mismatch,
+            meta.look_scan,
+        )
+
     if ident is not None and ident.is_active() and not ident.in_registration():
         names = [n for n in (visible_names or []) if str(n).strip()]
         if not names and camera_identity_state == "recognized" and camera_identity_name:
@@ -2683,6 +2872,7 @@ def process_voice_wav(
             visible_names=names,
             scene_state=camera_identity_state or "no_face",
             allow_register=False,
+            voice_name=voice_for_scene,
         )
         if switched is not None and switched.user_name:
             from conversation_sessions import bind_session_user
@@ -2699,6 +2889,102 @@ def process_voice_wav(
                 switched.is_guest,
                 user_text[:80],
             )
+        if speaker is not None and speaker.memory_name:
+            if ident.adopt_recognized_user(speaker.memory_name) and meta.session_id:
+                from conversation_sessions import bind_session_user
+
+                bind_session_user(
+                    meta.session_id,
+                    device_id=device_id,
+                    user_name=speaker.memory_name,
+                )
+                logger.info(
+                    "Voice identity adopt speaker=%s heard: %s",
+                    speaker.memory_name,
+                    user_text[:80],
+                )
+        if voice_for_scene and hasattr(ident, "set_voice_hint"):
+            ident.set_voice_hint(voice_for_scene)
+
+    from scene_agent import (
+        OBSERVE_ACK,
+        OPENING_LOOK_LINE,
+        get_scene_agent,
+        is_observe_command,
+        is_ok_nino_join,
+        is_register_request,
+    )
+
+    scene_agent = get_scene_agent(device_id)
+    if ident is not None:
+        ident_name, ident_is_guest = ident.current_user()
+        if ident_name:
+            scene_agent.set_user(ident_name, is_guest=ident_is_guest)
+
+    if speaker is not None:
+        scene_agent.note_speaker(
+            viewer_name=speaker.viewer_name,
+            voice_name=speaker.voice_name,
+            face_name=speaker.face_name,
+            source=speaker.source,
+            score=speaker.voice_score,
+            mismatch=speaker.identity_mismatch,
+            mismatch_note=speaker.mismatch_note,
+            looking_for=speaker.trigger_look_scan,
+        )
+
+    speaker_label = None
+    if speaker is not None:
+        cand = (speaker.viewer_name or speaker.voice_name or "").strip()
+        if cand and not cand.lower().startswith("guest"):
+            speaker_label = cand
+    elif ident is not None:
+        ident_name, ident_is_guest = ident.current_user()
+        if ident_name and not ident_is_guest:
+            speaker_label = ident_name
+
+    if scene_agent.is_observing() and not is_conversation_goodbye(user_text):
+        if is_ok_nino_join(user_text, wake_stripped=wake_found):
+            scene_agent.note_audio(user_text, speaker=speaker_label)
+            scene_agent.exit_observe()
+            reply = scene_agent.compose_report(ask_help=True, mode="observe_join")
+            scene_agent.persist_report(
+                reply,
+                user_text=user_text,
+                reply_path="observe_briefing",
+                session_id=meta.session_id,
+            )
+            logger.info("Voice observe join | heard: %s", user_text[:120])
+            return _short_handled_wav(
+                meta,
+                reply=reply,
+                reply_path="observe_briefing",
+                user_text=user_text,
+                audio_input_format=audio_input_format,
+                audio_in_seconds=audio_in_seconds,
+                wav_bytes=wav_bytes,
+                stt_engine=stt_engine,
+                t_start=t_start,
+                t_stt=t_stt,
+                observe=False,
+                motion=scene_agent.suggest_motion(),
+                eye_expression=scene_agent.suggest_eye(reply_path="observe_briefing"),
+            )
+        scene_agent.note_audio(user_text, speaker=speaker_label)
+        logger.info("Voice observe note | heard: %s", user_text[:120])
+        return _silent_close(
+            meta,
+            reply_path="observe_note",
+            heard=user_text,
+            audio_input_format=audio_input_format,
+            audio_in_seconds=audio_in_seconds,
+            wav_bytes=wav_bytes,
+            stt_engine=stt_engine,
+            t_start=t_start,
+            t_stt=t_stt,
+            preserve_continue_listen=True,
+            extra={"session": session, "energy": peak_energy, "turn": voice_turn},
+        )
 
     handled_volume, volume_reply = apply_volume_command(
         user_text, device_id=device_id or None
@@ -2800,23 +3086,13 @@ def process_voice_wav(
             motion=["nod3"],
         )
 
-    if is_what_do_you_see_command(user_text):
-        from object_detection_service import spoken_scene_report
-
-        names, detections = snapshot_visible_scene(device_id or None)
-        if not names and visible_names:
-            names = list(visible_names)
-        reply = spoken_scene_report(names, detections, pose="center")
-        logger.info(
-            "Voice what-do-you-see | names=%s objects=%s heard: %s",
-            names,
-            [d.get("label") for d in detections[:8]],
-            user_text[:120],
-        )
+    if is_observe_command(user_text):
+        scene_agent.enter_observe()
+        logger.info("Voice observe start | heard: %s", user_text[:120])
         return _short_handled_wav(
             meta,
-            reply=reply,
-            reply_path="look_scan",
+            reply=OBSERVE_ACK,
+            reply_path="observe_ack",
             user_text=user_text,
             audio_input_format=audio_input_format,
             audio_in_seconds=audio_in_seconds,
@@ -2825,7 +3101,54 @@ def process_voice_wav(
             t_start=t_start,
             t_stt=t_stt,
             look_scan=True,
+            observe=True,
+            eye_expression="curious",
         )
+
+    if ident is not None and not ident.in_registration() and is_register_request(user_text):
+        started = ident.begin_explicit_registration()
+        if started.handled:
+            if started.registered_name:
+                meta.registered_face_name = started.registered_name
+            logger.info("Voice explicit register | heard: %s", user_text[:120])
+            return _short_handled_wav(
+                meta,
+                reply=started.reply,
+                reply_path="face_registration",
+                user_text=user_text,
+                audio_input_format=audio_input_format,
+                audio_in_seconds=audio_in_seconds,
+                wav_bytes=wav_bytes,
+                stt_engine=stt_engine,
+                t_start=t_start,
+                t_stt=t_stt,
+            )
+
+    if is_what_do_you_see_command(user_text):
+        if not _should_trigger_look_scan(device_id):
+            logger.info(
+                "Voice what-do-you-see | cooldown skip heard: %s",
+                user_text[:120],
+            )
+        else:
+            logger.info(
+                "Voice what-do-you-see | start spatial sweep heard: %s",
+                user_text[:120],
+            )
+            return _short_handled_wav(
+                meta,
+                reply=OPENING_LOOK_LINE,
+                reply_path="look_scan",
+                user_text=user_text,
+                audio_input_format=audio_input_format,
+                audio_in_seconds=audio_in_seconds,
+                wav_bytes=wav_bytes,
+                stt_engine=stt_engine,
+                t_start=t_start,
+                t_stt=t_stt,
+                look_scan=True,
+                eye_expression="curious",
+            )
 
     ident_handled = False
     if ident is not None and ident.should_skip_prompt_echo(user_text):
@@ -2854,6 +3177,9 @@ def process_voice_wav(
             reply = ident_result.reply
             if ident_result.registered_name:
                 meta.registered_face_name = ident_result.registered_name
+                profiles = get_voice_profiles()
+                if profiles is not None:
+                    profiles.enroll_registration(ident_result.registered_name, wav_bytes)
                 from conversation_sessions import bind_session_user
 
                 if meta.session_id:
@@ -2881,29 +3207,6 @@ def process_voice_wav(
                     "stt_seconds": round(t_stt - t_start, 3),
                 }
                 return b"", meta
-    elif ident is not None and ident.is_active():
-        ident_result = ident.handle_voice(user_text)
-        if ident_result.handled:
-            ident_handled = True
-            reply_path = "identity_correction" if ident_result.registered_name else "face_registration"
-            reply = ident_result.reply
-            if ident_result.registered_name:
-                meta.registered_face_name = ident_result.registered_name
-                from conversation_sessions import bind_session_user
-
-                if meta.session_id:
-                    bind_session_user(
-                        meta.session_id,
-                        device_id=device_id,
-                        user_name=ident_result.registered_name,
-                    )
-            if ident_result.relisten_after_reply:
-                meta.face_reg_relisten = True
-            logger.info(
-                "Voice session identity (active) | registered=%s heard: %s",
-                ident_result.registered_name or "(none)",
-                user_text[:120],
-            )
 
     if not ident_handled and (
         is_bare_thank_you_stt(user_text)
@@ -2936,7 +3239,7 @@ def process_voice_wav(
     from memory_service import get_memory_service, resolve_alarm_user
 
     memory_svc = get_memory_service()
-    memory_name = _live_memory_viewer_name(
+    memory_name = resolved_memory_name or _live_memory_viewer_name(
         camera_identity_name,
         camera_identity_state,
     )
@@ -2950,7 +3253,10 @@ def process_voice_wav(
     ident_guest = False
     if ident is not None:
         ident_user, ident_guest = ident.current_user()
-        if ident_user:
+        if ident_user and not ident_guest:
+            memory_name = ident_user
+            viewer_name = ident_user
+        elif ident_user:
             if ident_guest or preserve_identity:
                 memory_name = ident_user
                 viewer_name = ident_user
@@ -2959,6 +3265,7 @@ def process_voice_wav(
                     visible_names=visible_names or [],
                     scene_state="no_face",
                     allow_register=False,
+                    voice_name=voice_for_scene,
                 )
                 if switch is not None and switch.user_name:
                     memory_name = switch.user_name
@@ -2978,6 +3285,8 @@ def process_voice_wav(
     memory_ctx = None
     if memory_name:
         memory_ctx = memory_svc.load_context(memory_name, query_text=user_text)
+        if memory_ctx:
+            eye_memory_turns = int(memory_ctx.recent_turns or 0)
     alarm_user_id, alarm_person_name = resolve_alarm_user(
         camera_identity_name,
         camera_identity_state,
@@ -3350,34 +3659,6 @@ def process_voice_wav(
                 memory_name,
                 user_text[:120],
             )
-    if reply_path == "llm":
-        from conversation_correction import is_correction_request, rework_voice_reply
-
-        if is_correction_request(user_text):
-            last_turn = None
-            if memory_svc.ready and memory_name:
-                last_turn = memory_svc.get_last_conversation_turn(
-                    memory_name, getattr(meta, "session_id", "") or ""
-                )
-            reply, reply_path = rework_voice_reply(
-                user_text=user_text,
-                viewer_name=memory_name or viewer_name,
-                device_id=device_id,
-                last_turn=last_turn,
-            )
-            if memory_svc.ready and memory_name:
-                memory_svc.log_conversation_correction(
-                    memory_name,
-                    correction_text=user_text,
-                    reworked_assistant_text=reply,
-                    conversation_id=(last_turn or {}).get("id"),
-                )
-            logger.info(
-                "Voice conversation correction | viewer=%s path=%s heard: %s",
-                memory_name or viewer_name or "-",
-                reply_path,
-                user_text[:120],
-            )
     if reply_path == "llm" and is_identity_question(user_text):
         reply_path = "identity_llm"
         logger.info(
@@ -3442,6 +3723,13 @@ def process_voice_wav(
                 viewer_name=viewer_name,
                 effective_viewer=effective_viewer,
             )
+            eye_follow_up = follow_up
+            from scene_agent import get_scene_agent
+
+            spatial_ctx = get_scene_agent(device_id).context_block()
+            scene_for_llm = " ".join(
+                part for part in (spatial_ctx, camera_scene) if str(part or "").strip()
+            )
             reply = answer_voice_query(
                 llm_text,
                 viewer_name=effective_viewer,
@@ -3455,7 +3743,10 @@ def process_voice_wav(
                 memory_context=memory_context,
                 recent_assistant_replies=_recent_assistant_replies(recent_history),
                 is_follow_up=follow_up,
-                vision_context=camera_scene,
+                vision_context=_vision_context_with_emotion(
+                    scene_for_llm, effective_viewer or viewer_name, viewer_emotion
+                ),
+                emotion_context=camera_emotion,
             )
             if append_clock:
                 reply = f"{reply.rstrip()} {local_server_time_reply()}"
@@ -3465,6 +3756,24 @@ def process_voice_wav(
             memory_name or viewer_name,
             is_guest=ident_guest,
         )
+    if not ident_guest and viewer_name and reply_path not in {
+        "silent_skip",
+        "stt_rejected",
+        "face_registration",
+        "session_register_offer",
+        "session_ask_name",
+        "session_spell",
+        "session_confirm",
+        "session_letter",
+        "goodbye",
+        "say_no3",
+        "say_yes3",
+    }:
+        from session_emotion import observe_viewer_emotion
+
+        ask = observe_viewer_emotion(device_id, viewer_name, viewer_emotion)
+        if ask:
+            reply = f"{reply.rstrip()} {ask}"
     t_reply = time.perf_counter()
 
     memory_store = "skipped"
@@ -3478,11 +3787,29 @@ def process_voice_wav(
             session_id=meta.session_id,
         )
 
+    from device_session import get_device_session_turns
+
+    from scene_agent import get_scene_agent
+
+    spatial_agent = get_scene_agent(device_id)
+    spatial_block = spatial_agent.context_block()
     meta.eye_expression = infer_eye_expression_for_response(
         reply,
         user_text=user_text,
         reply_path=reply_path,
+        person_name=(memory_name or viewer_name or "").strip(),
+        camera_emotion=spatial_agent.dominant_emotion() or camera_emotion or "",
+        camera_scene=spatial_block or camera_scene or "",
+        memory_turn_count=eye_memory_turns,
+        session_turn_count=len(get_device_session_turns(device_id)),
+        is_follow_up=eye_follow_up,
+        visible_names=tuple(visible_names or ()),
     )
+    spatial_eye = spatial_agent.suggest_eye(reply_path=reply_path)
+    if spatial_eye and (
+        not meta.eye_expression or meta.eye_expression in {"curious", "idle"}
+    ):
+        meta.eye_expression = spatial_eye
     if reply_path == "session_greet" or (
         reply_path == "face_registration"
         and meta.registered_face_name
@@ -3503,6 +3830,12 @@ def process_voice_wav(
     from servo_tts_motion import motion_actions_for_reply
 
     meta.motion = motion_actions_for_reply(reply, reply_path=reply_path)
+    if reply_path in {"llm", "identity_llm", "smalltalk", "greeting"}:
+        look = spatial_agent.suggest_motion()
+        if look and look != ["nod"] and "talk" in (meta.motion or []):
+            meta.motion = look + ["talk"]
+        elif look and look != ["nod"] and not meta.motion:
+            meta.motion = look
     t_pre_tts = time.perf_counter()
 
     wav, _voice = synthesize_sapi_wav_bytes(reply)

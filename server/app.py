@@ -39,7 +39,7 @@ from stream_asr import (
     stream_listen_max_ms,
 )
 from alarm_service import get_alarm_service
-from camera import CameraPool, normalize_camera_rotation
+from camera import CameraPool, STATUS_STALE_FRAME_SECONDS, normalize_camera_rotation
 from device_discovery import (
     discover_once as discover_devices_once,
     discovery_status,
@@ -47,6 +47,7 @@ from device_discovery import (
     stop_discovery_loop,
 )
 from device_registry import get_device_registry, resolve_device_id
+from ota_service import OtaError, get_ota_service, ota_token
 from user_devices import normalize_device_mac
 from eye_expression import normalize_eye_expression
 from face_registration_service import capture_face_samples, configure_face_registration
@@ -63,7 +64,7 @@ from esp_playback import (
     mark_device_busy_for,
     stream_echo_tail_seconds,
 )
-from emotion_service import EmotionService
+from emotion_service import EmotionService, emotion_scene_context
 from object_detection_service import ObjectDetectionService, summarize_detections
 from tts_service import (
     TTSService,
@@ -129,7 +130,6 @@ def voice_pipeline_active(device_id: str | None = None) -> bool:
             return _voice_query_by_device.get(_voice_query_key(device_id), 0) > 0
         return any(count > 0 for count in _voice_query_by_device.values())
 
-
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name, str(int(default))).strip().lower()
     return raw not in {"0", "false", "no", "off"}
@@ -191,6 +191,78 @@ def _maybe_start_coding_agent_worker() -> None:
             )
     except Exception:
         logger.exception("Failed to start coding agent worker")
+
+
+
+
+_spatial_scan_lock = threading.Lock()
+_spatial_scan_devices: set[str] = set()
+_stream_voice_sessions: set[str] = set()
+_stream_voice_lock = threading.Lock()
+
+
+def begin_stream_voice_session(device_id: str | None) -> None:
+    key = _voice_query_key(device_id)
+    if not key or key == "_":
+        return
+    with _stream_voice_lock:
+        _stream_voice_sessions.add(key)
+
+
+def end_stream_voice_session(device_id: str | None) -> None:
+    key = _voice_query_key(device_id)
+    if not key or key == "_":
+        return
+    with _stream_voice_lock:
+        _stream_voice_sessions.discard(key)
+
+
+def stream_voice_session_active(device_id: str | None = None) -> bool:
+    with _stream_voice_lock:
+        if device_id:
+            return _voice_query_key(device_id) in _stream_voice_sessions
+        return bool(_stream_voice_sessions)
+
+
+def set_spatial_scan_active(device_id: str | None, active: bool) -> None:
+    key = _voice_query_key(device_id)
+    if not key or key == "_":
+        return
+    with _spatial_scan_lock:
+        if active:
+            was_active = key in _spatial_scan_devices
+            _spatial_scan_devices.add(key)
+            if not was_active:
+                objects.bump_vision_generation()
+                from scene_agent import get_scene_agent
+
+                get_scene_agent(device_id).begin_sweep()
+        else:
+            _spatial_scan_devices.discard(key)
+
+
+def spatial_scan_active(device_id: str | None = None) -> bool:
+    with _spatial_scan_lock:
+        if device_id:
+            return _voice_query_key(device_id) in _spatial_scan_devices
+        return bool(_spatial_scan_devices)
+
+
+def spatial_skip_continue_listen(session_id: str, device_id: str) -> bool:
+    """True when spatial_scan skip should keep the stream in listen mode."""
+    from voice_listen_state import in_post_tts_grace, session_continue_active
+
+    if device_busy_speaking(device_id) or in_post_tts_grace(session_id, device_id):
+        return False
+    return session_continue_active(session_id, device_id)
+
+
+def vision_pipeline_paused(device_id: str | None = None) -> bool:
+    return (
+        voice_pipeline_active(device_id)
+        or spatial_scan_active(device_id)
+        or stream_voice_session_active(device_id)
+    )
 
 
 class _GracefulShutdownFilter(logging.Filter):
@@ -281,17 +353,14 @@ class NoCacheStaticFiles(StarletteStaticFiles):
 
 app.mount("/static", NoCacheStaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
-from ota_service import firmware_dir
-
-app.mount(
-    "/firmware",
-    StarletteStaticFiles(directory=str(firmware_dir()), check_dir=False),
-    name="firmware",
-)
-
 registry = get_device_registry()
 cameras = CameraPool()
 faces = FaceService(BASE_DIR / "data")
+from voice_profile_service import VoiceProfileService
+from voice_service import configure_voice_profiles
+
+voice_profiles = VoiceProfileService(BASE_DIR / "data")
+configure_voice_profiles(voice_profiles)
 # Face registration / UI enroll uses the selected UI device's camera.
 face_registration = configure_face_registration(
     faces, cameras.frame_getter(registry.ui_device_id())
@@ -316,6 +385,16 @@ latest_results: list[dict] = []
 _latest_results_by_device: dict[str, list[dict]] = {}
 _latest_results_at_by_device: dict[str, float] = {}
 FACE_CACHE_LIVE_MAX_AGE_S = float(os.environ.get("FACE_CACHE_LIVE_MAX_AGE_S", "2.5"))
+MJPEG_TARGET_FPS = max(5.0, float(os.environ.get("MJPEG_TARGET_FPS", "24")))
+MJPEG_JPEG_QUALITY = max(40, min(95, int(os.environ.get("MJPEG_JPEG_QUALITY", "65"))))
+MJPEG_LIGHTWEIGHT = os.environ.get("MJPEG_LIGHTWEIGHT", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+_object_detect_pending: set[str] = set()
+_object_detect_lock = threading.Lock()
 # Update vision-driven TTS every frame so greetings start as soon as recognition succeeds
 # (throttling here added a noticeable delay before enqueue).
 TTS_UPDATE_INTERVAL_SECONDS = 0.0
@@ -364,6 +443,24 @@ class DeviceWifiNetworkRequest(BaseModel):
     channel: int | None = Field(default=None, ge=1, le=196)
 
 
+class OtaTriggerRequest(BaseModel):
+    firmware_id: str | None = None
+    url: str | None = None
+
+
+def _require_ota_token(header: str | None, query_token: str | None = None) -> None:
+    expected = ota_token()
+    if not expected:
+        return
+    offered = header or query_token or ""
+    if not hmac.compare_digest(offered, expected):
+        raise HTTPException(status_code=401, detail="Invalid OTA token")
+
+
+def _ota_http_error(exc: OtaError) -> HTTPException:
+    return HTTPException(status_code=exc.status_code, detail=str(exc))
+
+
 @app.on_event("startup")
 def startup() -> None:
     logging.getLogger("uvicorn.access").addFilter(UvicornPollFilter())
@@ -379,10 +476,11 @@ def startup() -> None:
     get_memory_service().startup()
     get_alarm_service().start()
     registry.reload()
-    # Start each server run from a fresh LAN inventory. This removes devices
-    # persisted by a previous run when they no longer answer mDNS/UDP discovery.
-    # An empty first scan keeps the persisted robots (mDNS is often late).
-    discover_devices_once(replace_registry=True)
+    from vision_pause import configure_vision_inference_paused
+
+    configure_vision_inference_paused(vision_pipeline_paused)
+    # Keep persisted robots across restarts; periodic discovery prunes stale ones.
+    discover_devices_once(replace_registry=False)
     cameras.start_all()
     # Discovery runs in its own daemon thread. Startup remains responsive when
     # no robots or multicast-capable network are present.
@@ -447,7 +545,7 @@ def startup() -> None:
         Identity greet + register live on the stream session (session_identity),
         not this MJPEG loop. Camera auto-welcome and auto-register are off.
         """
-        interval = float(os.environ.get("MULTI_DEVICE_VISION_INTERVAL_S", "0.5"))
+        interval = float(os.environ.get("MULTI_DEVICE_VISION_INTERVAL_S", "0.35"))
         while True:
             try:
                 for record in registry.list_devices():
@@ -529,10 +627,6 @@ def startup() -> None:
     _maybe_start_soak_runner()
     _maybe_start_coding_agent_worker()
 
-    from daily_training_service import start_daily_training
-
-    start_daily_training(faces=faces, memory_service=get_memory_service())
-
 
 @app.on_event("shutdown")
 def shutdown() -> None:
@@ -556,12 +650,6 @@ def shutdown() -> None:
         pass
     try:
         get_memory_service().stop()
-    except BaseException:
-        pass
-    try:
-        from daily_training_service import get_daily_training_service
-
-        get_daily_training_service().stop()
     except BaseException:
         pass
     try:
@@ -591,6 +679,23 @@ def index(request: Request):
             "device_id": device_id,
             "devices": registry.status().get("devices", []),
         },
+    )
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+@app.get("/ops")
+def ops_page(request: Request):
+    response = templates.TemplateResponse(request, "ops.html", {"focus_device_id": None})
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
+@app.get("/ops/device/{device_id}")
+def ops_device_page(request: Request, device_id: str):
+    response = templates.TemplateResponse(
+        request, "ops.html", {"focus_device_id": device_id.strip()}
     )
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     response.headers["Pragma"] = "no-cache"
@@ -682,14 +787,6 @@ def actions_page(request: Request):
             "devices": registry.status().get("devices", []),
         },
     )
-    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-    response.headers["Pragma"] = "no-cache"
-    return response
-
-
-@app.get("/ops")
-def ops_page(request: Request):
-    response = templates.TemplateResponse(request, "ops.html", {})
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     response.headers["Pragma"] = "no-cache"
     return response
@@ -858,8 +955,8 @@ def update_device_wifi_network(
     request: Request,
 ) -> dict:
     """Record Wi-Fi identity reported after a registered device connects."""
-    mac = normalize_device_mac(device_id)
     host = str(getattr(request.client, "host", "") or "") if request.client else ""
+    mac = resolve_device_id(device_id, client_host=host) or normalize_device_mac(device_id)
     created = False
     if not mac:
         mac, created = registry.ensure_from_client_host(host)
@@ -890,142 +987,6 @@ def update_device_wifi_network(
     }
 
 
-@app.get("/api/weather")
-def current_weather(device_id: str | None = None) -> dict:
-    """Return cached current conditions for the named device's location."""
-    device = registry.resolve_or_default(device_id)
-    try:
-        weather = get_weather_service().current_for_device(device)
-    except DeviceLocationUnavailableError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "No location is configured for this device. "
-                "POST its latitude and longitude to /api/devices/{device_id}/location."
-            ),
-        ) from exc
-    except WeatherUnavailableError as exc:
-        raise HTTPException(
-            status_code=503, detail="Current weather is temporarily unavailable"
-        ) from exc
-    return {
-        "ok": True,
-        "device_id": device.device_id,
-        "location": {
-            "latitude": device.latitude,
-            "longitude": device.longitude,
-            "name": device.location_name,
-            "updated_at": device.location_updated_at,
-        },
-        "weather": weather,
-    }
-
-
-class MusicPlayRequest(BaseModel):
-    query: str = Field(min_length=1, max_length=200)
-    device_id: str | None = None
-    # False arms the stream without calling the robot, for PC-side testing
-    # before the /music firmware lands.
-    push_to_device: bool = True
-
-
-@app.get("/music/stream.wav")
-def music_stream(device_id: str | None = None) -> StreamingResponse:
-    """Continuous mono 16-bit PCM the robot pulls while a track is playing."""
-    from music_service import MusicNoDeviceError, get_music_service
-
-    service = get_music_service()
-    try:
-        chunks = service.iter_stream(device_id)
-    except MusicNoDeviceError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return StreamingResponse(
-        chunks,
-        media_type="audio/wav",
-        headers={"Cache-Control": "no-store", "Accept-Ranges": "none"},
-    )
-
-
-@app.post("/api/music/play")
-def music_play(req: MusicPlayRequest) -> dict:
-    from music_service import MusicNoDeviceError, get_music_service
-    from music_source import (
-        MusicNotConfiguredError,
-        MusicNotFoundError,
-        MusicUnavailableError,
-    )
-
-    service = get_music_service()
-    try:
-        track = service.play(
-            req.device_id, req.query, notify_device=req.push_to_device
-        )
-    except MusicNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except MusicNotConfiguredError as exc:
-        raise HTTPException(status_code=501, detail=str(exc)) from exc
-    except MusicNoDeviceError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except MusicUnavailableError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return {
-        "ok": True,
-        "track": {
-            "title": track.title,
-            "artist": track.artist,
-            "duration_seconds": track.duration_seconds,
-            "page_url": track.page_url,
-        },
-        "stream_url": service.stream_url_for(req.device_id),
-    }
-
-
-@app.post("/api/music/stop")
-def music_stop(device_id: str | None = None) -> dict:
-    from music_service import get_music_service
-
-    return {"ok": True, "was_playing": get_music_service().stop(device_id)}
-
-
-@app.get("/api/music/status")
-def music_status(device_id: str | None = None) -> dict:
-    from music_service import get_music_service
-    from music_source import ffmpeg_path
-
-    try:
-        import yt_dlp  # noqa: F401
-
-        ytdlp_ready = True
-    except ImportError:
-        ytdlp_ready = False
-
-    return {
-        "ok": True,
-        "ffmpeg": bool(ffmpeg_path()),
-        "yt_dlp": ytdlp_ready,
-        **get_music_service().status(device_id),
-    }
-
-
-@app.get("/api/latency-log")
-def latency_log(limit: int = 50) -> dict:
-    """Return recent voice latency records (newest last)."""
-    limit = max(1, min(limit, 500))
-    records = _load_latency_records()
-    return {
-        "ok": True,
-        "total": len(records),
-        "records": records[-limit:],
-        "path": str(LATENCY_LOG_PATH),
-    }
-
-
-def _stt_status() -> dict:
-    from voice_service import whisper_runtime_status
-
-    return whisper_runtime_status()
-
-
 @app.get("/api/intelligent-mode/status")
 def intelligent_mode_status() -> dict:
     from intelligent_mode.orchestrator import get_orchestrator
@@ -1037,8 +998,8 @@ def intelligent_mode_status() -> dict:
 
 
 @app.get("/api/intelligent-mode/dashboard")
-def intelligent_mode_dashboard() -> dict:
-    from intelligent_mode.dashboard import build_dashboard
+def intelligent_mode_dashboard(device_id: str | None = None) -> dict:
+    from intelligent_mode.dashboard import build_dashboard, filter_dashboard_for_device
     from intelligent_mode.orchestrator import get_orchestrator
     from intelligent_mode.soak_test import get_soak_runner, get_soak_store
     from llm_service import ollama_runtime_status, resolve_ollama_api_url, set_ollama_env_url
@@ -1091,12 +1052,15 @@ def intelligent_mode_dashboard() -> dict:
         "live_esp_play_url": soak_device[1] if soak_device else None,
     }
 
-    return build_dashboard(
-        snapshot=snapshot,
-        intelligent_status=intelligent_status,
-        incidents=incidents,
-        last_smoke_run=last_smoke_run,
-        voice_active_fn=voice_pipeline_active,
+    return filter_dashboard_for_device(
+        build_dashboard(
+            snapshot=snapshot,
+            intelligent_status=intelligent_status,
+            incidents=incidents,
+            last_smoke_run=last_smoke_run,
+            voice_active_fn=voice_pipeline_active,
+        ),
+        device_id,
     )
 
 
@@ -1450,105 +1414,233 @@ def soak_test_cycle() -> dict:
     return {"ok": True, **cycle.to_dict()}
 
 
-@app.get("/api/training/status")
-def training_status() -> dict:
-    from daily_training_service import get_daily_training_service
-
-    return {"ok": True, **get_daily_training_service().status()}
-
-
-@app.post("/api/training/run")
-def training_run_now() -> dict:
-    from daily_training_service import get_daily_training_service
-
-    svc = get_daily_training_service()
-    try:
-        result = svc.run_now()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return {"ok": True, **result}
-
-
 @app.get("/api/ota/firmware")
-def ota_list_firmware() -> dict:
-    from ota_service import list_firmware_builds
+def list_ota_firmware() -> dict:
+    items = [r.as_dict() for r in get_ota_service().list_firmware()]
+    return {"ok": True, "firmware": items}
 
-    return {"ok": True, "builds": list_firmware_builds()}
 
-
-@app.post("/api/ota/firmware/upload")
-async def ota_upload_firmware(file: UploadFile = File(...)) -> dict:
-    from ota_service import save_firmware_upload
-
+@app.post("/api/ota/firmware")
+async def upload_ota_firmware(
+    file: UploadFile = File(...),
+    label: str | None = Query(default=None),
+    x_nino_ota_token: str | None = Header(default=None),
+) -> dict:
+    """Store an ESP-IDF .bin so it can be pushed to robots by MAC."""
+    _require_ota_token(x_nino_ota_token)
     data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty firmware file")
     try:
-        saved = save_firmware_upload(file.filename or "firmware.bin", data)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"ok": True, **saved}
-
-
-@app.get("/api/ota/pending")
-def ota_pending() -> dict:
-    from ota_service import list_pending_deployments
-
-    return {"ok": True, "pending": list_pending_deployments()}
-
-
-@app.post("/api/ota/approve/{approval_id}")
-def ota_approve(approval_id: str) -> dict:
-    from ota_service import approve_deployment
-
-    try:
-        result = approve_deployment(approval_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {"ok": True, "deployment": result}
-
-
-@app.post("/api/ota/deploy/{device_id}")
-def ota_deploy(device_id: str, body: dict[str, Any]) -> dict:
-    from device_registry import get_registry
-    from ota_service import bot_firmware_status, request_firmware_deploy
-
-    filename = str(body.get("filename") or "").strip()
-    if not filename:
-        raise HTTPException(status_code=400, detail="filename required")
-    record = get_registry().get(device_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail=f"Unknown device {device_id}")
-    base = record.effective_base_url()
-    if not base:
-        raise HTTPException(status_code=400, detail="Device has no base URL")
-    require_approval = body.get("require_approval")
-    try:
-        result = request_firmware_deploy(
-            device_id=device_id,
-            filename=filename,
-            base_url=base,
-            requested_by=str(body.get("requested_by") or "ops"),
-            require_approval=require_approval if require_approval is not None else None,
+        record = get_ota_service().save_firmware(
+            data, filename=file.filename or "firmware.bin", label=label or ""
         )
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    status = bot_firmware_status(base)
-    return {"ok": True, "deployment": result, "bot_status": status}
+    except OtaError as exc:
+        raise _ota_http_error(exc) from exc
+    return {"ok": True, **record.as_dict()}
 
 
-@app.get("/api/ota/status/{device_id}")
-def ota_device_status(device_id: str) -> dict:
-    from device_registry import get_registry
-    from ota_service import bot_firmware_status
-
-    record = get_registry().get(device_id)
+@app.get("/api/ota/firmware/{firmware_id}/bin")
+def download_ota_firmware(
+    firmware_id: str,
+    token: str | None = Query(default=None),
+    x_nino_ota_token: str | None = Header(default=None),
+) -> FileResponse:
+    """Robot pulls this URL during OTA."""
+    _require_ota_token(x_nino_ota_token, token)
+    record = get_ota_service().get(firmware_id)
     if record is None:
-        raise HTTPException(status_code=404, detail=f"Unknown device {device_id}")
-    base = record.effective_base_url()
-    if not base:
-        raise HTTPException(status_code=400, detail="Device has no base URL")
-    return {"ok": True, "status": bot_firmware_status(base)}
+        raise HTTPException(status_code=404, detail="Unknown firmware_id")
+    path = get_ota_service().bin_path(record)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Firmware file missing")
+    return FileResponse(
+        path,
+        media_type="application/octet-stream",
+        filename=record.filename or f"{record.firmware_id}.bin",
+    )
+
+
+@app.post("/api/devices/{device_id}/ota")
+def push_device_ota(
+    device_id: str,
+    req: OtaTriggerRequest | None = None,
+    firmware_id: str | None = Query(default=None),
+    x_nino_ota_token: str | None = Header(default=None),
+) -> dict:
+    """Tell the robot (MAC / device_id) to pull a stored or remote firmware image."""
+    _require_ota_token(x_nino_ota_token)
+    trigger_id = (firmware_id or (req.firmware_id if req else None) or "").strip() or None
+    trigger_url = ((req.url if req else None) or "").strip() or None
+    try:
+        return get_ota_service().trigger_device(
+            device_id, firmware_id=trigger_id, url=trigger_url
+        )
+    except OtaError as exc:
+        raise _ota_http_error(exc) from exc
+
+
+@app.post("/api/devices/{device_id}/ota/upload")
+async def upload_and_push_device_ota(
+    device_id: str,
+    file: UploadFile = File(...),
+    x_nino_ota_token: str | None = Header(default=None),
+) -> dict:
+    """Upload a .bin and immediately push it to the robot identified by MAC."""
+    _require_ota_token(x_nino_ota_token)
+    data = await file.read()
+    service = get_ota_service()
+    try:
+        record = service.save_firmware(data, filename=file.filename or "firmware.bin")
+        return service.trigger_device(device_id, firmware_id=record.firmware_id)
+    except OtaError as exc:
+        raise _ota_http_error(exc) from exc
+
+
+@app.get("/api/devices/{device_id}/ota")
+def device_ota_status(
+    device_id: str,
+    x_nino_ota_token: str | None = Header(default=None),
+) -> dict:
+    _require_ota_token(x_nino_ota_token)
+    try:
+        return get_ota_service().robot_status(device_id)
+    except OtaError as exc:
+        raise _ota_http_error(exc) from exc
+
+
+@app.get("/api/weather")
+def current_weather(device_id: str | None = None) -> dict:
+    """Return cached current conditions for the named device's location."""
+    device = registry.resolve_or_default(device_id)
+    try:
+        weather = get_weather_service().current_for_device(device)
+    except DeviceLocationUnavailableError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "No location is configured for this device. "
+                "POST its latitude and longitude to /api/devices/{device_id}/location."
+            ),
+        ) from exc
+    except WeatherUnavailableError as exc:
+        raise HTTPException(
+            status_code=503, detail="Current weather is temporarily unavailable"
+        ) from exc
+    return {
+        "ok": True,
+        "device_id": device.device_id,
+        "location": {
+            "latitude": device.latitude,
+            "longitude": device.longitude,
+            "name": device.location_name,
+            "updated_at": device.location_updated_at,
+        },
+        "weather": weather,
+    }
+
+
+class MusicPlayRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=200)
+    device_id: str | None = None
+    # False arms the stream without calling the robot, for PC-side testing
+    # before the /music firmware lands.
+    push_to_device: bool = True
+
+
+@app.get("/music/stream.wav")
+def music_stream(device_id: str | None = None) -> StreamingResponse:
+    """Continuous mono 16-bit PCM the robot pulls while a track is playing."""
+    from music_service import MusicNoDeviceError, get_music_service
+
+    service = get_music_service()
+    try:
+        chunks = service.iter_stream(device_id)
+    except MusicNoDeviceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return StreamingResponse(
+        chunks,
+        media_type="audio/wav",
+        headers={"Cache-Control": "no-store", "Accept-Ranges": "none"},
+    )
+
+
+@app.post("/api/music/play")
+def music_play(req: MusicPlayRequest) -> dict:
+    from music_service import MusicNoDeviceError, get_music_service
+    from music_source import (
+        MusicNotConfiguredError,
+        MusicNotFoundError,
+        MusicUnavailableError,
+    )
+
+    service = get_music_service()
+    try:
+        track = service.play(
+            req.device_id, req.query, notify_device=req.push_to_device
+        )
+    except MusicNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except MusicNotConfiguredError as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
+    except MusicNoDeviceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except MusicUnavailableError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "track": {
+            "title": track.title,
+            "artist": track.artist,
+            "duration_seconds": track.duration_seconds,
+            "page_url": track.page_url,
+        },
+        "stream_url": service.stream_url_for(req.device_id),
+    }
+
+
+@app.post("/api/music/stop")
+def music_stop(device_id: str | None = None) -> dict:
+    from music_service import get_music_service
+
+    return {"ok": True, "was_playing": get_music_service().stop(device_id)}
+
+
+@app.get("/api/music/status")
+def music_status(device_id: str | None = None) -> dict:
+    from music_service import get_music_service
+    from music_source import ffmpeg_path
+
+    try:
+        import yt_dlp  # noqa: F401
+
+        ytdlp_ready = True
+    except ImportError:
+        ytdlp_ready = False
+
+    return {
+        "ok": True,
+        "ffmpeg": bool(ffmpeg_path()),
+        "yt_dlp": ytdlp_ready,
+        **get_music_service().status(device_id),
+    }
+
+
+@app.get("/api/latency-log")
+def latency_log(limit: int = 50) -> dict:
+    """Return recent voice latency records (newest last)."""
+    limit = max(1, min(limit, 500))
+    records = _load_latency_records()
+    return {
+        "ok": True,
+        "total": len(records),
+        "records": records[-limit:],
+        "path": str(LATENCY_LOG_PATH),
+    }
+
+
+def _stt_status() -> dict:
+    from voice_service import whisper_runtime_status
+
+    return whisper_runtime_status()
 
 
 @app.get("/api/status")
@@ -1585,7 +1677,9 @@ def detected_objects(device_id: str | None = None, refresh: bool = False) -> dic
     active = resolve_device_id(device_id)
     if refresh:
         frame = cameras.read(active)
-        detections = _detect_objects(frame, active) if frame is not None else []
+        detections = (
+            _detect_objects(frame, active, force=True) if frame is not None else []
+        )
     else:
         detections = objects.latest(active)
     return {
@@ -1742,12 +1836,77 @@ def video_feed(device_id: str | None = None) -> StreamingResponse:
     )
 
 
+_palm_pending: set[str] = set()
+_palm_pending_lock = threading.Lock()
+
+
+def _schedule_palm_stop(frame, device_id: str) -> None:
+    """Detect an open palm off the vision tick so face/emotion stay smooth."""
+    key = _results_device_key(device_id)
+    if not key:
+        return
+    with _palm_pending_lock:
+        if key in _palm_pending:
+            return
+        _palm_pending.add(key)
+
+    def _run() -> None:
+        try:
+            from palm_gesture_service import (
+                get_palm_gesture_service,
+                request_esp_palm_listen,
+            )
+            from scene_agent import get_scene_agent
+
+            if not get_palm_gesture_service().maybe_trigger(frame, device_id):
+                return
+            get_scene_agent(device_id).exit_observe()
+            ok, err = request_esp_palm_listen(device_id)
+            logger.info(
+                "Palm stop listen device=%s ok=%s err=%s",
+                device_id,
+                ok,
+                err or "-",
+            )
+        except Exception:
+            logger.debug("Palm stop hook failed for %s", device_id, exc_info=True)
+        finally:
+            with _palm_pending_lock:
+                _palm_pending.discard(key)
+
+    threading.Thread(target=_run, daemon=True, name=f"palm-stop-{key[:8]}").start()
+
+
+def _schedule_object_detect(frame, device_id: str) -> None:
+    """Run Qwen-VL / YOLO off the hot path so MJPEG and face ticks stay smooth."""
+    if vision_pipeline_paused(device_id):
+        return
+    key = _results_device_key(device_id)
+    if not key:
+        return
+    with _object_detect_lock:
+        if key in _object_detect_pending:
+            return
+        _object_detect_pending.add(key)
+
+    def _run() -> None:
+        try:
+            _detect_objects(frame, device_id)
+        finally:
+            with _object_detect_lock:
+                _object_detect_pending.discard(key)
+
+    threading.Thread(target=_run, daemon=True, name=f"obj-detect-{key[:8]}").start()
+
+
 def _mjpeg_generator(device_id: str):
     global latest_results
     last_tts_update_at = 0.0
     is_ui_device = device_id == registry.ui_device_id()
+    frame_interval = 1.0 / MJPEG_TARGET_FPS
     try:
         while True:
+            loop_start = time.perf_counter()
             frame = cameras.read(device_id)
             if frame is None:
                 if is_ui_device:
@@ -1756,15 +1915,21 @@ def _mjpeg_generator(device_id: str):
                 time.sleep(0.02)
                 continue
 
-            results = faces.recognize(frame, device_id=device_id)
-            try:
-                emotion.attach_emotions(frame, results)
-            except Exception:
-                logger.exception("Emotion detection failed; continuing MJPEG")
-            detections = _detect_objects(frame, device_id)
+            if MJPEG_LIGHTWEIGHT:
+                # Annotate only — face/emotion/objects come from the background vision loop.
+                results = _cached_face_results(device_id)
+                detections = objects.latest(device_id)
+            else:
+                results = faces.recognize(frame, device_id=device_id)
+                try:
+                    emotion.attach_emotions(frame, results)
+                except Exception:
+                    logger.exception("Emotion detection failed; continuing MJPEG")
+                detections = _detect_objects(frame, device_id)
+                _store_face_cache(device_id, results)
+
             annotated, results = faces.annotate(frame, results=results)
             objects.annotate(annotated, detections)
-            _store_face_cache(device_id, results)
             if is_ui_device:
                 latest_results = results
             now = time.time()
@@ -1773,10 +1938,10 @@ def _mjpeg_generator(device_id: str):
                 last_tts_update_at = now
 
             ok, encoded = cv2.imencode(
-                ".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 70]
+                ".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), MJPEG_JPEG_QUALITY]
             )
             if not ok:
-                time.sleep(0.01)
+                time.sleep(0.005)
                 continue
 
             payload = encoded.tobytes()
@@ -1787,6 +1952,10 @@ def _mjpeg_generator(device_id: str):
                 + payload
                 + b"\r\n"
             )
+            elapsed = time.perf_counter() - loop_start
+            remaining = frame_interval - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
     except (GeneratorExit, BrokenPipeError, ConnectionResetError, KeyboardInterrupt):
         return
 
@@ -1795,20 +1964,39 @@ def _vision_tick_device(
     device_id: str, *, update_tts: bool = True
 ) -> None:
     """One recognition/emotion pass for a device (used by the background vision loop)."""
+    if vision_pipeline_paused(device_id):
+        return
+    frame_age = cameras.frame_age_seconds(device_id)
+    if frame_age is not None and frame_age > STATUS_STALE_FRAME_SECONDS:
+        key = _results_device_key(device_id) or device_id
+        cameras.clear_frame(device_id)
+        _clear_face_cache(device_id)
+        objects.clear_device(key)
+        vision_eye.update([], device_id=device_id)
+        return
     frame = cameras.read(device_id)
     if frame is None:
         vision_eye.update([], device_id=device_id)
         _clear_face_cache(device_id)
+        objects.clear_device(_results_device_key(device_id) or device_id)
         return
     results = faces.recognize(frame, device_id=device_id)
     try:
         emotion.attach_emotions(frame, results)
     except Exception:
         logger.debug("Emotion tick failed for %s", device_id, exc_info=True)
-    # Keeps the object cache warm for voice queries with no browser attached.
-    _detect_objects(frame, device_id)
     _store_face_cache(device_id, results)
-    vision_eye.update(results, device_id=device_id)
+    _schedule_object_detect(frame.copy(), device_id)
+    _schedule_palm_stop(frame.copy(), device_id)
+    from object_detection_service import spatial_scene_context
+
+    scene_ctx = spatial_scene_context(
+        objects.latest(device_id),
+        scene_summary=objects.scene_summary(device_id),
+    )
+    vision_eye.update(
+        results, device_id=device_id, scene_context=scene_ctx
+    )
     if update_tts:
         _update_tts_face_state(results, device_id=device_id)
 
@@ -1874,6 +2062,20 @@ def _clear_face_cache(device_id: str | None) -> None:
         return
     _latest_results_by_device.pop(key, None)
     _latest_results_at_by_device.pop(key, None)
+
+
+def _release_device_perception_state(device_id: str | None) -> None:
+    """Drop cached camera/vision state when a voice session ends."""
+    key = _results_device_key(device_id)
+    if not key:
+        return
+    cameras.clear_frame(device_id)
+    _clear_face_cache(device_id)
+    objects.clear_device(key)
+    vision_eye.update([], device_id=device_id)
+    tts.update_face_state([], device_id=device_id)
+    _forget_voice_viewer(device_id)
+    logger.info("Released perception state for device=%s", key)
 
 
 def _cached_face_results_fresh(
@@ -1945,6 +2147,52 @@ def _recognized_viewer_names(
     return [name for _area, name in ranked]
 
 
+def _result_viewer_name(result: dict, *, allow_pending: bool = False) -> str:
+    name = ""
+    if result.get("recognized") or result.get("stabilized"):
+        name = str(result.get("name", "")).strip()
+    elif allow_pending and result.get("pending"):
+        name = str(result.get("candidate_name") or result.get("name") or "").strip()
+    key = name.lower()
+    if not name or key in {"unknown", "face"}:
+        return ""
+    return name
+
+
+def _emotions_from_results(
+    results: list[dict] | None, *, allow_pending: bool = True
+) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for result in results or []:
+        name = _result_viewer_name(result, allow_pending=allow_pending)
+        emo = str(result.get("emotion") or "").strip()
+        if name and emo:
+            out[name] = emo
+    return out
+
+
+def _emotion_for_viewer(device_id: str | None, name: str | None) -> str | None:
+    wanted = str(name or "").strip().lower()
+    if not wanted:
+        return None
+    active = resolve_device_id(device_id)
+    results = _cached_face_results_fresh(active) or []
+    frame = cameras.read(active)
+    if frame is not None:
+        try:
+            live = faces.recognize(frame, device_id=active)
+            emotion.attach_emotions(frame, live)
+            if live:
+                results = live
+                _store_face_cache(active, live)
+        except Exception:
+            logger.debug("live viewer emotion failed", exc_info=True)
+    for seen, emo in _emotions_from_results(results, allow_pending=True).items():
+        if seen.lower() == wanted:
+            return emo
+    return None
+
+
 def _viewer_for_voice_query(device_id: str | None = None) -> str | None:
     """Who is speaking — live frame first, then fresh overlay cache only."""
     active = resolve_device_id(device_id)
@@ -1975,10 +2223,23 @@ def _camera_identity_snapshot(
     active = resolve_device_id(device_id)
 
     if require_live_face:
+        cached = _cached_face_results_fresh(active)
+        if cached:
+            primary = _primary_recognized_viewer(cached, allow_pending=True)
+            if primary:
+                _remember_voice_viewer(primary, active)
+                return primary, "recognized"
         frame = cameras.read(active)
         if frame is None:
+            recalled = _recall_voice_viewer(active)
+            if recalled:
+                return recalled, "recognized"
             return None, "no_face"
         results = faces.recognize(frame, device_id=active)
+        try:
+            emotion.attach_emotions(frame, results)
+        except Exception:
+            logger.debug("identity snapshot emotion failed", exc_info=True)
         _store_face_cache(active, results)
         primary = _primary_recognized_viewer(results, allow_pending=True)
         if primary:
@@ -1986,6 +2247,9 @@ def _camera_identity_snapshot(
             return primary, "recognized"
         if results:
             return None, "unknown"
+        recalled = _recall_voice_viewer(active)
+        if recalled:
+            return recalled, "recognized"
         name, state = faces.recognize_identity(
             cameras.frame_getter(active),
             allow_session_hint=False,
@@ -2033,17 +2297,54 @@ def _camera_identity_snapshot(
     return None, "unknown"
 
 
+def _camera_emotion_snapshot(device_id: str | None = None) -> str:
+    """Facial mood cues for the LLM from the latest camera pass."""
+    active = resolve_device_id(device_id)
+    cached = _cached_face_results_fresh(active)
+    focus = _recall_voice_viewer(active)
+    if cached:
+        names = _recognized_viewer_names(cached, allow_pending=True)
+        if names and not focus:
+            focus = names[0]
+        ctx = emotion_scene_context(cached, focus_name=focus)
+        if ctx:
+            return ctx
+    frame = cameras.read(active)
+    if frame is None:
+        return ""
+    results = faces.recognize(frame, device_id=active)
+    try:
+        emotion.attach_emotions(frame, results)
+    except Exception:
+        logger.debug("live emotion snapshot failed", exc_info=True)
+    names = _recognized_viewer_names(results, allow_pending=True)
+    return emotion_scene_context(
+        results,
+        focus_name=focus or (names[0] if names else None),
+    )
+
+
 def _camera_scene_snapshot(device_id: str | None = None) -> str:
     """What the camera can see right now, phrased for the LLM prompt."""
     if not objects.enabled:
         return ""
     active = resolve_device_id(device_id)
     detections = objects.latest(active)
+    summary = objects.scene_summary(active)
     if not detections:
-        # No background tick yet (or nothing seen last pass) — try a live frame.
         frame = cameras.read(active)
         if frame is not None:
             detections = _detect_objects(frame, active)
+            summary = objects.scene_summary(active)
+    from object_detection_service import spatial_scene_context
+
+    names: list[str] = []
+    cached = _cached_face_results_fresh(active)
+    if cached:
+        names = _recognized_viewer_names(cached, allow_pending=True)
+    ctx = spatial_scene_context(detections, scene_summary=summary, names=names)
+    if ctx:
+        return ctx
     return summarize_detections(detections)
 
 
@@ -2051,29 +2352,36 @@ def _live_visible_scene(
     device_id: str | None = None,
     *,
     force_objects: bool = False,
-) -> tuple[list[str], list[dict]]:
+) -> tuple[list[str], list[dict], dict[str, str]]:
     """People (overlay, then live frame) + objects. No stale session-hint names."""
     active = resolve_device_id(device_id)
     names: list[str] = []
+    emotions: dict[str, str] = {}
+    results: list[dict] = []
     frame = cameras.read(active)
     if frame is not None:
         try:
-            names = _recognized_viewer_names(
-                faces.recognize(frame, device_id=active), allow_pending=True
-            )
+            results = faces.recognize(frame, device_id=active)
+            try:
+                emotion.attach_emotions(frame, results)
+            except Exception:
+                logger.debug("live scene emotion failed", exc_info=True)
+            names = _recognized_viewer_names(results, allow_pending=True)
+            emotions = _emotions_from_results(results, allow_pending=True)
         except Exception:
             logger.debug("live scene face recognize failed", exc_info=True)
     if not names:
         cached = _cached_face_results_fresh(active)
         if cached:
             names = _recognized_viewer_names(cached, allow_pending=True)
+            emotions = _emotions_from_results(cached, allow_pending=True)
     detections: list[dict] = []
     if objects.enabled:
         if frame is not None:
             detections = _detect_objects(frame, active, force=force_objects)
         else:
             detections = objects.latest(active)
-    return names, detections
+    return names, detections, emotions
 
 
 from voice_service import configure_visible_scene_snapshot
@@ -2333,6 +2641,7 @@ def _device_id_from_websocket(websocket: WebSocket) -> str:
         # P4 firmware may send eFuse/base MAC while discovery registers Wi-Fi MAC.
         mapped = get_device_registry().find_device_id_by_host(host)
         if mapped:
+            get_device_registry().add_mac_alias(mac, mapped)
             logger.info(
                 "Voice WS remapped unknown mac=%s client=%s -> %s",
                 mac,
@@ -2400,14 +2709,30 @@ async def _process_voice_query_audio(
                     "face",
                 }:
                     active_viewer = normalized_identity
+            if not active_viewer:
+                active_viewer = await run_in_threadpool(_recall_voice_viewer, device_id)
+            if active_viewer and identity_state != "recognized":
+                identity_name = active_viewer
+                identity_state = "recognized"
             identity_seconds = round(time.perf_counter() - t_ident, 3)
             camera_scene = await run_in_threadpool(
                 _camera_scene_snapshot, device_id
+            )
+            camera_emotion = await run_in_threadpool(
+                _camera_emotion_snapshot, device_id
             )
             visible_names = (
                 [active_viewer]
                 if active_viewer
                 else []
+            )
+            viewer_emotion = None
+            if active_viewer:
+                viewer_emotion = await run_in_threadpool(
+                    _emotion_for_viewer, device_id, active_viewer
+                )
+            visible_emotions = (
+                {active_viewer: viewer_emotion} if active_viewer and viewer_emotion else {}
             )
 
             def _run_voice() -> tuple[bytes, VoiceReplyMeta]:
@@ -2417,7 +2742,10 @@ async def _process_voice_query_audio(
                     camera_identity_name=identity_name,
                     camera_identity_state=identity_state,
                     camera_scene=camera_scene,
+                    camera_emotion=camera_emotion,
                     visible_names=visible_names,
+                    visible_emotions=visible_emotions,
+                    viewer_emotion=viewer_emotion,
                     device_id=device_id,
                     session_kind=session_kind,
                     session_id=session_id,
@@ -2433,9 +2761,26 @@ async def _process_voice_query_audio(
             pipeline_error = str(exc)[:200]
             err_note = str(exc)[:512]
             try:
-                from voice_service import voice_pipeline_recovery_wav
+                from llm_service import (
+                    OLLAMA_UNAVAILABLE_REPLY,
+                    brief_spoken_message,
+                    is_ollama_error,
+                )
+                from wav_resample import ESP_PCM_SAMPLE_RATE_HZ, resample_wav_bytes_to_mono_16bit
 
-                wav_out = await run_in_threadpool(voice_pipeline_recovery_wav, exc)
+                def _recover_wav(pipeline_exc: BaseException = exc) -> bytes:
+                    if is_ollama_error(pipeline_exc):
+                        txt = OLLAMA_UNAVAILABLE_REPLY
+                    else:
+                        txt = brief_spoken_message(
+                            err_note,
+                            model=os.environ.get("OLLAMA_MODEL"),
+                            api_url=os.environ.get("OLLAMA_URL"),
+                        )
+                    raw, _ = synthesize_sapi_wav_bytes(txt)
+                    return resample_wav_bytes_to_mono_16bit(raw, ESP_PCM_SAMPLE_RATE_HZ)
+
+                wav_out = await run_in_threadpool(_recover_wav)
             except Exception:
                 logger.exception("Voice pipeline recovery failed")
                 wav_out = minimal_voice_reply_wav()
@@ -2489,6 +2834,21 @@ async def _process_voice_query_audio(
         await run_in_threadpool(end_voice_query, device_id)
 
 
+def _device_uses_http_play_wav_fallback(device_id: str, wav_out: bytes | None) -> bool:
+    """Some boards need HTTP /play_wav because WS binary aux-in stays silent.
+
+    When enabled for a device, send reply metadata over WS but play audio only once
+    via HTTP — never both WS WAV bytes and HTTP /play_wav.
+    """
+    if not wav_out or len(wav_out) <= 8000:
+        return False
+    raw = os.environ.get("VOICE_HTTP_PLAY_WAV_DEVICES", "b0a6048addd4").strip()
+    if raw.lower() in {"0", "false", "no", "off", "none", ""}:
+        return False
+    allowed = {item.strip().lower() for item in raw.split(",") if item.strip()}
+    return device_id.strip().lower() in allowed
+
+
 async def _voice_ws_send_reply(
     websocket: WebSocket,
     *,
@@ -2530,6 +2890,8 @@ async def _voice_ws_send_reply(
         ws_meta["type"] = "reply"
     if getattr(meta, "look_scan", False):
         ws_meta["look_scan"] = True
+    if getattr(meta, "observe", None) is not None:
+        ws_meta["observe"] = bool(meta.observe)
     if getattr(meta, "face_track", None) is not None:
         ws_meta["face_track"] = bool(meta.face_track)
     if not await _ws_send_json(websocket, ws_meta):
@@ -2539,7 +2901,9 @@ async def _voice_ws_send_reply(
             client_label,
         )
         return False
-    if wav_out and not await _ws_send_bytes(websocket, wav_out):
+
+    http_play = _device_uses_http_play_wav_fallback(device_id, wav_out)
+    if wav_out and not http_play and not await _ws_send_bytes(websocket, wav_out):
         logger.info(
             "WS WAV skipped, socket closed device=%s client=%s",
             device_id,
@@ -2547,22 +2911,15 @@ async def _voice_ws_send_reply(
         )
         return False
 
-    # Vaseekaran (d4) queues the WS WAV (wait_idle matches clip length) but the
-    # ES8311 speaker stays silent. POST /play_wav after the board has reopened
-    # Aux so the HTTP job forces a DAC reopen. Skip tiny wake-reject clips.
-    # Do not do this on Gitam — that unit already plays the WS binary.
-    if (
-        wav_out
-        and len(wav_out) > 8000
-        and device_id == "b0a6048addd4"
-    ):
+    # Vaseekaran (d4): play TTS once via HTTP /play_wav (WS sends metadata only).
+    if http_play and wav_out:
         wav_copy = bytes(wav_out)
         eye_copy = eye_tag
         delay_s = max(0.5, (len(wav_copy) - 44) / 32000.0 + 0.45)
         play_s = max(0.5, (len(wav_copy) - 44) / 32000.0)
         mark_device_busy_for(delay_s + play_s + 0.8, device_id=device_id)
         logger.info(
-            "HTTP play_wav fallback in %.2fs device=%s bytes=%s",
+            "HTTP play_wav (WS audio skipped) in %.2fs device=%s bytes=%s",
             delay_s,
             device_id,
             len(wav_copy),
@@ -2621,9 +2978,9 @@ async def _voice_ws_send_reply(
             tts_seconds=float(meta.timings.get("tts_seconds") or 0.0),
             audio_out_seconds=play_s,
         )
-        from esp_playback import extend_playback_busy
-
-        extend_playback_busy(wav_out, device_id=device_id)
+        # Busy only while the clip should still be playing. A 4s post-TTS grace
+        # used to drop the user's first words after the LED went listen.
+        mark_device_busy_for(play_s + stream_echo_tail_seconds(), device_id=device_id)
 
     from voice_service import SERVO_360_TRIGGER_DELAY_SECONDS
 
@@ -2657,6 +3014,7 @@ async def _voice_ws_stream_pipeline(
     voice_turn = _voice_turn_from_websocket(websocket) or 0
     client_label = _ws_client_label(websocket)
     _forget_voice_viewer(device_id)
+    await run_in_threadpool(begin_stream_voice_session, device_id)
 
     buf = UtteranceBuffer()
     accepting = True
@@ -2712,6 +3070,11 @@ async def _voice_ws_stream_pipeline(
             identity_name, identity_state = await run_in_threadpool(
                 _session_open_identity_snapshot, device_id
             )
+            identity_emotion = None
+            if identity_state == "recognized" and identity_name:
+                identity_emotion = await run_in_threadpool(
+                    _emotion_for_viewer, device_id, identity_name
+                )
             ident = get_session_identity(device_id)
             if ident is None:
                 greet_sent = True
@@ -2723,12 +3086,22 @@ async def _voice_ws_stream_pipeline(
                 device_id=device_id,
                 identity_name=identity_name,
                 identity_state=identity_state,
+                identity_emotion=identity_emotion,
             )
+            if identity_name:
+                from session_emotion import observe_viewer_emotion
+
+                observe_viewer_emotion(device_id, identity_name, identity_emotion)
             if open_result.user_name:
                 bind_session_user(
                     session_id, device_id=device_id, user_name=open_result.user_name
                 )
                 _remember_voice_viewer(open_result.user_name, device_id)
+            from scene_agent import get_scene_agent
+
+            get_scene_agent(device_id).begin_session(
+                open_result.user_name, is_guest=open_result.is_guest
+            )
             from voice_service import synthesize_session_open_wav
 
             wav_out, reply_meta = await run_in_threadpool(
@@ -2833,52 +3206,105 @@ async def _voice_ws_stream_pipeline(
             logger.exception("stream identity_scan failed device=%s", device_id)
             return await send_skip("identity_scan_error")
 
-    last_look_key = None
-    last_look_side = None
-
-    async def send_look_scan(side: str, force: bool = False) -> bool:
-        """Snapshot people+objects at the current pose and speak a report."""
-        pose = "left" if str(side or "").strip().lower() == "left" else "right"
+    async def send_spatial_scan(side: str, tilt: str = "center") -> bool:
+        """Ingest one pose into the scene agent. Never speaks."""
+        set_spatial_scan_active(device_id, True)
+        raw_side = str(side or "").strip().lower()
+        pose = raw_side if raw_side in {"left", "right", "front"} else "front"
+        elev = str(tilt or "center").strip().lower()
+        if elev not in {"up", "center", "down"}:
+            elev = "center"
         try:
-            from object_detection_service import spoken_scene_report
-            from voice_service import synthesize_look_scan_wav
+            from scene_agent import get_scene_agent
 
-            names, detections = await run_in_threadpool(
+            names, detections, emotions = await run_in_threadpool(
                 lambda: _live_visible_scene(device_id, force_objects=True)
             )
-            name_key = tuple(
-                str(n).strip().lower() for n in (names or []) if str(n).strip()
+            scene_summary = str(objects.scene_summary(device_id) or "").strip()
+            get_scene_agent(device_id).ingest_pose(
+                side=pose,
+                tilt=elev,
+                names=names,
+                detections=detections,
+                emotions=emotions,
+                scene_summary=scene_summary,
             )
-            label_key = tuple(
-                sorted(
-                    str(d.get("label") or "").strip().lower()
-                    for d in (detections or [])
-                    if str(d.get("label") or "").strip()
+            logger.info(
+                "stream spatial_scan side=%s tilt=%s names=%s objects=%s device=%s",
+                pose,
+                elev,
+                names,
+                [d.get("label") for d in (detections or [])],
+                device_id,
+            )
+            return await send_skip(
+                "spatial_scan",
+                continue_listen=spatial_skip_continue_listen(session_id, device_id),
+            )
+        except Exception:
+            logger.exception(
+                "stream spatial_scan failed device=%s side=%s tilt=%s",
+                device_id,
+                pose,
+                elev,
+            )
+            return await send_skip(
+                "spatial_scan_error",
+                continue_listen=spatial_skip_continue_listen(session_id, device_id),
+            )
+
+    async def send_spatial_done() -> bool:
+        """Compose one Qwen spatial report after a silent sweep."""
+        set_spatial_scan_active(device_id, True)
+        try:
+            from scene_agent import get_scene_agent
+            from voice_service import synthesize_spatial_report_wav
+
+            agent = get_scene_agent(device_id)
+            if agent.is_observing():
+                logger.info("stream spatial_done skipped — observe device=%s", device_id)
+                return await send_skip(
+                    "spatial_done_observe",
+                    continue_listen=True,
                 )
+            ident = get_session_identity(device_id)
+            if ident is not None:
+                user_name, is_guest = ident.current_user()
+                if user_name:
+                    agent.set_user(user_name, is_guest=is_guest)
+            reply = await run_in_threadpool(
+                lambda: agent.compose_report(ask_help=True, mode="opening")
             )
-            scene_key = (name_key, label_key)
-            nonlocal last_look_key, last_look_side
-            if not force and last_look_side == pose and last_look_key == scene_key:
+            if not (reply or "").strip():
                 logger.info(
-                    "stream look_scan skip unchanged side=%s device=%s",
-                    pose,
+                    "stream spatial_done unchanged — silent device=%s session=%s",
                     device_id,
+                    session_id,
                 )
-                return await send_skip("look_scan_unchanged")
-            last_look_key = scene_key
-            last_look_side = pose
-            reply = spoken_scene_report(names, detections, pose=pose)
+                return await send_skip(
+                    "spatial_done_unchanged",
+                    continue_listen=spatial_skip_continue_listen(session_id, device_id),
+                )
+            agent.persist_report(
+                reply,
+                user_text="[spatial look]",
+                reply_path="spatial_report",
+                session_id=session_id,
+            )
             wav_out, reply_meta = await run_in_threadpool(
-                lambda: synthesize_look_scan_wav(
-                    reply, session_id=session_id, device_id=device_id
+                lambda: synthesize_spatial_report_wav(
+                    reply,
+                    session_id=session_id,
+                    device_id=device_id,
+                    reply_path="spatial_report",
+                    eye_expression=agent.suggest_eye(reply_path="spatial_report"),
+                    motion=agent.suggest_motion(),
                 )
             )
             logger.info(
-                "stream look_scan side=%s names=%s objects=%s device=%s",
-                pose,
-                names,
-                [d.get("label") for d in (detections or [])[:8]],
+                "stream spatial_done device=%s reply=%s",
                 device_id,
+                reply[:120],
             )
             return await _voice_ws_send_reply(
                 websocket,
@@ -2889,8 +3315,11 @@ async def _voice_ws_stream_pipeline(
                 client_label=client_label,
             )
         except Exception:
-            logger.exception("stream look_scan failed device=%s side=%s", device_id, pose)
-            return await send_skip("look_scan_error")
+            logger.exception("stream spatial_done failed device=%s", device_id)
+            return await send_skip("spatial_done_error")
+        finally:
+            set_spatial_scan_active(device_id, False)
+            objects.bump_vision_generation()
 
     async def send_wake_result(detected: bool) -> bool:
         return await _ws_send_json(
@@ -2977,9 +3406,13 @@ async def _voice_ws_stream_pipeline(
             return ("wake_ok",)
         if path == "wake_reject":
             return ("wake_reject",)
-        if path in {"stt_silent", "stt_empty", "silent_skip", "stt_rejected"} and not getattr(
-            reply_meta, "end_session", False
-        ):
+        if path in {
+            "stt_silent",
+            "stt_empty",
+            "silent_skip",
+            "stt_rejected",
+            "observe_note",
+        } and not getattr(reply_meta, "end_session", False):
             return ("skip", path, reply_meta)
         return ("reply", wav_out, reply_meta)
 
@@ -3032,13 +3465,6 @@ async def _voice_ws_stream_pipeline(
     async def finish_utterance(reason: str) -> bool:
         """Send EOS (receive not in flight). Skip now or start STT off-websocket."""
         nonlocal accepting, first_turn, voice_turn, stt_task
-        if stt_task is not None and not stt_task.done():
-            buf.reset()
-            return True
-        if device_busy_speaking(device_id):
-            buf.reset()
-            accepting = True
-            return True
         ident = get_session_identity(device_id)
         registering = ident is not None and ident.in_registration()
         peak_energy = buf.vad.peak_energy
@@ -3161,10 +3587,13 @@ async def _voice_ws_stream_pipeline(
         if not accepting:
             # Same-task drain: drop PCM so uvicorn max_queue cannot stall TCP.
             return True
-        if stt_task is not None and not stt_task.done():
-            buf.reset()
-            return True
-        if device_busy_speaking(device_id):
+        from voice_listen_state import in_post_tts_grace
+
+        if (
+            spatial_scan_active(device_id)
+            or device_busy_speaking(device_id)
+            or in_post_tts_grace(session_id, device_id)
+        ):
             buf.reset()
             return True
         pcm_frames += 1
@@ -3205,21 +3634,30 @@ async def _voice_ws_stream_pipeline(
             except ValueError:
                 return True
             if str(payload.get("type") or "").strip().lower() == "listen":
-                # Board arms Aux after wait_idle, but server may still be inside the
-                # playback window — do not open ASR until TTS has fully finished.
-                if device_busy_speaking(device_id):
+                # Board finished TTS and is about to send Aux PCM.
+                from voice_listen_state import in_post_tts_grace
+
+                buf.reset()
+                if spatial_scan_active(device_id):
                     logger.info(
-                        "stream listen deferred — TTS still playing device=%s session=%s",
+                        "stream listen deferred — spatial sweep device=%s session=%s",
                         device_id,
                         session_id,
                     )
-                else:
-                    clear_device_busy(device_id)
+                    return True
+                if in_post_tts_grace(session_id, device_id):
                     logger.info(
-                        "stream listen — accept Aux now device=%s session=%s",
+                        "stream listen deferred — post-TTS grace device=%s session=%s",
                         device_id,
                         session_id,
                     )
+                    return True
+                clear_device_busy(device_id)
+                logger.info(
+                    "stream listen — accept Aux now device=%s session=%s",
+                    device_id,
+                    session_id,
+                )
                 return True
             if str(payload.get("type") or "").strip().lower() == "ready":
                 logger.info(
@@ -3237,22 +3675,25 @@ async def _voice_ws_stream_pipeline(
                     session_id,
                 )
                 return await send_identity_refresh()
-            if str(payload.get("type") or "").strip().lower() == "look_scan":
+            msg_type = str(payload.get("type") or "").strip().lower()
+            if msg_type in {"look_scan", "spatial_scan"}:
                 side = str(payload.get("side") or "").strip().lower()
-                force_raw = payload.get("force")
-                force = force_raw is True or str(force_raw).strip().lower() in {
-                    "1",
-                    "true",
-                    "yes",
-                }
+                tilt = str(payload.get("tilt") or "center").strip().lower()
                 logger.info(
-                    "stream look_scan side=%s force=%s device=%s session=%s",
-                    side or "right",
-                    force,
+                    "stream spatial_scan side=%s tilt=%s device=%s session=%s",
+                    side or "front",
+                    tilt or "center",
                     device_id,
                     session_id,
                 )
-                return await send_look_scan(side, force=force)
+                return await send_spatial_scan(side, tilt=tilt)
+            if msg_type == "spatial_done":
+                logger.info(
+                    "stream spatial_done device=%s session=%s",
+                    device_id,
+                    session_id,
+                )
+                return await send_spatial_done()
             return True
         chunk = message.get("bytes")
         if not chunk:
@@ -3363,6 +3804,13 @@ async def _voice_ws_stream_pipeline(
         ident = get_session_identity(device_id)
         if ident is not None:
             ident.end_session()
+        from session_emotion import reset_session_emotions
+        from scene_agent import reset_scene_agent
+
+        reset_session_emotions(device_id)
+        reset_scene_agent(device_id)
+        _release_device_perception_state(device_id)
+        await run_in_threadpool(end_stream_voice_session, device_id)
 
 
 async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
@@ -3515,6 +3963,9 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                         active_viewer = await run_in_threadpool(
                             _recall_voice_viewer, device_id
                         )
+                    if active_viewer and identity_state != "recognized":
+                        identity_name = active_viewer
+                        identity_state = "recognized"
                     identity_seconds = round(time.perf_counter() - t_ident, 3)
                     pipeline_log(
                         "IDENT",
@@ -3532,9 +3983,25 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                     camera_scene = await run_in_threadpool(
                         _camera_scene_snapshot, device_id
                     )
+                    camera_emotion = await run_in_threadpool(
+                        _camera_emotion_snapshot, device_id
+                    )
                     visible_names = _recognized_viewer_names(
                         _cached_face_results(device_id), allow_pending=True
                     )
+                    cached_emotions = _emotions_from_results(
+                        _cached_face_results(device_id), allow_pending=True
+                    )
+                    viewer_emotion = None
+                    if active_viewer:
+                        for seen, emo in cached_emotions.items():
+                            if seen.lower() == str(active_viewer).strip().lower():
+                                viewer_emotion = emo
+                                break
+                        if not viewer_emotion:
+                            viewer_emotion = await run_in_threadpool(
+                                _emotion_for_viewer, device_id, active_viewer
+                            )
 
                     def _run_voice() -> tuple[bytes, VoiceReplyMeta]:
                         return process_voice_wav(
@@ -3543,7 +4010,10 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                             camera_identity_name=identity_name,
                             camera_identity_state=identity_state,
                             camera_scene=camera_scene,
+                            camera_emotion=camera_emotion,
                             visible_names=visible_names,
+                            visible_emotions=cached_emotions,
+                            viewer_emotion=viewer_emotion,
                             device_id=device_id,
                             session_kind=session_kind,
                             session_id=_session_id_from_websocket(websocket),
@@ -3558,9 +4028,26 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                     pipeline_error = str(exc)[:200]
                     err_note = str(exc)[:512]
                     try:
-                        from voice_service import voice_pipeline_recovery_wav
+                        from llm_service import (
+                            OLLAMA_UNAVAILABLE_REPLY,
+                            brief_spoken_message,
+                            is_ollama_error,
+                        )
+                        from wav_resample import ESP_PCM_SAMPLE_RATE_HZ, resample_wav_bytes_to_mono_16bit
 
-                        wav_out = await run_in_threadpool(voice_pipeline_recovery_wav, exc)
+                        def _recover_wav(pipeline_exc: BaseException = exc) -> bytes:
+                            if is_ollama_error(pipeline_exc):
+                                txt = OLLAMA_UNAVAILABLE_REPLY
+                            else:
+                                txt = brief_spoken_message(
+                                    err_note,
+                                    model=os.environ.get("OLLAMA_MODEL"),
+                                    api_url=os.environ.get("OLLAMA_URL"),
+                                )
+                            raw, _ = synthesize_sapi_wav_bytes(txt)
+                            return resample_wav_bytes_to_mono_16bit(raw, ESP_PCM_SAMPLE_RATE_HZ)
+
+                        wav_out = await run_in_threadpool(_recover_wav)
                     except Exception:
                         logger.exception("Voice pipeline recovery failed")
                         wav_out = minimal_voice_reply_wav()
@@ -3651,6 +4138,8 @@ async def _voice_ws_pipeline(websocket: WebSocket, device_id: str) -> None:
                     )
                 if getattr(reply_meta, "look_scan", False):
                     ws_meta["look_scan"] = True
+                if getattr(reply_meta, "observe", None) is not None:
+                    ws_meta["observe"] = bool(reply_meta.observe)
                 if getattr(reply_meta, "face_track", None) is not None:
                     ws_meta["face_track"] = bool(reply_meta.face_track)
                 await websocket.send_json(ws_meta)
@@ -3938,15 +4427,14 @@ def main() -> None:
     if args.alarm_wav.strip():
         os.environ["ALARM_WAV_PATH"] = args.alarm_wav.strip()
 
-    from llm_service import resolve_ollama_api_url, set_ollama_env_url, try_start_gpu_ollama
+    from llm_service import resolve_ollama_api_url, try_start_gpu_ollama
 
     try_start_gpu_ollama()
-    ollama_url = set_ollama_env_url(
-        resolve_ollama_api_url(
-            model=args.ollama_model.strip(),
-            preferred=args.ollama_url,
-        )
+    ollama_url = resolve_ollama_api_url(
+        model=args.ollama_model.strip(),
+        preferred=args.ollama_url,
     )
+    os.environ["OLLAMA_URL"] = ollama_url
     os.environ["OLLAMA_MODEL"] = args.ollama_model.strip()
     os.environ["WHISPER_MODEL"] = args.whisper_model.strip()
     if args.whisper_device.strip():

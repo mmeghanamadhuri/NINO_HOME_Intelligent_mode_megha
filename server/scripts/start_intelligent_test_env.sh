@@ -44,6 +44,16 @@ if [[ -f "${SERVER_DIR}/.venv/bin/activate" ]]; then
   source "${SERVER_DIR}/.venv/bin/activate"
 fi
 
+if [[ -f "${SERVER_DIR}/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "${SERVER_DIR}/.env"
+  set +a
+fi
+
+export SOAK_TEST_ENABLED="${SOAK_TEST_ENABLED:-0}"
+export SOAK_LIVE_ESP="${SOAK_LIVE_ESP:-0}"
+
 PID_FILE="${SERVER_DIR}/data/nino_server.pid"
 LOG_FILE="${SERVER_DIR}/data/nino_server.log"
 mkdir -p "${SERVER_DIR}/data"
@@ -51,8 +61,9 @@ mkdir -p "${SERVER_DIR}/data"
 if [[ -f "${PID_FILE}" ]] && kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
   log "NiNO server already running (pid $(cat "${PID_FILE}"))"
 else
-  log "Starting NiNO server on 0.0.0.0:8000 (Intelligent Mode from .env)..."
-  nohup python3 app.py --host 0.0.0.0 --port 8000 >>"${LOG_FILE}" 2>&1 &
+  log "Starting NiNO server on 0.0.0.0:8000 (Intelligent Mode from .env, soak off)..."
+  nohup env SOAK_TEST_ENABLED="${SOAK_TEST_ENABLED}" SOAK_LIVE_ESP="${SOAK_LIVE_ESP}" \
+    python3 app.py --host 0.0.0.0 --port 8000 >>"${LOG_FILE}" 2>&1 &
   echo $! >"${PID_FILE}"
 fi
 

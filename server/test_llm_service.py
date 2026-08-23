@@ -8,9 +8,7 @@ from unittest.mock import patch
 
 from llm_service import (
     DEFAULT_LLM_GREETING_ONE_IN,
-    DEFAULT_OLLAMA_HTTP_RETRIES,
     _defers_to_recognized_speaker,
-    _ollama_http_retries,
     answer_voice_query,
     greeting_allowed_for_llm_turn,
     llm_greeting_one_in,
@@ -134,37 +132,6 @@ class ChatGreetingRateTests(unittest.TestCase):
 
         self.assertEqual(reply, "Good evening! Mars is the fourth planet.")
         self.assertNotIn("Do NOT greet at all", generate.call_args.args[0])
-
-
-class OllamaUrlTests(unittest.TestCase):
-    def test_ollama_base_url_strips_doubled_generate_suffix(self) -> None:
-        from llm_service import _ollama_base_url
-
-        base = _ollama_base_url("http://127.0.0.1:11435/api/generate/api/generate")
-        self.assertEqual(base, "http://127.0.0.1:11435")
-
-    def test_set_ollama_env_url_normalizes_doubled_suffix(self) -> None:
-        from llm_service import _ollama_base_url, set_ollama_env_url
-
-        with patch.dict(
-            "os.environ",
-            {"OLLAMA_URL": "http://127.0.0.1:11435/api/generate/api/generate"},
-            clear=False,
-        ):
-            url = set_ollama_env_url()
-            self.assertEqual(url, "http://127.0.0.1:11435/api/generate")
-            self.assertEqual(os.environ["OLLAMA_URL"], url)
-            self.assertEqual(_ollama_base_url(url), "http://127.0.0.1:11435")
-
-
-class OllamaHttpRetryTests(unittest.TestCase):
-    def test_default_retry_count(self) -> None:
-        with patch.dict("os.environ", {}, clear=True):
-            self.assertEqual(_ollama_http_retries(), DEFAULT_OLLAMA_HTTP_RETRIES)
-
-    def test_env_override(self) -> None:
-        with patch.dict("os.environ", {"OLLAMA_HTTP_RETRIES": "10"}, clear=False):
-            self.assertEqual(_ollama_http_retries(), 10)
 
 
 if __name__ == "__main__":

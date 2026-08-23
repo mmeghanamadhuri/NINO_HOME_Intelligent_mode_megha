@@ -12,7 +12,6 @@
         <h1>NiNO Camera Face Server</h1>
         <div class="header-actions">
           <a class="header-link" href="/actions">Actions</a>
-          <a class="header-link" href="/ops">Ops</a>
           <div class="status-pill" id="connectionStatus">Starting...</div>
         </div>
       </div>
@@ -45,6 +44,15 @@
         </div>
         <div class="stream-frame">
           <img id="stream" src="/video_feed?device_id={{ device_id }}" alt="Annotated camera stream" data-device-id="{{ device_id }}" />
+          <div id="streamOffline" class="stream-offline" hidden>
+            <p class="stream-offline-title">Camera offline</p>
+            <p class="stream-offline-hint">
+              Wake the robot (<strong>Ok Nino</strong>) to turn the camera on, or set
+              <code>http://&lt;P4-IP&gt;/stream</code> and click
+              <strong>Start / Restart Stream</strong>.
+            </p>
+            <p id="streamOfflineDetail" class="stream-offline-detail"></p>
+          </div>
         </div>
       </section>
 
@@ -113,6 +121,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js?v=5"></script>
+    <script src="/static/app.js?v=6"></script>
   </body>
 </html>

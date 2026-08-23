@@ -54,6 +54,59 @@ def _format_emotion_label(emotion: str) -> str:
     return key.capitalize()
 
 
+_SKIP_EMOTIONS = frozenset({"", "uncertain", "unknown"})
+
+
+def _face_display_name(result: dict[str, Any]) -> str:
+    name = ""
+    if result.get("recognized") or result.get("stabilized"):
+        name = str(result.get("name", "")).strip()
+    elif result.get("pending"):
+        name = str(result.get("candidate_name") or result.get("name") or "").strip()
+    if name and name.lower() not in {"unknown", "face"}:
+        return name
+    return "someone in frame"
+
+
+def emotion_scene_context(
+    face_results: list[dict[str, Any]] | None,
+    *,
+    focus_name: str | None = None,
+) -> str:
+    """LLM-readable mood cues from the live DrGM / Rekognition pipeline."""
+    if not face_results:
+        return ""
+    ranked: list[tuple[int, str, str]] = []
+    for result in face_results:
+        if not result.get("detection_valid", True):
+            continue
+        if not isinstance(result.get("box"), dict):
+            continue
+        emotion = str(result.get("emotion") or "").strip().lower()
+        if not emotion or emotion in _SKIP_EMOTIONS:
+            continue
+        box = result["box"]
+        area = int(box.get("w", 0) or 0) * int(box.get("h", 0) or 0)
+        ranked.append((area, _face_display_name(result), emotion))
+    if not ranked:
+        return ""
+    ranked.sort(key=lambda item: item[0], reverse=True)
+
+    focus_key = str(focus_name or "").strip().lower()
+    phrases: list[str] = []
+    for _area, name, mood in ranked[:3]:
+        name_key = name.lower()
+        if focus_key and name_key == focus_key:
+            phrases.append(
+                f"{name} (the person you're speaking to) looks {mood}"
+            )
+        elif name == "someone in frame":
+            phrases.append(f"Someone in frame looks {mood}")
+        else:
+            phrases.append(f"{name} looks {mood}")
+    return "; ".join(phrases)
+
+
 class EmotionService:
     """Attach emotion labels to face recognition results for the live feed."""
 

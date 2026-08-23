@@ -2,11 +2,120 @@
 
 from __future__ import annotations
 
+import copy
 from datetime import datetime, timezone
 from typing import Any
 
 from intelligent_mode.incident_ui import enrich_incident_for_ui
 from intelligent_mode.session_camera import classify_camera_state
+from device_registry import effective_device_display_name
+
+PROJECT_TASKS: list[dict[str, Any]] = [
+    {
+        "id": "orchestrator",
+        "name": "Master Orchestrator",
+        "layer": "control",
+        "interval": "~45s",
+        "role": "Runs the full detect → debug → fix → verify → email loop.",
+        "handles": "Grace periods, skip-fix during live voice, incident lifecycle.",
+    },
+    {
+        "id": "testing_l1",
+        "name": "Testing Agent — L1 Smoke",
+        "layer": "testing",
+        "interval": "Each tick",
+        "role": "Quick health probes (~10 checks).",
+        "handles": "Ollama, Whisper, TTS, bot HTTP, camera, playback routes.",
+    },
+    {
+        "id": "testing_l2",
+        "name": "Testing Agent — L2 E2E Voice",
+        "layer": "testing",
+        "interval": "Each tick (skipped if voice active)",
+        "role": "Scripted voice pipeline test in-process.",
+        "handles": "LLM Q&A path, STT/TTS wiring without live ESP mic.",
+    },
+    {
+        "id": "testing_l3",
+        "name": "Testing Agent — L3 Soak",
+        "layer": "testing",
+        "interval": "~90s loop",
+        "role": "Continuous live robot Q&A stress test.",
+        "handles": "ESP speaker playback, memory, face stack, bot /status.",
+    },
+    {
+        "id": "detector",
+        "name": "Anomaly Detector",
+        "layer": "detection",
+        "interval": "Each tick",
+        "role": "Rule-based monitoring from live snapshot + latency log.",
+        "handles": "Bot offline, camera faults, LLM down, repeated STT-empty.",
+    },
+    {
+        "id": "debug",
+        "name": "Debug Agent",
+        "layer": "analysis",
+        "interval": "On incident open / after fix",
+        "role": "Root-cause classification before recovery.",
+        "handles": "Operational vs logic bug vs configuration issues.",
+    },
+    {
+        "id": "remediation",
+        "name": "Agent Remediation",
+        "layer": "classification",
+        "interval": "Before fix chain",
+        "role": "Pattern matcher for known benign vs real failures.",
+        "handles": "Soak skips, CPU Ollama noise, STT recovery, valid soak replies.",
+    },
+    {
+        "id": "recovery",
+        "name": "Recovery Workers",
+        "layer": "recovery",
+        "interval": "When incident open",
+        "role": "Whitelisted ops fixes only.",
+        "handles": "Restart Ollama/camera, reload Whisper/Piper, voice pipeline reset.",
+    },
+    {
+        "id": "verification",
+        "name": "Verification Agent",
+        "layer": "verification",
+        "interval": "Before resolved",
+        "role": "Confirms fixes actually worked.",
+        "handles": "Subsystem health, smoke, live Ollama probe, STT log check.",
+    },
+    {
+        "id": "code_bug",
+        "name": "Code Bug Analyzer",
+        "layer": "escalation",
+        "interval": "On logic/regression signals",
+        "role": "Escalates firmware/software bugs to developer.",
+        "handles": "Bug summary, affected files — never auto-patches code.",
+    },
+    {
+        "id": "coding_agent",
+        "name": "Coding Agent",
+        "layer": "developer",
+        "interval": "~30s background",
+        "role": "Drafts fix proposals for code bugs (optional).",
+        "handles": "LLM-generated patches — human approval required.",
+    },
+    {
+        "id": "email",
+        "name": "Email / Reporter",
+        "layer": "reporting",
+        "interval": "Immediate or 15 min digest",
+        "role": "Notifies humans with plain-English reports.",
+        "handles": "Critical/escalated immediate; benign patterns silent in email.",
+    },
+    {
+        "id": "discovery",
+        "name": "Discovery Agent",
+        "layer": "ops",
+        "interval": "~8s LAN scan",
+        "role": "Finds ESP32 bots on the local network.",
+        "handles": "device_id, camera URL, play_wav URL, Wi-Fi telemetry.",
+    },
+]
 
 
 def _utc_now() -> str:
@@ -347,7 +456,11 @@ def build_dashboard(
         if not device_id:
             continue
 
-        display_name = str(row.get("display_name") or device_id)
+        display_name = effective_device_display_name(
+            device_id=device_id,
+            display_name=str(row.get("display_name") or ""),
+            location_name=str(row.get("location_name") or ""),
+        )
         bot_incidents = _incidents_for_device(enriched_incidents, device_id, active_only=True)
         bot_smoke = smoke_by_device.get(device_id, [])
 
@@ -443,6 +556,7 @@ def build_dashboard(
             {
                 "device_id": device_id,
                 "display_name": display_name,
+                "location_name": str(row.get("location_name") or ""),
                 "health": bot_health,
                 "agent_status": agent_status,
                 "voice_pipeline_active": voice_active,
@@ -531,4 +645,101 @@ def build_dashboard(
         "agent_activity": agent_activity,
         "soak_test": intelligent_status.get("soak_test") or {},
         "server_runtime": intelligent_status.get("server_runtime") or {},
+        "project_tasks": PROJECT_TASKS,
     }
+
+
+def filter_dashboard_for_device(
+    payload: dict[str, Any],
+    device_id: str | None,
+) -> dict[str, Any]:
+    """Return a copy of the dashboard scoped to one device (or fleet view)."""
+    if not device_id or str(device_id).strip().lower() in {"", "fleet", "all"}:
+        out = copy.deepcopy(payload)
+        out["focus"] = {
+            "mode": "fleet",
+            "device_id": None,
+            "display_name": "All fleet",
+        }
+        return out
+
+    focus_id = str(device_id).strip()
+    out = copy.deepcopy(payload)
+
+    if focus_id == "server":
+        bot_rows: list[dict[str, Any]] = []
+        display_name = "NiNO Server"
+        health = (out.get("server") or {}).get("health") or "unknown"
+    else:
+        bot_rows = [
+            bot
+            for bot in (out.get("bots") or [])
+            if str(bot.get("device_id") or "") == focus_id
+        ]
+        if not bot_rows:
+            out["focus"] = {
+                "mode": "missing",
+                "device_id": focus_id,
+                "display_name": focus_id,
+            }
+            return out
+        display_name = str(bot_rows[0].get("display_name") or focus_id)
+        health = bot_rows[0].get("health") or "unknown"
+
+    def _match_row(row: dict[str, Any]) -> bool:
+        return str(row.get("device_id") or "") == focus_id
+
+    queues = out.get("issue_queues") or {}
+    filtered_queues: dict[str, list[dict[str, Any]]] = {}
+    for key, rows in queues.items():
+        if not isinstance(rows, list):
+            continue
+        filtered_queues[key] = [row for row in rows if _match_row(row)]
+
+    activity = [
+        row for row in (out.get("agent_activity") or []) if _match_row(row)
+    ]
+    incidents = out.get("incidents") or {}
+    active = [
+        inc for inc in (incidents.get("active") or []) if _match_row(inc)
+    ]
+    recent_resolved = [
+        inc for inc in (incidents.get("recent_resolved") or []) if _match_row(inc)
+    ]
+
+    out["issue_queues"] = filtered_queues
+    out["agent_activity"] = activity
+    out["incidents"] = {
+        "active": active,
+        "recent_resolved": recent_resolved,
+    }
+    out["bots"] = bot_rows
+
+    summary = dict(out.get("summary") or {})
+    if focus_id == "server":
+        summary["total_bots"] = 0
+        summary["healthy_bots"] = 1 if health == "healthy" else 0
+        summary["needs_help_bots"] = 0 if health == "healthy" else 1
+    else:
+        summary["total_bots"] = 1
+        summary["healthy_bots"] = 1 if health == "healthy" and not active else 0
+        summary["needs_help_bots"] = 0 if health == "healthy" and not active else 1
+    summary["open_incidents"] = len(active)
+    summary["fixing_incidents"] = sum(
+        1 for inc in active if str(inc.get("status") or "") == "fixing"
+    )
+    summary["escalated_incidents"] = sum(
+        1 for inc in active if str(inc.get("status") or "") == "escalated"
+    )
+    summary["agent_handling_incidents"] = len(filtered_queues.get("agent_working") or [])
+    summary["developer_needed_incidents"] = len(filtered_queues.get("developer") or [])
+    summary["agent_resolved_recent"] = len(filtered_queues.get("agent_resolved") or [])
+    out["summary"] = summary
+
+    out["focus"] = {
+        "mode": "server" if focus_id == "server" else "bot",
+        "device_id": focus_id,
+        "display_name": display_name,
+        "health": health,
+    }
+    return out

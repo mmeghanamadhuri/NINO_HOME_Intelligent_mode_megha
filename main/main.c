@@ -101,6 +101,7 @@ static bool s_wifi_connected_chime_pending = false;
 static bool s_wifi_connected_chime_played = false;
 static bool s_audio_queue_ready = false;
 static volatile bool s_wifi_connected_chime_task_running = false;
+static portMUX_TYPE s_wifi_chime_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool s_boot_unprovisioned = false;
 static volatile bool s_provisioned_welcome_scheduled = false;
 static char s_setup_prev_ssid[WIFI_CONFIG_STA_SSID_MAX];
@@ -239,12 +240,25 @@ static bool play_wifi_connected_clip(void) {
  * chime pending and retry its queue operation instead of losing it. */
 static void wifi_connected_chime_task(void *arg) {
   (void)arg;
-  for (int attempt = 0; attempt < 120 && s_sta_connected &&
-                        s_wifi_connected_chime_pending;
+  for (int attempt = 0; attempt < 120 && s_sta_connected;
        ++attempt) {
-    if (s_audio_queue_ready && play_wifi_connected_clip()) {
+    if (!s_audio_queue_ready) {
+      vTaskDelay(pdMS_TO_TICKS(250));
+      continue;
+    }
+    bool should_play = false;
+    portENTER_CRITICAL(&s_wifi_chime_mux);
+    if (s_wifi_connected_chime_pending && !s_wifi_connected_chime_played) {
       s_wifi_connected_chime_pending = false;
       s_wifi_connected_chime_played = true;
+      should_play = true;
+    }
+    portEXIT_CRITICAL(&s_wifi_chime_mux);
+    if (should_play) {
+      (void)play_wifi_connected_clip();
+      break;
+    }
+    if (s_wifi_connected_chime_played) {
       break;
     }
     vTaskDelay(pdMS_TO_TICKS(250));
@@ -257,11 +271,14 @@ static void wifi_connected_chime_task(void *arg) {
 }
 
 static void schedule_wifi_connected_chime(void) {
+  portENTER_CRITICAL(&s_wifi_chime_mux);
   if (s_wifi_connected_chime_played || !s_sta_connected ||
       !s_wifi_connected_chime_pending || s_wifi_connected_chime_task_running) {
+    portEXIT_CRITICAL(&s_wifi_chime_mux);
     return;
   }
   s_wifi_connected_chime_task_running = true;
+  portEXIT_CRITICAL(&s_wifi_chime_mux);
   if (xTaskCreate(wifi_connected_chime_task, "wifi_chime", 3072, NULL, 5,
                   NULL) != pdPASS) {
     s_wifi_connected_chime_task_running = false;

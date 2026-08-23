@@ -25,6 +25,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from eye_expression import BITMAP_EYE_EXPRESSIONS, spatial_eye_from_text
 from esp_playback import device_busy_speaking, post_eye_expression_to_esp
 
 logger = logging.getLogger(__name__)
@@ -40,7 +41,7 @@ EMOTION_TO_EYE: dict[str, str] = {
     "neutral": "idle",
 }
 
-_ACTIVE_EMOTIONS = frozenset({"happy", "sad", "surprised"})
+_ACTIVE_EMOTIONS = frozenset({"happy", "sad", "surprised"}) | frozenset(BITMAP_EYE_EXPRESSIONS)
 
 
 @dataclass
@@ -110,6 +111,7 @@ class VisionEyeDriver:
         results: list[dict[str, Any]] | None,
         *,
         device_id: str | None = None,
+        scene_context: str = "",
         now: float | None = None,
     ) -> None:
         """Feed one frame's face results. Safe to call every frame."""
@@ -144,7 +146,7 @@ class VisionEyeDriver:
             if latch.last_pushed in _ACTIVE_EMOTIONS:
                 latch.last_pushed = "idle" if self._push("idle", device_id) else None
 
-        target = self._target_from_results(results)
+        target = self._target_from_results(results, scene_context=scene_context)
         if target != latch.candidate:
             latch.candidate = target
             latch.candidate_since = now
@@ -188,8 +190,21 @@ class VisionEyeDriver:
             return True
         return device_busy_speaking(device_id)
 
-    def _target_from_results(self, results: list[dict[str, Any]] | None) -> str:
+    def _target_from_results(
+        self,
+        results: list[dict[str, Any]] | None,
+        *,
+        scene_context: str = "",
+    ) -> str:
         label = self._primary_emotion(results)
+        if label and label not in {"neutral", "uncertain", "unknown"}:
+            mapped = EMOTION_TO_EYE.get(label, "idle")
+            if mapped != "idle":
+                return mapped
+        if scene_context:
+            spatial = spatial_eye_from_text(scene_context)
+            if spatial:
+                return spatial
         if not label:
             return "idle"
         return EMOTION_TO_EYE.get(label, "idle")
